@@ -143,7 +143,7 @@ python main.py --schedule                    # 定时模式自动包含选股任
 2. **Phase 2** — ✅ SectorRotationService + 板块历史数据（2026-06-13 完成）
 3. **Phase 3** — ✅ StrategyFilterService + DDE 数据层 + 同花顺问财集成（2026-06-14 完成）
 4. **Phase 4** — ✅ TechnicalIndicatorService + 风险评估 + 五维整合 + AI评分 + 便捷脚本（2026-06-16 完成）
-5. **Phase 5** — ⬜ Agent Tools + 更多论坛源 + API 端点 + 测试
+5. **Phase 5** — ✅ Agent Tools + Screener Repository + 报告模板 + 示例策略 + 测试（2026-06-25 完成核心项）
 
 ## Phase 3 新增内容（2026-06-14）
 
@@ -256,3 +256,53 @@ python scripts/run_screener.py                  # 默认运行
 python scripts/run_screener.py --notify          # 推送通知
 python scripts/run_screener.py --source eastmoney  # 东方财富数据源
 ```
+
+## Phase 5 新增内容（2026-06-25 完成核心项）
+
+### Agent Tools
+
+新增 `src/agent/tools/screener_tools.py`，注册 4 个选股工具到 Agent 框架：
+
+| 工具名 | 类别 | 功能 |
+|--------|------|------|
+| `get_forum_sentiment` | sentiment | 查询股票在论坛的舆情数据 |
+| `get_sector_rotation` | market | 获取板块轮动分析 |
+| `get_sector_constituents` | market | 查询板块成分股列表 |
+| `get_screener_results` | data | 获取选股结果（最新/按日期） |
+
+工具已注册到 `src/agent/factory.py` 的 ToolRegistry，Agent 可直接调用。
+
+### Screener Repository
+
+新增 `src/repositories/screener_repository.py`，封装 ScreenerResultRecord 的 CRUD：
+- `save_result()` / `batch_save_results()` — 保存选股结果
+- `get_results_by_date()` — 按日期查询（支持最低评分过滤）
+- `get_latest_results()` — 获取最新一次选股结果
+- `get_stock_history()` — 查询股票历史入选记录
+- `get_recommendation_stats()` — 推荐级别统计
+- `delete_old_results()` — 数据清理
+
+### 选股报告模板
+
+新增 `templates/report_screener.j2` — Jinja2 选股报告模板
+新增 `NotificationService.generate_screener_report()` — 选股报告生成方法（优先 Jinja2 渲染，降级到纯文本）
+
+### 示例策略
+
+| 策略文件 | 说明 |
+|----------|------|
+| `strategies/custom/forum_hot_screener.yaml` | 论坛热度精选（情绪共振策略） |
+| `strategies/custom/sector_leader.yaml` | 板块龙头精选（强势板块+龙头股） |
+
+### 集成测试
+
+新增测试文件（共 45 个测试用例全部通过）：
+- `tests/services/test_forum_sentiment.py` — 12 个用例（情绪分析、股票引用提取、数据模型）
+- `tests/services/test_stock_screener.py` — 13 个用例（数据模型、通知格式化、Agent Tools）
+- `tests/test_sector_rotation.py` — 20 个用例（已有）
+
+### 待完成（可选扩展）
+
+- [ ] API 端点（REST 接口，供外部调用）
+- [ ] 更多论坛源（东方财富股吧、淘股吧）
+- [ ] 使用文档和策略编写指南

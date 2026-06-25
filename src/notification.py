@@ -1763,6 +1763,71 @@ class NotificationService(
 
         return "\n".join(lines)
 
+    def generate_screener_report(self, screener_result) -> str:
+        """
+        生成选股报告（Markdown 格式）
+
+        Args:
+            screener_result: ScreenerRunResult 选股运行结果
+
+        Returns:
+            Markdown 格式的选股报告
+        """
+        from src.services.stock_screener import ScreenerRunResult
+
+        if not isinstance(screener_result, ScreenerRunResult):
+            return "❌ 无效的选股结果对象"
+
+        # 优先使用 Jinja2 模板渲染
+        try:
+            from src.services.report_renderer import _resolve_templates_dir
+            from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+            templates_dir = _resolve_templates_dir()
+            template_path = templates_dir / "report_screener.j2"
+            if template_path.exists():
+                env = Environment(
+                    loader=FileSystemLoader(str(templates_dir)),
+                    autoescape=select_autoescape([]),
+                )
+                template = env.get_template("report_screener.j2")
+                source_name = "同花顺问财" if screener_result.data_source == "ths" else "东方财富"
+                stocks_data = []
+                for s in screener_result.stocks:
+                    stocks_data.append({
+                        "code": s.code,
+                        "name": s.name,
+                        "score": s.score,
+                        "technical_score": s.technical_score,
+                        "volume_ratio": s.volume_ratio,
+                        "dde_big_order": s.dde_big_order,
+                        "signal_tags": s.signal_tags,
+                        "sector_name": s.sector_name,
+                        "sector_score": s.sector_score,
+                        "heat_score": s.heat_score,
+                        "sentiment_score": s.sentiment_score,
+                        "risk_score": s.risk_score,
+                        "risk_tags": s.risk_tags,
+                        "ai_reasoning": s.ai_reasoning,
+                    })
+                return template.render(
+                    run_date=screener_result.run_date,
+                    run_time=screener_result.run_time,
+                    source_name=source_name,
+                    strategy_name=screener_result.strategy_name,
+                    matched_count=screener_result.matched_count,
+                    elapsed_seconds=screener_result.elapsed_seconds,
+                    query=screener_result.query,
+                    stocks=stocks_data,
+                )
+        except Exception as e:
+            logger.debug(f"Jinja2 渲染选股报告失败，降级到纯文本: {e}")
+
+        # 降级：使用 stock_screener 内置的 format_notification
+        from src.services.stock_screener import StockScreenerPipeline
+        pipeline = StockScreenerPipeline.__new__(StockScreenerPipeline)
+        return pipeline.format_notification(screener_result)
+
     # Display name mapping for realtime data sources
     _SOURCE_DISPLAY_NAMES = {
         "tencent": {"zh": "腾讯财经", "en": "Tencent Finance"},

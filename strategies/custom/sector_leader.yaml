@@ -1,0 +1,44 @@
+# 板块龙头选股策略
+# 策略逻辑：筛选强势板块中的龙头股
+#
+# 条件说明：
+# 1. 板块强度分 >= 70  — 板块处于强势阶段
+# 2. DDE大单净量 >= 0.5%  — 主力资金明显介入
+# 3. 涨幅 >= 2%  — 当日表现强势
+#
+# 适用场景：跟随板块轮动，捕捉强势板块的龙头标的
+
+name: sector_leader
+display_name: 板块龙头精选
+description: 基于板块轮动分析和DDE数据的龙头股选股策略
+category: screener
+
+# 策略指令（供 AI 分析时参考）
+instructions: |
+  这是一个板块龙头选股策略，用于筛选强势板块中表现最好的个股：
+
+  1. 板块强度分 >= 70：板块处于强势阶段（5日涨幅、资金流入、涨停数等综合评分）
+  2. DDE大单净量 >= 0.5%：主力资金明显介入
+  3. 涨幅 >= 2%：当日表现强势，非板块中的落后股
+
+  核心逻辑：买强不买弱，龙头股在板块行情中涨幅最大、回调最小
+
+# 量化筛选条件
+screener_conditions:
+  - field: sector_score
+    operator: gte
+    value: 70
+    weight: 0.35
+    description: 板块强度分 >= 70
+
+  - field: dde_big_order
+    operator: gte
+    value: 0.5
+    weight: 0.35
+    description: DDE大单净量 >= 0.5%
+
+  - field: pct_change
+    operator: gte
+    value: 2.0
+    weight: 0.3
+    description: 当日涨幅 >= 2%

@@ -1,0 +1,44 @@
+# 论坛热度选股策略
+# 策略逻辑：筛选 NGA 大时代论坛高热度 + 正面情绪的股票
+#
+# 条件说明：
+# 1. 论坛热度 >= 40  — 有一定市场关注度
+# 2. 情绪分 >= 0.1  — 整体偏正面
+# 3. DDE大单净量 >= 0.3%  — 主力资金配合
+#
+# 适用场景：捕捉市场情绪共振、散户和主力方向一致的标的
+
+name: forum_hot_screener
+display_name: 论坛热度精选
+description: 基于NGA大时代论坛舆情和DDE数据的情绪共振选股策略
+category: screener
+
+# 策略指令（供 AI 分析时参考）
+instructions: |
+  这是一个情绪共振选股策略，用于筛选论坛热度高且主力资金配合的股票：
+
+  1. 论坛热度 >= 40：在 NGA 大时代有一定讨论量，非冷门股
+  2. 情绪分 >= 0.1：整体偏正面，非吐槽/恐慌情绪
+  3. DDE大单净量 >= 0.3%：主力资金至少小幅净流入
+
+  核心逻辑：散户情绪和主力资金方向一致时，短线成功率更高
+
+# 量化筛选条件
+screener_conditions:
+  - field: heat_score
+    operator: gte
+    value: 40
+    weight: 0.3
+    description: 论坛热度 >= 40
+
+  - field: sentiment_score
+    operator: gte
+    value: 0.1
+    weight: 0.3
+    description: 情绪分 >= 0.1（正面）
+
+  - field: dde_big_order
+    operator: gte
+    value: 0.3
+    weight: 0.4
+    description: DDE大单净量 >= 0.3%
