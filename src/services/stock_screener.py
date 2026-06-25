@@ -65,6 +65,13 @@ class ScreenerStock:
     risk_score: float = 0.0        # 风险评分 0-100, 越高越危险
     risk_tags: List[str] = field(default_factory=list)
     ai_reasoning: str = ""         # AI 点评摘要
+    recommendation: str = "watch"  # 推荐级别: strong_buy / buy / watch
+
+    # 持仓信息
+    portfolio_held: bool = False           # 是否已持仓
+    portfolio_quantity: float = 0.0        # 持仓数量
+    portfolio_avg_cost: float = 0.0        # 持仓均价
+    portfolio_pnl_pct: Optional[float] = None  # 持仓盈亏比例 %
 
 
 @dataclass
@@ -153,12 +160,20 @@ class StockScreenerPipeline:
             if not result.error and result.stocks:
                 self._enrich_risk_scores(result)
 
+            # 挂仓感知整合（标记已持仓、调整推荐级别）
+            if not result.error and result.stocks and self.config.screener_portfolio_enabled:
+                self._enrich_portfolio_context(result)
+
             # AI 综合评分（LLM 点评）
             if not result.error and result.stocks:
                 self._compute_composite_scores(result)
 
             # 保存结果到数据库
             self._save_screener_results(result)
+
+            # 自动记录模拟交易
+            if not result.error and result.stocks and self.config.screener_auto_trade:
+                self._record_simulated_trades(result)
 
             elapsed = time.time() - start_time
             result.elapsed_seconds = elapsed
@@ -447,6 +462,101 @@ class StockScreenerPipeline:
             f"[选股] 风险评估完成: {len(assessments)}/{len(result.stocks)} 只"
         )
 
+    def _enrich_portfolio_context(self, result: ScreenerRunResult) -> None:
+        """持仓感知整合：标记已持仓股票，调整推荐级别。"""
+        try:
+            from src.services.portfolio_service import PortfolioService
+            from src.repositories.portfolio_repo import PortfolioRepository
+            from data_provider.base import normalize_stock_code
+
+            repo = PortfolioRepository(self.db)
+            service = PortfolioService(repo)
+
+            snapshot = service.get_portfolio_snapshot()
+            held_symbols: Dict[str, Dict] = {}
+
+            for account in snapshot.get("accounts", []):
+                for pos in account.get("positions", []):
+                    sym = normalize_stock_code(pos.get("symbol", ""))
+                    if sym:
+                        held_symbols[sym] = {
+                            "quantity": pos.get("quantity", 0),
+                            "avg_cost": pos.get("avg_cost", 0),
+                            "unrealized_pnl_pct": pos.get("unrealized_pnl_pct"),
+                        }
+
+            if not held_symbols:
+                logger.info("[选股] 持仓感知: 无持仓或无账户")
+                return
+
+            held_count = 0
+            for stock in result.stocks:
+                norm_code = normalize_stock_code(stock.code)
+                if norm_code in held_symbols:
+                    pos = held_symbols[norm_code]
+                    stock.portfolio_held = True
+                    stock.portfolio_quantity = pos["quantity"]
+                    stock.portfolio_avg_cost = pos["avg_cost"]
+                    stock.portfolio_pnl_pct = pos.get("unrealized_pnl_pct")
+                    # 已持仓的降级推荐：strong_buy → buy
+                    if stock.recommendation == "strong_buy":
+                        stock.recommendation = "buy"
+                    held_count += 1
+
+            logger.info(f"[选股] 持仓感知: {held_count}/{len(result.stocks)} 只已持仓")
+
+        except Exception as e:
+            logger.warning(f"[选股] 持仓感知整合失败（不影响主流程）: {e}")
+
+    def _record_simulated_trades(self, result: ScreenerRunResult) -> None:
+        """为高评分未持仓股票记录模拟买入。"""
+        try:
+            from src.services.portfolio_service import PortfolioService
+            from src.repositories.portfolio_repo import PortfolioRepository
+
+            repo = PortfolioRepository(self.db)
+            service = PortfolioService(repo)
+            accounts = service.list_accounts()
+            if not accounts:
+                logger.info("[选股] 自动建仓: 无可用账户，跳过")
+                return
+
+            account_id = accounts[0]["id"]
+            min_score = self.config.screener_auto_trade_min_score
+            quantity = self.config.screener_auto_trade_quantity
+            traded = 0
+
+            for stock in result.stocks:
+                if stock.portfolio_held:
+                    continue
+                if stock.score < min_score:
+                    continue
+                if stock.recommendation not in ("strong_buy", "buy"):
+                    continue
+
+                try:
+                    service.record_trade(
+                        account_id=account_id,
+                        symbol=stock.code,
+                        trade_date=date.today(),
+                        side="buy",
+                        quantity=quantity,
+                        price=0.0,
+                        note=f"选股自动建仓: 综合评分{stock.score:.1f}",
+                    )
+                    stock.signal_tags.append("🆕模拟建仓")
+                    stock.portfolio_held = True
+                    stock.portfolio_quantity = quantity
+                    traded += 1
+                except Exception as e:
+                    logger.warning(f"[选股] 模拟建仓失败 {stock.code}: {e}")
+
+            if traded:
+                logger.info(f"[选股] 自动建仓: {traded} 只")
+
+        except Exception as e:
+            logger.warning(f"[选股] 自动建仓流程失败（不影响主流程）: {e}")
+
     def _compute_composite_scores(self, result: ScreenerRunResult) -> None:
         """
         综合评分
@@ -627,7 +737,8 @@ class StockScreenerPipeline:
                     )
                     existing = session.execute(stmt).scalar_one_or_none()
 
-                    recommendation = 'buy' if stock.score >= 80 else 'watch'
+                    # 推荐级别：优先用已设置的 recommendation，否则按分数计算
+                    recommendation = stock.recommendation or ('buy' if stock.score >= 80 else 'watch')
 
                     if existing:
                         existing.composite_score = stock.score
@@ -725,6 +836,17 @@ class StockScreenerPipeline:
             if stock.ai_reasoning:
                 reasoning = stock.ai_reasoning[:40]
                 lines.append(f"   💡 {reasoning}")
+
+            # 持仓状态
+            if stock.portfolio_held:
+                pnl_str = ""
+                if stock.portfolio_pnl_pct is not None:
+                    pnl_emoji = "📈" if stock.portfolio_pnl_pct > 0 else "📉"
+                    pnl_str = f" {pnl_emoji}{stock.portfolio_pnl_pct:+.1f}%"
+                lines.append(
+                    f"   💰 已持仓 {stock.portfolio_quantity:.0f}股"
+                    f" 成本{stock.portfolio_avg_cost:.2f}{pnl_str}"
+                )
 
         lines.append("")
         lines.append(f"⏱️ 耗时: {result.elapsed_seconds:.1f}s")

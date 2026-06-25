@@ -52,6 +52,31 @@ class TestScreenerStock(unittest.TestCase):
         self.assertEqual(stock.sector_name, "白酒")
         self.assertIn("高估值", stock.risk_tags)
 
+    def test_portfolio_fields(self):
+        """持仓字段默认值应正确"""
+        stock = ScreenerStock(code="600519", name="贵州茅台")
+        self.assertFalse(stock.portfolio_held)
+        self.assertEqual(stock.portfolio_quantity, 0.0)
+        self.assertEqual(stock.portfolio_avg_cost, 0.0)
+        self.assertIsNone(stock.portfolio_pnl_pct)
+        self.assertEqual(stock.recommendation, "watch")
+
+    def test_portfolio_held(self):
+        """已持仓股票数据"""
+        stock = ScreenerStock(
+            code="600519",
+            name="贵州茅台",
+            score=80.0,
+            recommendation="buy",
+            portfolio_held=True,
+            portfolio_quantity=100,
+            portfolio_avg_cost=1800.0,
+            portfolio_pnl_pct=5.2,
+        )
+        self.assertTrue(stock.portfolio_held)
+        self.assertEqual(stock.portfolio_quantity, 100)
+        self.assertEqual(stock.portfolio_pnl_pct, 5.2)
+
 
 class TestScreenerRunResult(unittest.TestCase):
     """ScreenerRunResult 数据模型测试"""

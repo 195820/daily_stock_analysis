@@ -306,3 +306,25 @@ python scripts/run_screener.py --source eastmoney  # 东方财富数据源
 - [ ] API 端点（REST 接口，供外部调用）
 - [ ] 更多论坛源（东方财富股吧、淘股吧）
 - [ ] 使用文档和策略编写指南
+
+### 持仓服务整合（2026-06-25 完成）
+
+复用原项目 `PortfolioService` 持仓管理能力，整合到选股流程：
+
+**持仓感知**（`_enrich_portfolio_context`）：
+- 选股时自动查询当前持仓（`PortfolioService.get_portfolio_snapshot`）
+- 已持仓股票标记 `portfolio_held=True`，显示持仓数量/成本/盈亏
+- 已持仓股票的推荐级别从 `strong_buy` 降级为 `buy`（避免重复推买入）
+
+**自动建仓**（`_record_simulated_trades`）：
+- 高评分未持仓股票自动记录模拟买入交易（`PortfolioService.record_trade`）
+- 需开启 `SCREENER_AUTO_TRADE=true`，默认关闭
+- 最低评分阈值 `SCREENER_AUTO_TRADE_MIN_SCORE=75`
+
+**配置项**：
+```bash
+SCREENER_PORTFOLIO_ENABLED=true         # 持仓感知（默认开启）
+SCREENER_AUTO_TRADE=false               # 自动建仓（默认关闭）
+SCREENER_AUTO_TRADE_MIN_SCORE=75        # 自动建仓最低评分
+SCREENER_AUTO_TRADE_QUANTITY=100        # 自动建仓数量（股）
+```

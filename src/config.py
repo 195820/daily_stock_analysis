@@ -734,6 +734,10 @@ class Config:
     screener_weight_technical: float = 0.20                # 技术形态权重
     screener_weight_strategy: float = 0.20                 # 策略匹配权重
     screener_weight_risk: float = 0.10                     # 风险因子权重
+    screener_portfolio_enabled: bool = True                # 持仓感知（已持仓不重复推买入）
+    screener_auto_trade: bool = False                      # 自动记录模拟交易
+    screener_auto_trade_min_score: float = 75.0            # 自动建仓最低评分
+    screener_auto_trade_quantity: float = 100.0            # 自动建仓数量（股）
 
     # === 板块轮动服务 ===
     sector_rotation_enabled: bool = True
@@ -1548,6 +1552,10 @@ class Config:
             screener_weight_technical=parse_env_float(os.getenv('SCREENER_WEIGHT_TECHNICAL'), 0.30, field_name='SCREENER_WEIGHT_TECHNICAL', minimum=0.0, maximum=1.0),
             screener_weight_strategy=parse_env_float(os.getenv('SCREENER_WEIGHT_STRATEGY'), 0.20, field_name='SCREENER_WEIGHT_STRATEGY', minimum=0.0, maximum=1.0),
             screener_weight_risk=parse_env_float(os.getenv('SCREENER_WEIGHT_RISK'), 0.10, field_name='SCREENER_WEIGHT_RISK', minimum=0.0, maximum=1.0),
+            screener_portfolio_enabled=parse_env_bool(os.getenv('SCREENER_PORTFOLIO_ENABLED'), default=True),
+            screener_auto_trade=parse_env_bool(os.getenv('SCREENER_AUTO_TRADE'), default=False),
+            screener_auto_trade_min_score=parse_env_float(os.getenv('SCREENER_AUTO_TRADE_MIN_SCORE'), 75.0, field_name='SCREENER_AUTO_TRADE_MIN_SCORE', minimum=0.0, maximum=100.0),
+            screener_auto_trade_quantity=parse_env_float(os.getenv('SCREENER_AUTO_TRADE_QUANTITY'), 100.0, field_name='SCREENER_AUTO_TRADE_QUANTITY', minimum=1.0),
             sector_rotation_enabled=parse_env_bool(os.getenv('SECTOR_ROTATION_ENABLED'), default=True),
             sector_rotation_lookback_days=parse_env_int(os.getenv('SECTOR_ROTATION_LOOKBACK_DAYS'), 5, field_name='SECTOR_ROTATION_LOOKBACK_DAYS', minimum=1, maximum=30),
             sector_rotation_top_n=parse_env_int(os.getenv('SECTOR_ROTATION_TOP_N'), 20, field_name='SECTOR_ROTATION_TOP_N', minimum=5, maximum=100),

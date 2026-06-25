@@ -29,6 +29,10 @@
 {% if stock.ai_reasoning %}
 - 💡 {{ stock.ai_reasoning[:60] }}
 {% endif %}
+{% if stock.portfolio_held %}
+{% set pnl_emoji = "📈" if (stock.portfolio_pnl_pct or 0) > 0 else "📉" %}
+- 💰 已持仓 {{ stock.portfolio_quantity | round(0) | int }}股 成本{{ stock.portfolio_avg_cost | round(2) }}{% if stock.portfolio_pnl_pct is not none %} {{ pnl_emoji }}{{ "%+.1f" | format(stock.portfolio_pnl_pct) }}%{% endif %}
+{% endif %}
 
 {% endfor %}
 {% else %}

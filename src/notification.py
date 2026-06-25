@@ -1809,6 +1809,10 @@ class NotificationService(
                         "risk_score": s.risk_score,
                         "risk_tags": s.risk_tags,
                         "ai_reasoning": s.ai_reasoning,
+                        "portfolio_held": s.portfolio_held,
+                        "portfolio_quantity": s.portfolio_quantity,
+                        "portfolio_avg_cost": s.portfolio_avg_cost,
+                        "portfolio_pnl_pct": s.portfolio_pnl_pct,
                     })
                 return template.render(
                     run_date=screener_result.run_date,
