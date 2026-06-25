@@ -712,6 +712,40 @@ class Config:
     social_sentiment_api_key: Optional[str] = None
     social_sentiment_api_url: str = "https://api.adanos.org"
 
+    # === 论坛舆情服务 (NGA 大时代) ===
+    forum_sentiment_enabled: bool = False
+    forum_sentiment_nga_uid: Optional[str] = None          # NGA Cookie: ngaPassportUid
+    forum_sentiment_nga_cid: Optional[str] = None          # NGA Cookie: ngaPassportCid
+    forum_sentiment_nga_fid: int = 706                     # NGA 版面 ID（大时代=706）
+    forum_sentiment_pages: int = 3                         # 帖子列表抓取页数
+    forum_sentiment_high_rise_threshold: int = 500         # 高楼帖回复数阈值
+    forum_sentiment_high_rise_extra_pages: int = 2         # 高楼帖额外抓取页数
+    forum_sentiment_cache_ttl: int = 1800                  # 缓存秒数（默认30分钟）
+    forum_sentiment_use_llm: bool = False                  # 是否用 LLM 做情绪分析
+    forum_sentiment_top_n: int = 50                        # 采集热门股数量
+
+    # === 选股流水线 ===
+    screener_enabled: bool = False
+    screener_schedule_time: str = "08:30"                  # 每日选股时间 (盘前)
+    screener_top_n: int = 10                               # 最终推荐数量
+    screener_min_score: float = 60.0                       # 最低推荐分
+    screener_weight_sector: float = 0.35                   # 板块强度权重
+    screener_weight_forum: float = 0.15                    # 论坛舆情权重
+    screener_weight_technical: float = 0.20                # 技术形态权重
+    screener_weight_strategy: float = 0.20                 # 策略匹配权重
+    screener_weight_risk: float = 0.10                     # 风险因子权重
+
+    # === 板块轮动服务 ===
+    sector_rotation_enabled: bool = True
+    sector_rotation_lookback_days: int = 5                  # 回溯天数
+    sector_rotation_top_n: int = 20                         # 分析板块数
+    sector_rotation_cache_ttl: int = 3600                   # 缓存秒数（默认1小时）
+    sector_weight_today: float = 0.25                       # 强度评分权重: 今日涨幅
+    sector_weight_3d: float = 0.20                          # 3日趋势
+    sector_weight_5d: float = 0.15                          # 5日趋势
+    sector_weight_capital_flow: float = 0.25                # 资金流向
+    sector_weight_up_ratio: float = 0.15                    # 板块内上涨比例
+
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
@@ -1495,6 +1529,34 @@ class Config:
             searxng_public_instances_enabled=searxng_public_instances_enabled,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
+            forum_sentiment_enabled=parse_env_bool(os.getenv('FORUM_SENTIMENT_ENABLED'), default=False),
+            forum_sentiment_nga_uid=os.getenv('FORUM_SENTIMENT_NGA_UID') or None,
+            forum_sentiment_nga_cid=os.getenv('FORUM_SENTIMENT_NGA_CID') or None,
+            forum_sentiment_nga_fid=parse_env_int(os.getenv('FORUM_SENTIMENT_NGA_FID'), 706, field_name='FORUM_SENTIMENT_NGA_FID', minimum=1),
+            forum_sentiment_pages=parse_env_int(os.getenv('FORUM_SENTIMENT_PAGES'), 3, field_name='FORUM_SENTIMENT_PAGES', minimum=1, maximum=10),
+            forum_sentiment_high_rise_threshold=parse_env_int(os.getenv('FORUM_SENTIMENT_HIGH_RISE_THRESHOLD'), 500, field_name='FORUM_SENTIMENT_HIGH_RISE_THRESHOLD', minimum=50),
+            forum_sentiment_high_rise_extra_pages=parse_env_int(os.getenv('FORUM_SENTIMENT_HIGH_RISE_EXTRA_PAGES'), 2, field_name='FORUM_SENTIMENT_HIGH_RISE_EXTRA_PAGES', minimum=1, maximum=5),
+            forum_sentiment_cache_ttl=parse_env_int(os.getenv('FORUM_SENTIMENT_CACHE_TTL'), 1800, field_name='FORUM_SENTIMENT_CACHE_TTL', minimum=60),
+            forum_sentiment_use_llm=parse_env_bool(os.getenv('FORUM_SENTIMENT_USE_LLM'), default=False),
+            forum_sentiment_top_n=parse_env_int(os.getenv('FORUM_SENTIMENT_TOP_N'), 50, field_name='FORUM_SENTIMENT_TOP_N', minimum=5, maximum=200),
+            screener_enabled=parse_env_bool(os.getenv('SCREENER_ENABLED'), default=False),
+            screener_schedule_time=os.getenv('SCREENER_SCHEDULE_TIME', '08:30'),
+            screener_top_n=parse_env_int(os.getenv('SCREENER_TOP_N'), 10, field_name='SCREENER_TOP_N', minimum=1, maximum=50),
+            screener_min_score=parse_env_float(os.getenv('SCREENER_MIN_SCORE'), 60.0, field_name='SCREENER_MIN_SCORE', minimum=0.0, maximum=100.0),
+            screener_weight_sector=parse_env_float(os.getenv('SCREENER_WEIGHT_SECTOR'), 0.25, field_name='SCREENER_WEIGHT_SECTOR', minimum=0.0, maximum=1.0),
+            screener_weight_forum=parse_env_float(os.getenv('SCREENER_WEIGHT_FORUM'), 0.15, field_name='SCREENER_WEIGHT_FORUM', minimum=0.0, maximum=1.0),
+            screener_weight_technical=parse_env_float(os.getenv('SCREENER_WEIGHT_TECHNICAL'), 0.30, field_name='SCREENER_WEIGHT_TECHNICAL', minimum=0.0, maximum=1.0),
+            screener_weight_strategy=parse_env_float(os.getenv('SCREENER_WEIGHT_STRATEGY'), 0.20, field_name='SCREENER_WEIGHT_STRATEGY', minimum=0.0, maximum=1.0),
+            screener_weight_risk=parse_env_float(os.getenv('SCREENER_WEIGHT_RISK'), 0.10, field_name='SCREENER_WEIGHT_RISK', minimum=0.0, maximum=1.0),
+            sector_rotation_enabled=parse_env_bool(os.getenv('SECTOR_ROTATION_ENABLED'), default=True),
+            sector_rotation_lookback_days=parse_env_int(os.getenv('SECTOR_ROTATION_LOOKBACK_DAYS'), 5, field_name='SECTOR_ROTATION_LOOKBACK_DAYS', minimum=1, maximum=30),
+            sector_rotation_top_n=parse_env_int(os.getenv('SECTOR_ROTATION_TOP_N'), 20, field_name='SECTOR_ROTATION_TOP_N', minimum=5, maximum=100),
+            sector_rotation_cache_ttl=parse_env_int(os.getenv('SECTOR_ROTATION_CACHE_TTL'), 3600, field_name='SECTOR_ROTATION_CACHE_TTL', minimum=60),
+            sector_weight_today=parse_env_float(os.getenv('SECTOR_WEIGHT_TODAY'), 0.25, field_name='SECTOR_WEIGHT_TODAY', minimum=0.0, maximum=1.0),
+            sector_weight_3d=parse_env_float(os.getenv('SECTOR_WEIGHT_3D'), 0.20, field_name='SECTOR_WEIGHT_3D', minimum=0.0, maximum=1.0),
+            sector_weight_5d=parse_env_float(os.getenv('SECTOR_WEIGHT_5D'), 0.15, field_name='SECTOR_WEIGHT_5D', minimum=0.0, maximum=1.0),
+            sector_weight_capital_flow=parse_env_float(os.getenv('SECTOR_WEIGHT_CAPITAL_FLOW'), 0.25, field_name='SECTOR_WEIGHT_CAPITAL_FLOW', minimum=0.0, maximum=1.0),
+            sector_weight_up_ratio=parse_env_float(os.getenv('SECTOR_WEIGHT_UP_RATIO'), 0.15, field_name='SECTOR_WEIGHT_UP_RATIO', minimum=0.0, maximum=1.0),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
             news_strategy_profile=cls._parse_news_strategy_profile(
                 os.getenv('NEWS_STRATEGY_PROFILE', 'short')

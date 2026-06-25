@@ -57,7 +57,7 @@ from src.config import get_config
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
+CURRENT_SCHEMA_VERSION = "2026-06-13-add-screener-tables"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -847,6 +847,97 @@ class DecisionSignalRecord(Base):
             'horizon',
             'market_phase',
         ),
+    )
+
+
+class ScreenerResultRecord(Base):
+    """选股流水线结果持久化。"""
+
+    __tablename__ = 'screener_results'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_date = Column(String(10), nullable=False, index=True)       # 选股日期 YYYY-MM-DD
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(64))
+    composite_score = Column(Float)                                  # 综合评分 0-100
+    sector = Column(String(64))                                      # 所属板块
+    sector_strength = Column(Float)                                  # 板块强度分
+    forum_heat = Column(Float)                                       # 论坛热度分
+    strategy_score = Column(Float)                                   # 策略评分
+    ai_reasoning = Column(Text)                                      # AI 推荐理由
+    recommendation = Column(String(16))                              # strong_buy / buy / watch
+    risk_tags_json = Column(Text)                                    # 风险标签 JSON 数组
+    matched_strategies_json = Column(Text)                           # 匹配策略 JSON 数组
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('run_date', 'stock_code', name='uix_screener_date_stock'),
+        Index('ix_screener_date_score', 'run_date', 'composite_score'),
+    )
+
+
+class ForumSentimentCacheRecord(Base):
+    """NGA 大时代舆情采集结果缓存。"""
+
+    __tablename__ = 'forum_sentiment_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String(32), nullable=False, index=True)          # 数据源: nga_dashidai
+    stock_code = Column(String(16), index=True)                      # 股票代码（空=整体市场情绪）
+    result_json = Column(Text, nullable=False)                       # JSON 序列化结果
+    heat_score = Column(Float)                                       # 热度评分
+    sentiment_score = Column(Float)                                  # 情绪评分
+    fetched_at = Column(DateTime, default=utc_naive_now, index=True)
+    expires_at = Column(DateTime, index=True)
+
+    __table_args__ = (
+        Index('ix_forum_cache_source_code', 'source', 'stock_code', 'expires_at'),
+    )
+
+
+class SectorHistoryRecord(Base):
+    """板块历史涨跌数据持久化（每日快照）。"""
+
+    __tablename__ = 'sector_history'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sector_name = Column(String(64), nullable=False, index=True)     # 板块名称
+    board_type = Column(String(16), nullable=False)                   # "concept" | "industry"
+    trade_date = Column(String(10), nullable=False, index=True)       # 交易日期 YYYY-MM-DD
+    change_pct = Column(Float)                                        # 当日涨跌幅 %
+    open_pct = Column(Float)                                          # 开盘涨跌幅（相对前收）
+    high_pct = Column(Float)                                          # 最高涨跌幅
+    low_pct = Column(Float)                                           # 最低涨跌幅
+    volume = Column(Float)                                            # 成交量（手）
+    amount = Column(Float)                                            # 成交额（元）
+    up_count = Column(Integer)                                        # 上涨成分股数
+    down_count = Column(Integer)                                      # 下跌成分股数
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('sector_name', 'trade_date', name='uix_sector_date'),
+        Index('ix_sector_history_type_date', 'board_type', 'trade_date'),
+    )
+
+
+class StockDdeRecord(Base):
+    """DDE 大单净量历史数据（东方财富 Data Decision Engine）。"""
+
+    __tablename__ = 'stock_dde'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    dde_big_order = Column(Float)          # DDE大单净量(%)
+    dde_big_order_buy = Column(Float)      # DDE大单买入(%)
+    dde_big_order_sell = Column(Float)     # DDE大单卖出(%)
+    dde_mid_order = Column(Float)          # DDE中单净量(%)
+    dde_small_order = Column(Float)        # DDE小单净量(%)
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'date', name='uix_dde_code_date'),
+        Index('ix_dde_date', 'date'),
     )
 
 

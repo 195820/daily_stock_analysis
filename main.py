@@ -334,6 +334,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--screener',
+        action='store_true',
+        help='仅运行选股流水线（全市场 DDE 筛选）'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -1251,6 +1257,39 @@ def main() -> int:
             )
             return 0
 
+        # 模式1.5: 仅选股
+        if args.screener:
+            logger.info("模式: 仅选股")
+            try:
+                from src.services.stock_screener import StockScreenerPipeline
+
+                screener = StockScreenerPipeline(config)
+                screener_result = screener.run()
+
+                if screener_result.error:
+                    logger.error(f"[选股] 执行失败: {screener_result.error}")
+                    return 1
+
+                # 输出摘要
+                logger.info(
+                    f"[选股] 完成: 数据源={screener_result.data_source}, "
+                    f"满足 {screener_result.matched_count} 只, "
+                    f"耗时 {screener_result.elapsed_seconds:.1f}s"
+                )
+
+                if screener_result.stocks:
+                    print("\n=== 选股结果 ===")
+                    for i, s in enumerate(screener_result.stocks[:20], 1):
+                        print(f"{i:2d}. {s.code} {s.name}")
+                    if len(screener_result.stocks) > 20:
+                        print(f"... 还有 {len(screener_result.stocks) - 20} 只")
+
+                return 0
+
+            except Exception as e:
+                logger.exception(f"[选股] 执行失败: {e}")
+                return 1
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
@@ -1271,6 +1310,21 @@ def main() -> int:
 
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
+
+                # 执行选股流水线（如果启用）
+                if getattr(runtime_config, 'screener_enabled', False):
+                    try:
+                        from src.services.stock_screener import StockScreenerPipeline
+
+                        screener = StockScreenerPipeline(runtime_config)
+                        screener_result = screener.run()
+
+                        if screener_result.stocks:
+                            logger.info(f"[选股] 完成: 获取到 {len(screener_result.stocks)} 只股票")
+                    except Exception as e:
+                        logger.error(f"[选股] 定时任务执行失败: {e}")
+
+                # 执行常规分析
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
 
             background_tasks = []
