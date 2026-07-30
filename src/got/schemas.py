@@ -8,7 +8,7 @@ GOT 节点输入输出 Pydantic Schema
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -97,6 +97,10 @@ class MarketContext(BaseModel):
     today_change: dict[str, float] = Field(
         default_factory=dict,
         description="T-0 实时涨跌幅（腾讯接口）: {\"sh\": -1.08, \"sz\": -1.43, \"cy\": -1.38}",
+    )
+    market_breadth: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="市场宽度（涨跌家数）: {up_count, down_count, limit_up_count, limit_down_count}",
     )
 
 

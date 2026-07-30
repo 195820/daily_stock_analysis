@@ -16,7 +16,7 @@ Node 1: 大盘分析节点
 import asyncio
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -150,9 +150,16 @@ class MarketAnalysisNode:
             confidence, tech_growth.get("score", 0), today_change
         )
 
-        # Step 10: LLM reasoning 生成
+        # Step 10: 市场宽度修正（涨跌家数 vs 技术面方向）
+        breadth_data, breadth_quality = self._fetch_market_breadth(fetcher)
+        if breadth_data:
+            confidence = self._apply_breadth_adjustment(
+                confidence, tech_growth.get("score", 0), breadth_data
+            )
+
+        # Step 11: LLM reasoning 生成
         reasoning = await self._generate_llm_reasoning(
-            tech_growth, timeframe_got, cross_pattern, today_change
+            tech_growth, timeframe_got, cross_pattern, today_change, breadth_data
         )
 
         # 构建输出
@@ -165,11 +172,15 @@ class MarketAnalysisNode:
             key_levels=key_levels,
             reasoning=reasoning,
             data_quality=DataQuality(
-                available_fields=available_fields,
-                missing_fields=missing_fields,
-                fetch_failed_fields=fetch_failed_fields,
+                available_fields=available_fields + ([
+                    "market_breadth"] if breadth_data else []),
+                missing_fields=missing_fields + ([
+                    "market_breadth"] if not breadth_data and breadth_quality == "missing" else []),
+                fetch_failed_fields=fetch_failed_fields + ([
+                    "market_breadth"] if breadth_quality == "failed" else []),
             ),
             today_change=today_change,
+            market_breadth=breadth_data,
         )
 
     def _get_index_kline(self, fetcher, code: str, days: int = 250) -> Optional[pd.DataFrame]:
@@ -564,6 +575,7 @@ class MarketAnalysisNode:
         timeframe_got: TimeframeGOTResult,
         cross_pattern: str,
         today_change: dict,
+        breadth_data: Optional[dict] = None,
     ) -> str:
         """LLM 推理生成（Fix 5，1 次调用）
 
@@ -588,6 +600,14 @@ class MarketAnalysisNode:
             parts = [f"{k}={v:+.2f}%" for k, v in today_change.items()]
             today_text = ", ".join(parts)
 
+        breadth_text = ""
+        if breadth_data:
+            up = breadth_data.get("up_count", 0)
+            down = breadth_data.get("down_count", 0)
+            limit_up = breadth_data.get("limit_up_count", 0)
+            limit_down = breadth_data.get("limit_down_count", 0)
+            breadth_text = f"上涨{up}家/下跌{down}家, 涨停{limit_up}/跌停{limit_down}"
+
         prompt = f"""你是资深投资顾问。基于以下大盘技术分析结果，生成简洁研判。
 
 技术指标：
@@ -599,6 +619,7 @@ class MarketAnalysisNode:
   - 矛盾模式: {timeframe_got.contradiction_type}
 - 跨指数模式: {cross_pattern}
 - 今日实时: {today_text or '无数据'}
+- 市场宽度: {breadth_text or '无数据'}
 
 请用 100 字以内总结市场状态和短期方向。直接输出文本，不要 JSON。"""
 
@@ -681,6 +702,52 @@ class MarketAnalysisNode:
         except Exception as exc:
             logger.warning(f"[Node 1] T-0 实时指数获取失败: {exc}")
             return {}
+
+    def _fetch_market_breadth(self, fetcher) -> Tuple[Optional[Dict], str]:
+        """获取市场宽度（涨跌家数）。
+
+        Returns:
+            (breadth_data, quality): quality = "normal" / "missing" / "failed"
+        """
+        try:
+            breadth = fetcher.get_market_breadth()
+            if breadth:
+                logger.info(f"[Node 1] 市场宽度: 上涨{breadth.get('up_count', 0)}家, "
+                            f"下跌{breadth.get('down_count', 0)}家")
+                return breadth, "normal"
+            return None, "missing"
+        except Exception as exc:
+            logger.warning(f"[Node 1] 市场宽度获取失败: {exc}")
+            return None, "failed"
+
+    def _apply_breadth_adjustment(
+        self, confidence: float, tech_score: float, breadth: Dict
+    ) -> float:
+        """市场宽度与技术面方向不一致时，降低 confidence。
+
+        逻辑：
+        - 技术面看空 (score < -0.3) 但红盘占优 (up > down) → confidence *= 0.7
+        - 技术面看多 (score > 0.3) 但绿盘占优 (up < down) → confidence *= 0.7
+        - 方向一致 → 不调整
+        """
+        up_count = breadth.get("up_count", 0)
+        down_count = breadth.get("down_count", 0)
+
+        if up_count == 0 and down_count == 0:
+            return confidence
+
+        breadth_bullish = up_count > down_count
+        tech_bearish = tech_score < -0.3
+        tech_bullish = tech_score > 0.3
+
+        # 方向不一致时降低 confidence
+        if (tech_bearish and breadth_bullish) or (tech_bullish and not breadth_bullish):
+            adjusted = confidence * 0.7
+            logger.info(f"[Node 1] 市场宽度修正: tech_score={tech_score:.2f}, "
+                        f"up/down={up_count}/{down_count}, confidence {confidence:.2f} → {adjusted:.2f}")
+            return adjusted
+
+        return confidence
 
     def _mock_output(self) -> MarketContext:
         """Mock 输出（震荡偏空场景）"""

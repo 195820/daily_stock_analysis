@@ -2464,12 +2464,43 @@ class AkshareFetcher(BaseFetcher):
         """
         获取市场宽度（涨跌家数、涨停跌停统计）。
 
-        来源：akshare stock_zh_a_spot_em()
+        数据源优先级：
+        1. 新浪财经 stock_zh_a_spot() — 稳定，不受东财反爬影响
+        2. 东财 push2 stock_zh_a_spot_em() — 降级方案（易被封）
         """
+        # 优先尝试新浪源
+        result = self._fetch_breadth_from_sina()
+        if result:
+            return result
+
+        # 降级到东财 push2
+        logger.info("[市场宽度] 新浪源失败，降级到东财 push2")
+        return self._fetch_breadth_from_eastmoney()
+
+    def _fetch_breadth_from_sina(self) -> Optional[Dict[str, Any]]:
+        """新浪源获取市场宽度"""
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
-            logger.info("[API调用] ak.stock_zh_a_spot_em() → 市场宽度")
+            logger.info("[API调用] ak.stock_zh_a_spot() → 市场宽度（新浪源）")
+
+            import akshare as ak
+            df = ak.stock_zh_a_spot()
+
+            if df is None or df.empty:
+                return None
+
+            return self._calc_breadth_stats(df, source="sina")
+        except Exception as e:
+            logger.warning(f"[Akshare] 新浪市场宽度获取失败: {e}")
+            return None
+
+    def _fetch_breadth_from_eastmoney(self) -> Optional[Dict[str, Any]]:
+        """东财 push2 源获取市场宽度（降级方案）"""
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_zh_a_spot_em() → 市场宽度（东财源）")
 
             import akshare as ak
             # 清除代理环境变量（东财 push2 对代理敏感）
@@ -2487,32 +2518,39 @@ class AkshareFetcher(BaseFetcher):
             if df is None or df.empty:
                 return None
 
-            # 计算涨跌统计
-            if '涨跌幅' in df.columns:
-                pct = pd.to_numeric(df['涨跌幅'], errors='coerce')
-                up_count = int((pct > 0).sum())
-                down_count = int((pct < 0).sum())
-                flat_count = int((pct == 0).sum())
-                limit_up_count = int((pct >= 9.9).sum())
-                limit_down_count = int((pct <= -9.9).sum())
-            else:
-                up_count = down_count = flat_count = limit_up_count = limit_down_count = 0
-
-            total_amount = 0.0
-            if '成交额' in df.columns:
-                total_amount = float(pd.to_numeric(df['成交额'], errors='coerce').sum())
-
-            return {
-                'up_count': up_count,
-                'down_count': down_count,
-                'flat_count': flat_count,
-                'limit_up_count': limit_up_count,
-                'limit_down_count': limit_down_count,
-                'total_amount': total_amount,
-            }
+            return self._calc_breadth_stats(df, source="eastmoney")
         except Exception as e:
-            logger.warning(f"[Akshare] 市场宽度获取失败: {e}")
+            logger.warning(f"[Akshare] 东财市场宽度获取失败: {e}")
             return None
+
+    def _calc_breadth_stats(self, df: pd.DataFrame, source: str) -> Dict[str, Any]:
+        """统一计算涨跌统计（适配不同数据源的列名）"""
+        if '涨跌幅' in df.columns:
+            pct = pd.to_numeric(df['涨跌幅'], errors='coerce')
+            up_count = int((pct > 0).sum())
+            down_count = int((pct < 0).sum())
+            flat_count = int((pct == 0).sum())
+            limit_up_count = int((pct >= 9.9).sum())
+            limit_down_count = int((pct <= -9.9).sum())
+        else:
+            up_count = down_count = flat_count = limit_up_count = limit_down_count = 0
+
+        total_amount = 0.0
+        if '成交额' in df.columns:
+            total_amount = float(pd.to_numeric(df['成交额'], errors='coerce').sum())
+
+        logger.info(f"[市场宽度] {source}: 上涨{up_count}家, 下跌{down_count}家, "
+                    f"涨停{limit_up_count}家, 跌停{limit_down_count}家")
+
+        return {
+            'up_count': up_count,
+            'down_count': down_count,
+            'flat_count': flat_count,
+            'limit_up_count': limit_up_count,
+            'limit_down_count': limit_down_count,
+            'total_amount': total_amount,
+            'source': source,
+        }
 
     def get_board_kline(
         self,

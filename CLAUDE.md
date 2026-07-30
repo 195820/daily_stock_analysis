@@ -365,6 +365,7 @@ daily_stock_analysis/
 **Phase 1d-2 Node 5 实现记录：**
 - ✅ 数据源切换：NGA 论坛已关闭，改用 akshare 雪球热榜（关注/交易/讨论 3 榜并发）
 - ✅ 市场宽度：akshare `stock_zh_a_spot_em` 获取涨跌家数/涨停跌停（代理受限时自动降级）
+- ✅ 市场宽度数据源修复（2026-07-30）：东财 push2 `stock_zh_a_spot_em()` 被反爬封锁 → 改用新浪 `stock_zh_a_spot()` 优先，push2 降级为备用。修复后 breadth_data 从 missing 恢复为 available，unified_signal 从 neutral 修正为 bearish
 - ✅ 搜索舆情：SearchService 搜索散户情绪关键词 → 正负面词频统计
 - ✅ 情绪评分：3 维度加权（市场宽度 0.50 + 雪球热度 0.25 + 搜索舆情 0.25），缺失维度权重归一化
 - ✅ 反身性 5 阶段分类（P2-2）：euphoria/optimism/neutral/pessimism/capitulation
@@ -445,6 +446,7 @@ daily_stock_analysis/
 - ✅ LLM reasoning 生成：1 次调用，失败降级到规则拼接
 - ✅ score→trend 阈值收窄：±0.5 → ±0.3
 - ✅ 数据置信度 vs 信号置信度分离（延续 Node 6 v2 思路）
+- ✅ **市场宽度恢复（2026-07-30 下午）**：数据源修复（新浪优先）后，Node 1 加回 `_fetch_market_breadth()` + `_apply_breadth_adjustment()`。技术面与市场宽度方向不一致时 confidence ×0.7。`MarketContext` schema 新增 `market_breadth` 字段
 
 **Node 1 v2 效果**：
 - confidence: 0.30 → 1.00（5 指数全向一致 → cross_index_consistency=1.0）
