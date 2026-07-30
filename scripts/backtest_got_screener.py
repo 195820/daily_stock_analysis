@@ -30,7 +30,7 @@ import pandas as pd
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.data_provider.manager import DataFetcherManager
+from data_provider.base import DataFetcherManager
 
 # 配置日志
 logging.basicConfig(
@@ -124,7 +124,9 @@ def backtest_stock(stock_data: dict, fetcher_manager: DataFetcherManager) -> dic
 
         # 计算最终盈亏
         final_pnl_pct = (exit_price / entry_price - 1) * 100
-        holding_days = (exit_date - start_date).days
+        # 统一日期类型（Timestamp 转 date）
+        exit_date_obj = exit_date.date() if hasattr(exit_date, 'date') else exit_date
+        holding_days = (exit_date_obj - start_date).days
 
         return {
             "code": code,
