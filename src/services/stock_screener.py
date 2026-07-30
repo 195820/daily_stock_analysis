@@ -23,6 +23,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.config import Config
@@ -72,6 +73,14 @@ class ScreenerStock:
     portfolio_quantity: float = 0.0        # 持仓数量
     portfolio_avg_cost: float = 0.0        # 持仓均价
     portfolio_pnl_pct: Optional[float] = None  # 持仓盈亏比例 %
+
+    # GOT 模式专用字段
+    capital_score: float = 0.0             # 资金面评分 0-100
+    news_score: float = 0.0                # 消息面评分 0-100
+    tech_wave_score: float = 0.0           # 波段技术评分 0-100
+    risk_score_safe: float = 100.0         # 风险评分 0-100（越高越安全，与 risk_score 相反）
+    sector_type: str = ""                  # 板块类型: active_mainline / ambush
+    backtest_snapshot: Optional[Dict[str, Any]] = None  # 回测快照
 
 
 @dataclass
@@ -778,6 +787,697 @@ class StockScreenerPipeline:
             logger.error(f"[选股] 保存结果失败: {e}")
 
         return saved
+
+    # ============================================================
+    # GOT 驱动选股模式
+    # ============================================================
+
+    def run_got_mode(
+        self,
+        got_date: Optional[date] = None,
+        top_n: int = 3
+    ) -> ScreenerRunResult:
+        """GOT 驱动的选股模式
+
+        动态读取 Phase 1 GOT 输出，从主线/埋伏板块成分股中精选 Top N
+
+        Args:
+            got_date: GOT 运行日期，默认今天
+            top_n: 输出 Top N 只股票
+
+        Returns:
+            ScreenerRunResult 包含精选股票
+        """
+        import time
+        start_time = time.time()
+
+        run_date = date.today().isoformat()
+        run_time = datetime.now().strftime('%H:%M:%S')
+        got_date = got_date or date.today()
+
+        result = ScreenerRunResult(
+            run_date=run_date,
+            run_time=run_time,
+            strategy_name="got_mode",
+            data_source="got",
+        )
+
+        try:
+            # 1. 加载 GOT 上下文
+            got_context = self._load_got_context(got_date)
+            if not got_context:
+                raise ValueError(f"无法加载 {got_date} 的 GOT 上下文")
+
+            logger.info(f"[GOT选股] 已加载 {got_date} 的 GOT 上下文")
+
+            # 2. 提取主线/埋伏板块成分股
+            universe = self._extract_got_universe(got_context)
+            result.total_scanned = len(universe)
+            logger.info(f"[GOT选股] 提取到 {len(universe)} 只候选股")
+
+            if not universe:
+                result.error = "未找到主线/埋伏板块成分股"
+                return result
+
+            # 3. 执行 5 轮漏斗筛选
+            finalists = self._filter_got_finalists(universe, got_context, top_n)
+            result.matched_count = len(finalists)
+            logger.info(f"[GOT选股] 精选出 {len(finalists)} 只股票")
+
+            # 4. 构建输出
+            result.stocks = finalists
+
+            # 5. 保存结果到 JSON（用于回测）
+            self._save_got_result(result, got_date)
+
+            elapsed = time.time() - start_time
+            result.elapsed_seconds = elapsed
+            logger.info(f"[GOT选股] 完成，耗时 {elapsed:.1f}s")
+
+        except Exception as e:
+            result.error = str(e)
+            logger.exception(f"[GOT选股] 执行失败: {e}")
+
+        return result
+
+    def _load_got_context(self, got_date: date) -> Optional[dict]:
+        """动态加载 GOT 上下文
+
+        优先读取 data/got_daily/YYYYMMDD/ 目录下的所有 6 个节点 JSON
+        降级读取 data/aggregator_contexts/previous_context_YYYYMMDD.json
+        """
+        date_str = got_date.strftime("%Y%m%d")
+
+        # 优先：每日存档（完整 6 节点）
+        archive_dir = Path(f"data/got_daily/{date_str}")
+        if archive_dir.exists():
+            context = {}
+
+            # 加载各节点上下文
+            node_files = {
+                "market_context": "market.json",
+                "sector_context": "sector.json",
+                "capital_context": "capital.json",
+                "news_context": "news.json",
+                "sentiment_context": "sentiment.json",
+                "unified_context": "unified.json",
+            }
+
+            for key, filename in node_files.items():
+                filepath = archive_dir / filename
+                if filepath.exists():
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        context[key] = json.load(f)
+
+            # 如果至少加载了 unified_context，就返回
+            if "unified_context" in context:
+                return context
+
+        # 降级：聚合上下文（仅 unified）
+        context_path = Path(f"data/aggregator_contexts/previous_context_{date_str}.json")
+        if context_path.exists():
+            with open(context_path, "r", encoding="utf-8") as f:
+                unified_data = json.load(f)
+            return {"unified_context": unified_data}
+
+        return None
+
+    def _extract_got_universe(self, got_context: dict) -> List[Dict]:
+        """从 GOT 上下文提取选股池（先用问财快速筛选）
+
+        Returns:
+            [{"code": "600519", "name": "贵州茅台", "sector": "白酒",
+              "sector_type": "active_mainline", "sector_score": 80}, ...]
+        """
+        sector_ctx = got_context.get("sector_context", {})
+
+        # 检查 notes 字段，识别"兜底填充"的板块
+        notes = sector_ctx.get("notes", [])
+        fallback_sectors = set()
+        for note in notes:
+            # 解析格式："⚠️ 活跃主线: 无板块满足标准，**兜底填充** 多元金融（80分, neutral）— 非真正达标"
+            if "兜底填充" in note and "非真正达标" in note:
+                # 提取板块名称（在"兜底填充"和"（"之间）
+                import re
+                match = re.search(r"兜底填充\*\*?\s*([^（(]+)[（(]", note)
+                if match:
+                    sector_name = match.group(1).strip()
+                    fallback_sectors.add(sector_name)
+                    logger.warning(f"识别到兜底填充板块: {sector_name}")
+
+        # 提取主线板块（active_mainline），排除兜底填充的
+        active_mainlines = sector_ctx.get("active_mainline", [])
+        qualified_mainlines = [
+            s for s in active_mainlines
+            if s.get("name") not in fallback_sectors
+        ]
+
+        if len(qualified_mainlines) < len(active_mainlines):
+            logger.info(
+                f"主线板块: {len(active_mainlines)} 个中 "
+                f"{len(qualified_mainlines)} 个达标，"
+                f"{len(active_mainlines) - len(qualified_mainlines)} 个为兜底填充已排除"
+            )
+
+        # 提取埋伏板块（ambush），也排除兜底填充的
+        ambush_sectors = sector_ctx.get("ambush", [])
+        qualified_ambush = [
+            s for s in ambush_sectors
+            if s.get("name") not in fallback_sectors
+        ]
+
+        universe = []
+
+        # 从达标的主线/埋伏板块获取成分股（用问财快速筛选）
+        for sector_info in qualified_mainlines + qualified_ambush:
+            sector_name = sector_info.get("name")
+            sector_score = sector_info.get("strength_score", 0)
+            sector_type = "active_mainline" if sector_info in qualified_mainlines else "ambush"
+
+            # 用问财快速筛选板块成分股
+            constituents = self._get_sector_constituents_filtered(sector_name)
+
+            for stock_info in constituents:
+                universe.append({
+                    "code": stock_info["code"],
+                    "name": stock_info.get("name", ""),
+                    "sector": sector_name,
+                    "sector_type": sector_type,
+                    "sector_score": sector_score
+                })
+
+        # 去重（同一股票可能在多个板块）
+        seen = set()
+        deduped = []
+        for stock in universe:
+            if stock["code"] not in seen:
+                seen.add(stock["code"])
+                deduped.append(stock)
+
+        logger.info(
+            f"选股池: {len(qualified_mainlines)} 个主线 + "
+            f"{len(qualified_ambush)} 个埋伏 → {len(deduped)} 只股票（问财初筛后）"
+        )
+
+        return deduped
+
+    def _get_sector_constituents_filtered(self, sector_name: str) -> List[Dict]:
+        """用问财快速筛选板块成分股（服务端过滤）
+
+        查询条件：
+        - 属于{sector_name}概念板块
+        - 主力资金净流入 > 0（资金面筛选）
+        - 近5日涨幅 > 0%（有动量）
+        - 量比 > 1（有资金关注）
+        - 非ST（排除风险股）
+        - 取涨幅前 10 只
+
+        Returns:
+            [{"code": "600519", "name": "贵州茅台"}, ...]
+        """
+        try:
+            from src.services.ths_screener import THSScreenerService
+            ths_service = THSScreenerService(self.config)
+
+            # 构造问财查询（加入主力资金净流入筛选）
+            query = f"{sector_name}概念板块成分股，主力资金净流入>0，近5日涨幅>0%，量比>1，非ST，按涨跌幅降序"
+            logger.info(f"[问财初筛] {sector_name}: {query}")
+
+            ths_result = ths_service.query(query)
+            if ths_result and ths_result.stocks:
+                # 取前 10 只
+                stocks = [
+                    {"code": s.code, "name": s.name}
+                    for s in ths_result.stocks[:10]
+                ]
+                logger.info(f"[问财初筛] {sector_name} 获取到 {len(stocks)} 只候选（已筛选主力资金净流入）")
+                return stocks
+            else:
+                logger.warning(f"[问财初筛] {sector_name} 无结果，降级为不带资金流筛选")
+                # 降级：不带资金流筛选
+                query_fallback = f"{sector_name}概念板块成分股，近5日涨幅>0%，量比>1，非ST，按涨跌幅降序"
+                ths_result = ths_service.query(query_fallback)
+                if ths_result and ths_result.stocks:
+                    stocks = [
+                        {"code": s.code, "name": s.name}
+                        for s in ths_result.stocks[:10]
+                    ]
+                    logger.info(f"[问财初筛-降级] {sector_name} 获取到 {len(stocks)} 只候选")
+                    return stocks
+                return []
+
+        except Exception as e:
+            logger.error(f"[问财初筛] {sector_name} 失败: {e}")
+            return []
+
+    def _filter_got_finalists(
+        self,
+        universe: List[Dict],
+        got_context: dict,
+        top_n: int
+    ) -> List[ScreenerStock]:
+        """4 轮漏斗筛选（资金面已在问财初筛完成）
+
+        轮次 1: 信号过滤（主线+埋伏 → 全部通过）
+        轮次 2: 波段技术确认 Top 15（MA20/布林带/周线趋势）
+        轮次 3: 风险排雷 Top 8（估值/超买/波动率）
+        轮次 4: 板块分散 Top N（每个板块最多 1 只）
+        """
+        from data_provider.base import DataFetcherManager
+        fetcher_manager = DataFetcherManager()
+
+        candidates = universe.copy()
+
+        # 轮次 1: 信号过滤（主线+埋伏全部通过，排除衰竭板块）
+        exhausted = [s.get("name") for s in got_context.get("sector_context", {}).get("exhausted_mainline", [])]
+        candidates = [c for c in candidates if c["sector"] not in exhausted]
+        logger.info(f"轮次 1: {len(candidates)} 只（排除衰竭板块）")
+
+        # 轮次 2: 波段技术确认 Top 15（资金面已在问财初筛完成，跳过）
+        tech_scores = self._score_technical_wave(candidates, fetcher_manager)
+        for c in candidates:
+            c["tech_wave_score"] = tech_scores.get(c["code"], 0)
+        candidates.sort(key=lambda x: x["tech_wave_score"], reverse=True)
+        candidates = candidates[:15]
+        logger.info(f"轮次 2: {len(candidates)} 只（波段技术 Top 15）")
+
+        # 轮次 3: 风险排雷 Top 8
+        risk_scores = self._score_risk(candidates, fetcher_manager)
+        for c in candidates:
+            c["risk_score_safe"] = risk_scores.get(c["code"], 0)
+        candidates = [c for c in candidates if c["risk_score_safe"] > 50]  # 风险阈值
+        candidates.sort(key=lambda x: x["risk_score_safe"], reverse=True)
+        candidates = candidates[:8]
+        logger.info(f"轮次 3: {len(candidates)} 只（风险排雷后）")
+
+        # 轮次 4: 板块分散 Top N（每个板块最多 1 只）
+        sector_count = {}
+        finalists = []
+        for c in candidates:
+            sector = c["sector"]
+            if sector_count.get(sector, 0) < 1:  # 每板块最多 1 只
+                # 构建 ScreenerStock 对象
+                stock = ScreenerStock(
+                    code=c["code"],
+                    name=self._get_stock_name(c["code"], fetcher_manager),
+                    score=0.0,  # 稍后计算
+                    source="got",
+                    capital_score=0.0,  # 资金面已在问财初筛完成
+                    tech_wave_score=c["tech_wave_score"],
+                    risk_score_safe=c["risk_score_safe"],
+                    sector_name=c["sector"],
+                    sector_score=c["sector_score"],
+                    sector_type=c["sector_type"],
+                )
+
+                # 计算综合评分
+                stock.score = self._compute_got_composite_score(stock, got_context)
+
+                # 生成推荐理由
+                stock.ai_reasoning = self._generate_got_reasoning(stock, got_context)
+
+                # 生成回测快照
+                stock.backtest_snapshot = self._build_backtest_snapshot(stock, fetcher_manager)
+
+                finalists.append(stock)
+                sector_count[sector] = sector_count.get(sector, 0) + 1
+            if len(finalists) >= top_n:
+                break
+        logger.info(f"轮次 5: {len(finalists)} 只（板块分散）")
+
+        return finalists
+
+    def _score_capital(self, candidates: List[Dict], capital_ctx: dict, fetcher_manager) -> Dict[str, float]:
+        """资金面评分（30% 权重）
+
+        评分维度：
+        - 龙虎榜机构买入: +40分（如果在 mainline_stocks_bought 中）
+        - 主力资金净流入: +30分（从 AKShare 获取）
+        - 北向资金净买入: +15分（如果 get_northbound_flow 显示净流入）
+        - 大宗交易溢价: +15分（如果 signal_type == "抢筹"）
+        """
+        # 解析龙虎榜买入列表（格式: "300502.新易盛"）
+        dragon_tiger_bought_raw = capital_ctx.get("evidence", {}).get("dragon_tiger", {}).get("mainline_stocks_bought", [])
+        dragon_tiger_bought_codes = set()
+        for item in dragon_tiger_bought_raw:
+            if "." in item:
+                code = item.split(".")[0]
+                dragon_tiger_bought_codes.add(code)
+
+        # 批量获取主力资金流数据（使用 AKShare）
+        capital_flow_data = {}
+        try:
+            from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+            adapter = AkshareFundamentalAdapter()
+
+            for c in candidates:
+                try:
+                    flow_result = adapter.get_capital_flow(c["code"])
+                    if flow_result and flow_result.get("status") == "ok":
+                        stock_flow = flow_result.get("stock_flow", {})
+                        main_net = stock_flow.get("main_net_inflow", 0)
+                        capital_flow_data[c["code"]] = main_net
+                except Exception as e:
+                    logger.debug(f"获取 {c['code']} 资金流失败: {e}")
+
+            if capital_flow_data:
+                logger.info(f"[资金面] 获取到 {len(capital_flow_data)} 只股票的主力资金流数据")
+        except Exception as e:
+            logger.warning(f"获取主力资金流数据失败: {e}")
+
+        # 一次性获取北向资金数据（避免重复请求）
+        northbound_positive = False
+        try:
+            northbound_df = fetcher_manager.get_northbound_flow()
+            if northbound_df is not None and not northbound_df.empty:
+                latest = northbound_df.iloc[-1]
+                if latest.get("net_amount", 0) > 0:
+                    northbound_positive = True
+                    logger.info("[资金面] 北向资金净流入")
+        except Exception as e:
+            logger.warning(f"获取北向资金失败: {e}")
+
+        # 一次性获取大宗交易数据（避免重复请求）
+        block_trade_data = {}
+        try:
+            block_trade_df = fetcher_manager.get_block_trade()
+            if block_trade_df is not None and not block_trade_df.empty:
+                # 大宗交易数据按股票代码分组
+                # 注意：字段名可能是 '代码' 而不是 'code'
+                code_col = '代码' if '代码' in block_trade_df.columns else 'code'
+                signal_col = 'signal_type' if 'signal_type' in block_trade_df.columns else None
+
+                if signal_col:
+                    for _, row in block_trade_df.iterrows():
+                        stock_code = str(row.get(code_col, ''))
+                        signal = row.get(signal_col, '')
+                        if stock_code:
+                            # 如果有多条记录，取最新的信号
+                            block_trade_data[stock_code] = signal
+                    logger.info(f"[资金面] 获取到 {len(block_trade_data)} 只股票的大宗交易数据")
+        except Exception as e:
+            logger.warning(f"获取大宗交易失败: {e}")
+
+        scores = {}
+        for c in candidates:
+            score = 0
+
+            # 龙虎榜机构买入
+            if c["code"] in dragon_tiger_bought_codes:
+                score += 40
+
+            # 主力资金净流入（从 AKShare 获取）
+            main_net = capital_flow_data.get(c["code"], 0)
+            if main_net > 0:
+                score += 30
+
+            # 北向资金（所有股票共享同一个结果）
+            if northbound_positive:
+                score += 15
+
+            # 大宗交易（检查该股票是否为抢筹）
+            stock_signal = block_trade_data.get(c["code"], "")
+            if stock_signal == "抢筹":
+                score += 15
+
+            scores[c["code"]] = score
+
+        return scores
+
+    def _score_technical_wave(self, candidates: List[Dict], fetcher_manager) -> Dict[str, float]:
+        """波段技术指标评分（15% 权重）
+
+        与短线不同，波段操作关注：
+        - MA20 趋势: 20%（价格在 MA20 上方且 MA20 向上）
+        - 布林带位置: 15%（在中轨和上轨之间）
+        - 周线趋势: 15%（周线 MA10 向上）
+        - RSI12: 10%（50-70 区间，未超买）
+        - 20 日突破: 10%（突破 20 日最高价）
+        - 量比: 10%（1.5-3.0 温和放量）
+        - 换手率: 10%（3%-8% 适中）
+        - MACD 金叉: 10%（DIF 上穿 DEA）
+        """
+        scores = {}
+
+        for c in candidates:
+            # 获取 60 天 K 线
+            try:
+                df, _ = fetcher_manager.get_daily_data(c["code"], days=60)
+                if df is None or len(df) < 20:
+                    scores[c["code"]] = 0
+                    continue
+
+                score = 0
+
+                # MA20 趋势（20%）
+                ma20 = df["close"].rolling(20).mean().iloc[-1]
+                ma20_5d_ago = df["close"].rolling(20).mean().iloc[-5]
+                if df["close"].iloc[-1] > ma20 and ma20 > ma20_5d_ago:
+                    score += 20
+
+                # 布林带位置（15%）
+                bb_mid = df["close"].rolling(20).mean().iloc[-1]
+                bb_std = df["close"].rolling(20).std().iloc[-1]
+                bb_upper = bb_mid + 2 * bb_std
+                if bb_mid < df["close"].iloc[-1] < bb_upper:
+                    score += 15
+
+                # RSI12（10%）
+                rsi12 = self._calc_rsi(df["close"], 12)
+                if 50 <= rsi12 <= 70:
+                    score += 10
+
+                # 20 日突破（10%）
+                high_20d = df["high"].rolling(20).max().iloc[-2]
+                if df["close"].iloc[-1] > high_20d:
+                    score += 10
+
+                # 量比（10%）
+                volume_ratio = df["volume"].iloc[-1] / df["volume"].rolling(5).mean().iloc[-2]
+                if 1.5 <= volume_ratio <= 3.0:
+                    score += 10
+
+                # 换手率（10%）
+                try:
+                    quote = fetcher_manager.get_realtime_quote(c["code"])
+                    if quote and 0.03 <= quote.turnover_rate <= 0.08:
+                        score += 10
+                except Exception:
+                    pass
+
+                # MACD 金叉（10%）
+                macd_line, signal_line, _ = self._calc_macd(df["close"])
+                if macd_line.iloc[-1] > signal_line.iloc[-1] and macd_line.iloc[-2] <= signal_line.iloc[-2]:
+                    score += 10
+
+                # 均线多头排列（15%）
+                ma5 = df["close"].rolling(5).mean().iloc[-1]
+                ma10 = df["close"].rolling(10).mean().iloc[-1]
+                if ma5 > ma10 > ma20:
+                    score += 15
+
+                scores[c["code"]] = score
+            except Exception as e:
+                logger.warning(f"计算技术指标失败 {c['code']}: {e}")
+                scores[c["code"]] = 0
+
+        return scores
+
+    def _score_risk(self, candidates: List[Dict], fetcher_manager) -> Dict[str, float]:
+        """风险评分（15% 权重，越高越安全）
+
+        扣分项：
+        - PE > 100: -20分
+        - RSI > 80（超买）: -30分
+        - 近 5 日涨幅 > 20%: -25分
+        - 波动率 > 0.05: -15分
+        """
+        scores = {}
+
+        for c in candidates:
+            score = 100  # 基础分
+
+            try:
+                quote = fetcher_manager.get_realtime_quote(c["code"])
+                if not quote:
+                    scores[c["code"]] = 0
+                    continue
+
+                # PE 估值
+                if quote.pe_ratio and quote.pe_ratio > 100:
+                    score -= 20
+
+                # RSI 超买
+                df, _ = fetcher_manager.get_daily_data(c["code"], days=30)
+                if df is not None and len(df) >= 12:
+                    rsi6 = self._calc_rsi(df["close"], 6)
+                    if rsi6 > 80:
+                        score -= 30
+
+                # 近 5 日涨幅
+                if df is not None and len(df) >= 5:
+                    pct_5d = (df["close"].iloc[-1] / df["close"].iloc[-5] - 1) * 100
+                    if pct_5d > 20:
+                        score -= 25
+
+                # 波动率
+                if df is not None and len(df) >= 20:
+                    volatility = df["pct_chg"].rolling(20).std().iloc[-1]
+                    if volatility > 0.05:
+                        score -= 15
+
+                scores[c["code"]] = max(0, score)
+            except Exception as e:
+                logger.warning(f"计算风险评分失败 {c['code']}: {e}")
+                scores[c["code"]] = 0
+
+        return scores
+
+    def _compute_got_composite_score(self, stock: ScreenerStock, got_context: dict) -> float:
+        """综合评分（满分 100）
+
+        权重分配（资金面已在问财初筛完成）：
+        - 板块强度: 40%（主线/埋伏/启动信号）
+        - 技术面(波段): 35%（MA20/布林带/周线）
+        - 风险因子: 25%（估值/超买/波动率，反向）
+        """
+        sector_score = stock.sector_score  # 0-100
+        tech_score = stock.tech_wave_score  # 0-100
+        risk_score = stock.risk_score_safe  # 0-100（越高越安全）
+
+        composite = (
+            sector_score * 0.40 +
+            tech_score * 0.35 +
+            risk_score * 0.25
+        )
+
+        return round(composite, 2)
+
+    def _generate_got_reasoning(self, stock: ScreenerStock, got_context: dict) -> str:
+        """生成推荐理由（Markdown 格式）"""
+        lines = [
+            f"**综合评分**: {stock.score:.1f}/100",
+            "",
+            "### 核心逻辑",
+            f"1. **板块强度** ({stock.sector_score*0.4:.1f}/40): ",
+            f"   - 属于{stock.sector_type}板块「{stock.sector_name}」",
+            f"   - 板块强度 {stock.sector_score:.0f} 分",
+            f"2. **技术面** ({stock.tech_wave_score*0.35:.1f}/35): ",
+            f"   - 波段技术指标评分 {stock.tech_wave_score:.0f}/100",
+            f"3. **风险** ({stock.risk_score_safe*0.25:.1f}/25): ",
+            f"   - 安全评分 {stock.risk_score_safe:.0f}/100",
+            "",
+            "### 交易建议",
+        ]
+
+        if stock.backtest_snapshot:
+            snapshot = stock.backtest_snapshot
+            lines.extend([
+                f"- **买入价**: {snapshot['entry_price']:.2f} 元（当前价）",
+                f"- **目标价**: {snapshot['target_price']:.2f} 元（+{snapshot['target_pct']:.0f}%）",
+                f"- **止损价**: {snapshot['stop_loss_price']:.2f} 元（{snapshot['stop_loss_pct']:.0f}%）",
+                f"- **持仓周期**: 10-15 个交易日",
+            ])
+
+        return "\n".join(lines)
+
+    def _build_backtest_snapshot(self, stock: ScreenerStock, fetcher_manager) -> Dict[str, Any]:
+        """构建回测快照"""
+        try:
+            quote = fetcher_manager.get_realtime_quote(stock.code)
+            if not quote:
+                return {}
+
+            entry_price = quote.price
+            target_price = entry_price * 1.10  # +10%
+            stop_loss_price = entry_price * 0.93  # -7%
+
+            return {
+                "entry_date": date.today().isoformat(),
+                "entry_price": entry_price,
+                "target_price": target_price,
+                "target_pct": 10,
+                "stop_loss_price": stop_loss_price,
+                "stop_loss_pct": -7,
+                "exit_date": None,
+                "exit_price": None,
+                "exit_reason": None,
+                "pnl_pct": None,
+            }
+        except Exception as e:
+            logger.warning(f"构建回测快照失败 {stock.code}: {e}")
+            return {}
+
+    def _save_got_result(self, result: ScreenerRunResult, got_date: date) -> None:
+        """保存 GOT 选股结果到 JSON（用于回测）"""
+        try:
+            output_dir = Path("data/got_screener")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            date_str = got_date.strftime("%Y%m%d")
+            output_file = output_dir / f"{date_str}.json"
+
+            data = {
+                "run_date": result.run_date,
+                "run_time": result.run_time,
+                "got_date": got_date.isoformat(),
+                "strategy_name": result.strategy_name,
+                "total_scanned": result.total_scanned,
+                "matched_count": result.matched_count,
+                "elapsed_seconds": result.elapsed_seconds,
+                "top_stocks": [],
+            }
+
+            for stock in result.stocks:
+                stock_data = {
+                    "code": stock.code,
+                    "name": stock.name,
+                    "score": stock.score,
+                    "sector": stock.sector_name,
+                    "sector_type": stock.sector_type,
+                    "sector_score": stock.sector_score,
+                    "capital_score": stock.capital_score,
+                    "news_score": stock.news_score,
+                    "tech_wave_score": stock.tech_wave_score,
+                    "risk_score_safe": stock.risk_score_safe,
+                    "reasoning": stock.ai_reasoning,
+                    "backtest_snapshot": stock.backtest_snapshot,
+                }
+                data["top_stocks"].append(stock_data)
+
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"[GOT选股] 已保存结果到 {output_file}")
+        except Exception as e:
+            logger.error(f"[GOT选股] 保存结果失败: {e}")
+
+    def _get_stock_name(self, code: str, fetcher_manager) -> str:
+        """获取股票名称"""
+        try:
+            return fetcher_manager.get_stock_name(code) or code
+        except Exception:
+            return code
+
+    def _calc_rsi(self, prices, period: int = 14) -> float:
+        """计算 RSI 指标"""
+        import pandas as pd
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1] if not rsi.empty else 50.0
+
+    def _calc_macd(self, prices, fast: int = 12, slow: int = 26, signal: int = 9):
+        """计算 MACD 指标"""
+        import pandas as pd
+        ema_fast = prices.ewm(span=fast, adjust=False).mean()
+        ema_slow = prices.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
 
     def format_notification(self, result: ScreenerRunResult) -> str:
         """格式化通知消息"""

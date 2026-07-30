@@ -77,7 +77,8 @@ class SectorRotationResult:
 class _EastMoneyClient:
     """东方财富板块数据 HTTP 客户端。
 
-    使用 trust_env=False 绕过系统代理，避免连接被代理中断。
+    push2 东财 API 对 Python TLS 指纹有反爬封锁，
+    需要通过系统代理（HTTP_PROXY）发起请求。
     """
 
     # 板块列表 API（概念 t:3, 行业 t:2）
@@ -92,7 +93,7 @@ class _EastMoneyClient:
 
     def __init__(self):
         self._session = requests.Session()
-        self._session.trust_env = False  # 绕过系统代理
+        # trust_env=True（默认值）以读取系统代理，push2 需要代理绕过 TLS 指纹检测
         retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry)
         self._session.mount("https://", adapter)
@@ -113,52 +114,64 @@ class _EastMoneyClient:
     ) -> List[Dict[str, Any]]:
         """获取板块排行列表（按涨跌幅降序）。
 
-        先尝试 EastMoney push2 API，失败后降级到 akshare。
-
-        Args:
-            board_type: "concept" 或 "industry"
-            top_n: 返回前 N 个
-
-        Returns:
-            [{name, code, change_pct, price, volume, amount, up_count, down_count}, ...]
+        优先 akshare（单次获取全量，避免分页限流），失败降级到 push2 直连。
         """
-        # 优先: EastMoney 直连
-        try:
-            boards = self._fetch_board_list_direct(board_type, top_n)
-            if boards:
-                return boards
-        except Exception as e:
-            logger.debug(f"EastMoney 板块列表直连失败({board_type}): {e}")
+        # 优先: akshare（内部处理分页，一次返回全量）
+        boards = self._fetch_board_list_akshare(board_type, top_n)
+        if boards:
+            return boards
 
-        # 降级: akshare
-        return self._fetch_board_list_akshare(board_type, top_n)
+        # 降级: push2 直连
+        logger.debug(f"akshare 板块列表失败({board_type})，降级到 push2 直连")
+        try:
+            return self._fetch_board_list_direct(board_type, top_n)
+        except Exception as e:
+            logger.warning(f"EastMoney push2 板块列表也失败({board_type}): {e}")
+            return []
 
     def _fetch_board_list_direct(
         self,
         board_type: str,
         top_n: int,
     ) -> List[Dict[str, Any]]:
-        """通过 EastMoney push2 API 直接获取板块列表。"""
+        """通过 EastMoney push2 API 直接获取板块列表。
+
+        支持分页：单页上限 100 条，超过时自动翻页。
+        某页失败时返回已获取数据，不抛异常。
+        """
         fs_type = "3" if board_type == "concept" else "2"
-        params = {
-            "pn": "1",
-            "pz": str(top_n),
-            "po": "1",           # 降序
-            "np": "1",
-            "ut": self._COMMON_UT,
-            "fltt": "2",
-            "invt": "2",
-            "fid": "f3",         # 按涨跌幅排序
-            "fs": f"m:90+t:{fs_type}+f:!50",  # 排除 ST 等
-            "fields": "f2,f3,f4,f8,f12,f14,f15,f16,f17,f20,f21,f24,f25,f22,f104,f105",
-        }
-        data = self._get_json(self._BOARD_LIST_URL, params)
-        diff = data.get("data", {}).get("diff", [])
-        if not diff:
-            return []
+        page_size = min(top_n, 100)  # API 单页上限约 100
+        total_pages = (top_n + page_size - 1) // page_size
+
+        all_items: List[Dict] = []
+        for page in range(1, total_pages + 1):
+            params = {
+                "pn": str(page),
+                "pz": str(page_size),
+                "po": "1",           # 降序
+                "np": "1",
+                "ut": self._COMMON_UT,
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f3",         # 按涨跌幅排序
+                "fs": f"m:90+t:{fs_type}+f:!50",  # 排除 ST 等
+                "fields": "f2,f3,f4,f8,f12,f14,f15,f16,f17,f20,f21,f24,f25,f22,f104,f105",
+            }
+            try:
+                data = self._get_json(self._BOARD_LIST_URL, params)
+                diff = data.get("data", {}).get("diff", [])
+                if not diff:
+                    break
+                all_items.extend(diff)
+                if len(all_items) >= top_n:
+                    break
+                time.sleep(0.2)  # 分页间隔
+            except Exception as e:
+                logger.warning(f"板块列表第 {page} 页获取失败（返回已有 {len(all_items)} 条）: {e}")
+                break
 
         boards = []
-        for item in diff:
+        for item in all_items[:top_n]:
             code = str(item.get("f12", ""))
             if not code.startswith("BK"):
                 continue
@@ -178,9 +191,10 @@ class _EastMoneyClient:
         board_type: str,
         top_n: int,
     ) -> List[Dict[str, Any]]:
-        """通过 akshare 获取板块列表（降级方案）。"""
+        """通过 akshare 获取板块列表（单次全量，避免分页限流）。"""
         try:
             import akshare as ak
+            import pandas as pd
 
             if board_type == "concept":
                 df = ak.stock_board_concept_name_em()
@@ -190,26 +204,30 @@ class _EastMoneyClient:
             if df is None or df.empty:
                 return []
 
-            import pandas as pd
-            change_col = "涨跌幅"
-            name_col = "板块名称"
-            code_col = "板块代码" if "板块代码" in df.columns else None
+            # 标准化数值列
+            numeric_cols = ["涨跌幅", "换手率", "上涨家数", "下跌家数"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-            df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
-            df = df.dropna(subset=[change_col])
-            df = df.nlargest(top_n, change_col)
+            # 按涨跌幅降序排序，取 top_n
+            if "涨跌幅" in df.columns:
+                df = df.sort_values("涨跌幅", ascending=False)
+            df = df.head(top_n)
 
             boards = []
             for _, row in df.iterrows():
-                code = str(row.get(code_col, "")) if code_col else ""
+                code = str(row.get("板块代码", ""))
+                if not code.startswith("BK"):
+                    continue
                 boards.append({
-                    "name": str(row[name_col]),
+                    "name": str(row.get("板块名称", "")),
                     "code": code,
-                    "change_pct": _safe_float(row[change_col]),
-                    "price": 0.0,
-                    "turnover_rate": 0.0,
-                    "up_count": 0,
-                    "down_count": 0,
+                    "change_pct": _safe_float(row.get("涨跌幅", 0)),
+                    "price": _safe_float(row.get("最新价", 0)),
+                    "turnover_rate": _safe_float(row.get("换手率", 0)),
+                    "up_count": int(_safe_float(row.get("上涨家数", 0))),
+                    "down_count": int(_safe_float(row.get("下跌家数", 0))),
                 })
             return boards
         except Exception as e:

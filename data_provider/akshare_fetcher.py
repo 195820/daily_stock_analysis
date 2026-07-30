@@ -231,6 +231,55 @@ def _is_us_code(stock_code: str) -> bool:
     return is_us_stock_code(stock_code)
 
 
+def _is_index_code(stock_code: str) -> bool:
+    """
+    判断代码是否为 A 股指数
+
+    A 股指数代码规则：
+    - 上证指数: 000001.SH, 000016.SH, 000300.SH, 000688.SH, 000905.SH 等
+    - 深证指数: 399001.SZ, 399006.SZ, 399005.SZ 等
+    - 格式: XXXXXX.SH 或 XXXXXX.SZ（带后缀）
+
+    注意：
+    - 000001.SH 是上证指数，不是平安银行（平安银行是 000001.SZ）
+    - 仅当代码带有 .SH 或 .SZ 后缀时才判断为指数
+    - 无前缀的 6 位数字默认视为股票
+
+    Args:
+        stock_code: 股票/指数代码
+
+    Returns:
+        True 表示是 A 股指数代码，False 表示不是
+    """
+    code = stock_code.strip().upper()
+
+    # 必须有后缀 .SH 或 .SZ
+    if not ('.SH' in code or '.SZ' in code):
+        return False
+
+    # 提取数字部分
+    if '.SH' in code:
+        numeric_part = code.split('.SH')[0]
+    else:
+        numeric_part = code.split('.SZ')[0]
+
+    # 指数代码通常是 6 位数字
+    if not (numeric_part.isdigit() and len(numeric_part) == 6):
+        return False
+
+    # 上证指数常见代码
+    sh_index_prefixes = ('000001', '000002', '000003', '000010', '000011', '000012',
+                         '000016', '000300', '000688', '000905', '000852')
+    if code.endswith('.SH') and numeric_part in sh_index_prefixes:
+        return True
+
+    # 深证指数常见代码（399 开头）
+    if code.endswith('.SZ') and numeric_part.startswith('399'):
+        return True
+
+    return False
+
+
 def _to_sina_tx_symbol(stock_code: str) -> str:
     """Convert 6-digit A-share code to sh/sz/bj prefixed symbol for Sina/Tencent APIs."""
     base = (stock_code.strip().split(".")[0] if "." in stock_code else stock_code).strip()
@@ -474,6 +523,8 @@ class AkshareFetcher(BaseFetcher):
             return self._fetch_hk_data(stock_code, start_date, end_date)
         elif _is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)
+        elif _is_index_code(stock_code):
+            return self._fetch_index_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
     
@@ -708,7 +759,100 @@ class AkshareFetcher(BaseFetcher):
                 raise RateLimitError(f"Akshare 可能被限流: {e}") from e
             
             raise DataFetchError(f"Akshare 获取 ETF 数据失败: {e}") from e
-    
+
+    def _fetch_index_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取 A 股指数历史数据
+
+        数据来源：ak.stock_zh_index_daily()（新浪财经接口）
+
+        Args:
+            stock_code: 指数代码，如 '399006.SZ', '000001.SH'
+            start_date: 开始日期，格式 'YYYY-MM-DD'
+            end_date: 结束日期，格式 'YYYY-MM-DD'
+
+        Returns:
+            指数历史数据 DataFrame，列名已标准化为中文格式
+        """
+        import akshare as ak
+
+        # 转换代码格式：399006.SZ -> sz399006, 000001.SH -> sh000001
+        symbol = self._to_index_symbol(stock_code)
+
+        # 防封禁策略
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+
+        logger.info(f"[API调用] ak.stock_zh_index_daily(symbol={symbol})")
+
+        try:
+            import time as _time
+            api_start = _time.time()
+
+            df = _akshare_call_with_timeout(
+                ak.stock_zh_index_daily,
+                symbol=symbol,
+                timeout=self._history_call_timeout,
+                call_name="ak.stock_zh_index_daily",
+            )
+
+            api_elapsed = _time.time() - api_start
+
+            if df is not None and not df.empty:
+                logger.info(f"[API返回] ak.stock_zh_index_daily 成功: {len(df)} 行, 耗时 {api_elapsed:.2f}s")
+                logger.info(f"[API返回] 列名: {list(df.columns)}")
+
+                # 按日期过滤
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    start_dt = pd.to_datetime(start_date)
+                    end_dt = pd.to_datetime(end_date)
+                    df = df[(df['date'] >= start_dt) & (df['date'] <= end_dt)]
+
+                # 标准化列名为中文格式（与其他接口保持一致）
+                column_mapping = {
+                    'date': '日期',
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'close': '收盘',
+                    'volume': '成交量',
+                }
+                df = df.rename(columns=column_mapping)
+
+                return df
+            else:
+                logger.warning(f"[API返回] ak.stock_zh_index_daily 返回空数据, 耗时 {api_elapsed:.2f}s")
+                return pd.DataFrame()
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
+                logger.warning(f"检测到可能被封禁: {e}")
+                raise RateLimitError(f"Akshare 可能被限流: {e}") from e
+            raise DataFetchError(f"Akshare 获取指数数据失败: {e}") from e
+
+    def _to_index_symbol(self, stock_code: str) -> str:
+        """
+        将指数代码转换为 akshare stock_zh_index_daily 所需的格式
+
+        Args:
+            stock_code: 指数代码，如 '399006.SZ', '000001.SH'
+
+        Returns:
+            akshare 格式的代码，如 'sz399006', 'sh000001'
+        """
+        code = stock_code.strip().upper()
+        if '.SH' in code:
+            numeric_part = code.split('.SH')[0]
+            return f"sh{numeric_part}"
+        elif '.SZ' in code:
+            numeric_part = code.split('.SZ')[0]
+            return f"sz{numeric_part}"
+        else:
+            # 无前缀时，默认按深交所处理
+            return f"sz{code}"
+
     def _fetch_us_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         获取美股历史数据
@@ -2217,6 +2361,377 @@ class AkshareFetcher(BaseFetcher):
             if all(keyword in col_text for keyword in keywords):
                 return col
         return None
+
+    # ==================== Phase D-2: 8个新方法（GOT节点数据统一入口） ====================
+
+    def get_northbound_flow(self, symbol: str = "沪股通") -> Optional[pd.DataFrame]:
+        """
+        获取北向资金（沪深股通）历史流入数据。
+
+        来源：akshare stock_hsgt_hist_em()
+        注意：2024-08 后 '当日成交净买额' 列可能全 NaN（沪深港通停披）
+        """
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(f"[API调用] ak.stock_hsgt_hist_em(symbol={symbol})")
+            df = ak.stock_hsgt_hist_em(symbol=symbol)
+            if df is not None and not df.empty:
+                df["通道"] = symbol
+                return df
+            return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 北向资金 {symbol} 获取失败: {e}")
+            return None
+
+    def get_dragon_tiger(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取龙虎榜机构买卖数据。
+
+        来源：akshare stock_lhb_jgmmtj_em()
+        """
+        import akshare as ak
+        from datetime import timedelta
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            today = datetime.now()
+            if not end_date:
+                end_date = today.strftime("%Y%m%d")
+            if not start_date:
+                start_date = (today - timedelta(days=30)).strftime("%Y%m%d")
+
+            logger.info(f"[API调用] ak.stock_lhb_jgmmtj_em({start_date}~{end_date})")
+            df = ak.stock_lhb_jgmmtj_em(start_date=start_date, end_date=end_date)
+            return df if df is not None and not df.empty else None
+        except Exception as e:
+            logger.warning(f"[Akshare] 龙虎榜获取失败: {e}")
+            return None
+
+    def get_margin_trading(self) -> Optional[pd.DataFrame]:
+        """
+        获取融资融券数据（沪市）。
+
+        来源：akshare macro_china_market_margin_sh()
+        """
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.macro_china_market_margin_sh()")
+            df = ak.macro_china_market_margin_sh()
+            return df if df is not None and not df.empty else None
+        except Exception as e:
+            logger.warning(f"[Akshare] 融资融券获取失败: {e}")
+            return None
+
+    def get_block_trade(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取大宗交易数据。
+
+        来源：akshare stock_dzjy_mrtj()
+        """
+        import akshare as ak
+        from datetime import timedelta
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            today = datetime.now()
+            if not end_date:
+                end_date = today.strftime("%Y%m%d")
+            if not start_date:
+                start_date = (today - timedelta(days=30)).strftime("%Y%m%d")
+
+            logger.info(f"[API调用] ak.stock_dzjy_mrtj({start_date}~{end_date})")
+            df = ak.stock_dzjy_mrtj(start_date=start_date, end_date=end_date)
+            return df if df is not None and not df.empty else None
+        except Exception as e:
+            logger.warning(f"[Akshare] 大宗交易获取失败: {e}")
+            return None
+
+    def get_market_breadth(self) -> Optional[Dict[str, Any]]:
+        """
+        获取市场宽度（涨跌家数、涨停跌停统计）。
+
+        来源：akshare stock_zh_a_spot_em()
+        """
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_zh_a_spot_em() → 市场宽度")
+
+            import akshare as ak
+            # 清除代理环境变量（东财 push2 对代理敏感）
+            import os
+            proxy_keys = [k for k in os.environ if k.upper() in ('HTTP_PROXY', 'HTTPS_PROXY',
+                                                                    'http_proxy', 'https_proxy')]
+            saved = {k: os.environ.pop(k, None) for k in proxy_keys}
+            try:
+                df = ak.stock_zh_a_spot_em()
+            finally:
+                for k, v in saved.items():
+                    if v is not None:
+                        os.environ[k] = v
+
+            if df is None or df.empty:
+                return None
+
+            # 计算涨跌统计
+            if '涨跌幅' in df.columns:
+                pct = pd.to_numeric(df['涨跌幅'], errors='coerce')
+                up_count = int((pct > 0).sum())
+                down_count = int((pct < 0).sum())
+                flat_count = int((pct == 0).sum())
+                limit_up_count = int((pct >= 9.9).sum())
+                limit_down_count = int((pct <= -9.9).sum())
+            else:
+                up_count = down_count = flat_count = limit_up_count = limit_down_count = 0
+
+            total_amount = 0.0
+            if '成交额' in df.columns:
+                total_amount = float(pd.to_numeric(df['成交额'], errors='coerce').sum())
+
+            return {
+                'up_count': up_count,
+                'down_count': down_count,
+                'flat_count': flat_count,
+                'limit_up_count': limit_up_count,
+                'limit_down_count': limit_down_count,
+                'total_amount': total_amount,
+            }
+        except Exception as e:
+            logger.warning(f"[Akshare] 市场宽度获取失败: {e}")
+            return None
+
+    def get_board_kline(
+        self,
+        board_code: str,
+        board_type: str = "concept",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取板块 K 线数据。
+
+        当前仅支持东财 push2delay（被封时返回 None，不降级到过时数据源）。
+
+        Args:
+            board_code: 东财板块代码
+            board_type: "concept" / "industry"
+            days: 获取天数
+        """
+        return self._get_board_kline_em(board_code, board_type, days)
+
+    def _get_board_kline_em(
+        self, board_code: str, board_type: str, days: int,
+    ) -> Optional[pd.DataFrame]:
+        """东财 push2delay 板块 K 线。"""
+        from .em_rate_limiter import em_get
+        try:
+            logger.info(f"[API调用] push2delay 板块K线: {board_code} ({board_type}, {days}天)")
+
+            offset = min(days * 5 // 7 + 10, 800)
+            url = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
+            params = {
+                "secid": f"90.{board_code}",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101",
+                "fqt": "1",
+                "end": "20500101",
+                "lmt": str(offset),
+            }
+            resp = em_get(url, params=params)
+            data = resp.json()
+
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                return None
+
+            rows = []
+            for line in klines:
+                parts = line.split(",")
+                if len(parts) >= 7:
+                    rows.append({
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "amount": float(parts[6]),
+                    })
+            return pd.DataFrame(rows)
+        except Exception as e:
+            logger.debug(f"[Akshare] push2delay 板块K线 {board_code} 失败: {e}")
+            return None
+
+    def get_board_constituents(
+        self,
+        board_type: str = "concept",
+        n: int = 50,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取板块排名列表（概念/行业板块涨跌幅排行）。
+
+        仅走东财 push2（带实时涨跌幅）。THS 无实时涨跌幅，已移除。
+        push2 部分页失败时返回已获取的数据（不整体丢弃）。
+        """
+        return self._get_board_constituents_em(board_type, n)
+
+    # push2 单页实际返回上限（测试发现 ~100，即使 pz=500 也只返回 100）
+    _PAGE_SIZE = 100
+    # 最大分页次数：3 页 × 100 = 300 条
+    # 超过 3 页会触发 push2 反爬封锁（RemoteDisconnected），
+    # 300 条已足够覆盖精选概念列表（~25 类 × top2 = ~50 匹配）
+    _MAX_PAGES = 3
+
+    def _get_board_constituents_em(
+        self, board_type: str, n: int,
+    ) -> Optional[pd.DataFrame]:
+        """东财 push2delay 板块列表（分页拉取，返回 BK 代码格式）。
+
+        push2delay API 单页有 ~100 条的隐性上限，需分页循环拉取全量数据。
+        某一页失败时保留已获取数据（不整体丢弃）。
+        """
+        from .em_rate_limiter import em_get
+
+        fs = "m:90+t:3" if board_type == "concept" else "m:90+t:2"
+        url = "https://push2delay.eastmoney.com/api/qt/clist/get"
+
+        all_rows: list[dict] = []
+        page = 1
+        total_available: Optional[int] = None
+
+        while len(all_rows) < n and page <= self._MAX_PAGES:
+            params = {
+                "pn": str(page),
+                "pz": str(self._PAGE_SIZE),
+                "po": "1",       # 降序
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f3",     # 按涨跌幅排序
+                "fs": fs,
+                "fields": "f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f18,f104,f105",
+            }
+
+            if page == 1:
+                logger.info(f"[API调用] push2 板块排行: {board_type} 目标 {n} 条")
+            try:
+                resp = em_get(url, params=params)
+                data = resp.json()
+            except Exception as exc:
+                # 分页中途被封：保留已获取数据，不整体丢弃
+                if all_rows:
+                    logger.warning(
+                        f"[Akshare] push2 第 {page} 页失败，"
+                        f"保留前 {len(all_rows)} 条: {exc}"
+                    )
+                    break
+                logger.debug(f"[Akshare] push2 板块排行首页失败: {exc}")
+                return None
+
+            if data.get("rc") != 0:
+                logger.warning(f"[Akshare] push2 板块排行返回 rc={data.get('rc')}")
+                break
+
+            inner = data.get("data", {})
+            if total_available is None:
+                total_available = inner.get("total", 0)
+                logger.info(f"[Akshare] push2 板块总数: {total_available}")
+
+            diff = inner.get("diff", [])
+            if not diff:
+                break
+
+            for item in diff:
+                # push2 对停牌/未上市板块返回 "-"，统一清洗为 0
+                def _num(key, default=0):
+                    v = item.get(key, default)
+                    if v == "-" or v is None:
+                        return default
+                    return v
+
+                all_rows.append({
+                    "板块名称": item.get("f14", ""),
+                    "板块代码": item.get("f12", ""),
+                    "最新价": _num("f2"),
+                    "涨跌额": _num("f4"),
+                    "涨跌幅": _num("f3"),
+                    "成交量": _num("f5"),
+                    "成交额": _num("f6"),
+                    "换手率": _num("f8"),
+                    "上涨家数": _num("f104"),
+                    "下跌家数": _num("f105"),
+                    "领涨股票": item.get("f128", ""),
+                    "领涨股票-涨跌幅": _num("f136"),
+                })
+
+            # 已拿满或本页不足一页（最后一页）
+            if len(diff) < self._PAGE_SIZE:
+                break
+            # 已达到 API 报告的总数
+            if total_available is not None and len(all_rows) >= total_available:
+                break
+
+            page += 1
+
+        if not all_rows:
+            return None
+
+        logger.info(
+            f"[Akshare] push2 板块排行完成: "
+            f"共获取 {len(all_rows)} 条（{page} 页）"
+        )
+        return pd.DataFrame(all_rows).head(n).reset_index(drop=True)
+
+    def _get_board_constituents_ths(
+        self, board_type: str, n: int,
+    ) -> Optional[pd.DataFrame]:
+        """同花顺 THS 板块列表（不依赖 push2，仅返回名称+代码）。"""
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            if board_type == "industry":
+                logger.info(f"[API调用] ak.stock_board_industry_name_ths()")
+                df = ak.stock_board_industry_name_ths()
+            else:
+                logger.info(f"[API调用] ak.stock_board_concept_name_ths()")
+                df = ak.stock_board_concept_name_ths()
+
+            if df is None or df.empty:
+                return None
+
+            # THS 返回 name + code，无涨跌幅
+            # 构造与东财兼容的格式
+            result = pd.DataFrame({
+                '板块名称': df['name'],
+                '板块代码': df['code'].astype(str),
+                '涨跌幅': 0.0,  # 占位，由 K 线计算
+                '最新价': 0.0,
+                '换手率': 0.0,
+                '上涨家数': 0,
+                '下跌家数': 0,
+                '_source': 'ths',  # 标记数据来源
+            })
+
+            return result.head(n).reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"[Akshare] 同花顺板块列表也失败: {e}")
+            return None
 
 
 if __name__ == "__main__":

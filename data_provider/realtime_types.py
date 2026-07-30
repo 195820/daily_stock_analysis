@@ -93,6 +93,7 @@ def safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
 
 class RealtimeSource(Enum):
     """实时行情数据源"""
+    MOOTDX = "mootdx"               # 通达信 TCP（mootdx 库，不封 IP）
     EFINANCE = "efinance"           # 东方财富（efinance库）
     AKSHARE_EM = "akshare_em"       # 东方财富（akshare库）
     AKSHARE_SINA = "akshare_sina"   # 新浪财经

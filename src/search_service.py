@@ -3914,6 +3914,107 @@ class SearchService:
             error_message="事件搜索失败"
         )
     
+    def search_market_news(
+        self,
+        query: str,
+        max_results: int = 8,
+        days: int = 3,
+    ) -> SearchResponse:
+        """市场级新闻搜索（不绑定个股，跳过 relevance 评分管道）。
+
+        复用 provider 故障切换 + 缓存 + 日期过滤，但跳过
+        ``_score_news_relevance`` 等个股专属逻辑。
+
+        Args:
+            query: 搜索关键词（如 "A股 政策 最新"）
+            max_results: 最大返回结果数
+            days: 搜索最近天数
+
+        Returns:
+            SearchResponse 对象
+        """
+        if not self.is_available:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="None",
+                success=False,
+                error_message="No search engine available",
+            )
+
+        search_days = min(days, self.news_max_age_days)
+        provider_max_results = self._provider_request_size(max_results)
+
+        logger.info(
+            "市场级新闻搜索: query='%s', 时间范围: 近%s天, 目标条数=%s",
+            query, search_days, max_results,
+        )
+
+        cache_key = self._cache_key(f"market_news|{query}", max_results, search_days)
+        cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
+        if cached is not None:
+            logger.info("市场级新闻搜索命中缓存: query='%s'", query)
+            return cached
+        if cache_owner is False and cache_event is not None:
+            cached = self._wait_for_cached(cache_key, cache_event)
+            if cached is not None:
+                return cached
+
+        try:
+            for provider in self._providers:
+                if not provider.is_available:
+                    continue
+
+                search_kwargs: Dict[str, Any] = {}
+                if isinstance(provider, TavilySearchProvider):
+                    search_kwargs["topic"] = "news"
+
+                try:
+                    response = provider.search(
+                        query, provider_max_results, days=search_days, **search_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "市场级新闻搜索 provider=%s 异常: %s", provider.name, exc,
+                    )
+                    continue
+
+                if not response.success:
+                    continue
+
+                filtered = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=provider_max_results,
+                    log_scope=f"market_news:{provider.name}",
+                    keep_unknown=True,
+                )
+
+                if filtered.results:
+                    filtered.results = filtered.results[:max_results]
+                    logger.info(
+                        "市场级新闻搜索成功: provider=%s, 返回 %d 条",
+                        provider.name, len(filtered.results),
+                    )
+                    return filtered
+
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="None",
+                success=False,
+                error_message="所有搜索引擎均未返回结果",
+            )
+        except Exception as exc:
+            logger.error("市场级新闻搜索失败: %s", exc)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="error",
+                success=False,
+                error_message=str(exc),
+            )
+
     def search_comprehensive_intel(
         self,
         stock_code: str,

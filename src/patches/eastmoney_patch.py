@@ -168,6 +168,9 @@ def eastmoney_patch():
         # 处理 Headers：确保不破坏业务代码传入的 headers
         headers = kwargs.get("headers", {})
         headers["User-Agent"] = user_agent
+        # push2his 需要 Referer 头，否则返回 rc:102
+        if "push2his.eastmoney.com" in (url or ""):
+            headers.setdefault("Referer", "https://quote.eastmoney.com/")
         nid = _get_nid(user_agent)
         if nid:
             headers["Cookie"] = f"nid18={nid}"

@@ -405,6 +405,103 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_northbound_flow(self, symbol: str = "沪股通") -> Optional[pd.DataFrame]:
+        """
+        获取北向资金（沪深股通）流入数据。
+
+        Args:
+            symbol: "沪股通" 或 "深股通"
+
+        Returns:
+            DataFrame with columns: date, buy_amount, sell_amount, net_amount
+            失败返回 None → Manager 自动降级到下一数据源
+        """
+        return None
+
+    def get_dragon_tiger(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取龙虎榜机构买卖数据。
+
+        Args:
+            start_date: YYYYMMDD
+            end_date: YYYYMMDD
+
+        Returns:
+            DataFrame with dragon-tiger list data
+        """
+        return None
+
+    def get_margin_trading(self) -> Optional[pd.DataFrame]:
+        """
+        获取融资融券数据（沪市）。
+
+        Returns:
+            DataFrame with margin trading data (date, margin_balance, etc.)
+        """
+        return None
+
+    def get_block_trade(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取大宗交易数据。
+
+        Returns:
+            DataFrame with block trade data (date, code, price, premium, etc.)
+        """
+        return None
+
+    def get_market_breadth(self) -> Optional[Dict[str, Any]]:
+        """
+        获取市场宽度（涨跌家数、涨停跌停统计）。
+
+        Returns:
+            Dict: up_count, down_count, limit_up_count, limit_down_count, total_amount
+        """
+        return None
+
+    def get_board_kline(
+        self,
+        board_code: str,
+        board_type: str = "concept",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取板块 K 线数据。
+
+        Args:
+            board_code: 板块代码（如 BK0xxx）
+            board_type: "concept" / "industry"
+            days: 获取天数
+
+        Returns:
+            标准化 DataFrame (date, open, high, low, close, volume)
+        """
+        return None
+
+    def get_board_constituents(
+        self,
+        board_type: str = "concept",
+        n: int = 50,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取板块排名列表（含涨跌幅、成交额等）。
+
+        Args:
+            board_type: "concept" / "industry"
+            n: 返回条数
+
+        Returns:
+            DataFrame with board rankings
+        """
+        return None
+
     def get_daily_data(
         self,
         stock_code: str, 
@@ -564,6 +661,7 @@ class DataFetcherManager:
     """
 
     _DAILY_MARKET_FETCHER_SUPPORT = {
+        "MootdxFetcher": {"cn"},
         "EfinanceFetcher": {"cn"},
         "AkshareFetcher": {"cn", "hk"},
         "TushareFetcher": {"cn", "hk"},
@@ -578,10 +676,18 @@ class DataFetcherManager:
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
         初始化管理器
-        
+
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
+        # 自动加载东财反爬补丁（NID 令牌 + 随机 UA + 请求休眠）
+        # 确保所有通过 Manager 获取东财数据的入口都有反爬保护
+        try:
+            from src.patches.eastmoney_patch import eastmoney_patch
+            eastmoney_patch()
+        except ImportError:
+            pass  # patches 模块不存在时跳过
+
         self._fetchers: List[BaseFetcher] = []
         self._fetchers_lock = RLock()
         self._fetchers_by_name: Dict[str, BaseFetcher] = {}
@@ -606,6 +712,46 @@ class DataFetcherManager:
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
+
+    def _is_a_share_index(self, stock_code: str) -> bool:
+        """
+        判断是否为 A 股指数代码（在归一化之前检测）
+
+        A 股指数代码格式：
+        - XXXXXX.SH（上证指数、沪深300等）
+        - XXXXXX.SZ（深证指数、创业板指等）
+
+        Args:
+            stock_code: 原始股票代码（可能带 .SH/.SZ 后缀）
+
+        Returns:
+            True 表示是 A 股指数
+        """
+        code = stock_code.strip().upper()
+        if not ('.SH' in code or '.SZ' in code):
+            return False
+
+        # 提取数字部分
+        if '.SH' in code:
+            numeric_part = code.split('.SH')[0]
+        else:
+            numeric_part = code.split('.SZ')[0]
+
+        # 指数代码是 6 位数字
+        if not (numeric_part.isdigit() and len(numeric_part) == 6):
+            return False
+
+        # 上证指数常见代码
+        sh_index_prefixes = ('000001', '000002', '000003', '000010', '000011', '000012',
+                             '000016', '000300', '000688', '000905', '000852')
+        if code.endswith('.SH') and numeric_part in sh_index_prefixes:
+            return True
+
+        # 深证指数常见代码（399 开头）
+        if code.endswith('.SZ') and numeric_part.startswith('399'):
+            return True
+
+        return False
 
     def _ensure_concurrency_guards(self) -> None:
         """Lazily initialize thread-safety primitives for test scaffolds using __new__."""
@@ -738,6 +884,34 @@ class DataFetcherManager:
                 ", ".join(skipped),
             )
 
+        return kept
+
+    @staticmethod
+    def _is_a_index_code(stock_code: str) -> bool:
+        """判断是否为 A 股指数代码。
+
+        上证指数系列: 000001.SH, 000300.SH, 000688.SH, 000905.SH
+        深证指数系列: 399001.SZ, 399006.SZ, 399005.SZ, 399673.SZ
+        """
+        code = stock_code.upper()
+        if code.endswith(".SH"):
+            return code[:-3].startswith("000")
+        if code.endswith(".SZ"):
+            return code[:-3].startswith("399")
+        return False
+
+    @classmethod
+    def _filter_fetchers_for_a_index(
+        cls, fetchers: List[BaseFetcher],
+    ) -> List[BaseFetcher]:
+        """A 股指数跳过 MootdxFetcher 和 EfinanceFetcher（间歇失败/反爬严格）。"""
+        _SKIP_FOR_INDEX = {"MootdxFetcher", "EfinanceFetcher"}
+        kept = [f for f in fetchers if f.name not in _SKIP_FOR_INDEX]
+        skipped = [f.name for f in fetchers if f.name in _SKIP_FOR_INDEX]
+        if skipped:
+            logger.info(
+                "[数据源路由] A股指数跳过不稳定源: %s", ", ".join(skipped),
+            )
         return kept
 
     def _get_cached_stock_name(self, stock_code: str) -> Optional[str]:
@@ -1044,13 +1218,15 @@ class DataFetcherManager:
         - 如果配置了 Longbridge OAuth 或 Legacy 凭据：实例化 LongbridgeFetcher 作为美股/港股兜底
         - 未配置的可选数据源不实例化，避免在批量拉取时反复探测无效源
         - 默认优先级：
-          0. EfinanceFetcher (Priority 0) - 最高优先级
+          0. MootdxFetcher (Priority 0) - 通达信 TCP（不封 IP）
+          0. EfinanceFetcher (Priority 0) - 东财 HTTP
           1. AkshareFetcher (Priority 1)
           2. PytdxFetcher (Priority 2) - 通达信
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
         """
         from src.config import get_config
+        from .mootdx_fetcher import MootdxFetcher
         from .efinance_fetcher import EfinanceFetcher
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
@@ -1060,6 +1236,7 @@ class DataFetcherManager:
         from .longbridge_fetcher import LongbridgeFetcher
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
+        mootdx = MootdxFetcher()        # 通达信 TCP（P0，不封 IP）
         efinance = EfinanceFetcher()
         akshare = AkshareFetcher()
         pytdx = PytdxFetcher()      # 通达信数据源（可配 PYTDX_HOST/PYTDX_PORT）
@@ -1096,6 +1273,7 @@ class DataFetcherManager:
         self._ensure_concurrency_guards()
         with self._fetchers_lock:
             self._fetchers = [
+                mootdx,
                 efinance,
                 akshare,
                 pytdx,
@@ -1151,8 +1329,26 @@ class DataFetcherManager:
         """
         from .us_index_mapping import is_us_index_code, is_us_stock_code
 
+        # 保存原始代码（用于恢复指数后缀）
+        original_code = stock_code
+
+        # 检测 A 股指数（在归一化之前，因为归一化会去掉 .SH/.SZ 后缀）
+        is_a_share_index = self._is_a_share_index(stock_code)
+        a_share_index_suffix = ""
+        if is_a_share_index:
+            # 提取后缀用于恢复
+            code_upper = stock_code.strip().upper()
+            if '.SH' in code_upper:
+                a_share_index_suffix = '.SH'
+            elif '.SZ' in code_upper:
+                a_share_index_suffix = '.SZ'
+
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+
+        # 如果是 A 股指数，恢复后缀以便 fetcher 能识别
+        if is_a_share_index and a_share_index_suffix:
+            stock_code = stock_code + a_share_index_suffix
 
         fetchers = self._get_fetchers_snapshot()
         errors = []
@@ -1165,8 +1361,13 @@ class DataFetcherManager:
         is_us_index = is_us_index_code(stock_code)
         is_us = is_us_index or is_us_stock_code(stock_code)
         is_hk = (not is_us) and _is_hk_market(stock_code)
+        # A 股指数代码：MootdxFetcher 间歇缺数据、EfinanceFetcher push2his 对指数反爬严格
+        # 直接走 AkshareFetcher(P1, 新浪源) 更稳，省掉 30 秒无效重试
+        is_a_index = (not is_us) and (not is_hk) and self._is_a_index_code(stock_code)
         if is_hk:
             fetchers = self._filter_daily_fetchers_for_market(fetchers, "hk")
+        if is_a_index:
+            fetchers = self._filter_fetchers_for_a_index(fetchers)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
         total_fetchers = len(fetchers)
 
@@ -3280,3 +3481,80 @@ class DataFetcherManager:
         if last_error:
             logger.warning(f"[涨停池] 所有数据源均失败，最终错误: {last_error}")
         return []
+
+    def _try_fetchers_for_method(
+        self,
+        method_name: str,
+        label: str,
+        *args,
+        **kwargs,
+    ):
+        """
+        通用 fetcher降级代理：按优先级尝试每个fetcher的指定方法，
+        返回第一个非None结果。全部失败返回None。
+        """
+        last_error = ""
+        for fetcher in self._get_fetchers_snapshot():
+            method = getattr(fetcher, method_name, None)
+            if method is None:
+                continue
+            if not self._is_fetcher_available(fetcher, capability=method_name):
+                continue
+            try:
+                result = self._call_fetcher_method(fetcher, method_name, *args, **kwargs)
+                if result is not None:
+                    logger.debug(f"[{label}] {fetcher.name} 成功")
+                    return result
+                last_error = f"{fetcher.name}返回空结果"
+            except Exception as e:
+                error_type, error_reason = summarize_exception(e)
+                last_error = f"{fetcher.name} ({error_type}) {error_reason}"
+                logger.debug(f"[{label}] {fetcher.name} 失败: {error_reason}")
+        if last_error:
+            logger.debug(f"[{label}] 所有数据源均失败: {last_error}")
+        return None
+
+    def get_northbound_flow(self, symbol: str = "沪股通") -> Optional[pd.DataFrame]:
+        """获取北向资金数据（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_northbound_flow", "北向资金", symbol)
+
+    def get_dragon_tiger(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """获取龙虎榜数据（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_dragon_tiger", "龙虎榜", start_date, end_date)
+
+    def get_margin_trading(self) -> Optional[pd.DataFrame]:
+        """获取融资融券数据（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_margin_trading", "融资融券")
+
+    def get_block_trade(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Optional[pd.DataFrame]:
+        """获取大宗交易数据（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_block_trade", "大宗交易", start_date, end_date)
+
+    def get_market_breadth(self) -> Optional[Dict[str, Any]]:
+        """获取市场宽度（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_market_breadth", "市场宽度")
+
+    def get_board_kline(
+        self,
+        board_code: str,
+        board_type: str = "concept",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """获取板块K线（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_board_kline", "板块K线", board_code, board_type, days)
+
+    def get_board_constituents(
+        self,
+        board_type: str = "concept",
+        n: int = 50,
+    ) -> Optional[pd.DataFrame]:
+        """获取板块排名列表（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_board_constituents", "板块排名", board_type, n)
