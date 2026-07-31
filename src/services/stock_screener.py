@@ -1036,41 +1036,57 @@ class StockScreenerPipeline:
         got_context: dict,
         top_n: int
     ) -> List[ScreenerStock]:
-        """4 轮漏斗筛选（资金面已在问财初筛完成）
+        """5 轮漏斗筛选
 
-        轮次 1: 信号过滤（主线+埋伏 → 全部通过）
-        轮次 2: 波段技术确认 Top 15（MA20/布林带/周线趋势）
-        轮次 3: 风险排雷 Top 8（估值/超买/波动率）
-        轮次 4: 板块分散 Top N（每个板块最多 1 只）
+        轮次 1: 信号过滤（排除衰竭板块）
+        轮次 2: 资金面评分 Top 20（龙虎榜/主力资金/大宗交易）
+        轮次 3: 波段技术确认 Top 15（MA20/布林带/周线趋势）
+        轮次 4: 风险排雷 Top 8（估值/超买/波动率）
+        轮次 5: 板块分散 Top N（每个板块最多 1 只）
         """
         from data_provider.base import DataFetcherManager
         fetcher_manager = DataFetcherManager()
 
         candidates = universe.copy()
 
-        # 轮次 1: 信号过滤（主线+埋伏全部通过，排除衰竭板块）
+        # 轮次 1: 信号过滤（排除衰竭板块）
         exhausted = [s.get("name") for s in got_context.get("sector_context", {}).get("exhausted_mainline", [])]
         candidates = [c for c in candidates if c["sector"] not in exhausted]
         logger.info(f"轮次 1: {len(candidates)} 只（排除衰竭板块）")
 
-        # 轮次 2: 波段技术确认 Top 15（资金面已在问财初筛完成，跳过）
+        # 轮次 2: 资金面评分 Top 20
+        capital_ctx = got_context.get("capital_context", {})
+        capital_scores = self._score_capital(candidates, capital_ctx, fetcher_manager)
+        for c in candidates:
+            c["capital_score"] = capital_scores.get(c["code"], 0)
+        candidates.sort(key=lambda x: x["capital_score"], reverse=True)
+        candidates = candidates[:20]
+        logger.info(f"轮次 2: {len(candidates)} 只（资金面 Top 20）")
+
+        # 轮次 3: 波段技术确认 Top 15
         tech_scores = self._score_technical_wave(candidates, fetcher_manager)
         for c in candidates:
             c["tech_wave_score"] = tech_scores.get(c["code"], 0)
         candidates.sort(key=lambda x: x["tech_wave_score"], reverse=True)
         candidates = candidates[:15]
-        logger.info(f"轮次 2: {len(candidates)} 只（波段技术 Top 15）")
+        logger.info(f"轮次 3: {len(candidates)} 只（波段技术 Top 15）")
 
-        # 轮次 3: 风险排雷 Top 8
+        # 轮次 4: 风险排雷 Top 8
         risk_scores = self._score_risk(candidates, fetcher_manager)
         for c in candidates:
             c["risk_score_safe"] = risk_scores.get(c["code"], 0)
         candidates = [c for c in candidates if c["risk_score_safe"] > 50]  # 风险阈值
         candidates.sort(key=lambda x: x["risk_score_safe"], reverse=True)
         candidates = candidates[:8]
-        logger.info(f"轮次 3: {len(candidates)} 只（风险排雷后）")
+        logger.info(f"轮次 4: {len(candidates)} 只（风险排雷后）")
 
-        # 轮次 4: 板块分散 Top N（每个板块最多 1 只）
+        # 消息面评分（全量候选，不排序但记录分数）
+        news_ctx = got_context.get("news_context", {})
+        news_scores = self._score_news(candidates, news_ctx)
+        for c in candidates:
+            c["news_score"] = news_scores.get(c["code"], 0)
+
+        # 轮次 5: 板块分散 Top N（每个板块最多 1 只）
         sector_count = {}
         finalists = []
         for c in candidates:
@@ -1082,7 +1098,8 @@ class StockScreenerPipeline:
                     name=self._get_stock_name(c["code"], fetcher_manager),
                     score=0.0,  # 稍后计算
                     source="got",
-                    capital_score=0.0,  # 资金面已在问财初筛完成
+                    capital_score=c.get("capital_score", 0),
+                    news_score=c.get("news_score", 0),
                     tech_wave_score=c["tech_wave_score"],
                     risk_score_safe=c["risk_score_safe"],
                     sector_name=c["sector"],
@@ -1090,7 +1107,7 @@ class StockScreenerPipeline:
                     sector_type=c["sector_type"],
                 )
 
-                # 计算综合评分
+                # 计算综合评分（5 维）
                 stock.score = self._compute_got_composite_score(stock, got_context)
 
                 # 生成推荐理由
@@ -1203,6 +1220,65 @@ class StockScreenerPipeline:
             scores[c["code"]] = score
 
         return scores
+
+    def _score_news(self, candidates: List[Dict], news_ctx: dict) -> Dict[str, float]:
+        """消息面评分（20% 权重）
+
+        根据新闻事件中 affected_sectors 与候选股所在板块的匹配度评分。
+        - high impact + positive → +40
+        - high impact + negative → -20（减分）
+        - medium impact + positive → +20
+        - medium impact + negative → -10
+        - 多源确认（source_count ≥ 3）额外 ×1.5
+        """
+        events = news_ctx.get("major_events", [])
+        if not events:
+            return {c["code"]: 50.0 for c in candidates}  # 无新闻时中性
+
+        scores = {}
+        for c in candidates:
+            sector = c.get("sector", "")
+            score = 50.0  # 基础分（中性）
+
+            for event in events:
+                affected = event.get("affected_sectors", [])
+                # 板块名匹配（模糊匹配：板块名包含在 affected 或反之）
+                if not any(self._sector_matches(sector, a) for a in affected):
+                    continue
+
+                impact = event.get("impact_level", "low")
+                sentiment = event.get("sentiment", "neutral")
+                source_count = event.get("source_count", 1)
+
+                # 基础分数
+                if impact == "high" and sentiment == "positive":
+                    delta = 40
+                elif impact == "high" and sentiment == "negative":
+                    delta = -20
+                elif impact == "medium" and sentiment == "positive":
+                    delta = 20
+                elif impact == "medium" and sentiment == "negative":
+                    delta = -10
+                else:
+                    delta = 0
+
+                # 多源确认加成
+                if source_count >= 3:
+                    delta = int(delta * 1.5)
+
+                score += delta
+
+            scores[c["code"]] = max(0, min(100, score))
+
+        return scores
+
+    @staticmethod
+    def _sector_matches(stock_sector: str, news_sector: str) -> bool:
+        """板块名模糊匹配（处理新闻板块名与问财板块名不一致的情况）"""
+        if not stock_sector or not news_sector:
+            return False
+        # 精确匹配或包含关系
+        return stock_sector in news_sector or news_sector in stock_sector
 
     def _score_technical_wave(self, candidates: List[Dict], fetcher_manager) -> Dict[str, float]:
         """波段技术指标评分（15% 权重）
@@ -1336,19 +1412,25 @@ class StockScreenerPipeline:
     def _compute_got_composite_score(self, stock: ScreenerStock, got_context: dict) -> float:
         """综合评分（满分 100）
 
-        权重分配（资金面已在问财初筛完成）：
-        - 板块强度: 40%（主线/埋伏/启动信号）
-        - 技术面(波段): 35%（MA20/布林带/周线）
-        - 风险因子: 25%（估值/超买/波动率，反向）
+        权重分配（5 维度）：
+        - 资金面: 30%（龙虎榜/主力资金/大宗交易）
+        - 消息面: 20%（事件影响 + 多源确认）
+        - 板块强度: 20%（主线/埋伏/启动信号）
+        - 技术面(波段): 15%（MA20/布林带/周线）
+        - 风险因子: 15%（估值/超买/波动率，反向 → risk_score_safe）
         """
-        sector_score = stock.sector_score  # 0-100
+        sector_score = stock.sector_score   # 0-100
         tech_score = stock.tech_wave_score  # 0-100
         risk_score = stock.risk_score_safe  # 0-100（越高越安全）
+        capital = stock.capital_score       # 0-100
+        news = stock.news_score             # 0-100
 
         composite = (
-            sector_score * 0.40 +
-            tech_score * 0.35 +
-            risk_score * 0.25
+            capital * 0.30 +
+            news * 0.20 +
+            sector_score * 0.20 +
+            tech_score * 0.15 +
+            risk_score * 0.15
         )
 
         return round(composite, 2)
@@ -1359,12 +1441,16 @@ class StockScreenerPipeline:
             f"**综合评分**: {stock.score:.1f}/100",
             "",
             "### 核心逻辑",
-            f"1. **板块强度** ({stock.sector_score*0.4:.1f}/40): ",
+            f"1. **资金面** ({stock.capital_score*0.3:.1f}/30): ",
+            f"   - 资金面评分 {stock.capital_score:.0f}/100",
+            f"2. **消息面** ({stock.news_score*0.2:.1f}/20): ",
+            f"   - 消息面评分 {stock.news_score:.0f}/100",
+            f"3. **板块强度** ({stock.sector_score*0.2:.1f}/20): ",
             f"   - 属于{stock.sector_type}板块「{stock.sector_name}」",
             f"   - 板块强度 {stock.sector_score:.0f} 分",
-            f"2. **技术面** ({stock.tech_wave_score*0.35:.1f}/35): ",
+            f"4. **技术面** ({stock.tech_wave_score*0.15:.1f}/15): ",
             f"   - 波段技术指标评分 {stock.tech_wave_score:.0f}/100",
-            f"3. **风险** ({stock.risk_score_safe*0.25:.1f}/25): ",
+            f"5. **风险** ({stock.risk_score_safe*0.15:.1f}/15): ",
             f"   - 安全评分 {stock.risk_score_safe:.0f}/100",
             "",
             "### 交易建议",

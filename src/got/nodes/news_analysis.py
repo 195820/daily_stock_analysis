@@ -13,9 +13,11 @@ Node 4: 消息面分析节点
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +27,7 @@ from src.got.schemas import (
     DataQuality,
 )
 from src.got.news_feeds import fetch_all_news
+from src.storage import DatabaseManager, Node4EventRecord
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,8 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
 
 当前科技成长方向的板块精选概念列表：{concept_list}
 
+{historical_context}
+
 新闻数据：
 {news_data}
 
@@ -72,7 +77,8 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
    - affected_sectors: 受影响板块列表（尽量映射到概念列表中的概念）
 2. 不要遗漏重要事件，也不要重复
 3. 同一事件被多家媒体报道时，合并为一个事件
-4. 严格按 importance 排序，high 在前
+4. 如果当前新闻中的事件与历史事件相关（同一主题或因果关系），请在 summary 中标注"延续自：[历史事件标题]"
+5. 严格按 importance 排序，high 在前
 
 输出 JSON 格式（不要 markdown 代码块）：
 {{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."]}}]}}"""
@@ -80,6 +86,8 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
 CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
 
 当前已有的概念列表：{current_concepts}
+
+{historical_context}
 
 最新新闻：
 {news_data}
@@ -89,6 +97,7 @@ CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新�
 2. 每个概念需提供：concept_name（概念名）、evidence（证据，1-2句）、mention_frequency（新闻中被提及的次数估计）
 3. 只输出真正有价值的新概念，不要凑数
 4. 如果没有新概念，返回空列表
+5. 如果某个概念在历史事件中已经连续多天出现（fermenting 或 peak 状态），请特别关注并标注"持续发酵中"
 
 输出 JSON 格式（不要 markdown 代码块）：
 {{"concepts": [{{"concept_name": "...", "evidence": "...", "mention_frequency": 3}}]}}"""
@@ -166,6 +175,9 @@ class NewsAnalysisNode:
         # 过滤 low-impact 事件（不参与 major_events 输出）
         events = [e for e in events if e.impact_level != "low"]
 
+        # Step 3.5: 事件持久化（跨日记忆）
+        self._save_events_to_db(events, raw_news)
+
         # Step 4: 评分计算
         impact_score = self._calculate_impact_score(events)
         overall_impact = self._score_to_impact(impact_score)
@@ -241,22 +253,30 @@ class NewsAnalysisNode:
         news_text = self._format_news_for_prompt(raw_news)
         concept_list_str = "科技成长（AI、半导体、机器人、新能源）"
 
-        # 事件提取
+        # 加载历史事件用于 LLM prompt 注入（跨日记忆）
+        historical_events = self._load_historical_events_for_prompt(days=7)
+        historical_context = self._format_historical_context_for_prompt(historical_events)
+
+        # 事件提取（注入历史上下文）
         events_result = await asyncio.to_thread(
             self._call_llm,
             EVENT_EXTRACTION_PROMPT.format(
-                concept_list=concept_list_str, news_data=news_text,
+                concept_list=concept_list_str,
+                news_data=news_text,
+                historical_context=historical_context,
             ),
             temperature=EVENT_EXTRACTION_TEMPERATURE,
             max_tokens=EVENT_EXTRACTION_MAX_TOKENS,
         )
         events = self._parse_events(events_result)
 
-        # 概念发现
+        # 概念发现（注入历史上下文）
         concepts_result = await asyncio.to_thread(
             self._call_llm,
             CONCEPT_DISCOVERY_PROMPT.format(
-                current_concepts=concept_list_str, news_data=news_text,
+                current_concepts=concept_list_str,
+                news_data=news_text,
+                historical_context=historical_context,
             ),
             temperature=CONCEPT_DISCOVERY_TEMPERATURE,
             max_tokens=CONCEPT_DISCOVERY_MAX_TOKENS,
@@ -481,28 +501,234 @@ class NewsAnalysisNode:
     def _apply_source_count(
         events: List[NewsEvent], raw_news: List[Dict],
     ) -> List[NewsEvent]:
-        """为每个 LLM 事件映射 source_count 和 source_type（从原始新闻中匹配）。"""
+        """跨源合并：统计每个事件被多少独立来源报道。
+
+        LLM 事件提取已合并同一事件的多源报道（见 prompt 第 3 条），
+        但输出中 source_count 默认为 1。本方法反向匹配：
+        将每条原始新闻映射到最相似的 LLM 事件，然后按事件统计独立来源数。
+        """
         if not events or not raw_news:
             return events
 
-        for event in events:
-            best_source_count = 1
-            best_source_type = "search"
+        # Step 1: 每条原始新闻 → 最佳匹配的 LLM 事件
+        event_source_map: dict[int, set[str]] = {i: set() for i in range(len(events))}
+
+        for item in raw_news:
+            item_title = item.get("title", "")
+            if not item_title:
+                continue
+            source = item.get("source_type", "unknown")
+
+            best_idx = -1
             best_ratio = 0.0
-
-            for item in raw_news:
-                ratio = SequenceMatcher(
-                    None, event.title, item.get("title", ""),
-                ).ratio()
-                if ratio >= TITLE_SIMILARITY_THRESHOLD and ratio > best_ratio:
+            for i, event in enumerate(events):
+                ratio = SequenceMatcher(None, item_title, event.title).ratio()
+                if ratio > best_ratio:
                     best_ratio = ratio
-                    best_source_count = item.get("source_count", 1)
-                    best_source_type = item.get("source_type", "search")
+                    best_idx = i
 
-            event.source_count = best_source_count
-            event.source_type = best_source_type
+            # 阈值 0.35：LLM 生成的事件标题是对多条新闻的概括，与单条标题相似度较低
+            if best_idx >= 0 and best_ratio >= 0.35:
+                event_source_map[best_idx].add(source)
+
+        # Step 2: 设置 source_count 和 source_type
+        for i, event in enumerate(events):
+            sources = event_source_map[i]
+            event.source_count = max(len(sources), 1)
+            # source_type 取匹配到该事件的所有原始新闻中出现最多的 source_type
+            if sources:
+                event.source_type = max(sources, key=lambda s: sum(
+                    1 for item in raw_news if item.get("source_type") == s
+                ))
 
         return events
+
+    # =================================================================
+    # Step 3.5: 事件持久化（跨日记忆）
+    # =================================================================
+
+    def _save_events_to_db(self, events: List[NewsEvent], raw_news: List[Dict]) -> None:
+        """保存事件到 SQLite，支持跨日累积。
+
+        去重策略：标题相似度 ≥0.6 视为同一事件，复用 _deduplicate_news() 逻辑。
+        同一事件多次出现时：mention_count += 1，更新 last_seen，追加 sources_seen。
+        """
+        if not events:
+            return
+
+        try:
+            db = DatabaseManager()
+            today = date.today()
+
+            with db.get_session() as session:
+                # 加载最近 7 天的历史事件用于去重
+                historical_events = self._load_historical_events_from_db(session, days=7)
+
+                for event in events:
+                    # 在历史事件中查找相似事件
+                    matched_event_id = None
+                    for hist_event in historical_events:
+                        similarity = SequenceMatcher(None, event.title, hist_event.title).ratio()
+                        if similarity >= 0.6:
+                            matched_event_id = hist_event.event_id
+                            break
+
+                    if matched_event_id:
+                        # 更新已有事件
+                        db_event = session.query(Node4EventRecord).filter_by(event_id=matched_event_id).first()
+                        if db_event:
+                            db_event.mention_count += 1
+                            db_event.last_seen = today
+                            # 追加新来源
+                            existing_sources = db_event.get_sources_seen()
+                            if event.source_type and event.source_type not in existing_sources:
+                                existing_sources.append(event.source_type)
+                                db_event.set_sources_seen(existing_sources)
+                            # 追加情感值到轨迹
+                            sentiment_value = self._sentiment_to_float(event.sentiment)
+                            trajectory = db_event.get_sentiment_trajectory()
+                            trajectory.append(sentiment_value)
+                            db_event.set_sentiment_trajectory(trajectory[-7:])  # 保留最近 7 天
+                            db_event.updated_at = datetime.utcnow()
+                    else:
+                        # 创建新事件
+                        event_id = self._generate_event_id(event.title, today)
+                        db_event = Node4EventRecord(
+                            event_id=event_id,
+                            title=event.title,
+                            source=event.source_type or "unknown",
+                            first_seen=today,
+                            last_seen=today,
+                            mention_count=1,
+                            lifecycle_state="emerging",
+                            category=event.event_type,
+                            significance_score=self._impact_to_score(event.impact_level),
+                        )
+                        db_event.set_sources_seen([event.source_type] if event.source_type else [])
+                        db_event.set_sentiment_trajectory([self._sentiment_to_float(event.sentiment)])
+                        session.add(db_event)
+
+                # 更新所有事件的生命周期状态
+                self._update_lifecycle_states(session)
+                session.commit()
+
+            logger.info("[Node 4] 事件持久化完成: %d 个事件", len(events))
+
+        except Exception as e:
+            logger.error("[Node 4] 事件持久化失败: %s", e, exc_info=True)
+
+    def _load_historical_events_from_db(self, session, days: int = 7) -> List[Node4EventRecord]:
+        """从 SQLite 加载最近 N 天的事件（用于去重和 LLM prompt 注入）。"""
+        cutoff_date = date.today() - timedelta(days=days)
+        return session.query(Node4EventRecord).filter(
+            Node4EventRecord.last_seen >= cutoff_date
+        ).order_by(Node4EventRecord.mention_count.desc()).all()
+
+    def _load_historical_events_for_prompt(self, days: int = 7) -> List[Dict[str, Any]]:
+        """加载历史事件用于 LLM prompt 注入。返回字典列表，便于格式化。"""
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                events = self._load_historical_events_from_db(session, days)
+                return [
+                    {
+                        "event_id": e.event_id,
+                        "title": e.title,
+                        "lifecycle_state": e.lifecycle_state,
+                        "mention_count": e.mention_count,
+                        "days_span": (e.last_seen - e.first_seen).days + 1,
+                        "source_count": len(e.get_sources_seen()),
+                        "sentiment_avg": sum(e.get_sentiment_trajectory()) / len(e.get_sentiment_trajectory()) if e.get_sentiment_trajectory() else 0,
+                        "category": e.category,
+                    }
+                    for e in events
+                ]
+        except Exception as e:
+            logger.error("[Node 4] 加载历史事件失败: %s", e, exc_info=True)
+            return []
+
+    def _update_lifecycle_states(self, session) -> None:
+        """批量更新事件的生命周期状态。
+
+        状态机：
+        - emerging: first_seen == today 且 mention_count == 1
+        - fermenting: mention_count >= 3 且跨 >=2 天
+        - peak: mention_count >= 10 且跨 >=3 个独立来源
+        - fading: last_seen < today 且 mention_count 较峰值下降 >50%
+        - archived: last_seen < today - 7 days
+        """
+        today = date.today()
+        events = session.query(Node4EventRecord).all()
+
+        for event in events:
+            days_span = (event.last_seen - event.first_seen).days + 1
+            source_count = len(event.get_sources_seen())
+
+            # archived: 7 天未出现
+            if event.last_seen < today - timedelta(days=7):
+                event.lifecycle_state = "archived"
+            # peak: 高热度 + 多来源
+            elif event.mention_count >= 10 and source_count >= 3 and days_span >= 3:
+                event.lifecycle_state = "peak"
+            # fermenting: 中等热度 + 跨日
+            elif event.mention_count >= 3 and days_span >= 2:
+                event.lifecycle_state = "fermenting"
+            # emerging: 新事件
+            elif event.first_seen == today and event.mention_count == 1:
+                event.lifecycle_state = "emerging"
+            # fading: 热度下降（简化判定：last_seen < today）
+            elif event.last_seen < today:
+                event.lifecycle_state = "fading"
+
+    def _generate_event_id(self, title: str, today: date) -> str:
+        """生成事件 ID（基于标题和日期的哈希）。"""
+        content = f"{title}|{today.isoformat()}"
+        return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _sentiment_to_float(sentiment: str) -> float:
+        """将情感标签转换为数值：positive=1.0, neutral=0.0, negative=-1.0。"""
+        mapping = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+        return mapping.get(sentiment, 0.0)
+
+    @staticmethod
+    def _impact_to_score(impact_level: str) -> float:
+        """将影响级别转换为数值分数。"""
+        mapping = {"high": 1.0, "medium": 0.5, "low": 0.0}
+        return mapping.get(impact_level, 0.0)
+
+    def _format_historical_context_for_prompt(self, historical_events: List[Dict[str, Any]]) -> str:
+        """格式化历史事件用于 LLM prompt 注入。"""
+        if not historical_events:
+            return ""
+
+        # 按生命周期状态分组
+        fermenting = [e for e in historical_events if e["lifecycle_state"] == "fermenting"]
+        peak = [e for e in historical_events if e["lifecycle_state"] == "peak"]
+        emerging = [e for e in historical_events if e["lifecycle_state"] == "emerging"]
+
+        lines = ["历史事件（最近 7 天）："]
+
+        if peak:
+            lines.append("【峰值事件】（高热度，多来源确认）：")
+            for e in peak[:3]:  # 最多 3 个
+                lines.append(f"  - {e['title']}（出现 {e['mention_count']} 次，{e['source_count']} 个来源，跨 {e['days_span']} 天）")
+
+        if fermenting:
+            lines.append("【发酵事件】（连续多天出现，正在升温）：")
+            for e in fermenting[:3]:
+                lines.append(f"  - {e['title']}（出现 {e['mention_count']} 次，跨 {e['days_span']} 天，{e['source_count']} 个来源）")
+
+        if emerging:
+            lines.append("【新兴事件】（今日首次出现）：")
+            for e in emerging[:2]:
+                lines.append(f"  - {e['title']}（{e['category']}）")
+
+        if not (peak or fermenting or emerging):
+            return ""
+
+        lines.append("\n请判断当前新闻中的事件是否与上述历史事件相关，并在 summary 中标注。")
+        return "\n".join(lines)
 
     # =================================================================
     # Step 4: 评分计算

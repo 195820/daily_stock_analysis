@@ -278,6 +278,35 @@ def get_thinking_extra_body(model: str) -> Optional[dict]:
     return _get_opt_in_payload(model, _OPT_IN_THINKING_MODELS)
 
 
+def _get_deepseek_thinking_extra_body(model: str) -> Optional[dict]:
+    """DeepSeek thinking 模式控制（v4 系列默认开启，需显式关闭）。
+
+    - Auto/Opt-in thinking 模型：返回已有配置（启用或跳过）
+    - 其他 deepseek 模型：显式关闭 thinking，防止 reasoning 吃光 token
+    - 非 deepseek 模型：不干预（返回 None）
+    """
+    # model 可能是短名（deepseek-v4-flash）或全名（deepseek/deepseek-v4-flash）
+    if "/" in model:
+        provider = model.split("/", 1)[0].lower()
+        if provider != "deepseek":
+            return None
+        model_short = model.split("/", 1)[1]
+    else:
+        # 无前缀时，通过命名约定判断：deepseek 模型名以 deepseek- 开头
+        m = model.lower().strip()
+        if not m.startswith("deepseek"):
+            return None
+        model_short = m
+
+    extra = get_thinking_extra_body(model_short)
+    if extra is not None:
+        return extra
+    if _model_matches(model_short, _AUTO_THINKING_MODELS):
+        return None
+    # v4 系列默认关闭 thinking，避免 reasoning 占满 max_tokens 导致 content 为空
+    return {"thinking": {"type": "disabled"}}
+
+
 def resolve_fallback_litellm_wire_models(
     model: str,
     model_list: Optional[List[Dict[str, Any]]] = None,
@@ -572,7 +601,7 @@ class LLMToolAdapter:
 
         # Use short model name (without provider prefix) for thinking model lookup
         model_short = model.split("/")[-1] if "/" in model else model
-        extra = get_thinking_extra_body(model_short)
+        extra = _get_deepseek_thinking_extra_body(model_short)
 
         call_kwargs: Dict[str, Any] = {
             "model": model,

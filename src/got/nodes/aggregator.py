@@ -64,7 +64,7 @@ SYSTEMIC_KEYWORDS = [
 SECTOR_SCORE_SCALE = 100.0
 
 # LLM 精炼触发阈值
-AGREEMENT_THRESHOLD = 0.6
+AGREEMENT_THRESHOLD = 0.5
 CONTRADICTION_CONFIDENCE_THRESHOLD = 0.4
 CONTRADICTION_SCORE_THRESHOLD = -0.2
 
@@ -131,6 +131,10 @@ class AggregatorNode:
             )
             # 仍需持久化（EMA 基线需要每日更新）
             self._save_context(result, market, sector, aggregation, today)
+            # 回写 EMA 基线
+            updated_ema = load_ema_baseline()
+            if updated_ema:
+                result.ema_baseline = updated_ema.get("weighted_score")
             return result
 
         # ── Phase B: 异常检测 ──
@@ -188,6 +192,11 @@ class AggregatorNode:
 
         # 持久化
         self._save_context(unified, market, sector, aggregation, today)
+
+        # 回写 EMA 基线到输出（_save_context 已更新磁盘）
+        updated_ema = load_ema_baseline()
+        if updated_ema:
+            unified.ema_baseline = updated_ema.get("weighted_score")
 
         logger.info(
             f"[Node 6] 聚合完成 — 信号: {unified.unified_signal}, "
@@ -451,14 +460,21 @@ class AggregatorNode:
 
     @staticmethod
     def _classify_conflict(a: DimensionSignal, b: DimensionSignal) -> str:
-        """矛盾分类（参考 ConflictRAG）: factual / temporal / opinion"""
-        # 时间框架差异（如 short_term vs long_term 信号）
-        if a.name == "market" and b.name == "market":
+        """矛盾分类（参考 ConflictRAG）: factual / temporal / opinion
+
+        - factual: 两个维度测量重叠现象（价量/资金都反映市场动态）
+        - temporal: 存在时间滞后效应（消息面领先情绪面，技术面领先资金面）
+        - opinion: 方法论根本不同（技术面 vs 情绪面）
+        """
+        names = frozenset({a.name, b.name})
+
+        # 时间滞后型：消息面→情绪面存在传导时滞，技术面→资金面有领先/跟随关系
+        if names == {"news", "sentiment"} or names == {"market", "capital"}:
             return "temporal"
-        # 同类数据源冲突
-        if a.name in ("capital", "market") and b.name in ("capital", "market"):
+        # 事实型：测量重叠现象（价量与资金、板块与大盘）
+        if names <= {"market", "sector", "capital"}:
             return "factual"
-        # 跨类分歧
+        # 其余为方法论分歧
         return "opinion"
 
     @staticmethod
@@ -577,7 +593,15 @@ class AggregatorNode:
         temporal: list[TemporalInconsistency],
         override: Optional[NewsOverride],
     ) -> bool:
-        """判断是否需要 LLM 精炼"""
+        """判断是否需要 LLM 精炼
+
+        触发条件（任一满足即触发）：
+        1. agreement < 0.5（维度间分歧较大）
+        2. 时间异常 severity ≥ high
+        3. 消息面覆盖激活
+        4. convergence pattern 为 strong_divergence / lone_outlier
+        5. mild_divergence 且有矛盾对（维度方向不完全一致）
+        """
         if aggregation.convergence.agreement_score < AGREEMENT_THRESHOLD:
             return True
         if any(c.severity in ("high", "critical") for c in temporal):
@@ -585,6 +609,9 @@ class AggregatorNode:
         if override and override.override:
             return True
         if aggregation.convergence.pattern in ("strong_divergence", "lone_outlier"):
+            return True
+        # mild_divergence + 存在矛盾对 → 需要 LLM 研判
+        if aggregation.convergence.pattern == "mild_divergence" and contradictions:
             return True
         return False
 
@@ -893,10 +920,12 @@ class AggregatorNode:
                 # EMA 更新
                 new_score = EMA_ALPHA * aggregation.weighted_score + (1 - EMA_ALPHA) * prev_score
 
-                # 滚动标准差更新
+                # 滚动标准差更新（Welford 在线算法）
                 delta = aggregation.weighted_score - prev_score
-                new_std = ((prev_count - 1) * prev_std**2 + prev_count * delta**2) / prev_count
-                new_std = max(new_std**0.5, 0.01)  # 下界
+                ss = (prev_count - 1) * prev_std**2  # 当前平方偏差和
+                new_ss = ss + delta**2 * prev_count / (prev_count + 1)
+                new_var = new_ss / prev_count  # 样本方差（n+1 样本，除以 n）
+                new_std = max(new_var**0.5, 0.01)
 
                 new_baseline = {
                     "weighted_score": new_score,

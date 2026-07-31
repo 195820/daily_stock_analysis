@@ -941,6 +941,126 @@ class StockDdeRecord(Base):
     )
 
 
+class Node4EventRecord(Base):
+    """Node 4 消息面事件生命周期追踪。
+
+    解决"中热度消息在滚动窗口中丢失"的问题：
+    - 追踪事件从 emerging → fermenting → peak → fading → archived 的完整生命周期
+    - 支持跨日记忆：同一事件在不同日期重复出现时，累积 mention_count
+    - 用于 LLM prompt 注入：提供"正在发酵"的历史事件上下文
+
+    去重策略：event_id = hash(title + source + date)，同一事件多次出现时 UPSERT
+    """
+
+    __tablename__ = 'node4_events'
+
+    event_id = Column(String(64), primary_key=True)  # MD5(title + source + date)
+    title = Column(Text, nullable=False)
+    source = Column(String(50), nullable=False)  # sina/cls/wallstcn/eastmoney/newsnow
+    first_seen = Column(Date, nullable=False, index=True)
+    last_seen = Column(Date, nullable=False, index=True)
+    mention_count = Column(Integer, default=1)
+    sources_seen = Column(Text)  # JSON array: ["sina", "cls", "wallstcn"]
+    lifecycle_state = Column(String(20), default='emerging')  # emerging/fermenting/peak/fading/archived
+    sentiment_trajectory = Column(Text)  # JSON array: [0.3, 0.5, 0.7]（跨日情感变化）
+    category = Column(String(30), index=True)  # policy/industry/global/risk
+    significance_score = Column(Float)  # 加权热度（0-1）
+    related_events = Column(Text)  # JSON array of event_ids（归一化后的关联事件）
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_node4_lifecycle', 'lifecycle_state', 'last_seen'),
+        Index('ix_node4_category_date', 'category', 'first_seen'),
+    )
+
+    def get_sources_seen(self) -> List[str]:
+        """反序列化 sources_seen JSON 字段"""
+        if not self.sources_seen:
+            return []
+        try:
+            return json.loads(self.sources_seen)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_sources_seen(self, sources: List[str]):
+        """序列化 sources_seen 为 JSON"""
+        self.sources_seen = json.dumps(list(set(sources)), ensure_ascii=False)
+
+    def get_sentiment_trajectory(self) -> List[float]:
+        """反序列化 sentiment_trajectory JSON 字段"""
+        if not self.sentiment_trajectory:
+            return []
+        try:
+            return json.loads(self.sentiment_trajectory)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_sentiment_trajectory(self, trajectory: List[float]):
+        """序列化 sentiment_trajectory 为 JSON"""
+        self.sentiment_trajectory = json.dumps(trajectory, ensure_ascii=False)
+
+    def get_related_events(self) -> List[str]:
+        """反序列化 related_events JSON 字段"""
+        if not self.related_events:
+            return []
+        try:
+            return json.loads(self.related_events)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_related_events(self, event_ids: List[str]):
+        """序列化 related_events 为 JSON"""
+        self.related_events = json.dumps(event_ids, ensure_ascii=False)
+
+
+class Node2SectorTrendRecord(Base):
+    """Node 2 板块强度趋势追踪。
+
+    解决"板块在某个状态停留多久"的问题：
+    - 追踪 strength_score 的日度变化（7 天轨迹）
+    - 追踪主线持续时间（mainline_days，用于检测 late_stage）
+    - 用于 LLM prompt 注入：提供"强度持续上升"的板块上下文
+
+    设计原则（基于用户反馈）：
+    - ❌ 不追踪"埋伏持续天数"（死板块无意义）
+    - ✅ 追踪"强度趋势"（neutral + increasing 连续 3 天 → 即将 launch）
+    - ✅ 追踪"主线持续时间"（mainline_days >= 5 + strength < 0.5 → 主线衰竭）
+    """
+
+    __tablename__ = 'node2_sector_trends'
+
+    sector_code = Column(String(20), primary_key=True)
+    sector_name = Column(String(100), nullable=False)
+    tracking_date = Column(Date, primary_key=True)
+    unified_signal = Column(String(20))  # bullish/bearish/neutral
+    lifecycle_phase = Column(String(30))  # launch/acceleration/mature/late_stage/mature_exhausted
+    strength_score = Column(Float)  # 5维加权评分（0-1）
+    is_mainline = Column(Boolean, default=False, index=True)  # 是否为主线板块
+    mainline_days = Column(Integer, default=0)  # 连续主线天数
+    strength_trajectory = Column(Text)  # JSON array: [0.45, 0.48, 0.52]（最近 7 天强度）
+    trend_direction = Column(String(20), index=True)  # increasing/stable/decreasing
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_node2_mainline_duration', 'is_mainline', 'mainline_days'),
+        Index('ix_node2_trend_date', 'trend_direction', 'tracking_date'),
+    )
+
+    def get_strength_trajectory(self) -> List[float]:
+        """反序列化 strength_trajectory JSON 字段"""
+        if not self.strength_trajectory:
+            return []
+        try:
+            return json.loads(self.strength_trajectory)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_strength_trajectory(self, trajectory: List[float]):
+        """序列化 strength_trajectory 为 JSON"""
+        self.strength_trajectory = json.dumps(trajectory, ensure_ascii=False)
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 

@@ -17,9 +17,10 @@ Node 2: 板块分析节点
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta
-from typing import Any, Optional
+from datetime import date, datetime, timedelta
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,7 @@ from src.got.schemas import (
     SectorContext,
     SectorDetail,
 )
+from src.storage import DatabaseManager, Node2SectorTrendRecord
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +381,9 @@ class SectorAnalysisNode:
             result = self._classify_sectors(analyzed, market_context)
             result.data_quality = quality
 
+            # Step 3.5: 板块趋势持久化（跨日记忆）
+            self._save_sector_trends(analyzed)
+
             # Step 4: LLM 生成 reasoning
             result.reasoning = await self._generate_reasoning(result)
 
@@ -567,45 +572,6 @@ class SectorAnalysisNode:
         if result:
             logger.info(f"[Node 2] T-0 板块涨跌幅: {result}")
         return result
-
-    @staticmethod
-    def _match_concept_universe(boards: list[dict]) -> list[dict]:
-        """关键词匹配精选概念列表。
-
-        匹配优先级：精确匹配 > 前缀匹配 > 子串匹配（覆盖 ≥30%）> 括号别名。
-        每个 category 取涨幅最高的前 2 个匹配板块（boards 已按涨跌幅降序）。
-        """
-        matched: list[dict] = []
-        seen_codes: set[str] = set()
-        _TOP_N_PER_CATEGORY = 2
-
-        for group_name, categories in CONCEPT_UNIVERSE.items():
-            for cat_name, keywords in categories.items():
-                cat_matches = []
-                for board in boards:
-                    code = board.get("code", "")
-                    name = board.get("name", "")
-                    if code in seen_codes:
-                        continue
-                    if _keyword_matches(name, keywords):
-                        cat_matches.append(board)
-                        if len(cat_matches) >= _TOP_N_PER_CATEGORY:
-                            break
-
-                for best_board in cat_matches:
-                    seen_codes.add(best_board["code"])
-                    matched.append({
-                        "code": best_board["code"],
-                        "name": best_board["name"],
-                        "change_pct": best_board.get("change_pct", 0.0),
-                        "up_count": best_board.get("up_count", 0),
-                        "down_count": best_board.get("down_count", 0),
-                        "turnover_rate": best_board.get("turnover_rate", 0.0),
-                        "group": group_name,
-                        "category": cat_name,
-                    })
-
-        return matched
 
     # =================================================================
     # 单板块分析流水线
@@ -1417,31 +1383,6 @@ class SectorAnalysisNode:
         )
 
     @staticmethod
-    def _fill_fallback(
-        sectors: list[SectorDetail],
-        active: list[SectorDetail],
-        exhausted: list[SectorDetail],
-        ambush: list[SectorDetail],
-        defensive: list[SectorDetail],
-    ) -> Optional[SectorDetail]:
-        """从 neutral 板块中选取最高分，补入 active_mainline（最多 1 个）。
-
-        已在其他分类中的板块不重复补入。
-        只选择有 tier 的板块（确保达到主线标准）。
-        """
-        used_codes = {
-            s.code for lst in (active, exhausted, ambush, defensive) for s in lst
-        }
-        neutral_candidates = sorted(
-            [s for s in sectors if s.state == "neutral" and s.code not in used_codes and s.tier is not None],
-            key=lambda s: s.strength_score,
-            reverse=True,
-        )
-        if not neutral_candidates:
-            return None
-        return neutral_candidates[0]
-
-    @staticmethod
     def _classify_market_direction(sectors: list[SectorDetail]) -> str:
         """市场方向: 普涨(>60%上涨) / 普跌(>60%下跌) / 分化。"""
         up = sum(1 for s in sectors if s.indicators.get("price_momentum", 0) > 0.2)
@@ -1456,6 +1397,183 @@ class SectorAnalysisNode:
         elif down / total > 0.6:
             return "普跌"
         return "分化"
+
+    # =================================================================
+    # 板块趋势持久化（跨日记忆）
+    # =================================================================
+
+    def _save_sector_trends(self, sectors: list[SectorDetail]) -> None:
+        """保存板块趋势到 SQLite，支持跨日追踪。
+
+        追踪目标：
+        - strength_score 日度变化（7 天轨迹）
+        - 主线持续时间（mainline_days，用于检测 late_stage）
+        """
+        if not sectors:
+            return
+
+        try:
+            db = DatabaseManager()
+            today = date.today()
+
+            with db.get_session() as session:
+                for sector in sectors:
+                    # 计算强度趋势
+                    trend_data = self._calc_strength_trend(session, sector.code, sector.strength_score)
+
+                    # 计算主线持续时间
+                    is_mainline = sector.state in ("active_mainline", "exhausted_mainline")
+                    mainline_days = self._calc_mainline_days(session, sector.code, is_mainline)
+
+                    # 创建或更新记录
+                    db_record = session.query(Node2SectorTrendRecord).filter_by(
+                        sector_code=sector.code,
+                        tracking_date=today,
+                    ).first()
+
+                    if db_record:
+                        # 更新已有记录
+                        db_record.unified_signal = self._state_to_signal(sector.state)
+                        db_record.lifecycle_phase = sector.lifecycle.phase if sector.lifecycle else None
+                        db_record.strength_score = sector.strength_score
+                        db_record.is_mainline = is_mainline
+                        db_record.mainline_days = mainline_days
+                        db_record.set_strength_trajectory(trend_data["trajectory"])
+                        db_record.trend_direction = trend_data["trend_direction"]
+                    else:
+                        # 创建新记录
+                        db_record = Node2SectorTrendRecord(
+                            sector_code=sector.code,
+                            sector_name=sector.name,
+                            tracking_date=today,
+                            unified_signal=self._state_to_signal(sector.state),
+                            lifecycle_phase=sector.lifecycle.phase if sector.lifecycle else None,
+                            strength_score=sector.strength_score,
+                            is_mainline=is_mainline,
+                            mainline_days=mainline_days,
+                            trend_direction=trend_data["trend_direction"],
+                        )
+                        db_record.set_strength_trajectory(trend_data["trajectory"])
+                        session.add(db_record)
+
+                session.commit()
+
+            logger.info("[Node 2] 板块趋势持久化完成: %d 个板块", len(sectors))
+
+        except Exception as e:
+            logger.error("[Node 2] 板块趋势持久化失败: %s", e, exc_info=True)
+
+    def _calc_strength_trend(self, session, sector_code: str, current_strength: float) -> dict:
+        """计算强度趋势（最近 7 天）。"""
+        history = session.query(Node2SectorTrendRecord).filter(
+            Node2SectorTrendRecord.sector_code == sector_code
+        ).order_by(Node2SectorTrendRecord.tracking_date.desc()).limit(7).all()
+
+        trajectory = [h.strength_score for h in reversed(history)] + [current_strength]
+
+        # 趋势判定：3 天变化
+        if len(trajectory) >= 3:
+            recent_change = trajectory[-1] - trajectory[-3]
+            trend = "increasing" if recent_change > 0.05 else \
+                    "decreasing" if recent_change < -0.05 else "stable"
+        else:
+            trend = "stable"
+
+        return {
+            "trajectory": trajectory,
+            "trend_direction": trend,
+            "days_tracked": len(trajectory),
+        }
+
+    def _calc_mainline_days(self, session, sector_code: str, is_currently_mainline: bool) -> int:
+        """计算连续主线天数。"""
+        if not is_currently_mainline:
+            return 0
+
+        history = session.query(Node2SectorTrendRecord).filter(
+            Node2SectorTrendRecord.sector_code == sector_code
+        ).order_by(Node2SectorTrendRecord.tracking_date.desc()).all()
+
+        days = 0
+        for record in history:
+            if record.is_mainline:
+                days += 1
+            else:
+                break
+        return days + 1  # +1 for today
+
+    def _load_sector_trend_history(self, sector_code: str, days: int = 7) -> Optional[dict]:
+        """加载板块趋势历史用于 LLM prompt 注入。"""
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                history = session.query(Node2SectorTrendRecord).filter(
+                    Node2SectorTrendRecord.sector_code == sector_code
+                ).order_by(Node2SectorTrendRecord.tracking_date.desc()).limit(days).all()
+
+                if not history:
+                    return None
+
+                # 取最新记录
+                latest = history[0]
+                trajectory = [h.strength_score for h in reversed(history)]
+
+                return {
+                    "sector_code": sector_code,
+                    "sector_name": latest.sector_name,
+                    "strength_trajectory": trajectory,
+                    "trend_direction": latest.trend_direction,
+                    "mainline_days": latest.mainline_days,
+                    "unified_signal": latest.unified_signal,
+                    "lifecycle_phase": latest.lifecycle_phase,
+                }
+
+        except Exception as e:
+            logger.error("[Node 2] 加载板块趋势历史失败: %s", e, exc_info=True)
+            return None
+
+    @staticmethod
+    def _state_to_signal(state: str) -> str:
+        """将板块状态转换为信号方向。"""
+        mapping = {
+            "active_mainline": "bullish",
+            "exhausted_mainline": "bearish",
+            "ambush": "neutral",
+            "defensive_rotation": "neutral",
+        }
+        return mapping.get(state, "neutral")
+
+    def _format_trend_context_for_prompt(self, sectors: list[SectorDetail]) -> str:
+        """格式化板块趋势历史用于 LLM prompt 注入。"""
+        if not sectors:
+            return ""
+
+        lines = ["板块历史趋势（最近 7 天）："]
+        has_trend_data = False
+
+        for sector in sectors[:5]:  # 最多 5 个板块
+            trend_data = self._load_sector_trend_history(sector.code, days=7)
+            if not trend_data or not trend_data.get("strength_trajectory"):
+                continue
+
+            has_trend_data = True
+            trajectory = trend_data["strength_trajectory"]
+            trend_direction = trend_data.get("trend_direction", "stable")
+            mainline_days = trend_data.get("mainline_days", 0)
+
+            # 格式化轨迹
+            trajectory_str = " → ".join(f"{s:.0f}" for s in trajectory)
+
+            lines.append(f"- {sector.name}: 强度轨迹 [{trajectory_str}]，趋势 {trend_direction}")
+
+            if mainline_days > 0:
+                lines.append(f"  （连续主线 {mainline_days} 天）")
+
+        if not has_trend_data:
+            return ""
+
+        lines.append("\n请结合历史趋势分析板块的持续性和潜在变化。")
+        return "\n".join(lines)
 
     # =================================================================
     # LLM reasoning 生成
@@ -1484,6 +1602,10 @@ class SectorAnalysisNode:
 
         notes_text = "\n".join(f"- {n}" for n in ctx.notes) if ctx.notes else "无"
 
+        # 加载板块趋势历史用于 LLM prompt 注入（跨日记忆）
+        all_sectors = ctx.active_mainline + ctx.exhausted_mainline + ctx.ambush + ctx.defensive_rotation
+        trend_context = self._format_trend_context_for_prompt(all_sectors)
+
         prompt = (
             "你是一个专业的板块分析师。根据以下板块分析结果，撰写一段简洁的分析报告。\n\n"
             f"板块分析结果：\n"
@@ -1493,6 +1615,12 @@ class SectorAnalysisNode:
             f"- 防守轮动：{defensive_names}\n"
             f"- 市场方向：{ctx.market_direction}\n"
             f"- 备注：{notes_text}\n\n"
+        )
+
+        if trend_context:
+            prompt += f"{trend_context}\n\n"
+
+        prompt += (
             "请输出：\n"
             "1. 一段200字以内的分析文本，解释当前板块轮动格局\n"
             "2. 重点说明哪些板块是主线、持续性如何\n"

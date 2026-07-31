@@ -138,6 +138,19 @@ class SectorDetail(BaseModel):
         default=None,
         description="T-0 板块涨跌幅（mootdx 成分股中位数），如 -3.38",
     )
+    # 趋势追踪字段（跨日记忆）
+    strength_trajectory: Optional[list[float]] = Field(
+        default=None,
+        description="最近 7 天强度分数轨迹",
+    )
+    trend_direction: Optional[str] = Field(
+        default=None,
+        description="increasing / stable / decreasing（基于 7 天趋势）",
+    )
+    mainline_days: Optional[int] = Field(
+        default=None,
+        description="连续主线天数（用于检测 late_stage）",
+    )
 
 
 class SectorContext(BaseModel):
@@ -196,6 +209,10 @@ class NewsEvent(BaseModel):
     timestamp: Optional[str] = None
     source_count: int = Field(default=1, ge=1)
     source_type: str = Field(default="search", description="cls / eastmoney / cctv / caixin / search")
+    # 生命周期追踪字段（跨日记忆）
+    lifecycle_state: Optional[str] = Field(default=None, description="emerging / fermenting / peak / fading / archived")
+    mention_count: Optional[int] = Field(default=None, description="跨日累计出现次数")
+    first_seen: Optional[str] = Field(default=None, description="首次出现日期（YYYY-MM-DD）")
 
 
 class NewsContext(BaseModel):

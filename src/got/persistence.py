@@ -10,6 +10,7 @@ GOT 聚合节点上下文持久化
 
 import json
 import logging
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +24,14 @@ _CONTEXTS_DIR = Path("data/aggregator_contexts")
 def _ensure_dir() -> None:
     """确保目录存在"""
     _CONTEXTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_write_json(filepath: Path, data: Any) -> None:
+    """原子写入 JSON：先写 .tmp 再 os.replace，防止写入中途崩溃损坏文件"""
+    tmp_path = filepath.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp_path, filepath)
 
 
 def _filepath_for(trading_date: date) -> Path:
@@ -68,8 +77,7 @@ def save_current_context(context: dict[str, Any], trading_date: date) -> Path:
     _ensure_dir()
     filepath = _filepath_for(trading_date)
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(context, f, ensure_ascii=False, indent=2, default=str)
+    _atomic_write_json(filepath, context)
 
     logger.info(f"[persistence] 已保存上下文: {filepath.name}")
     return filepath
@@ -146,8 +154,7 @@ def save_ema_baseline(baseline: dict[str, Any]) -> Path:
     """
     _ensure_dir()
 
-    with open(_EMA_BASELINE_FILE, "w", encoding="utf-8") as f:
-        json.dump(baseline, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(_EMA_BASELINE_FILE, baseline)
 
     logger.info(f"[persistence] 已保存 EMA 基线: score={baseline.get('weighted_score', 0):.3f}")
     return _EMA_BASELINE_FILE

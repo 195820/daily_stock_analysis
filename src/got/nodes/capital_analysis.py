@@ -66,9 +66,6 @@ _LOOKBACK_DAYS = 5
 # 龙虎榜默认查询区间（覆盖回溯天数 + 周末）
 _LHB_DATE_RANGE_DAYS = 10
 
-# 并发请求限制
-_CONCURRENT_FETCHES = 5
-
 # 态度判定阈值
 _BULLISH_THRESHOLD = 0.3
 _BEARISH_THRESHOLD = -0.3
@@ -146,25 +143,28 @@ class CapitalAnalysisNode:
     async def _fetch_all_dimensions(
         self, quality: DataQuality,
     ) -> dict[str, Any]:
-        """并发获取 5 维度数据。
+        """并发获取可用维度数据。
 
         北向资金和 ETF 申赎已知数据源受限，仍然尝试获取以支持未来恢复。
         """
-        tasks = {
-            "northbound": self._fetch_northbound(quality),
-            "dragon_tiger": self._fetch_dragon_tiger(quality),
-            "margin_trading": self._fetch_margin_trading(quality),
-            "block_trade": self._fetch_block_trade(quality),
-            # ETF 申赎暂无可用 API（仅快照无历史），跳过获取
-        }
+        dimension_keys = ["northbound", "dragon_tiger", "margin_trading", "block_trade"]
+        dimension_fetchers = [
+            self._fetch_northbound(quality),
+            self._fetch_dragon_tiger(quality),
+            self._fetch_margin_trading(quality),
+            self._fetch_block_trade(quality),
+        ]
+
+        # asyncio.gather + return_exceptions 实现真正并发 + 单维度失败不阻塞
+        raw_results = await asyncio.gather(*dimension_fetchers, return_exceptions=True)
 
         results = {}
-        for key, task in tasks.items():
-            try:
-                results[key] = await task
-            except Exception as e:
-                logger.warning(f"[Node 3] {DIMENSION_LABELS[key]} 获取失败: {e}")
+        for key, result in zip(dimension_keys, raw_results):
+            if isinstance(result, Exception):
+                logger.warning(f"[Node 3] {DIMENSION_LABELS[key]} 获取失败: {result}")
                 results[key] = None
+            else:
+                results[key] = result
 
         return results
 

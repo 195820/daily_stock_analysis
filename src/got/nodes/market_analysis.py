@@ -137,8 +137,8 @@ class MarketAnalysisNode:
         # Step 6: 支撑/阻力位
         key_levels = self._calculate_key_levels(index_data.get("399006.SZ"))
 
-        # Step 7: T-0 实时涨跌幅（腾讯接口）
-        today_change = self._fetch_realtime_index()
+        # Step 7: T-0 实时涨跌幅（腾讯接口，同步 HTTP → 放到线程池避免阻塞事件循环）
+        today_change = await asyncio.to_thread(self._fetch_realtime_index)
 
         # Step 8: 跨指数一致性 + confidence（三因素加权）
         cross_consistency, cross_pattern = self._compute_cross_index_consistency(indicator_results)
@@ -340,15 +340,6 @@ class MarketAnalysisNode:
             medium_term=Signal(trend=self._score_to_trend(medium_score), score=clip(medium_score, -1.0, 1.0)),
             long_term=Signal(trend=self._score_to_trend(long_score), score=clip(long_score, -1.0, 1.0)),
         )
-
-    def _score_to_trend(self, score: float) -> str:
-        """分数转趋势"""
-        if score > 0.5:
-            return "bullish"
-        elif score < -0.5:
-            return "bearish"
-        else:
-            return "neutral"
 
     def _aggregate_timeframe_signals(self, signals: TimeframeSignals, regime_metadata: dict) -> TimeframeGOTResult:
         """时间框架 mini GOT：score 级矛盾检测 + 模式分类
