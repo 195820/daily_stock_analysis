@@ -1895,114 +1895,112 @@ class SectorAnalysisNode:
         frames: dict[str, dict],
         analyzed: list[SectorDetail],
     ) -> list[SectorDetail]:
-        """框进出管理（主线框按产业主题组，埋伏框按个股）。
+        """框进出管理（主线框 + 埋伏框均为板块个体级）。
+
+        Node 2 v2 修正：主线框从家族级改为板块个体级。
+        家族仅用于聚合视图（_build_theme_families），不参与进出管理。
+        每个板块独立追踪分数、连续低分天数、踢出逻辑。
 
         Returns:
-            exhausted_from_frame: 今日被踢出主线框的板块（所有成员）
+            exhausted_from_frame: 今日被踢出主线框的板块
         """
         today = date.today()
         exhausted_from_frame: list[SectorDetail] = []
         analyzed_by_code: dict[str, SectorDetail] = {s.code: s for s in analyzed}
 
-        # ── 第一步：按 frame_group 聚合今日主线候选 ──
-        mainline_by_group: dict[str, list[SectorDetail]] = {}
-        for s in analyzed:
-            if s.state == "active_mainline" and s.frame_group:
-                mainline_by_group.setdefault(s.frame_group, []).append(s)
+        # ── 第一步：处理已在主线框内的板块（个体级）──
+        mainline_keys_to_remove: list[str] = []
 
-        # ── 第二步：处理已在主线框内的组 ──
-        groups_to_remove: list[str] = []
-
-        for group_name, frame in list(frames.items()):
+        for key, frame in list(frames.items()):
             if frame["frame_type"] != "mainline":
                 continue
 
-            # 用 frame 持久化的 member_codes 查找今日仍存在的成员（而非仅 active_mainline 状态）
-            # 避免成员状态降级导致 group_score 与输出成员不一致
-            frame_members = [
-                analyzed_by_code[c]
-                for c in frame.get("member_codes", [])
-                if c in analyzed_by_code
-            ]
-            today_active = mainline_by_group.get(group_name, [])
-
-            if not frame_members and not today_active:
-                # 该组今日无任何成员 → 低分计数
+            member_codes = frame.get("member_codes", [])
+            if not member_codes:
+                continue
+            # 主线框每个 key 对应一个板块
+            board_code = member_codes[0]
+            sector = analyzed_by_code.get(board_code)
+            if sector is None:
+                # 板块今日不在分析结果中 → 低分计数
                 frame["group_score"] = 0
                 frame["consecutive_low_days"] += 1
-            else:
-                # 计算 group_score：优先用 frame 成员的实际分数，兜底用 active 成员
-                score_source = frame_members or today_active
-                group_score = max(s.strength_score for s in score_source)
-                has_strong = any(
-                    s.tier in ("S", "A") for s in score_source
-                )
-                frame["group_score"] = group_score
-                frame["has_strong_member"] = has_strong
-                frame["member_codes"] = [s.code for s in score_source]
+                if frame["consecutive_low_days"] >= self._MAINLINE_STRONG_TOLERANCE_DAYS:
+                    mainline_keys_to_remove.append(key)
+                    logger.info(f"[Node 2] 主线框踢出 [{key}]: 连续{frame['consecutive_low_days']}天无数据")
+                continue
 
-                # 检查任何成员是否过热/衰竭
-                any_overheat = any(
-                    s.state == "exhausted_mainline" for s in score_source
-                )
-                if any_overheat:
-                    exhausted_from_frame.extend(score_source)
-                    groups_to_remove.append(group_name)
-                    logger.info(f"[Node 2] 主线框踢出 [{group_name}]: 成员过热")
+            score = sector.strength_score
+            frame["group_score"] = score
+            frame["has_strong_member"] = sector.tier in ("S", "A")
+
+            # 过热/衰竭 → 踢出个体
+            if sector.state == "exhausted_mainline":
+                exhausted_from_frame.append(sector)
+                mainline_keys_to_remove.append(key)
+                logger.info(f"[Node 2] 主线框踢出 [{sector.name}]: 过热/衰竭")
+                continue
+
+            # 低分检查（强板块容忍 3 天，弱板块 1 天）
+            tolerance = (
+                self._MAINLINE_STRONG_TOLERANCE_DAYS
+                if sector.tier in ("S", "A")
+                else self._MAINLINE_WEAK_TOLERANCE_DAYS
+            )
+            if score < self._MAINLINE_EXIT_SCORE_THRESHOLD:
+                frame["consecutive_low_days"] += 1
+                if frame["consecutive_low_days"] >= tolerance:
+                    exhausted_from_frame.append(sector)
+                    mainline_keys_to_remove.append(key)
+                    logger.info(
+                        f"[Node 2] 主线框踢出 [{sector.name}]: "
+                        f"连续{frame['consecutive_low_days']}天score<{self._MAINLINE_EXIT_SCORE_THRESHOLD}"
+                    )
                     continue
-
-                # 低分检查（强组容忍 3 天，弱组 1 天）
-                tolerance = (
-                    self._MAINLINE_STRONG_TOLERANCE_DAYS
-                    if has_strong
-                    else self._MAINLINE_WEAK_TOLERANCE_DAYS
-                )
-                if group_score < self._MAINLINE_EXIT_SCORE_THRESHOLD:
-                    frame["consecutive_low_days"] += 1
-                    if frame["consecutive_low_days"] >= tolerance:
-                        exhausted_from_frame.extend(score_source)
-                        groups_to_remove.append(group_name)
-                        logger.info(
-                            f"[Node 2] 主线框踢出 [{group_name}]: "
-                            f"连续{frame['consecutive_low_days']}天score<{self._MAINLINE_EXIT_SCORE_THRESHOLD}"
-                        )
-                        continue
-                else:
-                    frame["consecutive_low_days"] = 0
+            else:
+                frame["consecutive_low_days"] = 0
 
             frame["last_update"] = today
 
-        for g in groups_to_remove:
-            frames.pop(g, None)
+        for key in mainline_keys_to_remove:
+            frames.pop(key, None)
 
-        # ── 第三步：新主线组入框（含分数门槛）──
-        for group_name, members in mainline_by_group.items():
-            if group_name in frames:
+        # ── 第二步：新主线入框（个体级）──
+        # 收集已在主线框内的板块代码
+        existing_mainline_codes = {
+            f.get("member_codes", [None])[0]
+            for f in frames.values()
+            if f["frame_type"] == "mainline"
+        }
+
+        for sector in analyzed:
+            if sector.state != "active_mainline":
                 continue
-            has_strong = any(s.tier in ("S", "A") for s in members)
-            group_score = max(s.strength_score for s in members)
-            # 弱组（全 B 级）门槛更高：≥80 才入主线框，否则落入埋伏
-            min_score = self._MAINLINE_EXIT_SCORE_THRESHOLD if has_strong else 80
-            if group_score < min_score:
-                logger.info(
-                    f"[Node 2] [{group_name}] score={group_score:.1f} "
-                    f"< 入框门槛{min_score}，不入主线框"
-                )
+            if sector.code in existing_mainline_codes:
                 continue
-            frames[group_name] = {
+            # 入框门槛：S/A 级 ≥50，B 级 ≥80
+            min_score = (
+                self._MAINLINE_EXIT_SCORE_THRESHOLD
+                if sector.tier in ("S", "A")
+                else 80
+            )
+            if sector.strength_score < min_score:
+                continue
+            frames[sector.code] = {
                 "frame_type": "mainline",
-                "frame_group": group_name,
+                "frame_group": sector.frame_group or _build_frame_group(sector.name),
                 "entry_date": today,
                 "last_update": today,
-                "member_codes": [s.code for s in members],
-                "group_score": group_score,
-                "has_strong_member": has_strong,
+                "member_codes": [sector.code],
+                "group_score": sector.strength_score,
+                "has_strong_member": sector.tier in ("S", "A"),
                 "consecutive_low_days": 0,
                 "consecutive_rise_days": 0,
             }
-            logger.info(f"[Node 2] 主线框纳入 [{group_name}]: {[s.name for s in members]}")
+            existing_mainline_codes.add(sector.code)
+            logger.info(f"[Node 2] 主线框纳入 [{sector.name}] score={sector.strength_score:.1f}")
 
-        # ── 第四步：埋伏框（个股级，逻辑不变）──
+        # ── 第三步：埋伏框（逻辑不变，个体级）──
         ambush_codes_to_remove: list[str] = []
         ambush_frame_keys = [k for k, v in frames.items() if v["frame_type"] == "ambush"]
 
@@ -2011,7 +2009,6 @@ class SectorAnalysisNode:
             member_codes = frame.get("member_codes", [])
             if not member_codes:
                 continue
-            # 埋伏框每组成员只有一个
             sector = analyzed_by_code.get(member_codes[0])
             if sector is None:
                 continue
@@ -2023,26 +2020,19 @@ class SectorAnalysisNode:
             # 晋升检查
             launch_level = sector.launch_signal.level if sector.launch_signal else "none"
             if launch_level == "strong_launch":
-                # 晋升 → 转为主线框（以 frame_group 为 key）
-                fg = sector.frame_group or sector.name
+                # 晋升 → 转为主线框（以 board code 为 key）
                 frames.pop(key, None)
-                if fg not in frames:
-                    has_strong = sector.tier in ("S", "A")
-                    frames[fg] = {
-                        "frame_type": "mainline",
-                        "frame_group": fg,
-                        "entry_date": today,
-                        "last_update": today,
-                        "member_codes": [sector.code],
-                        "group_score": score,
-                        "has_strong_member": has_strong,
-                        "consecutive_low_days": 0,
-                        "consecutive_rise_days": 0,
-                    }
-                else:
-                    if sector.code not in frames[fg]["member_codes"]:
-                        frames[fg]["member_codes"].append(sector.code)
-                    frames[fg]["group_score"] = max(frames[fg]["group_score"], score)
+                frames[sector.code] = {
+                    "frame_type": "mainline",
+                    "frame_group": sector.frame_group or _build_frame_group(sector.name),
+                    "entry_date": today,
+                    "last_update": today,
+                    "member_codes": [sector.code],
+                    "group_score": score,
+                    "has_strong_member": sector.tier in ("S", "A"),
+                    "consecutive_low_days": 0,
+                    "consecutive_rise_days": 0,
+                }
                 logger.info(f"[Node 2] 埋伏→主线晋升 {sector.name}: strong_launch")
                 continue
 
@@ -2055,21 +2045,18 @@ class SectorAnalysisNode:
                 frame["consecutive_rise_days"] >= self._AMBUSH_PROMOTE_CONSECUTIVE_RISE_DAYS
                 and score > self._AMBUSH_PROMOTE_SCORE_THRESHOLD
             ):
-                fg = sector.frame_group or sector.name
                 frames.pop(key, None)
-                if fg not in frames:
-                    has_strong = sector.tier in ("S", "A")
-                    frames[fg] = {
-                        "frame_type": "mainline",
-                        "frame_group": fg,
-                        "entry_date": today,
-                        "last_update": today,
-                        "member_codes": [sector.code],
-                        "group_score": score,
-                        "has_strong_member": has_strong,
-                        "consecutive_low_days": 0,
-                        "consecutive_rise_days": 0,
-                    }
+                frames[sector.code] = {
+                    "frame_type": "mainline",
+                    "frame_group": sector.frame_group or _build_frame_group(sector.name),
+                    "entry_date": today,
+                    "last_update": today,
+                    "member_codes": [sector.code],
+                    "group_score": score,
+                    "has_strong_member": sector.tier in ("S", "A"),
+                    "consecutive_low_days": 0,
+                    "consecutive_rise_days": 0,
+                }
                 logger.info(f"[Node 2] 埋伏→主线晋升 {sector.name}: 连续动量")
                 continue
 
@@ -2096,10 +2083,11 @@ class SectorAnalysisNode:
         for key in ambush_codes_to_remove:
             frames.pop(key, None)
 
-        # ── 第五步：新埋伏入框 ──
-        # 收集当前活跃的主线 frame_group，防止同主题板块误入埋伏
-        active_mainline_groups = {
-            group_name for group_name, f in frames.items()
+        # ── 第四步：新埋伏入框 ──
+        # 收集当前活跃的主线板块 code，防止同板块误入埋伏
+        active_mainline_codes = {
+            f.get("member_codes", [None])[0]
+            for f in frames.values()
             if f["frame_type"] == "mainline"
         }
 
@@ -2110,13 +2098,13 @@ class SectorAnalysisNode:
                 c for f in frames.values() for c in f.get("member_codes", [])
             }:
                 continue
-            # 若该板块的 frame_group 已是主线组，不进入埋伏（避免银行/汽车这种大票误判）
-            if sector.frame_group and sector.frame_group in active_mainline_groups:
+            # 若该板块已在主线框，不进入埋伏
+            if sector.code in active_mainline_codes:
                 continue
-            key = sector.code  # 埋伏框以 sector_code 为 key
+            key = sector.code
             frames[key] = {
                 "frame_type": "ambush",
-                "frame_group": key,
+                "frame_group": sector.frame_group or _build_frame_group(sector.name),
                 "entry_date": today,
                 "last_update": today,
                 "member_codes": [sector.code],
@@ -2138,44 +2126,52 @@ class SectorAnalysisNode:
     ) -> SectorContext:
         """整合框内容到最终输出。
 
-        主线框 → list[MainlineGroup]（按产业主题聚合）
-        埋伏框 → list[SectorDetail]（个股级）
-        衰竭主线 = 从主线框踢出的板块
+        Node 2 v2：主线框为个体级，按 frame_group 聚合为 MainlineGroup 输出。
+        家族仅作聚合视图，不影响框的进出管理。
         """
         from src.got.schemas import MainlineGroup
 
         analyzed_by_code = {s.code: s for s in analyzed}
         used_codes: set[str] = set()
 
-        # 主线框 → MainlineGroup 列表
-        mainline_groups: list[MainlineGroup] = []
-        for group_name, frame in frames.items():
+        # 主线框（个体级）→ 按 frame_group 聚合为 MainlineGroup
+        family_boards: dict[str, list[SectorDetail]] = {}
+        family_tiers: dict[str, str] = {}
+
+        for key, frame in frames.items():
             if frame["frame_type"] != "mainline":
                 continue
-            members = [
-                analyzed_by_code[c]
-                for c in frame.get("member_codes", [])
-                if c in analyzed_by_code
-            ]
-            if not members:
+            member_codes = frame.get("member_codes", [])
+            if not member_codes:
                 continue
-            for m in members:
-                used_codes.add(m.code)
+            board_code = member_codes[0]
+            sector = analyzed_by_code.get(board_code)
+            if sector is None:
+                continue
+            used_codes.add(board_code)
 
-            best_tier = "B"
-            for m in members:
-                if m.tier == "S":
-                    best_tier = "S"
-                    break
-                elif m.tier == "A" and best_tier != "S":
-                    best_tier = "A"
+            # 按 frame_group 聚合
+            fg = frame.get("frame_group", sector.frame_group or "其他")
+            family_boards.setdefault(fg, []).append(sector)
 
+            # 追踪家族最高 tier
+            current_best = family_tiers.get(fg, "B")
+            if sector.tier == "S":
+                family_tiers[fg] = "S"
+            elif sector.tier == "A" and current_best != "S":
+                family_tiers[fg] = "A"
+
+        mainline_groups: list[MainlineGroup] = []
+        for fg, boards in family_boards.items():
+            best_tier = family_tiers.get(fg, "B")
+            group_score = max(b.strength_score for b in boards)
+            has_strong = best_tier in ("S", "A")
             mainline_groups.append(MainlineGroup(
-                group_name=group_name,
-                group_score=frame["group_score"],
+                group_name=fg,
+                group_score=group_score,
                 tier=best_tier,
-                mainline_quality="strong" if frame.get("has_strong_member") else "weak",
-                members=sorted(members, key=lambda s: s.strength_score, reverse=True),
+                mainline_quality="strong" if has_strong else "weak",
+                members=sorted(boards, key=lambda s: s.strength_score, reverse=True),
             ))
         mainline_groups.sort(key=lambda g: g.group_score, reverse=True)
 
