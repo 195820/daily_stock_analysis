@@ -23,6 +23,19 @@ class DataQuality(BaseModel):
     stale_fields: list[str] = Field(default_factory=list)
     fetch_failed_fields: list[str] = Field(default_factory=list)
     timestamp: datetime = Field(default_factory=datetime.now)
+    # 降级可见性（Node 2 v2 新增）
+    degradation_summary: Optional[str] = Field(
+        default=None,
+        description="人可读的降级摘要，输出到 reasoning.md 顶部",
+    )
+    effective_dimensions: Optional[dict[str, bool]] = Field(
+        default=None,
+        description="各评分维度是否有效（如 breadth_health 依赖 up_count/down_count）",
+    )
+    board_fetch_stats: Optional[dict[str, int]] = Field(
+        default=None,
+        description="板块获取统计 {total, success, failed}",
+    )
 
 
 class Signal(BaseModel):
@@ -133,6 +146,10 @@ class SectorDetail(BaseModel):
     launch_signal: Optional[LaunchSignal] = None
     lifecycle: Optional[LifecycleInfo] = None
     tier: Optional[str] = None  # S / A / B
+    mainline_quality: Optional[str] = Field(
+        default=None,
+        description="strong / weak — B级主线标记为weak，下游选股系统可打折",
+    )
     recommended_action: Optional[str] = None
     today_change: Optional[float] = Field(
         default=None,
@@ -151,11 +168,42 @@ class SectorDetail(BaseModel):
         default=None,
         description="连续主线天数（用于检测 late_stage）",
     )
+    frame_group: Optional[str] = Field(
+        default=None,
+        description="所属产业主题组名（如 AI产业链 / 黄金 / 华为系）",
+    )
+
+
+class MainlineGroup(BaseModel):
+    """主线组（产业主题级）"""
+    group_name: str
+    group_score: float = Field(..., description="成员最高分")
+    tier: str = Field(..., description="成员最高 tier（S/A/B）")
+    mainline_quality: str = Field(..., description="strong / weak")
+    members: list[SectorDetail] = Field(default_factory=list)
+
+
+class ThemeFamily(BaseModel):
+    """主线家族（产业主题聚合视图）
+
+    将多个概念板块按关键词归入同一主题家族，
+    家族评分 = 成员百分位均值，共振度 = 活跃成员占比。
+    """
+    family_name: str = Field(..., description="家族名（AI科技/机器人/新能源/医药/金融/周期资源/军工/消费/其他）")
+    family_score: float = Field(..., ge=0.0, le=100.0, description="成员百分位均值")
+    family_resonance: float = Field(..., ge=0.0, le=1.0, description="活跃成员占比")
+    theme_status: str = Field(
+        ...,
+        description="主线核心 / 主线扩散 / 独立异动 / 修复观察 / 高位降温",
+    )
+    member_boards: list[str] = Field(default_factory=list, description="命中的板块名称")
+    member_count: int = Field(default=0, description="命中板块数")
 
 
 class SectorContext(BaseModel):
     """Node 2 输出：板块分析上下文"""
-    active_mainline: list[SectorDetail] = Field(default_factory=list)
+    # ── 概念板块视角（短线题材）──
+    active_mainline: list[MainlineGroup] = Field(default_factory=list)
     exhausted_mainline: list[SectorDetail] = Field(default_factory=list)
     ambush: list[SectorDetail] = Field(default_factory=list)
     defensive_rotation: list[SectorDetail] = Field(default_factory=list)
@@ -163,10 +211,27 @@ class SectorContext(BaseModel):
         default_factory=list,
         description="评分最高的 N 个板块（参考用，不代表达标）",
     )
+
+    # ── 新增：行业板块视角（中期趋势）──
+    industry_top: list[SectorDetail] = Field(
+        default_factory=list,
+        description="行业板块 Top 10（按百分位评分排名，独立于概念板块）",
+    )
+
+    # ── 新增：主线家族视角 ──
+    theme_families: list[ThemeFamily] = Field(
+        default_factory=list,
+        description="主线家族（~10 个，含家族强度和题材地位）",
+    )
+
     market_direction: str = Field(default="分化", description="分化 / 普涨 / 普跌")
     notes: list[str] = Field(default_factory=list, description="附加说明（如评分不足警告）")
     reasoning: Optional[str] = None
     data_quality: DataQuality = Field(default_factory=DataQuality)
+    confidence_level: str = Field(
+        default="high",
+        description="评分可信度：high / medium / low（>30% 板块获取失败时降级为 low）",
+    )
 
 
 # =============================================================================
@@ -174,12 +239,11 @@ class SectorContext(BaseModel):
 # =============================================================================
 
 class CapitalEvidence(BaseModel):
-    """资金面证据"""
-    northbound: Optional[dict] = None
-    dragon_tiger: Optional[dict] = None
-    etf_flow: Optional[dict] = None
-    margin_trading: Optional[dict] = None
-    block_trade: Optional[dict] = None
+    """资金面证据（实时 T+0 维度）"""
+    sector_flow: Optional[dict] = None        # 概念/行业板块资金流
+    northbound_realtime: Optional[dict] = None  # 北向资金分钟级实时（备用，停披后全 0 自动降级）
+    dde: Optional[dict] = None                # 大单净流入（DDE，全市场）
+    individual_main_force: Optional[dict] = None  # 个股主力聚流（T-1 备用）
 
 
 class CapitalContext(BaseModel):
@@ -337,6 +401,27 @@ class AggregationResult(BaseModel):
     failed_count: int = Field(default=0, description="降级的维度数")
 
 
+class ConfirmedSector(BaseModel):
+    """Node 6 四维交叉验证后的板块推荐（Phase 2 直接消费）"""
+    sector_name: str = Field(..., description="板块名称")
+    sector_type: str = Field(..., description="confirmed / divergent / watch / avoid / speculative")
+    action: str = Field(..., description="buy_trend / buy_dip / watch / avoid")
+    position_hint: float = Field(default=0.0, ge=0.0, le=1.0, description="仓位权重 0~1，归一化用")
+
+    # 四维验证结果
+    capital_check: str = Field(default="neutral", description="aligned / neutral / divergent")
+    capital_detail: str = Field(default="", description="资金面验证细节")
+    trend_check: str = Field(default="stable", description="rising / stable / declining / cliff_drop")
+    trend_detail: str = Field(default="", description="趋势验证细节（含 trajectory）")
+    environment_check: str = Field(default="neutral", description="supportive / neutral / hostile")
+    environment_detail: str = Field(default="", description="环境验证细节")
+    news_check: str = Field(default="neutral", description="catalyzed / neutral / negative")
+    news_detail: Optional[str] = Field(default=None, description="消息催化细节")
+
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="综合置信度")
+    reasoning: str = Field(default="", description="一句话逻辑")
+
+
 class UnifiedContext(BaseModel):
     """Node 6 输出：GOT 最终输出"""
     status: str = Field(..., description="normal / manual_review_required")
@@ -382,3 +467,63 @@ class UnifiedContext(BaseModel):
         default=False,
         description="信息充分度不足：信号置信度均值 < 0.5 时置 true，建议空仓观望",
     )
+
+    # ── Phase D: 四维板块交叉验证 ──
+    confirmed_sectors: list[ConfirmedSector] = Field(
+        default_factory=list,
+        description="四维交叉验证后的板块推荐（资金+趋势+环境+消息），Phase 2 直接消费",
+    )
+
+
+# ── Phase 2: 统一决策节点 Schema ──
+
+
+class PortfolioRiskAssessment(BaseModel):
+    """Phase 2 Step 1: 风险评估（约束设定）"""
+    position_limit: float = Field(..., ge=0.0, le=1.0, description="仓位上限（来自 Phase 1）")
+    current_position_ratio: float = Field(..., ge=0.0, le=1.0, description="当前仓位比例")
+    stop_loss_threshold: float = Field(default=-0.07, description="止损阈值（-7%）")
+    sector_exposure_limits: dict[str, float] = Field(default_factory=dict, description="板块暴露上限")
+    risk_budget: float = Field(default=0.05, description="风险预算（单笔最大亏损占总资产比例）")
+    constraint_reasoning: str = Field(description="约束设定理由")
+
+
+class UnifiedScoringResult(BaseModel):
+    """Phase 2 Step 2: 统一打分（持仓 + 候选股）"""
+    symbol: str
+    name: str
+    is_holding: bool = Field(description="是否为当前持仓")
+    composite_score: float = Field(ge=0.0, le=100.0, description="综合评分")
+    dimension_scores: dict[str, float] = Field(description="五维分项: capital/news/sector/tech/risk")
+    action_recommendation: str = Field(description="buy_trend/buy_dip/hold/sell/avoid")
+    confidence: float = Field(ge=0.0, le=1.0, description="评分置信度")
+    reasoning: str = Field(description="一句话理由")
+
+
+class TradeAllocation(BaseModel):
+    """Phase 2 Step 3: 仓位分配"""
+    symbol: str
+    name: str
+    action: str = Field(description="buy/sell/hold")
+    target_quantity: int = Field(description="目标股数（100 的整数倍）")
+    target_value: float = Field(description="目标金额")
+    current_quantity: int = Field(default=0, description="当前持仓股数")
+    quantity_delta: int = Field(description="变动股数（正=买入，负=卖出）")
+    price_range: tuple[float, float] = Field(description="建议价格区间")
+    expected_return: float = Field(description="预期收益率")
+    stop_loss: float = Field(description="止损价")
+    risk_reward_ratio: float = Field(description="风险收益比")
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str
+
+
+class PortfolioDecision(BaseModel):
+    """Phase 2 统一决策节点输出"""
+    status: str = Field(description="normal/manual_review_required")
+    risk_assessment: PortfolioRiskAssessment
+    unified_scoring: list[UnifiedScoringResult] = Field(description="所有标的统一排序")
+    allocation: list[TradeAllocation] = Field(description="最终交易建议")
+    summary: str = Field(description="操作总结")
+    warnings: list[str] = Field(default_factory=list, description="风险提示")
+    reasoning: str = Field(description="LLM 推理过程（可追溯）")
+    data_quality: DataQuality = Field(default_factory=DataQuality)

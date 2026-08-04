@@ -466,6 +466,39 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_sector_fund_flow_concept(self) -> Optional[pd.DataFrame]:
+        """
+        获取概念板块实时资金流（盘中 T+0）。
+
+        Returns:
+            DataFrame with columns: 行业, 净额, 流入资金, 流出资金, etc.
+        """
+        return None
+
+    def get_sector_fund_flow_industry(self) -> Optional[pd.DataFrame]:
+        """
+        获取行业板块实时资金流（盘中 T+0）。
+
+        Returns:
+            DataFrame with columns: 行业, 净额, 流入资金, 流出资金, etc.
+        """
+        return None
+
+    def get_individual_fund_flow(
+        self, stock_code: str, market: str = "sh"
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取个股主力资金流（日线含今日）。
+
+        Args:
+            stock_code: 股票代码（如 "600519"）
+            market: "sh" 或 "sz"
+
+        Returns:
+            DataFrame with daily main/large/mid/small order net flow
+        """
+        return None
+
     def get_board_kline(
         self,
         board_code: str,
@@ -484,6 +517,30 @@ class BaseFetcher(ABC):
             标准化 DataFrame (date, open, high, low, close, volume)
         """
         return None
+
+    def get_all_concept_boards(self) -> Optional[list[dict]]:
+        """获取全量概念板块列表。
+
+        Returns:
+            [{"code": "880xxx", "name": "板块名"}, ...]
+        """
+        return None
+
+    def get_all_industry_boards(self) -> Optional[list[dict]]:
+        """获取全量行业板块列表。
+
+        Returns:
+            [{"code": "881xxx", "name": "板块名"}, ...]
+        """
+        return None
+
+    def get_board_quick_change(
+        self,
+        codes: list[str],
+        concurrency: int = 20,
+    ) -> dict[str, float]:
+        """批量获取板块当日涨跌幅（快筛用，仅取 2 天 K 线）。"""
+        return {}
 
     def get_board_constituents(
         self,
@@ -3542,6 +3599,20 @@ class DataFetcherManager:
         """获取市场宽度（自动切换数据源）。"""
         return self._try_fetchers_for_method("get_market_breadth", "市场宽度")
 
+    def get_sector_fund_flow_concept(self) -> Optional[pd.DataFrame]:
+        """获取概念板块实时资金流（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_sector_fund_flow_concept", "概念资金流")
+
+    def get_sector_fund_flow_industry(self) -> Optional[pd.DataFrame]:
+        """获取行业板块实时资金流（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_sector_fund_flow_industry", "行业资金流")
+
+    def get_individual_fund_flow(
+        self, stock_code: str, market: str = "sh"
+    ) -> Optional[pd.DataFrame]:
+        """获取个股资金流（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_individual_fund_flow", "个股资金流", stock_code, market)
+
     def get_board_kline(
         self,
         board_code: str,
@@ -3550,6 +3621,22 @@ class DataFetcherManager:
     ) -> Optional[pd.DataFrame]:
         """获取板块K线（自动切换数据源）。"""
         return self._try_fetchers_for_method("get_board_kline", "板块K线", board_code, board_type, days)
+
+    def get_all_concept_boards(self) -> Optional[list[dict]]:
+        """获取全量概念板块列表（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_all_concept_boards", "全量概念板块")
+
+    def get_all_industry_boards(self) -> Optional[list[dict]]:
+        """获取全量行业板块列表（自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_all_industry_boards", "全量行业板块")
+
+    def get_board_quick_change(
+        self,
+        codes: list[str],
+        concurrency: int = 20,
+    ) -> dict[str, float]:
+        """批量获取板块当日涨跌幅（快筛用）。"""
+        return self._try_fetchers_for_method("get_board_quick_change", "板块快筛涨跌", codes, concurrency)
 
     def get_board_constituents(
         self,

@@ -142,6 +142,18 @@ def _write_reasoning_md(
 ) -> None:
     """写 reasoning.md，汇总所有节点的 LLM 推理文本。"""
     lines = [f"# GOT 运行推理汇总 - {run_date}", ""]
+
+    # Node 2 v2: 数据质量摘要（放在最前面）
+    sector_ctx = contexts.get("sector")
+    if sector_ctx:
+        dq = getattr(sector_ctx, "data_quality", None)
+        degradation = getattr(dq, "degradation_summary", None) if dq else None
+        confidence = getattr(sector_ctx, "confidence_level", "high")
+        if degradation and "正常" not in degradation:
+            lines.append(f"> ⚠️ **数据质量**: {degradation}")
+            lines.append(f"> 评分可信度: **{confidence}**")
+            lines.append("")
+
     for key in NODE_ORDER:
         ctx = contexts[key]
         title = REASONING_NODE_TITLES[key]
@@ -224,3 +236,144 @@ def _get_git_commit() -> str:
     except (OSError, subprocess.SubprocessError):
         pass
     return "unknown"
+
+
+# ── Phase 2: 统一决策节点存档 ──
+
+
+def archive_phase2(
+    decision: "PortfolioDecision",
+    run_date: date,
+) -> None:
+    """
+    存档 Phase 2 决策到 data/got_daily/YYYYMMDD/portfolio_decision.json
+    并追加 Phase 2 reasoning 到 reasoning.md
+
+    Args:
+        decision: Phase 2 统一决策节点输出
+        run_date: 运行日期
+    """
+    from src.got.schemas import PortfolioDecision
+
+    base_dir = _default_base_dir()
+    date_str = run_date.strftime("%Y%m%d")
+    output_dir = base_dir / date_str
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 写入 portfolio_decision.json（全量 model_dump）
+    output_path = output_dir / "portfolio_decision.json"
+    output_path.write_text(
+        json.dumps(
+            decision.model_dump(mode="json"), ensure_ascii=False, indent=2
+        ),
+        encoding="utf-8",
+    )
+
+    # 2. 生成独立的交易建议 MD 文档
+    trading_md_path = output_dir / "trading_recommendations.md"
+    with open(trading_md_path, "w", encoding="utf-8") as f:
+        f.write(f"# Phase 2 交易建议 — {run_date}\n\n")
+        f.write(f"## 风险评估\n\n")
+        f.write(f"- **仓位上限:** {decision.risk_assessment.position_limit:.0%}\n")
+        f.write(f"- **当前仓位:** {decision.risk_assessment.current_position_ratio:.0%}\n")
+        f.write(f"- **止损线:** {decision.risk_assessment.stop_loss_threshold:.0%}\n")
+        f.write(f"- **约束理由:** {decision.risk_assessment.constraint_reasoning}\n\n")
+
+        f.write(f"## 候选股评分 Top 5\n\n")
+        for i, score in enumerate(decision.unified_scoring[:5], 1):
+            held_tag = "【持仓】" if score.is_holding else ""
+            f.write(f"### {i}. {score.name} ({score.symbol}) {held_tag}\n\n")
+            f.write(f"- **综合评分:** {score.composite_score:.1f}/100\n")
+            f.write(f"- **动作建议:** {score.action_recommendation}\n")
+            f.write(f"- **置信度:** {score.confidence:.0%}\n\n")
+            f.write(f"**评分明细:**\n")
+            for dim, val in score.dimension_scores.items():
+                f.write(f"- {dim}: {val:.1f}\n")
+            f.write(f"\n**理由:** {score.reasoning}\n\n")
+
+        f.write(f"## 交易建议 ({len(decision.allocation)} 条)\n\n")
+        if decision.allocation:
+            f.write(f"**操作总结:** {decision.summary}\n\n")
+            for alloc in decision.allocation:
+                action_emoji = {"buy": "🟢", "sell": "🔴", "hold": "🟡"}.get(alloc.action, "⚪")
+                f.write(f"### {action_emoji} {alloc.action.upper()} {alloc.name} ({alloc.symbol})\n\n")
+                f.write(f"- **数量:** {alloc.quantity_delta:+d} 股\n")
+                f.write(f"- **金额:** ¥{alloc.target_value:,.0f}\n")
+                f.write(f"- **价格区间:** ¥{alloc.price_range[0]:.2f} ~ ¥{alloc.price_range[1]:.2f}\n")
+                f.write(f"- **预期收益:** {alloc.expected_return:.1%}\n")
+                f.write(f"- **止损价:** ¥{alloc.stop_loss:.2f}\n")
+                f.write(f"- **风险收益比:** {alloc.risk_reward_ratio:.2f}\n")
+                f.write(f"- **置信度:** {alloc.confidence:.0%}\n\n")
+                f.write(f"**理由:** {alloc.reasoning}\n\n")
+        else:
+            f.write("**操作总结:** 当前无需操作，维持现有仓位\n\n")
+
+        if decision.warnings:
+            f.write(f"## ⚠️ 风险提示\n\n")
+            for warning in decision.warnings:
+                f.write(f"- {warning}\n")
+            f.write("\n")
+
+        f.write(f"## 推理总结\n\n")
+        f.write(f"{decision.reasoning}\n")
+
+    logger.info(f"[Archive] Phase 2 交易建议已生成: {trading_md_path}")
+
+    # 3. 追加 Phase 2 reasoning 到 reasoning.md
+    reasoning_path = output_dir / "reasoning.md"
+    if reasoning_path.exists():
+        with open(reasoning_path, "a", encoding="utf-8") as f:
+            f.write(f"\n## Node 7 交易建议\n\n")
+            f.write(f"{decision.reasoning}\n\n")
+            if decision.allocation:
+                f.write(f"**操作总结:** {decision.summary}\n\n")
+                f.write(f"**交易明细:**\n\n")
+                for alloc in decision.allocation:
+                    f.write(
+                        f"- **{alloc.action.upper()}** {alloc.name} "
+                        f"({alloc.symbol}): {alloc.quantity_delta:+d} 股, "
+                        f"¥{alloc.target_value:,.0f}\n"
+                    )
+                    f.write(f"  - 理由: {alloc.reasoning}\n"
+                            f"  - 止损: {alloc.stop_loss}, "
+                            f"风险收益比: {alloc.risk_reward_ratio}\n")
+                f.write("\n")
+            if decision.warnings:
+                f.write(f"**风险提示:**\n\n")
+                for w in decision.warnings:
+                    f.write(f"- {w}\n")
+                f.write("\n")
+        logger.info(f"[Archive] Phase 2 reasoning 已追加到: {reasoning_path}")
+
+    logger.info(f"[Archive] Phase 2 决策已存档: {output_path}")
+
+
+def load_phase2_decision(run_date: date) -> Optional["PortfolioDecision"]:
+    """
+    加载 Phase 2 决策
+
+    Args:
+        run_date: 运行日期
+
+    Returns:
+        PortfolioDecision 或 None（如果文件不存在）
+    """
+    from src.got.schemas import PortfolioDecision
+
+    base_dir = _default_base_dir()
+    date_str = run_date.strftime("%Y%m%d")
+    decision_path = base_dir / date_str / "portfolio_decision.json"
+
+    if not decision_path.exists():
+        logger.debug(f"[Archive] Phase 2 决策不存在: {decision_path}")
+        return None
+
+    try:
+        data = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision = PortfolioDecision(**data)
+        logger.info(f"[Archive] Phase 2 决策已加载: {decision_path}")
+        return decision
+    except Exception as e:
+        logger.error(f"[Archive] Phase 2 决策加载失败: {e}")
+        return None
+

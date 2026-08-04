@@ -23,9 +23,9 @@
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│  GOT 层（市场分析，新）                                          │
+│  GOT 层（市场分析）                                              │
 │  Phase 1: GOT 六节点（大盘→板块→资金‖消息‖情绪 → 聚合）         │
-│  Phase 2: CoT 三节点（持仓→选股→交易建议）                      │
+│  Phase 2: 统一决策节点（风险评估→统一打分→组合优化）              │
 │  src/got/                                                        │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -60,14 +60,15 @@ daily_stock_analysis/
 │   │   ├── llm_adapter.py       # LLM 调用封装（litellm 多 Provider）
 │   │   └── memory.py            # Agent 记忆 + 置信度校准
 │   │
-│   ├── got/                     # GOT 架构（市场分析，新建）
-│   │   ├── nodes/               # 6 个 GOT 节点
+│   ├── got/                     # GOT 架构（市场分析）
+│   │   ├── nodes/               # 7 个 GOT 节点（Phase 1: 6 个 + Phase 2: 1 个）
 │   │   │   ├── market_analysis.py    # Node 1: 大盘（ADX调权/多时间框架 mini GOT）
 │   │   │   ├── sector_analysis.py    # Node 2: 板块（启动信号/生命周期/主线分级）
 │   │   │   ├── capital_analysis.py   # Node 3: 资金面（5维机构评分/降级机制）
 │   │   │   ├── news_analysis.py      # Node 4: 消息面（3并发LLM/多源确认）
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（反身性5阶段）
-│   │   │   └── aggregator.py         # Node 6: 聚合（10对矛盾/时间一致性）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（10对矛盾/时间一致性）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，FINCON 风格 Manager）
 │   │   ├── schemas.py           # 节点输入输出 Pydantic Schema
 │   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度）
 │   │   ├── indicators.py        # 纯规则指标函数
@@ -79,7 +80,7 @@ daily_stock_analysis/
 │   │   ├── technical_indicator.py    # 短线技术指标（需扩展 ADX/MACD）
 │   │   ├── sector_rotation.py        # 板块轮动分析
 │   │   ├── forum_sentiment.py        # NGA 舆情（后续切雪球）
-│   │   ├── stock_screener.py         # 选股流水线（含 LLM AI 评分）
+│   │   ├── stock_screener.py         # 选股流水线（GOT 模式：DDE 初筛 + 5 轮漏斗）
 │   │   ├── ths_screener.py           # 同花顺问财
 │   │   ├── portfolio_service.py      # 持仓管理
 │   │   ├── risk_assessment.py        # 风险评估
@@ -159,11 +160,35 @@ daily_stock_analysis/
                                                 unified_context
 ```
 
-### Phase 2: CoT 决策流水线（待实现）
+### Phase 2: 统一决策节点（FINCON 风格）
+
+> 架构评审（2026-08-03）：原串行设计（持仓判断 → 选股 → 建议）存在循环依赖，改为统一决策节点
 
 ```
-持仓判断 → 选股评分 → 交易建议
+Phase 1 输出 (UnifiedContext) + 当前持仓
+         ↓
+┌─────────────────────────────────────────────┐
+│  统一决策节点（3 Step，1 个 LLM 调用）        │
+│                                             │
+│  Step 1: 风险评估（约束设定）                 │
+│  → 仓位上限/止损线/板块限制/风险预算          │
+│                                             │
+│  Step 2: 统一打分（持仓 + 候选股）            │
+│  → 所有标的统一排序（继续持有 vs 卖出 vs 买入）│
+│  → 候选股筛选：问财 DDE 策略（大单净量≥0.8%） │
+│                                             │
+│  Step 3: 组合优化（规则 + LLM 混合）          │
+│  → 在约束下生成最优配置                       │
+└─────────────────────────────────────────────┘
+         ↓
+    PortfolioDecision（交易建议 + reasoning）
 ```
+
+**候选股筛选优化**（2026-08-03）：
+- ✅ 问财初筛改为 DDE 策略（`dde大单净量>=0.8%`，替代宽松的`主力资金净流入>0`）
+- ✅ 移除无意义的"最低价"条件（限制波动在 0-2%，过滤掉活跃股）
+- ✅ 每板块从 10 只降到 5 只，总候选从 80-100 降到 30-40
+- ✅ Stage 2 耗时从 100s 降到 ~50s
 
 ---
 
@@ -465,6 +490,52 @@ daily_stock_analysis/
 - `src/got/nodes/market_analysis.py`（重写核心方法）：confidence/cross_index/时间框架/T-0/LLM
 - `agent_cot_design.md`（更新）：§3.1 设计文档同步
 
+**Node 2 v2 重设计（2026-08-04）：**
+
+> 基于 7 天运行数据（07-27~08-04）暴露的三个核心问题 + 3 个参考项目（sector-rotation-v2, STMS 模型, Athene）
+
+**问题诊断**：
+- ❌ `volume_price` 对所有概念板块恒定 0.3（30% 权重报废）— mootdx 板块 K 线的 volume 是指数型加总，波动率低导致 vol_ratio 全部 < 1.2
+- ❌ `capital_flow` 全部 clip 到 ±1.0（10% 权重报废）— 概念板块成交额日变化轻松超 5 亿，固定 clip 范围太小
+- ❌ 40% 评分权重失效 → 两天分数四舍五入后一模一样
+- ❌ 行业板块与概念板块混杂评分，成分股高度重叠（AIGC vs 人工智能 5/6 重叠）
+- ❌ `_FRAME_GROUP_KEYWORDS` 硬编码合并粒度不合理（黄金+有色合并、华为系聚合错误）
+- ❌ DataQuality 内部追踪但不输出到 reasoning.md，降级不可见
+
+**核心变更**：
+- ✅ 砍掉失效维度（volume_price + capital_flow），引入 turnover_expansion + breadth_health
+- ✅ 所有维度改为**截面排名百分位**（参考 STMS 模型），自适应牛熊市
+- ✅ 行业/概念**双视角分离**：独立评分、独立排名、不混合（参考 sector-rotation-v2）
+- ✅ 板块聚合改为**主线家族制**（~10 个家族，关键词自动归类），消除硬编码重叠
+- ✅ 降级信息输出到 reasoning.md 顶部（数据质量摘要 + 可信度标记）
+
+**新版评分体系（4 维，全部有效）**：
+```
+price_momentum     30%  ← 5 日涨幅的截面百分位排名
+turnover_expansion 25%  ← 成交额比（5d均值/20d均值）的截面百分位排名
+relative_strength  25%  ← 20 日涨幅的截面百分位排名
+breadth_health     20%  ← 板块内上涨个股占比的截面百分位排名
+```
+
+**主线家族（Level 1，~10 个）**：
+AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / 周期资源 / 军工 / 消费
+
+**题材地位判定（Level 2）**：
+主线核心（score>70 + resonance>0.5）/ 主线扩散 / 独立异动 / 修复观察 / 高位降温
+
+**数据源验证**：
+- mootdx `get_board_kline` 支持概念（880xxx）+ 行业（881xxx）✅
+- akshare `stock_board_industry_name_em()` 提供行业板块列表 ✅
+- breadth_health 依赖 mootdx K 线是否返回 up_count/down_count（待验证）
+- 行业板块的 breadth_health 暂缺，用其他 3 维权重归一化降级
+
+**Node 2 v2 文件改动清单**（待执行）：
+- `src/got/indicators.py`（+10 行）：新增 `percentile_rank()` 函数
+- `src/got/schemas.py`（+20 行）：新增 `ThemeFamily`，`SectorContext` 加 `industry_top`/`theme_families`/`confidence_level` 字段
+- `src/got/nodes/sector_analysis.py`（核心重写）：评分体系 + 双视角 + 主线家族 + 降级可见性
+- `src/got/archive.py`（+10 行）：reasoning.md 加降级摘要
+- `agent_cot_design.md`（更新）：§3.2 设计文档同步
+
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块
 - ✅ `main.py`（修改）：新增 `--got` 入口（`python main.py --got`）
@@ -520,6 +591,50 @@ python scripts/backtest_got_screener.py --date 2026-07-29
 - 消息面评分（`news_score`）暂未实现，当前设为 0（权重 20% 空缺）
 - 成分股获取依赖问财/东财，反爬环境下可能失败
 - 回测脚本假设次日可获取行情数据，非交易日无法回测
+
+**Phase 2 架构评审与优化（2026-08-03）：**
+
+> 基于 4 篇论文（FINCON NeurIPS 2024, RAPTOR NeurIPS 2025, FinCoT 2025, LLM-G-DRL 2025）的架构评审
+
+**问题识别**：
+- ❌ 原串行设计（持仓判断 → 选股 → 建议）存在循环依赖
+- ❌ 候选股筛选条件过宽松（80-100 只），Stage 2 资金面评分耗时 100s+
+- ❌ 问财"最低价"条件无意义且有害（限制波动在 0-2%，过滤掉活跃股）
+
+**解决方案**：
+- ✅ 采用 FINCON 风格的**统一决策节点**（3 Step 封装在 1 个节点，1 次 LLM 调用）
+  - Step 1: 风险评估（约束设定）→ 仓位上限/止损线/板块限制
+  - Step 2: 统一打分（持仓 + 候选股一起评）→ 消除循环依赖
+  - Step 3: 组合优化（规则 + LLM 混合）→ 在约束下生成最优配置
+- ✅ 问财初筛改为 **DDE 策略**（`dde大单净量>=0.8%`，替代宽松的`主力资金净流入>0`）
+- ✅ 移除无意义的"最低价"条件，保留 DDE + 上市天数 + 非ST
+- ✅ 每板块从 10 只降到 5 只，总候选从 80-100 降到 30-40
+- ✅ Stage 2 耗时从 100s 降到 ~50s
+- ✅ **板块类型适配 DDE 筛选**（2026-08-03）：
+  - 主线板块：`dde>=0.8%`（当天强势，确认主力介入）
+  - 埋伏板块：`dde连续3天为正`（持续吸筹信号，不要求当天爆发）
+  - 学术依据：DDE 连续性比单日阈值更重要（主力可操纵单日 DDE，但难以连续 3 天伪装）
+  - 测试效果：主线板块平均 DDE=4.11%，埋伏板块平均 DDE=0.03%（连续为正）
+
+**文件改动清单**：
+- `src/services/stock_screener.py`（修改）：
+  - `_get_sector_constituents_filtered()` 改为 DDE 策略
+  - 新增板块类型适配：主线用 `dde>=0.8%`，埋伏用 `dde连续3天为正`
+- `src/services/ths_screener.py`（修改）：
+  - 扩展 `THSStock` 数据模型，增加 `price/change_pct/dde_net_pct` 字段
+  - 实现 `_parse_json_api()` 解析问财 JSON API 返回的完整表格数据
+- `src/got/nodes/portfolio_decision.py`（新建 ~500 行）：统一决策节点
+- `src/got/schemas.py`（+4 个 Pydantic 模型）：Phase 2 Schema
+- `src/got/orchestrator.py`（修改）：集成 Phase 2 调用
+- `src/got/archive.py`（+2 个方法）：`archive_phase2()` + `load_phase2_decision()`
+- `main.py`（修改）：`--got` 入口显示 Phase 2 输出
+- `scripts/run_phase2.py`（新建 ~100 行）：独立运行脚本
+
+**学术依据**：
+- **FINCON (NeurIPS 2024)**：Manager-Analyst 层级，单一决策点同时处理选股和配置
+- **RAPTOR (NeurIPS 2025)**：组合构建是优化问题，不是顺序决策流水线
+- **FinCoT (2025)**：CoT 结构必须匹配领域实际工作流
+- **LLM-G-DRL (2025)**：CoT 用于感知层（信息处理），RL/规则用于决策层（数值优化）
 
 ---
 

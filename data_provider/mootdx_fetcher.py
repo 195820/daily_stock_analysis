@@ -411,6 +411,107 @@ class MootdxFetcher(BaseFetcher):
             return None
 
 
+    def get_all_concept_boards(self) -> Optional[list[dict]]:
+        """获取全量概念板块列表（mootdx TCP）。
+
+        Returns:
+            [{"code": "880xxx", "name": "板块名"}, ...]
+            失败返回 None
+        """
+        try:
+            with self._mootdx_session() as client:
+                logger.info("[API调用] mootdx stock_all() 全量品种列表")
+                df = client.stock_all()
+                if df is None or df.empty:
+                    return None
+                # 筛选 880xxx 概念板块
+                mask = df["code"].astype(str).str.startswith("880")
+                concepts = df[mask][["code", "name"]].to_dict("records")
+                logger.info(f"[Mootdx] 概念板块总数: {len(concepts)}")
+                return concepts
+        except Exception as e:
+            logger.warning(f"[Mootdx] stock_all() 失败: {e}")
+            return None
+
+    def get_all_industry_boards(self) -> Optional[list[dict]]:
+        """获取全量行业板块列表（mootdx TCP，881xxx）。
+
+        Returns:
+            [{"code": "881xxx", "name": "板块名"}, ...]
+            失败返回 None
+        """
+        try:
+            with self._mootdx_session() as client:
+                logger.info("[API调用] mootdx stock_all() 行业板块列表")
+                df = client.stock_all()
+                if df is None or df.empty:
+                    return None
+                # 筛选 881xxx 行业板块
+                mask = df["code"].astype(str).str.startswith("881")
+                industries = df[mask][["code", "name"]].to_dict("records")
+                logger.info(f"[Mootdx] 行业板块总数: {len(industries)}")
+                return industries
+        except Exception as e:
+            logger.warning(f"[Mootdx] 行业板块获取失败: {e}")
+            return None
+
+    def get_board_quick_change(
+        self,
+        codes: list[str],
+        concurrency: int = 20,
+    ) -> dict[str, float]:
+        """批量获取板块当日涨跌幅（每板块仅取 2 天 K 线，快筛用）。
+
+        Args:
+            codes: 板块代码列表
+            concurrency: 并发数
+
+        Returns:
+            {code: change_pct}，获取失败的板块不在结果中
+        """
+        import concurrent.futures
+
+        results: dict[str, float] = {}
+
+        def fetch_one(code: str) -> tuple[str, Optional[float]]:
+            try:
+                with self._mootdx_session() as client:
+                    df = client.index_bars(
+                        symbol=code, frequency=9, start=0, offset=5,
+                    )
+                    if df is None or len(df) < 2:
+                        return code, None
+                    # 过滤 vol=0 的 bar
+                    if "vol" in df.columns:
+                        df = df[df["vol"] > 0]
+                    if len(df) < 2:
+                        return code, None
+                    prev = float(df.iloc[-2]["close"])
+                    last = float(df.iloc[-1]["close"])
+                    if prev <= 0:
+                        return code, None
+                    chg = (last - prev) / prev * 100
+                    return code, round(chg, 2)
+            except Exception:
+                return code, None
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=concurrency,
+            ) as executor:
+                futures = {
+                    executor.submit(fetch_one, code): code for code in codes
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    code, chg = future.result()
+                    if chg is not None:
+                        results[code] = chg
+        except Exception as e:
+            logger.warning(f"[Mootdx] 批量快筛失败: {e}")
+
+        return results
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 

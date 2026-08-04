@@ -10,6 +10,7 @@ GOT 纯规则指标函数
 - MA 排列评分
 - 量价关系评分
 - 布林带评分
+- 截面排名百分位（cross_sectional_rank）
 
 设计理念：
 - 纯函数，无副作用
@@ -43,6 +44,27 @@ def percentile_rank(value: float, series: pd.Series) -> float:
         return 50.0
     rank = (series < value).sum() / len(series) * 100
     return rank
+
+
+def cross_sectional_rank(values: dict[str, float]) -> dict[str, float]:
+    """截面排名百分位（0-1），用于多板块横向比较。
+
+    将 dict[name → raw_value] 转为 dict[name → percentile_rank]。
+    排名越高 = 值越大。
+
+    优势：
+    - 牛市所有板块都涨 → 排名仍能区分强中弱
+    - 熊市所有板块都跌 → 排名仍能找到相对强势
+    - 不受量纲影响（%、亿元、个数都能统一到 0-1）
+    """
+    if not values:
+        return {}
+    sorted_vals = sorted(set(values.values()))
+    n = len(sorted_vals)
+    if n == 1:
+        return {name: 0.5 for name in values}
+    rank_map = {val: (i + 1) / n for i, val in enumerate(sorted_vals)}
+    return {name: rank_map[val] for name, val in values.items()}
 
 
 # =============================================================================

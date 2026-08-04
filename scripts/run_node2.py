@@ -131,13 +131,25 @@ async def main():
 
     # 输出摘要
     print(f"\n市场方向: {ctx.market_direction}")
-    print(f"\n活跃主线 ({len(ctx.active_mainline)}):")
-    for s in ctx.active_mainline:
-        print(f"  {s.name} ({s.code})  强度={s.strength_score:.1f}  "
-              f"分级={s.tier}  阶段={s.lifecycle.phase if s.lifecycle else '-'}  "
-              f"操作={s.recommended_action or '-'}")
-        if s.launch_signal:
-            print(f"    启动信号: {s.launch_signal.level} (score={s.launch_signal.score})")
+    print(f"评分可信度: {ctx.confidence_level}")
+
+    # 数据质量摘要（Node 2 v2）
+    if ctx.data_quality.degradation_summary:
+        print(f"数据质量: {ctx.data_quality.degradation_summary}")
+
+    print(f"\n活跃主线 ({len(ctx.active_mainline)} 个家族):")
+    for g in ctx.active_mainline:
+        print(f"  [{g.tier}] {g.group_name}  score={g.group_score:.1f}  quality={g.mainline_quality}")
+        for s in g.members:
+            inds = s.indicators
+            print(f"    {s.name} ({s.code})  强度={s.strength_score:.1f}  "
+                  f"pm={inds.get('price_momentum', 0):.2f}  "
+                  f"te={inds.get('turnover_expansion', 0):.2f}  "
+                  f"rs={inds.get('relative_strength', 0):.2f}  "
+                  f"bh={inds.get('breadth_health', 0):.2f}  "
+                  f"阶段={s.lifecycle.phase if s.lifecycle else '-'}")
+            if s.launch_signal:
+                print(f"      启动信号: {s.launch_signal.level} (score={s.launch_signal.score})")
 
     print(f"\n衰竭主线 ({len(ctx.exhausted_mainline)}):")
     for s in ctx.exhausted_mainline:
@@ -152,10 +164,28 @@ async def main():
     for s in ctx.defensive_rotation:
         print(f"  {s.name} ({s.code})  强度={s.strength_score:.1f}")
 
+    # Node 2 v2: 主线家族
+    if ctx.theme_families:
+        print(f"\n主线家族 ({len(ctx.theme_families)}):")
+        for f in ctx.theme_families:
+            print(f"  {f.family_name}: score={f.family_score:.0f}  "
+                  f"共振={f.family_resonance:.0%}  地位={f.theme_status}  "
+                  f"成员={f.member_count}")
+
+    # Node 2 v2: 行业板块 Top 10
+    if ctx.industry_top:
+        print(f"\n行业板块 Top {len(ctx.industry_top)}（中期趋势）:")
+        for s in ctx.industry_top:
+            print(f"  {s.name} ({s.code})  强度={s.strength_score:.1f}  "
+                  f"pm={s.indicators.get('price_momentum', 0):.2f}  "
+                  f"te={s.indicators.get('turnover_expansion', 0):.2f}  "
+                  f"rs={s.indicators.get('relative_strength', 0):.2f}  "
+                  f"bh={s.indicators.get('breadth_health', 0):.2f}")
+
     if ctx.notes:
         print(f"\n备注:")
         for note in ctx.notes:
-            print(f"  ⚠ {note}")
+            print(f"  {note}")
 
     if ctx.reasoning:
         print(f"\nReasoning:\n{ctx.reasoning}")
