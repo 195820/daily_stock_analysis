@@ -1,28 +1,27 @@
 """
-Node 3: 资金面分析节点
+Node 3: 资金面分析节点（实时版）
 
-职责：追踪机构资金行为，为其他节点提供辅助验证信号。
+职责：追踪盘中实时资金流向，为其他节点提供辅助验证信号。
 
 设计理念：
-- 5 维度：北向资金 / 龙虎榜 / ETF申赎 / 融资融券 / 大宗交易
-- 降级机制：某维度缺失时权重归一化 + 置信度下调（P2-4）
-- 机构视角：所有维度都指向机构行为
+- 3 实时维度：板块资金流 / DDE 大单净流入 / 北向资金分钟级（备用）
+- 降级机制：某维度缺失时权重归一化 + 置信度下调
+- 盘中 T+0：概念/行业资金流和 DDE 均为盘中实时数据
 
-数据源：akshare
-- 北向资金: stock_hsgt_hist_em（2024-08 后数据不可用，自动降级）
-- 龙虎榜: stock_lhb_jgmmtj_em（机构席位买卖统计）
-- 融资融券: macro_china_market_margin_sh（市场级汇总）
-- 大宗交易: stock_dzjy_mrtj（逐笔交易明细）
-- ETF 申赎: fund_etf_scale_sse/szse（仅快照，无历史，自动降级）
+数据源：
+- 板块资金流: akshare stock_fund_flow_concept/industry("即时") — 实时概念/行业净流入
+- DDE 大单: DdeFetcher (Playwright → push2.eastmoney.com) — 全市场大单净流入
+- 北向资金: akshare stock_hsgt_fund_min_em — 分钟级实时（2024-08 后全 0，自动降级）
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from data_provider.base import DataFetcherManager
@@ -42,41 +41,36 @@ logger = logging.getLogger(__name__)
 # 常量配置
 # =============================================================================
 
-# 5 维度权重（总分母 = 1.0）
+# 3 维度权重（总分母 = 1.0）
 DIMENSION_WEIGHTS: dict[str, float] = {
-    "northbound": 0.25,
-    "dragon_tiger": 0.25,
-    "etf_flow": 0.25,
-    "margin_trading": 0.15,
-    "block_trade": 0.10,
+    "sector_flow": 0.50,
+    "dde": 0.35,
+    "northbound_realtime": 0.15,
 }
 
-# 维度中文名称（用于日志和 missing_dimensions 输出）
+# 维度中文名称
 DIMENSION_LABELS: dict[str, str] = {
-    "northbound": "北向资金",
-    "dragon_tiger": "龙虎榜",
-    "etf_flow": "ETF 申赎",
-    "margin_trading": "融资融券",
-    "block_trade": "大宗交易",
+    "sector_flow": "板块资金流",
+    "dde": "大单净流入(DDE)",
+    "northbound_realtime": "北向资金(实时)",
 }
-
-# 数据回溯天数
-_LOOKBACK_DAYS = 5
-
-# 龙虎榜默认查询区间（覆盖回溯天数 + 周末）
-_LHB_DATE_RANGE_DAYS = 10
 
 # 态度判定阈值
 _BULLISH_THRESHOLD = 0.3
 _BEARISH_THRESHOLD = -0.3
 
-# 大宗交易信号阈值
-_BLOCK_PREMIUM_SIGNAL = 0.02       # 溢价 > 2% → 抢筹
-_BLOCK_DISCOUNT_SIGNAL = -0.05     # 折价 > 5% → 甩货
+# 板块资金流评分参数
+_CONCEPT_TOP_N = 20          # 取净流入 Top N 概念板块
+_INDUSTRY_TOP_N = 10         # 取净流入 Top N 行业板块
+_CONCEPT_WEIGHT = 0.65       # 概念板块在 sector_flow 中的权重
+_INDUSTRY_WEIGHT = 0.35      # 行业板块权重
+
+# DDE 评分参数
+_DDE_NET_INFLOW_SCALE = 1e8  # DDE 净流入额归一化基数（元）
 
 
 class CapitalAnalysisNode:
-    """资金面分析节点（GOT Node 3）"""
+    """资金面分析节点（GOT Node 3，实时版）"""
 
     def __init__(self, use_mock: bool = True):
         self.use_mock = use_mock
@@ -96,22 +90,22 @@ class CapitalAnalysisNode:
     ) -> CapitalContext:
         """执行资金面分析。
 
-        流程：并发获取 5 维度数据 → 逐维度评分 → 加权聚合 → LLM reasoning
+        流程：并发获取 3 维度数据 → 逐维度评分 → 加权聚合 → LLM reasoning
         """
         if self.use_mock:
             logger.info("[Node 3] 使用 mock 数据")
             return self._mock_output()
 
-        logger.info("[Node 3] 开始真实资金面分析...")
+        logger.info("[Node 3] 开始实时资金面分析...")
 
         quality = DataQuality()
 
         try:
-            # Step 1: 并发获取 5 维度数据
+            # Step 1: 并发获取 3 维度数据
             raw_data = await self._fetch_all_dimensions(quality)
 
             # Step 2: 逐维度评分 + 加权聚合
-            result = self._calculate_institutional_score(raw_data, quality)
+            result = self._calculate_institutional_score(raw_data, quality, sector_context)
 
             # Step 3: 判定失败
             if result.status == "failed":
@@ -143,19 +137,14 @@ class CapitalAnalysisNode:
     async def _fetch_all_dimensions(
         self, quality: DataQuality,
     ) -> dict[str, Any]:
-        """并发获取可用维度数据。
-
-        北向资金和 ETF 申赎已知数据源受限，仍然尝试获取以支持未来恢复。
-        """
-        dimension_keys = ["northbound", "dragon_tiger", "margin_trading", "block_trade"]
+        """并发获取 3 维度数据。"""
+        dimension_keys = ["sector_flow", "dde", "northbound_realtime"]
         dimension_fetchers = [
-            self._fetch_northbound(quality),
-            self._fetch_dragon_tiger(quality),
-            self._fetch_margin_trading(quality),
-            self._fetch_block_trade(quality),
+            self._fetch_sector_fund_flow(quality),
+            self._fetch_dde(quality),
+            self._fetch_northbound_realtime(quality),
         ]
 
-        # asyncio.gather + return_exceptions 实现真正并发 + 单维度失败不阻塞
         raw_results = await asyncio.gather(*dimension_fetchers, return_exceptions=True)
 
         results = {}
@@ -168,84 +157,84 @@ class CapitalAnalysisNode:
 
         return results
 
-    async def _fetch_northbound(self, quality: DataQuality) -> Optional[pd.DataFrame]:
-        """获取北向资金历史数据（沪股通 + 深股通）。
+    async def _fetch_sector_fund_flow(self, quality: DataQuality) -> Optional[dict]:
+        """获取概念 + 行业板块实时资金流。通过 DataFetcherManager 代理。"""
+        def _fetch():
+            concept_df = self.fetcher.get_sector_fund_flow_concept()
+            industry_df = self.fetcher.get_sector_fund_flow_industry()
 
-        通过 DataFetcherManager 代理（支持多源降级）。
-        注意：2024-08 后 `当日成交净买额` 列为 NaN，自动标记为缺失。
+            if concept_df is None and industry_df is None:
+                return None
+
+            return {
+                "concept": concept_df,
+                "industry": industry_df,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        return await asyncio.to_thread(_fetch)
+
+    async def _fetch_dde(self, quality: DataQuality) -> Optional[dict]:
+        """获取 DDE 大单净流入数据。复用已有的 DdeFetcher。"""
+        def _fetch():
+            try:
+                from src.services.dde_fetcher import DdeFetcher
+                from src.config import Config
+                config = Config()
+                dde = DdeFetcher(config)
+                result = dde.fetch_market_dde()
+                if not result or result.error or not result.snapshots:
+                    return None
+
+                # 将 snapshots dict 转为 list of dicts 以便评分
+                snapshot_list = []
+                total_net = 0.0
+                for code, snap in result.snapshots.items():
+                    snapshot_list.append({
+                        "code": snap.code,
+                        "dde_big_order": snap.dde_big_order,
+                        "big_net_amount": snap.big_net_amount,
+                    })
+                    total_net += snap.big_net_amount
+
+                return {
+                    "snapshots": snapshot_list,
+                    "total_net_amount": total_net,
+                    "stock_count": len(snapshot_list),
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            except Exception as e:
+                logger.warning(f"DDE 获取失败: {e}")
+            return None
+
+        return await asyncio.to_thread(_fetch)
+
+    async def _fetch_northbound_realtime(self, quality: DataQuality) -> Optional[pd.DataFrame]:
+        """获取北向资金分钟级实时数据。
+
+        注意：2024-08 后全 0（停披），自动降级。保留为备用维度。
         """
         def _fetch():
-            frames = []
-            for symbol in ("沪股通", "深股通"):
-                try:
-                    df = self.fetcher.get_northbound_flow(symbol)
-                    if df is not None and not df.empty:
-                        frames.append(df)
-                except Exception as e:
-                    logger.warning(f"北向资金 {symbol} 获取失败: {e}")
+            try:
+                df = self.fetcher.get_sector_fund_flow_concept()  # placeholder
+                # 实际调用北向分钟级 API
+                import akshare as ak
+                df = ak.stock_hsgt_fund_min_em(symbol="北向资金")
+                if df is None or df.empty:
+                    return None
 
-            if not frames:
+                # 检查是否有非零数据（停披后全 0）
+                last_col = df.columns[-1]
+                non_zero = df[last_col].dropna()
+                non_zero = non_zero[non_zero != 0]
+                if non_zero.empty:
+                    logger.info("北向资金分钟级数据全 0（2024-08 后停披），标记缺失")
+                    return None
+
+                return df
+            except Exception as e:
+                logger.warning(f"北向资金分钟级获取失败: {e}")
                 return None
-
-            combined = pd.concat(frames, ignore_index=True)
-            combined["日期"] = pd.to_datetime(combined["日期"])
-            combined = combined.sort_values("日期")
-
-            # 检查数据有效性（2024-08 后为 NaN）
-            recent = combined.tail(_LOOKBACK_DAYS)
-            if "当日成交净买额" in recent.columns and recent["当日成交净买额"].isna().all():
-                logger.info("北向资金数据近 5 日全为 NaN（2024-08 后已停披），标记缺失")
-                return None
-
-            return recent
-
-        return await asyncio.to_thread(_fetch)
-
-    async def _fetch_dragon_tiger(self, quality: DataQuality) -> Optional[pd.DataFrame]:
-        """获取龙虎榜机构席位买卖数据。通过 DataFetcherManager 代理。"""
-        def _fetch():
-            today = datetime.now()
-            end_date = today.strftime("%Y%m%d")
-            start_date = (today - timedelta(days=_LHB_DATE_RANGE_DAYS)).strftime("%Y%m%d")
-
-            df = self.fetcher.get_dragon_tiger(start_date=start_date, end_date=end_date)
-            if df is None or df.empty:
-                return None
-
-            required_cols = {"机构买入净额", "代码", "上榜日期"}
-            if not required_cols.issubset(set(df.columns)):
-                logger.warning(f"龙虎榜数据缺少关键列: {required_cols - set(df.columns)}")
-                return None
-
-            return df
-
-        return await asyncio.to_thread(_fetch)
-
-    async def _fetch_margin_trading(self, quality: DataQuality) -> Optional[pd.DataFrame]:
-        """获取融资融券市场级汇总数据（沪市，近 5 日）。通过 DataFetcherManager 代理。"""
-        def _fetch():
-            df = self.fetcher.get_margin_trading()
-            if df is None or df.empty:
-                return None
-
-            df["日期"] = pd.to_datetime(df["日期"])
-            df = df.sort_values("日期").tail(_LOOKBACK_DAYS + 1)
-            return df
-
-        return await asyncio.to_thread(_fetch)
-
-    async def _fetch_block_trade(self, quality: DataQuality) -> Optional[pd.DataFrame]:
-        """获取大宗交易数据（近 5 日）。通过 DataFetcherManager 代理。"""
-        def _fetch():
-            today = datetime.now()
-            end_date = today.strftime("%Y%m%d")
-            start_date = (today - timedelta(days=_LHB_DATE_RANGE_DAYS)).strftime("%Y%m%d")
-
-            df = self.fetcher.get_block_trade(start_date=start_date, end_date=end_date)
-            if df is None or df.empty:
-                return None
-
-            return df
 
         return await asyncio.to_thread(_fetch)
 
@@ -257,72 +246,52 @@ class CapitalAnalysisNode:
         self,
         raw_data: dict[str, Any],
         quality: DataQuality,
+        sector_context: Optional[SectorContext] = None,
     ) -> CapitalContext:
-        """综合机构态度评分（-1 ~ 1），支持降级模式。
-
-        每个维度独立评分，按权重归一化加权。
-        缺失维度自动排除，置信度按可用比例下调。
-        """
+        """综合机构态度评分（-1 ~ 1），支持降级模式。"""
         evidence = CapitalEvidence()
         available_scores: list[float] = []
         available_weights: list[float] = []
         missing_dimensions: list[str] = []
 
-        # --- 维度 1：北向资金（权重 0.25）---
-        north_score = self._score_northbound(raw_data.get("northbound"))
-        if north_score is not None:
-            score, ev_dict = north_score
-            evidence.northbound = ev_dict
+        # --- 维度 1：板块资金流（权重 0.50）---
+        sf_score = self._score_sector_flow(raw_data.get("sector_flow"), sector_context)
+        if sf_score is not None:
+            score, ev_dict = sf_score
+            evidence.sector_flow = ev_dict
             available_scores.append(score)
-            available_weights.append(DIMENSION_WEIGHTS["northbound"])
-            quality.available_fields.append("northbound")
+            available_weights.append(DIMENSION_WEIGHTS["sector_flow"])
+            quality.available_fields.append("sector_flow")
         else:
-            missing_dimensions.append(DIMENSION_LABELS["northbound"])
-            quality.fetch_failed_fields.append("northbound")
+            missing_dimensions.append(DIMENSION_LABELS["sector_flow"])
+            quality.fetch_failed_fields.append("sector_flow")
 
-        # --- 维度 2：龙虎榜（权重 0.25）---
-        dt_score = self._score_dragon_tiger(raw_data.get("dragon_tiger"))
-        if dt_score is not None:
-            score, ev_dict = dt_score
-            evidence.dragon_tiger = ev_dict
+        # --- 维度 2：DDE 大单净流入（权重 0.35）---
+        dde_score = self._score_dde(raw_data.get("dde"))
+        if dde_score is not None:
+            score, ev_dict = dde_score
+            evidence.dde = ev_dict
             available_scores.append(score)
-            available_weights.append(DIMENSION_WEIGHTS["dragon_tiger"])
-            quality.available_fields.append("dragon_tiger")
+            available_weights.append(DIMENSION_WEIGHTS["dde"])
+            quality.available_fields.append("dde")
         else:
-            missing_dimensions.append(DIMENSION_LABELS["dragon_tiger"])
-            quality.fetch_failed_fields.append("dragon_tiger")
+            missing_dimensions.append(DIMENSION_LABELS["dde"])
+            quality.fetch_failed_fields.append("dde")
 
-        # --- 维度 3：ETF 申赎（权重 0.25）---
-        # 当前无可用 API，始终缺失
-        missing_dimensions.append(DIMENSION_LABELS["etf_flow"])
-        quality.missing_fields.append("etf_flow")
-
-        # --- 维度 4：融资融券（权重 0.15）---
-        margin_score = self._score_margin_trading(raw_data.get("margin_trading"))
-        if margin_score is not None:
-            score, ev_dict = margin_score
-            evidence.margin_trading = ev_dict
+        # --- 维度 3：北向资金实时（权重 0.15，通常降级）---
+        nb_score = self._score_northbound_realtime(raw_data.get("northbound_realtime"))
+        if nb_score is not None:
+            score, ev_dict = nb_score
+            evidence.northbound_realtime = ev_dict
             available_scores.append(score)
-            available_weights.append(DIMENSION_WEIGHTS["margin_trading"])
-            quality.available_fields.append("margin_trading")
+            available_weights.append(DIMENSION_WEIGHTS["northbound_realtime"])
+            quality.available_fields.append("northbound_realtime")
         else:
-            missing_dimensions.append(DIMENSION_LABELS["margin_trading"])
-            quality.fetch_failed_fields.append("margin_trading")
-
-        # --- 维度 5：大宗交易（权重 0.10）---
-        block_score = self._score_block_trade(raw_data.get("block_trade"))
-        if block_score is not None:
-            score, ev_dict = block_score
-            evidence.block_trade = ev_dict
-            available_scores.append(score)
-            available_weights.append(DIMENSION_WEIGHTS["block_trade"])
-            quality.available_fields.append("block_trade")
-        else:
-            missing_dimensions.append(DIMENSION_LABELS["block_trade"])
-            quality.fetch_failed_fields.append("block_trade")
+            missing_dimensions.append(DIMENSION_LABELS["northbound_realtime"])
+            quality.fetch_failed_fields.append("northbound_realtime")
 
         # === 降级处理 ===
-        if len(available_scores) < 2:
+        if not available_scores:
             return CapitalContext(
                 status="failed",
                 institutional_attitude="neutral",
@@ -330,7 +299,7 @@ class CapitalAnalysisNode:
                 confidence_multiplier=0.0,
                 evidence=evidence,
                 missing_dimensions=missing_dimensions,
-                reasoning=f"可用数据不足（仅 {len(available_scores)} 个维度）",
+                reasoning="所有资金流维度数据均不可用",
                 data_quality=quality,
             )
 
@@ -341,7 +310,7 @@ class CapitalAnalysisNode:
         )
         institutional_score = clip(institutional_score, -1.0, 1.0)
 
-        # 置信度 = 可用维度数 / 总维度数（5）
+        # 置信度 = 可用维度数 / 总维度数
         confidence_multiplier = len(available_scores) / len(DIMENSION_WEIGHTS)
 
         # 态度判定
@@ -369,178 +338,167 @@ class CapitalAnalysisNode:
     # =================================================================
 
     @staticmethod
-    def _score_northbound(
-        df: Optional[pd.DataFrame],
+    def _score_sector_flow(
+        data: Optional[dict],
+        sector_context: Optional[SectorContext] = None,
     ) -> Optional[tuple[float, dict]]:
-        """北向资金评分。
+        """板块资金流评分（概念 + 行业）。
 
-        逻辑：5 日累计净买入 → base_score + 加速度 + 集中度加分
-        单位：当日成交净买额 为亿元。
+        逻辑：
+        1. 概念板块按净流入排名，Top N 均值为概念分数
+        2. 行业板块同理
+        3. 加权合并
+        4. 如果主线板块在 Top 10 中，额外加分
         """
-        if df is None or df.empty:
+        if data is None:
             return None
 
-        if "当日成交净买额" not in df.columns:
+        concept_df = data.get("concept")
+        industry_df = data.get("industry")
+
+        scores = []
+        weights = []
+        top_concepts = []
+        top_industries = []
+
+        # 概念板块评分
+        if concept_df is not None and not concept_df.empty:
+            net_col = _find_column(concept_df, ["净额", "净流"])
+            name_col = _find_column(concept_df, ["行业", "板块名称", "名称"])
+            if net_col and name_col:
+                concept_df = concept_df.copy()
+                concept_df[net_col] = pd.to_numeric(concept_df[net_col], errors="coerce")
+                concept_df = concept_df.dropna(subset=[net_col])
+
+                # Top N 净流入
+                top_n = concept_df.nlargest(_CONCEPT_TOP_N, net_col)
+                avg_net_flow = float(top_n[net_col].mean())
+                # 归一化：200 亿 → score 1.0（考虑深股通/融资融券等大资金板块）
+                concept_score = clip(avg_net_flow / 200.0, -1.0, 1.0)
+                scores.append(concept_score)
+                weights.append(_CONCEPT_WEIGHT)
+
+                top_concepts = [
+                    f"{row[name_col]}({row[net_col]:.1f}亿)"
+                    for _, row in top_n.head(5).iterrows()
+                ]
+
+        # 行业板块评分
+        if industry_df is not None and not industry_df.empty:
+            net_col = _find_column(industry_df, ["净额", "净流"])
+            name_col = _find_column(industry_df, ["行业", "板块名称", "名称"])
+            if net_col and name_col:
+                industry_df = industry_df.copy()
+                industry_df[net_col] = pd.to_numeric(industry_df[net_col], errors="coerce")
+                industry_df = industry_df.dropna(subset=[net_col])
+
+                top_n = industry_df.nlargest(_INDUSTRY_TOP_N, net_col)
+                avg_net_flow = float(top_n[net_col].mean())
+                # 归一化：100 亿 → score 1.0
+                industry_score = clip(avg_net_flow / 100.0, -1.0, 1.0)
+                scores.append(industry_score)
+                weights.append(_INDUSTRY_WEIGHT)
+
+                top_industries = [
+                    f"{row[name_col]}({row[net_col]:.1f}亿)"
+                    for _, row in top_n.head(3).iterrows()
+                ]
+
+        if not scores:
             return None
 
-        net_buy = df["当日成交净买额"].dropna()
-        if net_buy.empty or len(net_buy) < 2:
-            return None
+        # 加权合并
+        total_w = sum(weights)
+        final_score = sum(s * w / total_w for s, w in zip(scores, weights))
 
-        # 单位转换：亿 → 元（公式中除以 5e9、2e9 等）
-        net_buy_yuan = net_buy * 1e8
+        # 主线板块加分：如果活跃主线的板块出现在概念 Top 10
+        mainline_bonus = 0.0
+        if sector_context and concept_df is not None and not concept_df.empty:
+            mainline_names = {
+                m.name for g in sector_context.active_mainline for m in g.members
+            }
+            net_col = _find_column(concept_df, ["净额", "净流"])
+            name_col = _find_column(concept_df, ["行业", "板块名称", "名称"])
+            if net_col and name_col:
+                top10_names = set(
+                    concept_df.nlargest(10, net_col)[name_col].tolist()
+                )
+                if mainline_names & top10_names:
+                    mainline_bonus = 0.15  # 主线资金确认加分
 
-        cumulative_5d = float(net_buy_yuan.sum())
-        base_score = clip(cumulative_5d / 5e9, -1.0, 1.0)
+        final_score = clip(final_score + mainline_bonus, -1.0, 1.0)
 
-        today = float(net_buy_yuan.iloc[-1])
-        avg_5d = cumulative_5d / len(net_buy_yuan)
-        acceleration = clip((today - avg_5d) / 2e9, -0.3, 0.3)
-
-        concentration_bonus = 0.1 if today > 1e10 else 0.0
-
-        north_score = clip(base_score + acceleration + concentration_bonus, -1.0, 1.0)
-
-        cumulative_5d_yi = cumulative_5d / 1e8
-        today_yi = today / 1e8
-
-        if acceleration > 0.1:
-            accel_label = "加速流入"
-        elif acceleration < -0.1:
-            accel_label = "减速"
-        else:
-            accel_label = "稳定"
-
-        return north_score, {
-            "score": round(north_score, 4),
-            "cumulative_5d": round(cumulative_5d_yi, 2),
-            "today": round(today_yi, 2),
-            "acceleration": accel_label,
+        return final_score, {
+            "score": round(final_score, 4),
+            "top_concepts": top_concepts,
+            "top_industries": top_industries,
+            "mainline_bonus": mainline_bonus > 0,
+            "timestamp": data.get("timestamp"),
         }
 
     @staticmethod
-    def _score_dragon_tiger(
-        df: Optional[pd.DataFrame],
-    ) -> Optional[tuple[float, dict]]:
-        """龙虎榜机构席位评分。
+    def _score_dde(data: Optional[dict]) -> Optional[tuple[float, dict]]:
+        """DDE 大单净流入评分。
 
-        逻辑：区间内机构净买入总额 / 5e8 为基准分。
-        同一股票多日重复上榜时，净买入累计、名称取最新。
-        单位：机构买入净额 为元。
+        逻辑：全市场大单净流入金额合计 / 归一化基数 → clip(-1, 1)
+        数据源：DdeFetcher (Playwright → push2.eastmoney.com)
         """
-        if df is None or df.empty:
+        if data is None:
             return None
 
-        if "机构买入净额" not in df.columns:
+        total_net = data.get("total_net_amount")
+        if total_net is None:
             return None
 
-        total_net_buy = float(df["机构买入净额"].sum())
+        total_net = float(total_net)
+        stock_count = data.get("stock_count", 0)
 
-        # 按股票聚合：累计净买入 + 取最新名称
-        bought_stocks: list[str] = []
-        if "代码" in df.columns and "名称" in df.columns:
-            stock_agg = (
-                df.groupby("代码")
-                .agg(净买入=("机构买入净额", "sum"), 名称=("名称", "last"))
-                .sort_values("净买入", ascending=False)
-            )
-            top_bought = stock_agg[stock_agg["净买入"] > 0].head(5)
-            bought_stocks = [
-                f"{code}.{row['名称']}" for code, row in top_bought.iterrows()
-            ]
+        # 归一化：1000 亿（1e11 元）→ score 1.0
+        dde_score = clip(total_net / 1e11, -1.0, 1.0)
 
-        dt_score = clip(total_net_buy / 5e8, -1.0, 1.0)
+        # 统计流入/流出股票数
+        snapshots = data.get("snapshots", [])
+        inflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) > 0)
+        outflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) < 0)
 
-        return dt_score, {
-            "score": round(dt_score, 4),
-            "institutional_net_buy": round(total_net_buy / 1e8, 2),
-            "mainline_stocks_bought": bought_stocks,
+        return dde_score, {
+            "score": round(dde_score, 4),
+            "total_net_inflow": round(total_net / 1e8, 2),  # 亿元
+            "inflow_stock_count": inflow_count,
+            "outflow_stock_count": outflow_count,
+            "timestamp": data.get("timestamp"),
         }
 
     @staticmethod
-    def _score_margin_trading(
+    def _score_northbound_realtime(
         df: Optional[pd.DataFrame],
     ) -> Optional[tuple[float, dict]]:
-        """融资融券评分。
-
-        逻辑：最新一日融资余额相对前一日变化 / 2e9 → clip(-0.5, 0.5)
-        单位：融资融券余额 为元。
-        """
+        """北向资金分钟级实时评分（备用，通常降级）。"""
         if df is None or df.empty:
             return None
 
-        if "融资余额" not in df.columns:
-            return None
+        last_col = df.columns[-1]
+        valid = df[last_col].dropna()
+        valid = valid[valid != 0]
 
-        balance = df["融资余额"].dropna()
-        if len(balance) < 2:
-            return None
-
-        # 最新余额与前一日余额
-        latest = float(balance.iloc[-1])
-        prev = float(balance.iloc[-2])
-        daily_change = latest - prev
-
-        margin_score = clip(daily_change / 2e9, -0.5, 0.5)
-
-        return margin_score, {
-            "score": round(margin_score, 4),
-            "balance_change": round(daily_change / 1e8, 2),
-            "latest_balance": round(latest / 1e8, 2),
-        }
-
-    @staticmethod
-    def _score_block_trade(
-        df: Optional[pd.DataFrame],
-    ) -> Optional[tuple[float, dict]]:
-        """大宗交易评分。
-
-        逻辑：按成交额加权平均折溢率 → 分段评分
-        - 折价 > 5% → 甩货信号（看空）
-        - 溢价 > 2% → 抢筹信号（看多）
-        - 其他 → 平价成交
-        单位：成交总额 为万元，折溢率 为比率。
-        """
-        if df is None or df.empty:
-            return None
-
-        required_cols = {"折溢率", "成交总额"}
-        if not required_cols.issubset(set(df.columns)):
-            return None
-
-        # 清理数据
-        valid = df.dropna(subset=["折溢率", "成交总额"])
         if valid.empty:
             return None
 
-        # 按成交额加权平均折溢率
-        total_amount = float(valid["成交总额"].sum())
-        if total_amount <= 0:
-            return None
+        # 累计净流入（万元）
+        cumulative = float(valid.sum())
+        # 最后 30 分钟趋势
+        recent_30m = valid.tail(30)
+        recent_trend = float(recent_30m.sum()) if len(recent_30m) > 0 else 0
 
-        weighted_premium = float(
-            (valid["折溢率"] * valid["成交总额"]).sum() / total_amount
-        )
+        # 归一化：50 亿（500000 万元）→ score 1.0
+        nb_score = clip(cumulative / 500000, -1.0, 1.0)
+        trend_bonus = clip(recent_trend / 100000, -0.2, 0.2)
+        final_score = clip(nb_score + trend_bonus, -1.0, 1.0)
 
-        # 分段评分
-        if weighted_premium < _BLOCK_DISCOUNT_SIGNAL:
-            block_score = clip(weighted_premium * 10, -1.0, -0.3)
-            signal_type = "甩货（折价 > 5%）"
-        elif weighted_premium > _BLOCK_PREMIUM_SIGNAL:
-            block_score = clip(weighted_premium * 8, 0.3, 1.0)
-            signal_type = "抢筹（溢价）"
-        else:
-            block_score = clip(weighted_premium * 5, -0.3, 0.3)
-            signal_type = "平价成交"
-
-        # 成交总额：万元 → 亿元
-        amount_yi = total_amount / 1e4
-
-        return block_score, {
-            "score": round(block_score, 4),
-            "premium_ratio": round(weighted_premium, 6),
-            "signal_type": signal_type,
-            "amount": round(amount_yi, 2),
+        return final_score, {
+            "score": round(final_score, 4),
+            "cumulative_inflow": round(cumulative / 10000, 2),  # 万元 → 亿元
+            "recent_30m_trend": "流入" if recent_trend > 0 else "流出",
         }
 
     # =================================================================
@@ -562,48 +520,60 @@ class CapitalAnalysisNode:
 
         # 构建证据摘要
         evidence_parts = []
-        if ctx.evidence.northbound:
-            nb = ctx.evidence.northbound
+        if ctx.evidence.sector_flow:
+            sf = ctx.evidence.sector_flow
+            concepts = "、".join(sf.get("top_concepts", [])[:5]) or "无"
+            industries = "、".join(sf.get("top_industries", [])[:3]) or "无"
             evidence_parts.append(
-                f"- 北向资金：5日累计 {nb['cumulative_5d']}亿，"
-                f"今日 {nb['today']}亿（{nb['acceleration']}）"
+                f"- 板块资金流（实时）：净流入概念 Top5: {concepts}；"
+                f"行业 Top3: {industries}"
             )
-        if ctx.evidence.dragon_tiger:
-            dt = ctx.evidence.dragon_tiger
-            stocks = "、".join(dt.get("mainline_stocks_bought", [])[:3]) or "无"
+            if sf.get("mainline_bonus"):
+                evidence_parts.append("  → 主线板块资金确认（额外加分）")
+        if ctx.evidence.dde:
+            dde = ctx.evidence.dde
             evidence_parts.append(
-                f"- 龙虎榜：机构席位净买入 {dt['institutional_net_buy']}亿，"
-                f"买入个股：{stocks}"
+                f"- 大单净流入(DDE)：全市场净{'流入' if dde['total_net_inflow'] > 0 else '流出'} "
+                f"{abs(dde['total_net_inflow'])}亿，"
+                f"流入股 {dde['inflow_stock_count']} / 流出股 {dde['outflow_stock_count']}"
             )
-        if ctx.evidence.etf_flow:
-            etf = ctx.evidence.etf_flow
-            evidence_parts.append(f"- ETF申赎：净申购 {etf['net_subscription']}亿份")
-        if ctx.evidence.margin_trading:
-            mt = ctx.evidence.margin_trading
+        if ctx.evidence.northbound_realtime:
+            nb = ctx.evidence.northbound_realtime
             evidence_parts.append(
-                f"- 融资融券：融资余额变化 {mt['balance_change']}亿"
-            )
-        if ctx.evidence.block_trade:
-            bt = ctx.evidence.block_trade
-            evidence_parts.append(
-                f"- 大宗交易：{bt['signal_type']}（溢价率 {bt['premium_ratio']:.4f}，"
-                f"成交额 {bt['amount']}亿）"
+                f"- 北向资金(实时)：累计 {nb['cumulative_inflow']}亿，"
+                f"近30分钟趋势：{nb['recent_30m_trend']}"
             )
 
         evidence_text = "\n".join(evidence_parts) if evidence_parts else "无可用数据"
 
         trend = getattr(market_context.tech_growth, "trend", "未知")
         mainline_count = len(sector_context.active_mainline)
+        mainline_names = "、".join(
+            g.group_name for g in sector_context.active_mainline[:3]
+        ) or "无"
+
+        # 时序感知：交易时段 vs 收盘后
+        now_hour = datetime.now().hour
+        is_trading_hours = 9 <= now_hour < 15
+        if is_trading_hours:
+            time_context = "盘中实时（T+0）"
+            action_hint = "盘中资金整体态度"
+            timing_note = ""
+        else:
+            time_context = "收盘后（当日最终数据）"
+            action_hint = "当日资金整体态度"
+            timing_note = "请基于当日全天数据分析，不要使用午后等盘中时态。"
 
         prompt = (
-            "你是一个专业的资金流分析师。根据以下机构资金数据，撰写一段简洁的分析报告。\n\n"
+            f"你是一个专业的资金流分析师。根据以下{time_context}资金数据，撰写简洁分析报告。\n\n"
             f"机构态度评分：{ctx.institutional_score}（{ctx.institutional_attitude}）\n\n"
             f"支撑证据：\n{evidence_text}\n\n"
             f"大盘背景：科技成长趋势={trend}\n"
-            f"板块背景：活跃主线数量={mainline_count}\n\n"
+            f"板块背景：活跃主线={mainline_names}（{mainline_count}个）\n\n"
+            f"注意：以上数据为{time_context}数据。{timing_note}\n\n"
             "请输出：\n"
-            "1. 一段150字以内的分析文本，解释机构资金的整体态度\n"
-            "2. 重点说明机构对主线板块的态度（是否在加仓）\n"
+            f"1. 一段150字以内的分析文本，解释{action_hint}\n"
+            "2. 重点说明资金是否流向主线板块\n"
             "3. 提示风险信号（如有）\n\n"
             "输出格式：纯文本（不要JSON）"
         )
@@ -626,18 +596,17 @@ class CapitalAnalysisNode:
         """降级 reasoning（LLM 不可用时使用）。"""
         parts = [f"机构态度评分 {ctx.institutional_score:.3f}（{ctx.institutional_attitude}）。"]
 
-        if ctx.evidence.northbound:
-            nb = ctx.evidence.northbound
-            parts.append(f"北向资金5日累计 {nb['cumulative_5d']}亿（{nb['acceleration']}）。")
-        if ctx.evidence.dragon_tiger:
-            dt = ctx.evidence.dragon_tiger
-            parts.append(f"龙虎榜机构净买入 {dt['institutional_net_buy']}亿。")
-        if ctx.evidence.margin_trading:
-            mt = ctx.evidence.margin_trading
-            parts.append(f"融资余额变化 {mt['balance_change']}亿。")
-        if ctx.evidence.block_trade:
-            bt = ctx.evidence.block_trade
-            parts.append(f"大宗交易{bt['signal_type']}，成交额 {bt['amount']}亿。")
+        if ctx.evidence.sector_flow:
+            sf = ctx.evidence.sector_flow
+            concepts = "、".join(sf.get("top_concepts", [])[:3]) or "无"
+            parts.append(f"板块资金流净流入：{concepts}。")
+        if ctx.evidence.dde:
+            dde = ctx.evidence.dde
+            direction = "流入" if dde["total_net_inflow"] > 0 else "流出"
+            parts.append(f"大单净{direction} {abs(dde['total_net_inflow'])}亿。")
+        if ctx.evidence.northbound_realtime:
+            nb = ctx.evidence.northbound_realtime
+            parts.append(f"北向资金累计 {nb['cumulative_inflow']}亿。")
 
         if ctx.missing_dimensions:
             parts.append(f"缺失维度: {'、'.join(ctx.missing_dimensions)}。")
@@ -649,41 +618,47 @@ class CapitalAnalysisNode:
     # =================================================================
 
     def _mock_output(self) -> CapitalContext:
-        """Mock 输出（机构偏中性）"""
+        """Mock 输出"""
         return CapitalContext(
             status="degraded",
             institutional_attitude="neutral",
             institutional_score=0.05,
-            confidence_multiplier=0.8,
+            confidence_multiplier=0.67,
             evidence=CapitalEvidence(
-                northbound={
+                sector_flow={
                     "score": 0.15,
-                    "cumulative_5d": 12.5,
-                    "today": 3.2,
-                    "acceleration": "稳定",
+                    "top_concepts": ["AI视频(42亿)", "碳基指数(63亿)"],
+                    "top_industries": ["种植业(1.8亿)"],
+                    "mainline_bonus": False,
+                    "timestamp": "mock",
                 },
-                dragon_tiger={
-                    "score": 0.10,
-                    "institutional_net_buy": 2.8,
-                    "mainline_stocks_bought": ["002935", "300377"],
-                },
-                etf_flow={
-                    "score": -0.05,
-                    "net_subscription": -5.2,
-                },
-                margin_trading=None,
-                block_trade={
-                    "score": 0.05,
-                    "premium_ratio": 0.01,
-                    "signal_type": "平价成交",
-                    "amount": 8.5,
+                dde={
+                    "score": -0.10,
+                    "total_net_inflow": -15.0,
+                    "inflow_stock_count": 2200,
+                    "outflow_stock_count": 2800,
+                    "timestamp": "mock",
                 },
             ),
-            missing_dimensions=["融资融券"],
-            reasoning="[Mock] 北向资金小幅流入，龙虎榜机构净买入，但ETF净赎回。整体中性偏多。",
+            missing_dimensions=["北向资金(实时)"],
+            reasoning="[Mock] 板块资金小幅流入，大单净流出15亿。整体中性。",
             data_quality=DataQuality(
-                available_fields=["northbound", "dragon_tiger", "etf_flow", "block_trade"],
-                missing_fields=["margin_trading"],
-                fetch_failed_fields=["margin_trading"],
+                available_fields=["sector_flow", "dde"],
+                missing_fields=["northbound_realtime"],
+                fetch_failed_fields=["northbound_realtime"],
             ),
         )
+
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """在 DataFrame 列名中模糊匹配。"""
+    for col in df.columns:
+        col_text = str(col)
+        for candidate in candidates:
+            if candidate in col_text:
+                return col
+    return None
