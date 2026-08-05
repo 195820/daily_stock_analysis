@@ -43,12 +43,17 @@ async def main():
         print(f"  trading_signal: {result.trading_signal}")
         print(f"  signal_confidence: {result.signal_confidence}")
         print(f"  forum_mood: {result.forum_mood}")
+        print(f"  fear_greed_index: {result.fear_greed_index:.3f}")
+        print(f"  sentiment_dispersion: {result.sentiment_dispersion:.3f}")
+        print(f"  contrarian_signal: {result.contrarian_signal}")
+        print(f"  sentiment_momentum: {result.sentiment_momentum:+.3f}")
         print(f"  market_temperature: {result.market_temperature:.2f}")
         print(f"  retail_attention: {result.retail_attention_count}")
         print(f"  news_drift: {result.news_drift}")
         print(f"\n  hot_stocks ({len(result.hot_stocks)}只):")
         for i, s in enumerate(result.hot_stocks[:10], 1):
-            print(f"    {i}. {s.stock_code} {s.stock_name} (attention={s.mention_count})")
+            print(f"    {i}. {s.stock_code} {s.stock_name} "
+                  f"sentiment={s.sentiment} attention={s.mention_count}")
         print(f"\n  hot_topics: {result.hot_topics}")
         print(f"\n  reasoning: {(result.reasoning or '')[:300]}")
         print(f"\n  data_quality.available: {result.data_quality.available_fields}")

@@ -925,8 +925,21 @@ class StockScreenerPipeline:
                     fallback_sectors.add(sector_name)
                     logger.warning(f"识别到兜底填充板块: {sector_name}")
 
-        # 提取主线板块（active_mainline），排除兜底填充的
-        active_mainlines = sector_ctx.get("active_mainline", [])
+        # 提取主线板块（active_mainline），展开 MainlineGroup → 成员板块
+        active_mainline_groups = sector_ctx.get("active_mainline", [])
+        # 兼容新旧格式：如果元素有 members 字段则是新格式（MainlineGroup）
+        active_mainlines = []
+        for item in active_mainline_groups:
+            if "members" in item:
+                # 新格式：MainlineGroup，展开成员
+                for m in item["members"]:
+                    m["_group_name"] = item.get("group_name", "")
+                    m["_group_score"] = item.get("group_score", 0)
+                    active_mainlines.append(m)
+            else:
+                # 旧格式兼容：直接是 SectorDetail
+                active_mainlines.append(item)
+
         qualified_mainlines = [
             s for s in active_mainlines
             if s.get("name") not in fallback_sectors
@@ -955,7 +968,7 @@ class StockScreenerPipeline:
             sector_type = "active_mainline" if sector_info in qualified_mainlines else "ambush"
 
             # 用问财快速筛选板块成分股
-            constituents = self._get_sector_constituents_filtered(sector_name)
+            constituents = self._get_sector_constituents_filtered(sector_name, sector_type)
 
             for stock_info in constituents:
                 universe.append({
@@ -963,7 +976,13 @@ class StockScreenerPipeline:
                     "name": stock_info.get("name", ""),
                     "sector": sector_name,
                     "sector_type": sector_type,
-                    "sector_score": sector_score
+                    "sector_score": sector_score,
+                    # 保留问财量价+DDE 数据（供资金面/技术面评分使用）
+                    "price": stock_info.get("price", 0),
+                    "dde_net_pct": stock_info.get("dde_net_pct", 0),
+                    "change_pct": stock_info.get("change_pct", 0),
+                    "turnover_rate": stock_info.get("turnover_rate", 0),
+                    "volume": stock_info.get("volume", 0),
                 })
 
         # 去重（同一股票可能在多个板块）
@@ -981,53 +1000,112 @@ class StockScreenerPipeline:
 
         return deduped
 
-    def _get_sector_constituents_filtered(self, sector_name: str) -> List[Dict]:
-        """用问财快速筛选板块成分股（服务端过滤）
+    def _get_sector_constituents_filtered(self, sector_name: str, sector_type: str = "active_mainline") -> List[Dict]:
+        """用问财快速筛选板块成分股（DDE 策略）
 
-        查询条件：
-        - 属于{sector_name}概念板块
-        - 主力资金净流入 > 0（资金面筛选）
-        - 近5日涨幅 > 0%（有动量）
-        - 量比 > 1（有资金关注）
-        - 非ST（排除风险股）
-        - 取涨幅前 10 只
+        主线板块（active_mainline）：要求当天 DDE 强势（>=0.8%）
+        埋伏板块（ambush）：要求 DDE 连续 3 天为正（确认主力持续吸筹，不要求当天爆发）
 
         Returns:
-            [{"code": "600519", "name": "贵州茅台"}, ...]
+            [{"code": "600519", "name": "贵州茅台", "price": ..., "dde_net_pct": ...}, ...]
         """
         try:
             from src.services.ths_screener import THSScreenerService
             ths_service = THSScreenerService(self.config)
 
-            # 构造问财查询（加入主力资金净流入筛选）
-            query = f"{sector_name}概念板块成分股，主力资金净流入>0，近5日涨幅>0%，量比>1，非ST，按涨跌幅降序"
-            logger.info(f"[问财初筛] {sector_name}: {query}")
+            # 根据板块类型使用不同的 DDE 筛选条件
+            if sector_type == "active_mainline":
+                # 主线：当天 DDE 强势
+                dde_condition = "1个交易日前的dde大单净量>=0.8%，近2个交易日的区间dde大单净量>=0.8%，"
+            else:
+                # 埋伏：近5日DDE累计为正（吸筹信号，不要求连续，刚启动的板块也能入选）
+                dde_condition = "近5个交易日的dde大单净量合计>0，"
+
+            # 概念→行业关键词映射（用于过滤蹭概念的票）
+            concept_industry_map = {
+                "数据要素": ["计算机", "软件", "数据处理", "信息服务", "互联网", "通信"],
+                "AI产业链": ["计算机", "软件", "电子", "通信", "人工智能", "芯片", "半导体"],
+                "AIGC概念": ["计算机", "软件", "传媒", "互联网", "人工智能"],
+                "AI智能体": ["计算机", "软件", "人工智能", "机器人"],
+                "华为鸿蒙": ["计算机", "软件", "电子", "通信", "手机"],
+                "CXO": ["医药", "医疗", "生物", "制药", "CRO", "CDMO"],
+                "黄金": ["贵金属", "有色", "矿业", "黄金"],
+                "钢铁": ["钢铁", "金属制品", "特钢"],
+                "化纤": ["化学纤维", "化工", "涤纶", "氨纶"],
+                "汽车整车": ["汽车", "整车", "新能源车"],
+                "虚拟电厂": ["电力", "电气", "电网", "能源"],
+            }
+
+            query = (
+                f"{sector_name}概念板块成分股，"
+                f"{dde_condition}"
+                "上市天数>365天，"
+                "非ST，"
+                "所属同花顺行业，"
+                "按涨跌幅降序"
+            )
+            logger.info(f"[问财初筛-DDE-{sector_type}] {sector_name}: {query[:60]}...")
 
             ths_result = ths_service.query(query)
             if ths_result and ths_result.stocks:
-                # 取前 10 只
+                # 行业过滤：检查每只票的行业板块是否与概念主题相关
+                industry_keywords = concept_industry_map.get(sector_name, [])
+                filtered_stocks = []
+                for s in ths_result.stocks:
+                    if industry_keywords and s.industry:
+                        # 检查 industry 字段是否包含相关关键词
+                        if any(kw in s.industry for kw in industry_keywords):
+                            filtered_stocks.append(s)
+                        else:
+                            logger.debug(f"[行业过滤] {s.code} {s.name} 行业'{s.industry}'与{sector_name}不匹配，跳过")
+                    else:
+                        # 无映射或无行业信息，保留
+                        filtered_stocks.append(s)
+
+                if len(filtered_stocks) < len(ths_result.stocks):
+                    logger.info(f"[行业过滤] {sector_name}: {len(ths_result.stocks)}→{len(filtered_stocks)} 只（过滤{len(ths_result.stocks)-len(filtered_stocks)}只蹭概念票）")
+
+                # 取前 5 只
                 stocks = [
-                    {"code": s.code, "name": s.name}
-                    for s in ths_result.stocks[:10]
+                    {
+                        "code": s.code,
+                        "name": s.name,
+                        "price": s.price,
+                        "dde_net_pct": s.dde_net_pct,
+                        "change_pct": s.change_pct,
+                        "turnover_rate": s.turnover_rate,
+                        "volume": s.volume,
+                    }
+                    for s in filtered_stocks[:5]
                 ]
-                logger.info(f"[问财初筛] {sector_name} 获取到 {len(stocks)} 只候选（已筛选主力资金净流入）")
+                logger.info(
+                    f"[问财初筛-DDE-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选"
+                    f"（DDE: {stocks[0]['dde_net_pct']:.2f}%~{stocks[-1]['dde_net_pct']:.2f}%）"
+                    if stocks else ""
+                )
                 return stocks
             else:
-                logger.warning(f"[问财初筛] {sector_name} 无结果，降级为不带资金流筛选")
-                # 降级：不带资金流筛选
-                query_fallback = f"{sector_name}概念板块成分股，近5日涨幅>0%，量比>1，非ST，按涨跌幅降序"
+                logger.warning(f"[问财初筛-DDE-{sector_type}] {sector_name} 无结果，降级为不带 DDE 筛选")
+                # 降级：不过滤 DDE 阈值，但仍查询 DDE 值（供资金面评分用）
+                query_fallback = f"{sector_name}概念板块成分股，dde大单净量，上市天数>365天，非ST，按涨跌幅降序"
                 ths_result = ths_service.query(query_fallback)
                 if ths_result and ths_result.stocks:
                     stocks = [
-                        {"code": s.code, "name": s.name}
-                        for s in ths_result.stocks[:10]
+                        {
+                            "code": s.code,
+                            "name": s.name,
+                            "price": s.price,
+                            "dde_net_pct": s.dde_net_pct,
+                            "change_pct": s.change_pct,
+                        }
+                        for s in ths_result.stocks[:5]
                     ]
-                    logger.info(f"[问财初筛-降级] {sector_name} 获取到 {len(stocks)} 只候选")
+                    logger.info(f"[问财初筛-降级-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选")
                     return stocks
                 return []
 
         except Exception as e:
-            logger.error(f"[问财初筛] {sector_name} 失败: {e}")
+            logger.error(f"[问财初筛-DDE-{sector_type}] {sector_name} 失败: {e}")
             return []
 
     def _filter_got_finalists(
@@ -1141,26 +1219,22 @@ class StockScreenerPipeline:
                 code = item.split(".")[0]
                 dragon_tiger_bought_codes.add(code)
 
-        # 批量获取主力资金流数据（使用 AKShare）
+        # 资金流数据：直接从候选股的 DDE 字段获取（问财初筛已包含）
+        # 不再逐只调用 AKShare/mootdx，节省 90%+ 耗时
         capital_flow_data = {}
-        try:
-            from data_provider.fundamental_adapter import AkshareFundamentalAdapter
-            adapter = AkshareFundamentalAdapter()
+        for c in candidates:
+            dde = c.get("dde_net_pct", 0)
+            if dde != 0:
+                capital_flow_data[c["code"]] = dde
 
-            for c in candidates:
-                try:
-                    flow_result = adapter.get_capital_flow(c["code"])
-                    if flow_result and flow_result.get("status") == "ok":
-                        stock_flow = flow_result.get("stock_flow", {})
-                        main_net = stock_flow.get("main_net_inflow", 0)
-                        capital_flow_data[c["code"]] = main_net
-                except Exception as e:
-                    logger.debug(f"获取 {c['code']} 资金流失败: {e}")
-
-            if capital_flow_data:
-                logger.info(f"[资金面] 获取到 {len(capital_flow_data)} 只股票的主力资金流数据")
-        except Exception as e:
-            logger.warning(f"获取主力资金流数据失败: {e}")
+        if capital_flow_data:
+            logger.info(
+                f"[资金面-THS] 使用问财 DDE 数据: "
+                f"{len(capital_flow_data)} 只, "
+                f"范围 {min(capital_flow_data.values()):.2f}%~{max(capital_flow_data.values()):.2f}%"
+            )
+        else:
+            logger.warning("[资金面-THS] 候选股无 DDE 数据，资金面维度将为 0")
 
         # 一次性获取北向资金数据（避免重复请求）
         northbound_positive = False
@@ -1196,23 +1270,30 @@ class StockScreenerPipeline:
             logger.warning(f"获取大宗交易失败: {e}")
 
         scores = {}
+
+        # 资金流排名百分位（DDE 大单净量%，用于 0-30 分评分）
+        flow_values = sorted(capital_flow_data.values(), reverse=True) if capital_flow_data else []
+
         for c in candidates:
             score = 0
 
-            # 龙虎榜机构买入
+            # 龙虎榜机构买入 (+40)
             if c["code"] in dragon_tiger_bought_codes:
                 score += 40
 
-            # 主力资金净流入（从 AKShare 获取）
-            main_net = capital_flow_data.get(c["code"], 0)
-            if main_net > 0:
-                score += 30
+            # 主力资金净流入 — DDE 大单净量排名百分位 (+0~30)
+            if c["code"] in capital_flow_data and flow_values:
+                dde_val = capital_flow_data[c["code"]]
+                # 排名百分位：DDE 越高排名越靠前，percentile 越高
+                rank_idx = flow_values.index(dde_val)
+                percentile = 1.0 - (rank_idx / max(len(flow_values) - 1, 1))
+                score += int(30 * percentile)
 
-            # 北向资金（所有股票共享同一个结果）
+            # 北向资金（所有股票共享同一个结果）(+15)
             if northbound_positive:
                 score += 15
 
-            # 大宗交易（检查该股票是否为抢筹）
+            # 大宗交易抢筹 (+15)
             stock_signal = block_trade_data.get(c["code"], "")
             if stock_signal == "抢筹":
                 score += 15
@@ -1333,13 +1414,10 @@ class StockScreenerPipeline:
                 if 1.5 <= volume_ratio <= 3.0:
                     score += 10
 
-                # 换手率（10%）
-                try:
-                    quote = fetcher_manager.get_realtime_quote(c["code"])
-                    if quote and 0.03 <= quote.turnover_rate <= 0.08:
-                        score += 10
-                except Exception:
-                    pass
+                # 换手率（10%）— 直接使用问财返回的数据，避免逐只拉行情
+                turnover_rate = c.get("turnover_rate", 0)
+                if turnover_rate and 0.03 <= turnover_rate <= 0.08:
+                    score += 10
 
                 # MACD 金叉（10%）
                 macd_line, signal_line, _ = self._calc_macd(df["close"])
@@ -1363,10 +1441,11 @@ class StockScreenerPipeline:
         """风险评分（15% 权重，越高越安全）
 
         扣分项：
-        - PE > 100: -20分
         - RSI > 80（超买）: -30分
         - 近 5 日涨幅 > 20%: -25分
         - 波动率 > 0.05: -15分
+
+        注：PE 估值检查已移除（需逐只拉行情，push2 被封时耗时 5s/只）。
         """
         scores = {}
 
@@ -1374,30 +1453,24 @@ class StockScreenerPipeline:
             score = 100  # 基础分
 
             try:
-                quote = fetcher_manager.get_realtime_quote(c["code"])
-                if not quote:
-                    scores[c["code"]] = 0
+                df, _ = fetcher_manager.get_daily_data(c["code"], days=30)
+                if df is None or len(df) < 5:
+                    scores[c["code"]] = 50  # 数据不足给中间分
                     continue
 
-                # PE 估值
-                if quote.pe_ratio and quote.pe_ratio > 100:
-                    score -= 20
-
                 # RSI 超买
-                df, _ = fetcher_manager.get_daily_data(c["code"], days=30)
-                if df is not None and len(df) >= 12:
+                if len(df) >= 12:
                     rsi6 = self._calc_rsi(df["close"], 6)
                     if rsi6 > 80:
                         score -= 30
 
                 # 近 5 日涨幅
-                if df is not None and len(df) >= 5:
-                    pct_5d = (df["close"].iloc[-1] / df["close"].iloc[-5] - 1) * 100
-                    if pct_5d > 20:
-                        score -= 25
+                pct_5d = (df["close"].iloc[-1] / df["close"].iloc[-5] - 1) * 100
+                if pct_5d > 20:
+                    score -= 25
 
                 # 波动率
-                if df is not None and len(df) >= 20:
+                if len(df) >= 20 and "pct_chg" in df.columns:
                     volatility = df["pct_chg"].rolling(20).std().iloc[-1]
                     if volatility > 0.05:
                         score -= 15
@@ -1405,7 +1478,7 @@ class StockScreenerPipeline:
                 scores[c["code"]] = max(0, score)
             except Exception as e:
                 logger.warning(f"计算风险评分失败 {c['code']}: {e}")
-                scores[c["code"]] = 0
+                scores[c["code"]] = 50
 
         return scores
 

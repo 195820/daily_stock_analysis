@@ -417,6 +417,61 @@ Phase 1 输出 (UnifiedContext) + 当前持仓
 - `src/got/nodes/sentiment_analysis.py`（重写）：Node 5 真实数据实现（~480 行）
 - `scripts/run_node5.py`（新建）：本地运行脚本
 
+**Node 5 v2 重设计（2026-08-04）：**
+
+> 基于 8 天运行数据（07-24~08-04）暴露的 6 大致命缺陷 + 3 篇学术论文（国金证券舆情选股/清华投资者情绪/fffinstill Fear & Greed Index）
+
+**问题诊断**：
+- ❌ hot_stocks sentiment 全部硬编码 "positive"（50 只股票无真实情绪判断）
+- ❌ 雪球数据陈旧（07-24~07-31 热门股列表完全相同，API 返回缓存数据）
+- ❌ 搜索舆情仅 28 个关键词匹配（无否定检测、无强度区分）
+- ❌ NGA 间歇性缺失导致权重偏移（07-24~07-31 正常，08-03~04 缺失）
+- ❌ 情绪评分与市场严重脱节（08-04 涨停 243 日 score 仅 0.085）
+- ❌ 缺少关键维度（无恐贪指数、无时序对比、不利用 Node 4 新闻）
+
+**核心变更**：
+- ✅ 新增东财千股千评数据源（`stock_comment_em()` → `datacenter-web.eastmoney.com`，非 push2，5190 股 ~3s）
+- ✅ 新增评论详情采样（`stock_comment_detail_*` 系列，15 只热门股并发获取参与意愿/关注度/机构参与度历史）
+- ✅ 6 维置信度加权评分（东财评论 25% + 市场宽度 15% + NGA 20% + 搜索舆情 15% + 散户行为 10% + 时序动量 15%）
+- ✅ 置信度加权聚合（参考 fffinstill F&G Index）：缺失维度权重自动重分配
+- ✅ 情绪分歧度（参考国金证券研究）：`_compute_sentiment_dispersion()` 计算综合得分变异系数，低分歧+极端均值 → 反向信号
+- ✅ 时序动量：`_compute_sentiment_momentum()` 加载近期 sentiment.json 计算 EMA(5) 偏差
+- ✅ 恐贪指数：`fear_greed_index = (score + 1) / 2`，映射到 [0, 1]
+- ✅ HotStocks 改造：使用东财综合得分判断真实情绪（≥70 positive, ≤30 negative），不再硬编码
+- ✅ 关键词匹配改进：词库从 28 扩展到 44，新增否定词翻转检测（"不看好"→负面而非正面）
+- ✅ 反身性分类改用东财关注指数（替代雪球的缓存数据）
+- ✅ LLM reasoning prompt 增加分歧度/反向信号信息
+- ✅ SentimentContext 新增 4 字段：fear_greed_index / sentiment_dispersion / contrarian_signal / sentiment_momentum
+- ✅ Archive 覆盖修复：`archive_daily_run()` 开头清理旧档，确保当天重跑全量覆盖
+
+**效果对比（08-04 涨停 243 日）**：
+
+| 指标 | 旧版 | 新版 |
+|------|------|------|
+| sentiment_score | 0.085（中性） | 0.316（乐观） |
+| hot_stocks sentiment | 全 "positive" | positive/neutral 真实区分 |
+| fear_greed_index | 不存在 | 0.658（贪婪侧） |
+| sentiment_dispersion | 不存在 | 0.092（低分歧=一致看多） |
+| sentiment_momentum | 不存在 | +0.219（情绪升温） |
+
+**数据源端点确认**：
+- 东财千股千评 → `datacenter-web.eastmoney.com` ✅ 不走 push2
+- 东财评论详情 → `datacenter-web.eastmoney.com` ✅ 不走 push2
+- 数据时效性：实测返回当日数据
+
+**Phase 2 性能优化（2026-08-04）**：
+- ✅ `_get_sector_constituents_filtered()` 新增携带 `turnover_rate`/`volume` 字段（问财已返回，无需重复获取）
+- ✅ `_score_technical_wave()` 换手率直接用候选数据，消除逐只实时行情获取（~5s/只）
+- ✅ `_score_risk()` 移除 `get_realtime_quote` 依赖，全部使用 K 线数据
+- ✅ 预估提速：Phase 2 从 ~11 分钟降到 ~3 分钟（43 次行情获取 × 5s → 0s）
+
+**Node 5 v2 文件改动清单：**
+- `src/got/nodes/sentiment_analysis.py`（核心重写 ~650 行）：6 源采集 + 置信度加权评分 + 分歧度 + 动量
+- `src/got/schemas.py`（+4 字段）：fear_greed_index / sentiment_dispersion / contrarian_signal / sentiment_momentum
+- `src/services/stock_screener.py`（性能优化）：携带问财字段 + 消除逐只行情获取
+- `src/got/archive.py`（覆盖修复）：当天重跑清理旧档
+- `scripts/run_node5.py`（更新）：打印新字段
+
 **Phase 1e Node 6 聚合实现记录：**
 - ✅ 12 步完整流水线（1018 行）：路径级校验 → 加载前日 JSON → 10 对矛盾规则检测 → LLM 批处理 → 消息面覆盖三层防护 → 时间一致性校验 4 类异常 → critical 强制人工审核 → 最终研判 LLM + 规则降级 → 仓位日限幅 ±0.2 → key_risks/opportunities 汇总 → UnifiedContext 构建 → 持久化
 - ✅ 10 对矛盾检测（含 ④b/④c 子矛盾）

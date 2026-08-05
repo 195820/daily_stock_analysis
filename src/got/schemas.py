@@ -315,11 +315,28 @@ class SentimentContext(BaseModel):
     forum_mood: str = Field(default="中性")
     hot_stocks: list[HotStock] = Field(default_factory=list)
     hot_topics: list[str] = Field(default_factory=list)
-    retail_attention_count: int = Field(default=0, description="散户关注热度（雪球讨论量归一化）")
+    retail_attention_count: int = Field(default=0, description="散户关注热度（东财关注指数总量）")
     market_temperature: float = Field(default=0.5, ge=0.0, le=1.0, description="市场温度（0=冰点, 1=沸点）")
     news_drift: str = Field(default="neutral", description="消息面偏离（positive/negative/neutral）")
     reasoning: Optional[str] = None
     data_quality: DataQuality = Field(default_factory=DataQuality)
+    # v2 新增：恐贪指数 + 情绪分歧度 + 反向信号
+    fear_greed_index: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="恐贪指数（0=极度恐惧, 1=极度贪婪）",
+    )
+    sentiment_dispersion: float = Field(
+        default=0.0,
+        description="情绪分歧度（低=一致, 高=分歧。一致看多→反向信号）",
+    )
+    contrarian_signal: bool = Field(
+        default=False,
+        description="反向信号（情绪极端一致时触发）",
+    )
+    sentiment_momentum: float = Field(
+        default=0.0,
+        description="情绪动量（当前score与EMA5偏差，正=升温, 负=降温）",
+    )
 
 
 # =============================================================================

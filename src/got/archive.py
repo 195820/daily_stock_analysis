@@ -88,6 +88,15 @@ def archive_daily_run(
     run_date = run_date or date.today()
     base_dir = base_dir or _default_base_dir()
     archive_dir = base_dir / run_date.strftime("%Y%m%d")
+
+    # 当天重跑：清理旧档，确保数据全部覆盖（不残留旧版 JSON/reasoning）
+    if archive_dir.exists():
+        import shutil
+        for item in archive_dir.iterdir():
+            if item.is_file():
+                item.unlink()
+        logger.info("[GOT Archive] 清理旧档: %s", archive_dir)
+
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     contexts = {
@@ -321,29 +330,28 @@ def archive_phase2(
 
     # 3. 追加 Phase 2 reasoning 到 reasoning.md
     reasoning_path = output_dir / "reasoning.md"
-    if reasoning_path.exists():
-        with open(reasoning_path, "a", encoding="utf-8") as f:
-            f.write(f"\n## Node 7 交易建议\n\n")
-            f.write(f"{decision.reasoning}\n\n")
-            if decision.allocation:
-                f.write(f"**操作总结:** {decision.summary}\n\n")
-                f.write(f"**交易明细:**\n\n")
-                for alloc in decision.allocation:
-                    f.write(
-                        f"- **{alloc.action.upper()}** {alloc.name} "
-                        f"({alloc.symbol}): {alloc.quantity_delta:+d} 股, "
-                        f"¥{alloc.target_value:,.0f}\n"
-                    )
-                    f.write(f"  - 理由: {alloc.reasoning}\n"
-                            f"  - 止损: {alloc.stop_loss}, "
-                            f"风险收益比: {alloc.risk_reward_ratio}\n")
-                f.write("\n")
-            if decision.warnings:
-                f.write(f"**风险提示:**\n\n")
-                for w in decision.warnings:
-                    f.write(f"- {w}\n")
-                f.write("\n")
-        logger.info(f"[Archive] Phase 2 reasoning 已追加到: {reasoning_path}")
+    with open(reasoning_path, "a", encoding="utf-8") as f:
+        f.write(f"\n## Node 7 交易建议\n\n")
+        f.write(f"{decision.reasoning}\n\n")
+        if decision.allocation:
+            f.write(f"**操作总结:** {decision.summary}\n\n")
+            f.write(f"**交易明细:**\n\n")
+            for alloc in decision.allocation:
+                f.write(
+                    f"- **{alloc.action.upper()}** {alloc.name} "
+                    f"({alloc.symbol}): {alloc.quantity_delta:+d} 股, "
+                    f"¥{alloc.target_value:,.0f}\n"
+                )
+                f.write(f"  - 理由: {alloc.reasoning}\n"
+                        f"  - 止损: {alloc.stop_loss}, "
+                        f"风险收益比: {alloc.risk_reward_ratio}\n")
+            f.write("\n")
+        if decision.warnings:
+            f.write(f"**风险提示:**\n\n")
+            for w in decision.warnings:
+                f.write(f"- {w}\n")
+            f.write("\n")
+    logger.info(f"[Archive] Phase 2 reasoning 已追加到: {reasoning_path}")
 
     logger.info(f"[Archive] Phase 2 决策已存档: {output_path}")
 
