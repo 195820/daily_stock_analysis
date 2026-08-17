@@ -43,6 +43,7 @@ from sqlalchemy import (
     desc,
     event,
     func,
+    text,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
@@ -57,7 +58,7 @@ from src.config import get_config
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-CURRENT_SCHEMA_VERSION = "2026-06-13-add-screener-tables"
+CURRENT_SCHEMA_VERSION = "2026-08-17-node2-state-machine"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -528,6 +529,7 @@ class PortfolioPosition(Base):
     market_value_base = Column(Float, nullable=False, default=0.0)
     unrealized_pnl_base = Column(Float, nullable=False, default=0.0)
     valuation_currency = Column(String(8), nullable=False, default='CNY')
+    name = Column(String(32), nullable=False, default='')  # 股票中文名
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
 
     __table_args__ = (
@@ -1022,10 +1024,14 @@ class Node2SectorTrendRecord(Base):
     - 追踪主线持续时间（mainline_days，用于检测 late_stage）
     - 用于 LLM prompt 注入：提供"强度持续上升"的板块上下文
 
-    设计原则（基于用户反馈）：
-    - ❌ 不追踪"埋伏持续天数"（死板块无意义）
-    - ✅ 追踪"强度趋势"（neutral + increasing 连续 3 天 → 即将 launch）
-    - ✅ 追踪"主线持续时间"（mainline_days >= 5 + strength < 0.5 → 主线衰竭）
+    设计原则（基于用户反馈 + 文献校准状态机 v2，2026-08-17）：
+    - ✅ 追踪"精确状态"（state：active_mainline/high_position_cooling/exhausted_mainline/ambush/defensive_rotation/neutral）
+      —— 替代 unified_signal 三值回映射（根因 #3：状态记忆断开），支撑规则版马尔可夫转移矩阵
+    - ✅ 追踪"状态驻留天数"（dwell_days，同状态累加/跨状态归 1）—— HMM 论文依据：
+      状态转移概率对角占优(0.89–0.99)，切换需最小驻留/置信度门槛
+    - ✅ 追踪 RRG 的 3 日 EMA 平滑值（rs_ratio_ema/rs_momentum_ema）—— 日频截面过敏感，
+      StockCharts 指出日频 RRG 是周频趋势的"短期 hiccup"，EMA 吸收单日噪音
+    - 保留 mainline_days（含 cooling/exhausted 期间连续计数，保住"曾是主线 N 天"记忆）
     """
 
     __tablename__ = 'node2_sector_trends'
@@ -1033,11 +1039,16 @@ class Node2SectorTrendRecord(Base):
     sector_code = Column(String(20), primary_key=True)
     sector_name = Column(String(100), nullable=False)
     tracking_date = Column(Date, primary_key=True)
-    unified_signal = Column(String(20))  # bullish/bearish/neutral
+    unified_signal = Column(String(20))  # bullish/bearish/neutral（对外信号，非状态机主记忆）
+    state = Column(String(32))  # 精确状态快照（六态，状态机主记忆）
+    dwell_days = Column(Integer, default=0)  # 当前状态连续驻留天数
+    rrg_ratio_ema = Column(Float)  # RS-Ratio 3日EMA（截面百分位平滑）
+    rrg_momentum_ema = Column(Float)  # RS-Momentum 3日EMA（斜率归一化平滑）
     lifecycle_phase = Column(String(30))  # launch/acceleration/mature/late_stage/mature_exhausted
     strength_score = Column(Float)  # 5维加权评分（0-1）
-    is_mainline = Column(Boolean, default=False, index=True)  # 是否为主线板块
-    mainline_days = Column(Integer, default=0)  # 连续主线天数
+    is_mainline = Column(Boolean, default=False, index=True)  # 是否为主线/降温/衰竭期板块
+    mainline_days = Column(Integer, default=0)  # 连续主线天数（含衍生期）
+    ambush_days = Column(Integer, default=0)  # 连续埋伏天数
     strength_trajectory = Column(Text)  # JSON array: [0.45, 0.48, 0.52]（最近 7 天强度）
     trend_direction = Column(String(20), index=True)  # increasing/stable/decreasing
     created_at = Column(DateTime, default=utc_naive_now)
@@ -1059,6 +1070,43 @@ class Node2SectorTrendRecord(Base):
     def set_strength_trajectory(self, trajectory: List[float]):
         """序列化 strength_trajectory 为 JSON"""
         self.strength_trajectory = json.dumps(trajectory, ensure_ascii=False)
+
+
+class SectorFrameRecord(Base):
+    """板块持久框记录（仅主线框）。
+
+    设计原则：
+    - 主线框按产业主题（frame_group）管理，而非单个板块
+    - 每个 frame_group 在同一时刻只属于一个框（frame_type 唯一）
+    - 强组容忍 3 天低分，弱组 1 天零容忍
+    - 埋伏板块不使用框系统，由 state=ambush 每日实时判定
+    """
+
+    __tablename__ = 'sector_frames'
+
+    frame_group = Column(String(50), primary_key=True)  # 产业主题名（如 AI产业链 / 黄金）
+    frame_type = Column(String(20), nullable=False)  # mainline（历史兼容，仅主线框使用）
+    entry_date = Column(Date, nullable=False)  # 入框日期
+    last_update = Column(Date, nullable=False)  # 最近更新日期
+    member_codes = Column(Text)  # JSON array: ["880645", "880948"] 当前成员板块 code
+    group_score = Column(Float)  # 成员最高 strength_score
+    has_strong_member = Column(Boolean, default=False)  # 是否含 S/A 级成员
+    consecutive_low_days = Column(Integer, default=0)  # 连续低分天数
+    consecutive_rise_days = Column(Integer, default=0)  # 连续上涨天数（埋伏晋升用）
+    exit_reason = Column(String(30))  # 踢出原因（过期记录保留）
+    is_active = Column(Boolean, default=True, index=True)  # 是否仍在框内
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    def get_member_codes(self) -> List[str]:
+        if not self.member_codes:
+            return []
+        try:
+            return json.loads(self.member_codes)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def set_member_codes(self, codes: List[str]):
+        self.member_codes = json.dumps(codes, ensure_ascii=False)
 
 
 class _DatabaseManagerMeta(type):
@@ -1141,6 +1189,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._migrate_node2_sector_trends()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1159,6 +1208,43 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._SessionLocal = None
             self.__class__._instance = None
             raise
+
+    def _migrate_node2_sector_trends(self) -> None:
+        """幂等轻量迁移：为 node2_sector_trends 补齐状态机新列。
+
+        SQLAlchemy create_all 只建新表、不补旧表列。老库 upgrade 后缺列会导致
+        INSERT/SELECT 抛异常，故此处用 PRAGMA 检查缺列 → ALTER TABLE ADD COLUMN。
+        幂等：已存在的列跳过；回滚代码后残留新列无害（SELECT 正常）。
+        失败不阻塞启动：_load_all_sector_trends 对缺失列有 try/except 默认值兜底。
+        """
+        if not self._is_sqlite_engine:
+            return
+        new_columns = {
+            "state": "VARCHAR(32)",
+            "dwell_days": "INTEGER",
+            "rrg_ratio_ema": "FLOAT",
+            "rrg_momentum_ema": "FLOAT",
+        }
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='node2_sector_trends'")
+                ).scalar()
+                if not table_exists:
+                    return
+                existing = {
+                    row[1]
+                    for row in session.execute(text("PRAGMA table_info(node2_sector_trends)")).fetchall()
+                }
+                for col, col_type in new_columns.items():
+                    if col not in existing:
+                        session.execute(
+                            text(f"ALTER TABLE node2_sector_trends ADD COLUMN {col} {col_type}")
+                        )
+                        logger.info("[storage] 迁移 node2_sector_trends: 新增列 %s", col)
+                session.commit()
+        except Exception as exc:
+            logger.warning("[storage] node2_sector_trends 列迁移失败，降级运行: %s", exc)
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()

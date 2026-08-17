@@ -1,22 +1,21 @@
 """
-Node 6: 聚合节点（v2 — 置信度加权聚合 + 条件迭代精炼）
+Node 6: 聚合节点（v3 — 分层 GOT 架构）
 
-设计理念（基于 15+ 篇论文）：
-- 投票优于辩论（Debate-or-Vote, NeurIPS 2025）
-- 质量评估优于计数（AoR, LREC 2024）
-- 概率聚合在 LLM 外部完成（ThinkSum, ACL 2023）
-- 反 Sycophancy（ConsensAgent, ACL 2025）
+设计理念：
+- 全局环境感知（Level 0）：使用 5 个节点的全局聚合字段判断市场 regime
+- 板块级情报整合（Level 1）：对每个候选板块做 4 维 mini GOT 交叉验证
+- 组合决策（Level 2）：基于 regime + confirmed_sectors 计算仓位和信号
 
-三阶段流水线：
-  Phase A: 信号标准化 + 置信度加权聚合（纯规则，零 LLM）
-  Phase B: 异常检测（自动矛盾 + EMA 时间一致性 + 消息面覆盖）
-  Phase C: 条件 LLM 精炼（最多 2 次调用，分歧大或异常时触发）
+参考论文：
+- ICLR 2025: Top-Down Sector Allocation（板块配置即决策）
+- FINCON NeurIPS 2024: Manager-Analyst 层级（Analyst 输出 insight 而非 score）
+- FinCoT ACL 2025: 推理结构匹配领域工作流
 """
 
 import asyncio
-import itertools
 import json
 import logging
+import re
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -31,10 +30,9 @@ from src.got.schemas import (
     NewsOverride,
     TemporalInconsistency,
     DataQuality,
-    DimensionSignal,
-    ConvergenceProfile,
-    DimensionContribution,
-    AggregationResult,
+    MarketRegime,
+    SectorIntel,
+    SectorDetail,
 )
 from src.got.persistence import (
     load_previous_context,
@@ -60,19 +58,11 @@ SYSTEMIC_KEYWORDS = [
     "印花税", "暂停", "熔断", "救市", "护盘",
 ]
 
-# 信号投影权重（用于板块维度）
-SECTOR_SCORE_SCALE = 100.0
-
-# LLM 精炼触发阈值
-AGREEMENT_THRESHOLD = 0.5
-CONTRADICTION_CONFIDENCE_THRESHOLD = 0.4
-CONTRADICTION_SCORE_THRESHOLD = -0.2
-
-# Surprising Popularity: 异见置信度倍数阈值
-OUTLIER_CONFIDENCE_RATIO = 1.5
-
 # 仓位日限幅
 POSITION_LIMIT_DELTA = 0.2
+
+# 泛化后缀：匹配时需剥离，防止 "概念" 等无意义后缀造成假阳性
+GENERIC_SUFFIXES = ("概念",)
 
 
 # =============================================================================
@@ -80,7 +70,7 @@ POSITION_LIMIT_DELTA = 0.2
 # =============================================================================
 
 class AggregatorNode:
-    """Node 6: 置信度加权聚合 + 条件迭代精炼"""
+    """Node 6: 分层 GOT 聚合（全局环境 → 板块 mini GOT → 组合决策）"""
 
     def __init__(self, use_mock: bool = True):
         self.use_mock = use_mock
@@ -93,410 +83,1160 @@ class AggregatorNode:
         news: NewsContext,
         sentiment: SentimentContext,
     ) -> UnifiedContext:
-        """执行聚合分析（三阶段流水线）"""
+        """执行分层 GOT 聚合"""
         if self.use_mock:
             logger.info("[Node 6] 使用 mock 数据")
             return self._mock_output()
 
-        logger.info("[Node 6] 开始 v2 聚合分析")
+        logger.info("[Node 6] 开始 v3 分层 GOT 聚合")
         today = date.today()
 
-        # ── Phase A: 信号标准化 + 置信度加权聚合 ──
-        signals = self._project_to_signal_space(market, sector, capital, news, sentiment)
-        aggregation = self._confidence_weighted_aggregate(signals)
-
-        # 计算信号置信度均值（衡量市场方向清晰度）
-        active_signals = [s for s in signals if s.status != "failed"]
-        sig_conf_avg = (
-            sum(s.confidence for s in active_signals) / len(active_signals)
-            if active_signals else 0.0
-        )
-        insufficient_data = sig_conf_avg < 0.5
-
+        # ── Level 0: 全局环境感知 ──
+        regime = self._compute_market_regime(market, sector, capital, news, sentiment)
         logger.info(
-            f"[Node 6] Phase A — weighted_score={aggregation.weighted_score:.3f}, "
-            f"convergence={aggregation.convergence.pattern}, "
-            f"agreement={aggregation.convergence.agreement_score:.2f}, "
-            f"sig_conf_avg={sig_conf_avg:.2f}, insufficient={insufficient_data}"
+            f"[Node 6] Level 0 — regime={regime.regime}, "
+            f"risk_budget={regime.risk_budget:.2f}, "
+            f"fear_greed={regime.fear_greed:.2f}"
         )
 
-        # ── 信息充分度门控 ──
-        if insufficient_data:
-            logger.warning(
-                f"[Node 6] 信号置信度均值 {sig_conf_avg:.2f} < 0.5，"
-                f"市场无可操作信号，建议空仓观望"
-            )
-            result = self._build_insufficient_data_output(
-                signals, aggregation, sig_conf_avg, news, today,
-            )
-            # 仍需持久化（EMA 基线需要每日更新）
-            self._save_context(result, market, sector, aggregation, today)
-            # 回写 EMA 基线
-            updated_ema = load_ema_baseline()
-            if updated_ema:
-                result.ema_baseline = updated_ema.get("weighted_score")
-            return result
+        # ── Level 1: 板块 mini GOT ──
+        sector_intels = self._build_sector_intel(sector, capital, news, sentiment)
+        logger.info(
+            f"[Node 6] Level 1 — {len(sector_intels)} 个板块情报, "
+            f"actionable={sum(1 for s in sector_intels if s.classification == 'actionable')}, "
+            f"caution={sum(1 for s in sector_intels if s.classification == 'caution')}, "
+            f"exclude={sum(1 for s in sector_intels if s.classification == 'exclude')}"
+        )
 
-        # ── Phase B: 异常检测 ──
-        contradictions = self._auto_detect_contradictions(signals)
-        temporal = self._adaptive_temporal_check(aggregation)
+        # LLM 精炼板块情报
+        sector_intels = await self._llm_refine_sectors(sector_intels, regime)
+
+        # ── Level 2: 组合决策 ──
+        position_limit = self._compute_position_from_regime(regime, sector_intels, market.position_limit)
+        unified_signal = self._determine_unified_signal(regime, sector_intels)
+
+        # 移除日限幅：三层仓位系统（波动率调整 + 状态缩放 + 回撤保护）已提供平滑过渡
+        # 旧版日限幅 bug：当 market.position_limit=0.0 时，clip 到 [−0.2, 0.2] 导致锁死 20%
+        # 参考：Moreira & Muir (2017), AlgoKing "Dynamic Position Sizing with Kelly + Regime"
+        final_position = position_limit
+
+        # ── 辅助信息 ──
+        contradictions = self._detect_contradictions(regime, sector_intels, sector, capital)
+        temporal = self._adaptive_temporal_check(regime)
         override = await self._simplified_news_override(news, market)
-        logger.info(
-            f"[Node 6] Phase B 完成 — {len(contradictions)} 对矛盾, "
-            f"{len(temporal)} 个时间异常, override={override is not None}"
-        )
 
-        # ── Phase C: 条件 LLM 精炼 ──
-        needs_llm = self._needs_llm_refinement(aggregation, contradictions, temporal, override)
-        if needs_llm:
-            logger.info("[Node 6] Phase C: 触发 LLM 精炼")
-            verdict = await self._llm_generate(aggregation, contradictions, temporal, override, signals)
-            verdict = await self._llm_critique(verdict, signals)
-        else:
-            logger.info("[Node 6] Phase C: 跳过 LLM，使用规则输出")
-            verdict = self._rule_based_verdict(aggregation, market, capital)
+        key_risks = self._collect_key_risks(news, sentiment, temporal)
+        key_opportunities = self._collect_key_opportunities(sector_intels)
 
         # ── 构建输出 ──
-        # 日限幅
-        final_position = clip(
-            verdict.get("final_position_limit", 0.5),
-            market.position_limit - POSITION_LIMIT_DELTA,
-            market.position_limit + POSITION_LIMIT_DELTA,
-        )
-
-        key_risks = self._collect_key_risks(news, sentiment, verdict, temporal)
-        key_opportunities = self._collect_key_opportunities(sector, news, verdict)
-
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
-            unified_signal=verdict.get("unified_signal", "neutral"),
-            overall_confidence=clip(verdict.get("overall_confidence", 0.5), 0.0, 1.0),
+            unified_signal=unified_signal,
+            overall_confidence=self._compute_overall_confidence(regime, sector_intels),
             final_position_limit=clip(final_position, 0.0, 1.0),
             contradictions=contradictions,
-            common_root_cause=verdict.get("common_root_cause"),
+            common_root_cause=None,
             news_override=override,
             temporal_inconsistencies=temporal,
             key_risks=key_risks,
             key_opportunities=key_opportunities,
             concept_suggestions=news.concept_suggestions,
-            reasoning=verdict.get("reasoning"),
-            data_quality=self._build_data_quality(signals),
-            convergence_profile=aggregation.convergence,
-            weighted_score=aggregation.weighted_score,
-            dimension_contributions=aggregation.dimension_contributions,
-            llm_refinement_used=needs_llm,
-            ema_baseline=None,  # 从 temporal 异常中提取
-            signal_confidence_avg=round(sig_conf_avg, 3),
-            insufficient_data=insufficient_data,
+            reasoning=self._build_reasoning(regime, sector_intels, contradictions),
+            data_quality=self._build_data_quality(market, sector, capital, news, sentiment),
+            market_regime=regime,
+            llm_refinement_used=True,
+            ema_baseline=None,
+            confirmed_sectors=sector_intels,
         )
 
         # 持久化
-        self._save_context(unified, market, sector, aggregation, today)
+        self._save_context(unified, regime, sector_intels, today)
 
-        # 回写 EMA 基线到输出（_save_context 已更新磁盘）
+        # 回写 EMA 基线
         updated_ema = load_ema_baseline()
         if updated_ema:
-            unified.ema_baseline = updated_ema.get("weighted_score")
+            unified.ema_baseline = updated_ema.get("regime_score")
 
         logger.info(
-            f"[Node 6] 聚合完成 — 信号: {unified.unified_signal}, "
-            f"置信度: {unified.overall_confidence:.2f}, "
+            f"[Node 6] 聚合完成 — regime: {regime.regime}, "
+            f"信号: {unified.unified_signal}, "
             f"仓位: {unified.final_position_limit:.0%}, "
-            f"LLM: {'是' if needs_llm else '否'}"
+            f"actionable sectors: {len([s for s in sector_intels if s.classification == 'actionable'])}"
         )
         return unified
 
     # =========================================================================
-    # Phase A: 信号标准化 + 置信度加权聚合
+    # Level 0: 全局环境感知
     # =========================================================================
 
     @staticmethod
-    def _project_to_signal_space(
+    def _compute_market_regime(
         market: MarketContext,
         sector: SectorContext,
         capital: CapitalContext,
         news: NewsContext,
         sentiment: SentimentContext,
-    ) -> list[DimensionSignal]:
-        """将 5 个维度 ctx 投影到统一信号空间 (-1, +1)
+    ) -> MarketRegime:
+        """全局市场环境判断（使用 5 个节点的全局聚合字段）"""
 
-        data_confidence: 数据完整度（available / total）→ 聚合权重衰减
-        confidence:     信号置信度（节点自评）→ 信息充分度门控
-        """
-        signals = []
+        # Node 1: 大盘
+        adx_value = market.tech_growth.regime_metadata.adx_value
+        cross_index_consistency = getattr(market.tech_growth, 'cross_index_consistency', 0.5)
 
-        # 1. 大盘技术面
-        #    data_confidence: K线数据完整度
-        dq = market.data_quality
-        total_fields = len(dq.available_fields) + len(dq.missing_fields) + len(dq.fetch_failed_fields)
-        market_data_conf = len(dq.available_fields) / max(total_fields, 1)
-        #    signal_confidence: 节点自评（已含 ADX/波动率/时间框架一致性调整）
-        market_sig_conf = market.confidence
-        market_score = market.tech_growth.score
-        signals.append(DimensionSignal(
-            name="market",
-            score=clip(market_score, -1.0, 1.0),
-            confidence=clip(market_sig_conf, 0.0, 1.0),
-            data_confidence=clip(market_data_conf, 0.0, 1.0),
-            status="normal" if market_data_conf > 0.5 else "degraded",
-        ))
+        # Node 2: 板块
+        market_direction = sector.market_direction
+        mainline_count = len(sector.active_mainline)
 
-        # 2. 板块
-        #    data_confidence: 板块数据是否完整
-        sdq = sector.data_quality
-        s_total = len(sdq.available_fields) + len(sdq.missing_fields) + len(sdq.fetch_failed_fields)
-        sector_data_conf = len(sdq.available_fields) / max(s_total, 1) if s_total > 0 else 1.0
-        #    signal_confidence: 有主线→高，无主线但数据完整→0.5（"市场确实无方向"是有价值信息）
-        if sector.active_mainline:
-            sector_sig_conf = 0.7
-        elif sector.market_direction == "分化":
-            sector_sig_conf = 0.5  # 数据完整 + 结论是"无方向" → 中等置信
+        # Node 3: 资金面
+        institutional_score = capital.institutional_score
+
+        # Node 4: 消息面
+        news_impact_score = news.impact_score
+
+        # Node 5: 情绪面
+        fear_greed = sentiment.fear_greed_index
+        sentiment_stage = sentiment.sentiment_stage
+        sentiment_momentum = sentiment.sentiment_momentum
+
+        # Regime 判定（规则决策树）
+        regime_score = 0.0
+
+        # Node 1: ADX + 趋势
+        if adx_value > 25:  # 有趋势
+            if market.tech_growth.score > 0.3:
+                regime_score += 0.3
+            elif market.tech_growth.score < -0.3:
+                regime_score -= 0.3
+        else:  # 无趋势
+            regime_score += market.tech_growth.score * 0.2
+
+        # Node 2: 板块方向
+        if market_direction == "普涨":
+            regime_score += 0.3
+        elif market_direction == "普跌":
+            regime_score -= 0.3
+        else:  # 分化
+            regime_score += 0.0
+
+        # Node 3: 资金面
+        regime_score += institutional_score * 0.2
+
+        # Node 4: 消息面
+        regime_score += news_impact_score * 0.1
+
+        # Node 5: 情绪面
+        # fear_greed: 0=恐惧, 1=贪婪
+        if fear_greed > 0.7:
+            regime_score += 0.1  # 贪婪 → 偏多
+        elif fear_greed < 0.3:
+            regime_score -= 0.1  # 恐惧 → 偏空
+
+        # sentiment_stage 修正
+        if sentiment_stage == "euphoria":
+            regime_score -= 0.15  # 过度乐观 → 反向修正
+        elif sentiment_stage == "capitulation":
+            regime_score += 0.15  # 过度悲观 → 反向修正
+        elif sentiment_stage == "optimism":
+            regime_score += 0.05
+        elif sentiment_stage == "pessimism":
+            regime_score -= 0.05
+
+        # 情绪动量
+        regime_score += sentiment_momentum * 0.1
+
+        # 分类 regime
+        regime_score = clip(regime_score, -1.0, 1.0)
+
+        if regime_score > 0.3:
+            regime = "bull"
+        elif regime_score < -0.3:
+            regime = "bear"
         else:
-            sector_sig_conf = 0.3
-        sector_score = AggregatorNode._compute_sector_score(sector)
-        signals.append(DimensionSignal(
-            name="sector",
-            score=clip(sector_score, -1.0, 1.0),
-            confidence=sector_sig_conf,
-            data_confidence=clip(sector_data_conf, 0.0, 1.0),
-            status="normal",
-        ))
+            regime = "transition"
 
-        # 3. 资金面
-        #    data_confidence: 基于 confidence_multiplier（缺失维度比例）
-        capital_data_conf = capital.confidence_multiplier
-        capital_status = capital.status
-        signals.append(DimensionSignal(
-            name="capital",
-            score=clip(capital.institutional_score, -1.0, 1.0),
-            confidence=capital_data_conf if capital_status != "failed" else 0.0,
-            data_confidence=capital_data_conf if capital_status != "failed" else 0.0,
-            status=capital_status,
-        ))
+        # 风险预算
+        if regime == "bull":
+            risk_budget = 0.6 + 0.2 * (regime_score - 0.3) / 0.7
+        elif regime == "bear":
+            risk_budget = 0.3 + 0.2 * (regime_score + 1.0) / 0.7
+        else:  # transition
+            risk_budget = 0.4 + 0.2 * (regime_score + 0.3) / 0.6
 
-        # 4. 消息面
-        #    data_confidence: status != failed → 完整
-        news_data_conf = 1.0 if news.status != "failed" else 0.0
-        signals.append(DimensionSignal(
-            name="news",
-            score=clip(news.impact_score, -1.0, 1.0),
-            confidence=0.8 if news.status != "failed" else 0.0,
-            data_confidence=news_data_conf,
-            status=news.status,
-        ))
+        risk_budget = clip(risk_budget, 0.2, 0.8)
 
-        # 5. 情绪面
-        #    data_confidence: 基于数据质量
-        sedq = sentiment.data_quality
-        se_total = len(sedq.available_fields) + len(sedq.missing_fields) + len(sedq.fetch_failed_fields)
-        sentiment_data_conf = len(sedq.available_fields) / max(se_total, 1) if se_total > 0 else 1.0
-        #    signal_confidence: 节点自评
-        signals.append(DimensionSignal(
-            name="sentiment",
-            score=clip(sentiment.sentiment_score, -1.0, 1.0),
-            confidence=sentiment.signal_confidence if sentiment.status != "failed" else 0.0,
-            data_confidence=sentiment_data_conf if sentiment.status != "failed" else 0.0,
-            status=sentiment.status,
-        ))
+        # 宏观判断文本
+        macro_overlay = (
+            f"regime_score={regime_score:.2f}, ADX={adx_value:.0f}, "
+            f"板块{market_direction}, 机构态度{institutional_score:+.2f}, "
+            f"恐贪={fear_greed:.2f}({sentiment_stage})"
+        )
 
-        return signals
+        return MarketRegime(
+            regime=regime,
+            risk_budget=round(risk_budget, 3),
+            adx_value=adx_value,
+            cross_index_consistency=cross_index_consistency,
+            market_direction=market_direction,
+            mainline_count=mainline_count,
+            institutional_score=institutional_score,
+            news_impact_score=news_impact_score,
+            fear_greed=fear_greed,
+            sentiment_stage=sentiment_stage,
+            sentiment_momentum=sentiment_momentum,
+            macro_overlay=macro_overlay,
+        )
+
+    # =========================================================================
+    # Level 1: 板块 mini GOT
+    # =========================================================================
+
+    def _build_sector_intel(
+        self,
+        sector: SectorContext,
+        capital: CapitalContext,
+        news: NewsContext,
+        sentiment: SentimentContext,
+    ) -> list[SectorIntel]:
+        """对每个候选板块做 4 维 mini GOT，标记主线/埋伏来源"""
+
+        # 收集候选板块：(name, detail, role_info)
+        candidates = []
+        seen_names = set()
+
+        # 主线板块（用组内最强成员代表）
+        for group in sector.active_mainline:
+            best_member = max(group.members, key=lambda m: m.strength_score) if group.members else None
+            role_info = {
+                "role": "mainline",
+                "tier": group.tier,
+                "quality": group.mainline_quality,
+                "mainline_days": best_member.mainline_days if best_member else None,
+            }
+            candidates.append((group.group_name, best_member, role_info))
+            seen_names.add(group.group_name)
+
+        # 埋伏板块
+        for detail in sector.ambush:
+            if detail.name not in seen_names:
+                role_info = {
+                    "role": "ambush",
+                    "tier": None,
+                    "quality": None,
+                    "mainline_days": None,
+                }
+                candidates.append((detail.name, detail, role_info))
+                seen_names.add(detail.name)
+
+        # 高位降温板块（前主线回调未破位，2026-08-17 状态机新增）：
+        # 纳入候选做 mini GOT，但独立角色，走 hold/reduce（防被误当埋伏选股）
+        for detail in sector.cooling_down:
+            if detail.name not in seen_names:
+                role_info = {
+                    "role": "cooling",
+                    "tier": detail.tier,
+                    "quality": "weak",
+                    "mainline_days": detail.mainline_days,
+                }
+                candidates.append((detail.name, detail, role_info))
+                seen_names.add(detail.name)
+
+        if not candidates:
+            return []
+
+        # 预提取各维度数据
+        capital_flows = self._parse_capital_flows(capital)
+        news_keywords = self._extract_news_keywords(news)
+        hot_sectors = self._extract_hot_sectors(sentiment)
+
+        # ── Pass 1: 计算所有板块的 composite score 和验证数据 ──
+        # 不创建 SectorIntel，先收集原始数据用于批量分类
+        raw_data = []  # [(name, composite, capital_check, news_check, detail, sector_role, ...)]
+        for name, detail, role_info in candidates:
+            sector_role = role_info.get("role", "mainline")
+            composite, capital_check, news_check, other = self._compute_sector_scores(
+                name, detail, capital_flows, news_keywords, hot_sectors, role_info,
+            )
+            raw_data.append((name, composite, capital_check, news_check, detail, sector_role, role_info, other))
+
+        # ── Pass 2: 批量分类（TOP-N → actionable）──
+        classify_input = [
+            (name, composite, capital_check, news_check, detail, sector_role)
+            for name, composite, capital_check, news_check, detail, sector_role, _, _ in raw_data
+        ]
+        classification_map = self._classify_all_sectors(classify_input, top_n=12)
+
+        # ── Pass 3: 创建 SectorIntel（使用批量分类结果）──
+        results = []
+        for name, composite, capital_check, news_check, detail, sector_role, role_info, other in raw_data:
+            classification = classification_map.get(name, "caution")
+            intel = self._build_sector_intel_from_scores(
+                name, detail, sector_role, role_info,
+                composite, capital_check, news_check, classification, other,
+            )
+            results.append(intel)
+
+        # 按 composite_score 降序排列
+        results.sort(key=lambda x: x.composite_score, reverse=True)
+
+        return results
+
+    def _compute_sector_scores(
+        self,
+        name: str,
+        detail: Optional[SectorDetail],
+        capital_flows: list[tuple[str, float]],
+        news_keywords: list[tuple[str, str, str]],
+        hot_sectors: list[str],
+        role_info: Optional[dict] = None,
+    ) -> tuple[float, str, str, dict]:
+        """计算板块的 4 维评分和综合分（不含分类）
+
+        Returns:
+            (composite_score, capital_check, news_check, other_data_dict)
+            other_data_dict 包含创建 SectorIntel 所需的所有中间数据
+        """
+        role_info = role_info or {"role": "mainline", "tier": None, "quality": None, "mainline_days": None}
+        sector_role = role_info.get("role", "mainline")
+
+        # ── 维度 1: 技术面（来自 Node 2）──
+        if detail:
+            tech_score = detail.strength_score
+            lifecycle = detail.lifecycle
+            trajectory = detail.strength_trajectory
+            tier = detail.tier
+
+            # 构建技术面详情
+            tech_parts = []
+            if lifecycle:
+                tech_parts.append(f"lifecycle={lifecycle.phase}")
+                if lifecycle.days_since_launch:
+                    tech_parts.append(f"day{lifecycle.days_since_launch}")
+            if tier:
+                tech_parts.append(f"tier={tier}")
+            if detail.mainline_quality:
+                tech_parts.append(f"quality={detail.mainline_quality}")
+
+            # trajectory 趋势
+            if trajectory and len(trajectory) >= 2:
+                recent = trajectory[-min(3, len(trajectory)):]
+                slope = (recent[-1] - recent[0]) / max(len(recent) - 1, 1)
+                if slope > 5:
+                    tech_parts.append("trajectory↑")
+                elif slope < -5:
+                    tech_parts.append("trajectory↓")
+
+            tech_detail = ", ".join(tech_parts) if tech_parts else "无详细信息"
+        else:
+            tech_score = 50.0  # 默认中等
+            tech_detail = "无 Node 2 数据"
+
+        # ── 维度 2: 资金面 ──
+        capital_check, capital_detail = self._cross_check_capital(name, capital_flows)
+
+        # ── 维度 3: 消息面 ──
+        news_check, news_detail = self._cross_check_news(name, news_keywords)
+
+        # ── 维度 4: 情绪面 ──
+        sentiment_check, sentiment_detail = self._cross_check_sentiment(name, hot_sectors)
+
+        # ── 综合评分 ──
+        # 基础分 = 技术面（Node 2 的 strength_score）
+        composite = tech_score
+
+        # 资金面修正（从门槛变为放大器）
+        if capital_check == "aligned":
+            composite += 10
+        elif capital_check == "divergent":
+            composite -= 15
+
+        # 消息面修正
+        if news_check == "catalyzed":
+            composite += 8
+        elif news_check == "negative":
+            composite -= 12
+
+        # 情绪面修正
+        if sentiment_check == "high":
+            composite += 5
+        elif sentiment_check == "low":
+            composite -= 5
+
+        # Lifecycle 修正
+        if detail and detail.lifecycle:
+            phase = detail.lifecycle.phase
+            if phase in ("launch", "acceleration"):
+                composite += 8  # 早期阶段加分
+            elif phase in ("late_stage", "mature_exhausted"):
+                composite -= 15  # 晚期阶段减分
+
+        composite = clip(composite, 0, 100)
+
+        # 置信度（基于数据完整度）
+        confidence = 0.5
+        if detail:
+            confidence += 0.2  # 有 Node 2 数据
+        if capital_check != "neutral":
+            confidence += 0.1  # 资金面有信号
+        if news_check != "neutral":
+            confidence += 0.1  # 消息面有信号
+        if sentiment_check != "low":
+            confidence += 0.1  # 情绪面有信号
+        confidence = clip(confidence, 0.0, 1.0)
+
+        other = {
+            "tech_score": tech_score,
+            "tech_detail": tech_detail,
+            "capital_detail": capital_detail,
+            "news_detail": news_detail,
+            "sentiment_check": sentiment_check,
+            "sentiment_detail": sentiment_detail,
+            "confidence": confidence,
+            "sector_role": sector_role,
+        }
+
+        return composite, capital_check, news_check, other
+
+    def _build_sector_intel_from_scores(
+        self,
+        name: str,
+        detail: Optional[SectorDetail],
+        sector_role: str,
+        role_info: dict,
+        composite: float,
+        capital_check: str,
+        news_check: str,
+        classification: str,
+        other: dict,
+    ) -> SectorIntel:
+        """从预计算的评分创建 SectorIntel（分类已由批量分类器决定）"""
+        reasoning = f"{name}: {classification}, score={composite:.0f}, {other['tech_detail']}"
+
+        return SectorIntel(
+            sector_name=name,
+            sector_code=detail.code if detail else "",
+            sector_type="concept",
+            sector_role=sector_role,
+            mainline_tier=role_info.get("tier"),
+            mainline_quality=role_info.get("quality"),
+            mainline_days=role_info.get("mainline_days"),
+            tech_score=other["tech_score"],
+            tech_detail=other["tech_detail"],
+            capital_check=capital_check,
+            capital_detail=other["capital_detail"],
+            news_check=news_check,
+            news_detail=other["news_detail"],
+            sentiment_check=other["sentiment_check"],
+            sentiment_detail=other["sentiment_detail"],
+            lifecycle=detail.lifecycle if detail and detail.lifecycle else None,
+            composite_score=round(composite, 1),
+            confidence=round(other["confidence"], 3),
+            classification=classification,
+            reasoning=reasoning,
+        )
+
+    def _cross_check_capital(
+        self,
+        name: str,
+        flows: list[tuple[str, float]],
+    ) -> tuple[str, str]:
+        """资金面交叉验证: (check, detail)"""
+        if not flows:
+            return "neutral", "资金面数据缺失"
+
+        # 模糊匹配：板块名是否出现在资金流 top 中
+        for flow_name, amount in flows:
+            if self._fuzzy_match(name, flow_name):
+                if amount > 10:
+                    return "aligned", f"{flow_name}净流入{amount:.1f}亿"
+                else:
+                    return "aligned", f"{flow_name}净流入{amount:.1f}亿（小额）"
+
+        # 子词匹配（剥离泛化后缀后）
+        clean_name = self._strip_generic_suffix(name)
+        name_parts = self._split_sector_name(clean_name)
+        for flow_name, amount in flows:
+            clean_flow = self._strip_generic_suffix(flow_name)
+            for part in name_parts:
+                if len(part) >= 2 and (part in clean_flow or clean_flow in part):
+                    if amount > 10:
+                        return "aligned", f"关联[{flow_name}]净流入{amount:.1f}亿"
+                    else:
+                        return "neutral", f"关联[{flow_name}]流入{amount:.1f}亿"
+
+        return "neutral", f"{name}不在资金流入 top"
+
+    def _cross_check_news(
+        self,
+        name: str,
+        keywords: list[tuple[str, str, str]],
+    ) -> tuple[str, str]:
+        """消息面交叉验证: (check, detail)"""
+        if not keywords:
+            return "neutral", "无消息催化"
+
+        name_parts = self._split_sector_name(name)
+        matched_events = []
+
+        for kw, title, sentiment in keywords:
+            for part in name_parts:
+                if len(part) >= 2 and (part in kw or kw in part or part in title):
+                    matched_events.append((title, sentiment))
+                    break
+
+        if not matched_events:
+            return "neutral", f"{name}无直接消息催化"
+
+        # 去重
+        seen = set()
+        unique = []
+        for title, sentiment in matched_events:
+            if title not in seen:
+                seen.add(title)
+                unique.append((title, sentiment))
+
+        pos = sum(1 for _, s in unique if s == "positive")
+        neg = sum(1 for _, s in unique if s == "negative")
+
+        if pos > neg and pos >= 2:
+            return "catalyzed", f"{pos}条正面催化: {unique[0][0][:30]}"
+        elif pos > neg:
+            return "catalyzed", f"1条正面催化: {unique[0][0][:30]}"
+        elif neg > pos:
+            return "negative", f"{neg}条负面消息: {unique[0][0][:30]}"
+        else:
+            return "neutral", f"消息中性: {unique[0][0][:30]}"
+
+    def _cross_check_sentiment(
+        self,
+        name: str,
+        hot_sectors: list[str],
+    ) -> tuple[str, str]:
+        """情绪面交叉验证: (check, detail)"""
+        if not hot_sectors:
+            return "low", "无热榜数据"
+
+        # 检查板块名是否出现在热榜关联板块中
+        name_parts = self._split_sector_name(name)
+        match_count = 0
+
+        for hot_sector in hot_sectors:
+            for part in name_parts:
+                if len(part) >= 2 and (part in hot_sector or hot_sector in part):
+                    match_count += 1
+                    break
+
+        if match_count >= 3:
+            return "high", f"{match_count}只关联股票上热榜"
+        elif match_count >= 1:
+            return "medium", f"{match_count}只关联股票上热榜"
+        else:
+            return "low", f"{name}未上热榜"
+
+    def _classify_all_sectors(
+        self,
+        candidates: list[tuple[str, float, str, str, Optional[SectorDetail], str]],
+        top_n: int = 12,
+    ) -> dict[str, str]:
+        """批量板块分类（TOP-N + conviction 分级）
+
+        参考论文：
+        - Bergemann, Hege & Peng (2008): 不确定性下序贯投资，分阶段递进
+        - Black-Litterman: 不同置信度 → 不同仓位权重（非二元准入）
+        - Ben-David et al. (NBER): 资金流是领先指标，非确认指标
+
+        设计：
+        - 排名决定能不能进（TOP-N 截断，控制候选池规模）
+        - 角色决定仓位大小（主线/埋伏 → conviction multiplier）
+        - 资金面从门槛变成放大器（有资金→加分，无资金→不减分）
+
+        Args:
+            candidates: (name, composite, capital_check, news_check, detail, sector_role)
+            top_n: actionable 板块上限
+
+        Returns:
+            {sector_name: classification}，值为 actionable / caution / exclude
+        """
+        if not candidates:
+            return {}
+
+        result = {}
+
+        # ── Pass 1: 标记硬拒绝（不可被 TOP-N 覆盖）──
+        for name, composite, capital_check, news_check, detail, sector_role in candidates:
+            if self._is_hard_exclude(composite, capital_check, news_check, detail):
+                result[name] = "exclude"
+
+        # ── Pass 2: 按综合分排名，TOP-N → actionable，其余 → caution ──
+        eligible = sorted(
+            [(name, score) for name, score, *_ in candidates if name not in result],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        actionable_count = 0
+        for name, score in eligible:
+            if actionable_count < top_n and score >= 50:
+                result[name] = "actionable"
+                actionable_count += 1
+            else:
+                result[name] = "caution"
+
+        return result
 
     @staticmethod
-    def _compute_sector_score(sector: SectorContext) -> float:
-        """从板块 ctx 计算统一方向分"""
-        # 主线板块平均强度 → 正向
-        if sector.active_mainline:
-            avg_strength = sum(s.strength_score for s in sector.active_mainline) / len(sector.active_mainline)
-            mainline_score = avg_strength / SECTOR_SCORE_SCALE  # 归一化到 0~1
-        else:
-            mainline_score = 0.0
+    def _is_hard_exclude(
+        composite: float,
+        capital_check: str,
+        news_check: str,
+        detail: Optional[SectorDetail],
+    ) -> bool:
+        """硬拒绝判定（不可被 TOP-N 覆盖）"""
+        if composite < 40:
+            return True
+        if detail and detail.lifecycle:
+            phase = detail.lifecycle.phase
+            if phase in ("late_stage", "mature_exhausted"):
+                if capital_check == "divergent" or news_check == "negative":
+                    return True
+        return False
 
-        # market_direction 映射
-        direction_map = {"普涨": 0.3, "分化": 0.0, "普跌": -0.3}
-        direction_adj = direction_map.get(sector.market_direction, 0.0)
+    async def _llm_refine_sectors(
+        self,
+        sectors: list[SectorIntel],
+        regime: MarketRegime,
+    ) -> list[SectorIntel]:
+        """LLM 精炼板块情报（可选，生成 narrative + 跨板块风险）"""
+        if not sectors:
+            return sectors
 
-        return clip(mainline_score + direction_adj, -1.0, 1.0)
+        # 构建板块情报文本
+        sector_lines = []
+        for i, s in enumerate(sectors[:10], 1):  # 只取前 10 个
+            sector_lines.append(
+                f"{i}. {s.sector_name} | {s.classification} | score={s.composite_score:.0f}\n"
+                f"   {s.tech_detail}\n"
+                f"   资金: {s.capital_check}（{s.capital_detail}）\n"
+                f"   催化: {s.news_check}（{s.news_detail}）\n"
+                f"   热度: {s.sentiment_check}（{s.sentiment_detail}）"
+            )
+
+        sectors_text = "\n".join(sector_lines)
+
+        prompt = f"""全局环境：regime={regime.regime}, risk_budget={regime.risk_budget:.2f}
+恐贪指数：{regime.fear_greed:.2f}（{regime.sentiment_stage}）
+
+板块情报：
+{sectors_text}
+
+请输出 JSON：
+{{
+  "narrative": "一段话总结板块格局（50字内）",
+  "cross_sector_risks": ["跨板块风险1", "跨板块风险2"],
+  "adjustments": [
+    {{"sector": "板块名", "new_classification": "actionable/caution/exclude", "reason": "调整理由"}}
+  ]
+}}"""
+
+        raw_text = await self._call_llm_async(prompt, temperature=0.3, max_tokens=500)
+
+        # 分类层级（数值越大越"好"），用于判断上调/下调
+        CLASS_RANK = {
+            "exclude": 0, "caution": 1, "actionable": 2,
+        }
+
+        try:
+            result = self._parse_json(raw_text)
+
+            # 应用调整（仅允许上调，禁止下调）
+            adjustments = result.get("adjustments", [])
+            for adj in adjustments:
+                sector_name = adj.get("sector", "")
+                new_class = adj.get("new_classification", "")
+                reason = adj.get("reason", "")
+
+                if new_class not in CLASS_RANK:
+                    continue
+
+                for s in sectors:
+                    if s.sector_name != sector_name:
+                        continue
+                    old_rank = CLASS_RANK.get(s.classification, 2)
+                    new_rank = CLASS_RANK.get(new_class, 2)
+                    if new_rank <= old_rank:
+                        # 禁止下调：confirmed → watch 等
+                        logger.warning(
+                            f"[Node 6] 跳过降级: {sector_name} {s.classification}→{new_class}（{reason}）"
+                        )
+                    else:
+                        s.classification = new_class
+                        s.reasoning += f" [LLM调整: {reason}]"
+                    break
+
+            # 添加 narrative 到第一个板块的 reasoning（作为全局摘要）
+            narrative = result.get("narrative", "")
+            if narrative and sectors:
+                sectors[0].reasoning = f"[全局] {narrative} | {sectors[0].reasoning}"
+
+            return sectors
+        except Exception as e:
+            logger.warning(f"[Node 6] LLM 精炼板块情报失败: {e}")
+            return sectors
+
+    # =========================================================================
+    # Level 2: 组合决策
+    # =========================================================================
 
     @staticmethod
-    def _confidence_weighted_aggregate(signals: list[DimensionSignal]) -> AggregationResult:
-        """置信度加权聚合
+    def _compute_position_from_regime(
+        regime: MarketRegime,
+        confirmed: list[SectorIntel],
+        base_position: float,
+    ) -> float:
+        """基于 regime + actionable_sectors 计算仓位"""
 
-        权重使用 data_confidence（数据完整度），而非 confidence（信号置信度）。
-        - 数据缺失的维度 → 降权（Node 3 缺北向/ETF → 0.6 权重）
-        - 数据完整但信号模糊 → 不降权（Node 1 波动大 → 仍 1.0 权重，但 confidence=0.3 被记录）
+        actionable_count = len([s for s in confirmed if s.classification == "actionable"])
+        avg_confidence = (
+            sum(s.confidence for s in confirmed if s.classification == "actionable") / actionable_count
+            if actionable_count > 0 else 0.0
+        )
+
+        if regime.regime == "bear":
+            # 熊市：低仓位
+            position = 0.2 + 0.1 * actionable_count
+        elif regime.regime == "transition":
+            # 震荡市：中等仓位
+            position = 0.3 + 0.1 * actionable_count + 0.1 * avg_confidence
+        else:  # bull
+            # 牛市：较高仓位
+            position = 0.4 + 0.08 * actionable_count + 0.1 * avg_confidence
+
+        # 限制在 risk_budget 内
+        position = min(position, regime.risk_budget)
+
+        return clip(position, 0.0, 0.8)
+
+    @staticmethod
+    def _determine_unified_signal(
+        regime: MarketRegime,
+        sectors: list[SectorIntel],
+    ) -> str:
+        """基于 regime + sectors 判定统一信号"""
+
+        actionable_count = len([s for s in sectors if s.classification == "actionable"])
+        exclude_count = len([s for s in sectors if s.classification == "exclude"])
+
+        if regime.regime == "bull" and actionable_count >= 3:
+            return "bullish"
+        elif regime.regime == "bear" and exclude_count >= 3:
+            return "bearish"
+        elif actionable_count > exclude_count:
+            return "cautious"  # 偏多但谨慎
+        else:
+            return "neutral"
+
+    @staticmethod
+    def _compute_overall_confidence(
+        regime: MarketRegime,
+        sectors: list[SectorIntel],
+    ) -> float:
+        """计算整体置信度"""
+
+        actionable = [s for s in sectors if s.classification == "actionable"]
+        if not actionable:
+            return 0.3
+
+        avg_conf = sum(s.confidence for s in actionable) / len(actionable)
+
+        # Regime 一致性加成
+        if regime.regime == "bull":
+            regime_bonus = 0.1
+        elif regime.regime == "bear":
+            regime_bonus = 0.1
+        else:
+            regime_bonus = 0.0
+
+        return clip(avg_conf * 0.8 + regime_bonus + 0.2, 0.0, 1.0)
+
+    # =========================================================================
+    # 辅助方法
+    # =========================================================================
+
+    @staticmethod
+    def _parse_capital_flows(capital: CapitalContext) -> list[tuple[str, float]]:
+        """解析资金流数据: [("核电", 31.6), ("绿色电力", 23.9), ...]"""
+        flows = []
+        evidence = capital.evidence
+        if not evidence.sector_flow:
+            return flows
+
+        for key in ("top_concepts", "top_industries"):
+            items = evidence.sector_flow.get(key, [])
+            for item in items:
+                match = re.match(r'(.+?)\(([+-]?[\d.]+)亿\)', item)
+                if match:
+                    flows.append((match.group(1), float(match.group(2))))
+        return flows
+
+    @staticmethod
+    def _extract_news_keywords(news: NewsContext) -> list[tuple[str, str, str]]:
+        """提取消息面关键词: [(关键词, 事件标题, sentiment), ...]"""
+        keywords = []
+        for event in news.major_events:
+            for sector_name in event.affected_sectors:
+                keywords.append((sector_name, event.title, event.sentiment))
+            keywords.append((event.title, event.title, event.sentiment))
+
+        for concept in news.concept_suggestions:
+            name = concept.get("concept_name", "")
+            if name:
+                keywords.append((name, name, "positive"))
+
+        return keywords
+
+    @staticmethod
+    def _extract_hot_sectors(sentiment: SentimentContext) -> list[str]:
+        """提取热榜关联板块"""
+        sectors = []
+        for stock in sentiment.hot_stocks:
+            sectors.extend(stock.associated_sectors)
+        return list(set(sectors))
+
+    @staticmethod
+    def _strip_generic_suffix(name: str) -> str:
+        """剥离泛化后缀（'AIGC概念' → 'AIGC'），防止后缀成为假阳性匹配词素"""
+        for suffix in GENERIC_SUFFIXES:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                return name[:-len(suffix)]
+        return name
+
+    @staticmethod
+    def _fuzzy_match(sector_name: str, target: str) -> bool:
+        """模糊匹配（先剥离泛化后缀再比较）"""
+        s = AggregatorNode._strip_generic_suffix(sector_name)
+        t = AggregatorNode._strip_generic_suffix(target)
+        if s == t:
+            return True
+        if t in s or s in t:
+            return True
+        for part in AggregatorNode._split_sector_name(s):
+            if len(part) >= 2 and (part in t or t in part):
+                return True
+        return False
+
+    @staticmethod
+    def _split_sector_name(name: str) -> list[str]:
+        """拆分板块名为子词列表。
+
+        先剥离泛化后缀（"概念"等），防止拆出"概念"这种万能匹配词素。
         """
-        active = [s for s in signals if s.status != "failed" and s.data_confidence > 0]
-        failed_count = len(signals) - len(active)
+        # 先剥离泛化后缀，再拆分
+        stripped = AggregatorNode._strip_generic_suffix(name)
+        parts = [stripped]
+        clean = re.sub(r'[（(].*?[）)]', '', stripped).strip()
+        if clean != stripped:
+            parts.append(clean)
+        if len(clean) >= 4:
+            for i in range(2, len(clean)):
+                parts.append(clean[:i])
+                parts.append(clean[i:])
+        for sep in ['/', '、', '与', '及']:
+            if sep in stripped:
+                parts.extend(stripped.split(sep))
+        # 过滤掉泛化后缀本身和过短词
+        return [p for p in parts if len(p) >= 2 and p not in GENERIC_SUFFIXES]
 
-        if not active:
-            return AggregationResult(
-                weighted_score=0.0,
-                convergence=ConvergenceProfile(pattern="low_confidence", agreement_score=0.0),
-                dimension_contributions=[],
-                active_count=0,
-                failed_count=failed_count,
-            )
+    @staticmethod
+    def _has_critical(temporal: list[TemporalInconsistency]) -> bool:
+        return any(t.severity == "critical" for t in temporal)
 
-        # 用 data_confidence 做权重
-        total_weight = sum(s.data_confidence for s in active)
-        weighted_score = sum(s.score * s.data_confidence for s in active) / total_weight
+    @staticmethod
+    def _collect_key_risks(
+        news: NewsContext,
+        sentiment: SentimentContext,
+        temporal: list[TemporalInconsistency],
+    ) -> list[str]:
+        """汇总关键风险"""
+        risks = list(news.key_risks[:3])
 
-        # 各维度贡献明细（含 data_confidence 和 signal_confidence）
-        contributions = [
-            DimensionContribution(
-                name=s.name,
-                score=s.score,
-                confidence=s.confidence,
-                data_confidence=s.data_confidence,
-                contribution=(s.score * s.data_confidence) / total_weight,
-            )
-            for s in active
+        if sentiment.sentiment_stage == "euphoria":
+            risks.append("散户情绪极度狂热（反向信号）")
+        elif sentiment.sentiment_stage == "capitulation":
+            risks.append("散户极度恐慌（市场可能超跌）")
+
+        for t in temporal:
+            if t.severity in ("critical", "high"):
+                risks.append(f"[时间异常] {t.description}")
+
+        return risks[:6]
+
+    @staticmethod
+    def _collect_key_opportunities(sectors: list[SectorIntel]) -> list[str]:
+        """汇总关键机会"""
+        opps = []
+        for s in sectors:
+            if s.classification == "actionable":
+                opps.append(f"确认板块: {s.sector_name}（score={s.composite_score:.0f}）")
+        return opps[:5]
+
+    @staticmethod
+    def _build_reasoning(
+        regime: MarketRegime,
+        sectors: list[SectorIntel],
+        contradictions: Optional[list[Contradiction]] = None,
+    ) -> str:
+        """构建推理文本（包含 mini GOT 板块情报详情 + 矛盾警示）"""
+        actionable = [s for s in sectors if s.classification == "actionable"]
+        caution = [s for s in sectors if s.classification == "caution"]
+        lines = [
+            f"[分层GOT] regime={regime.regime}, risk_budget={regime.risk_budget:.2f}, "
+            f"{regime.macro_overlay}. 确认板块: {len(actionable)}个, 观察: {len(caution)}个",
+            "",
         ]
 
-        # 收敛剖面（用 data_confidence 加权方向判断）
-        convergence = AggregatorNode._classify_convergence(active, weighted_score)
+        # ── 矛盾警示（放在最前面，确保可见）──
+        if contradictions:
+            mismatch = [c for c in contradictions if c.pair in (
+                "sector_capital_mainline_mismatch", "sector_capital_rank_divergence"
+            )]
+            if mismatch:
+                lines.append("⚠️ **主线-资金错位警示**")
+                for c in mismatch:
+                    lines.append(f"  - {c.description}")
+                if mismatch[0].resolution:
+                    lines.append(f"  - 建议: {mismatch[0].resolution}")
+                lines.append("")
+        # 输出每个 actionable 板块的 mini GOT 4 维交叉验证
+        for s in sorted(actionable, key=lambda x: x.composite_score, reverse=True):
+            # 角色标注：🎯主线-Tier / 🔍埋伏
+            role = getattr(s, "sector_role", "mainline")
+            if role == "mainline":
+                tier = getattr(s, "mainline_tier", None) or "?"
+                role_tag = f"🎯主线-{tier}"
+            elif role == "ambush":
+                role_tag = "🔍埋伏"
+            elif role == "cooling":
+                role_tag = "🔻高位降温"
+            else:
+                role_tag = "📌独立"
+            lines.append(f"### {role_tag} {s.sector_name}（{s.sector_code}）— 综合 {s.composite_score:.0f} 分，置信度 {s.confidence:.0%}")
+            lines.append(f"- **技术面**: {s.tech_score:.0f} 分 | {s.tech_detail or 'N/A'}")
+            lines.append(f"- **资金面**: {s.capital_check} | {s.capital_detail or '无异常'}")
+            lines.append(f"- **消息面**: {s.news_check} | {s.news_detail or '无显著催化'}")
+            lines.append(f"- **情绪面**: {s.sentiment_check} | {s.sentiment_detail or '热度一般'}")
+            if s.lifecycle:
+                phase_emoji = {"launch": "🚀", "acceleration": "📈", "mature": "✅", "late_stage": "⚠️", "mature_exhausted": ""}.get(s.lifecycle.phase, "❓")
+                lines.append(f"- **生命周期**: {phase_emoji} {s.lifecycle.phase}（第 {s.lifecycle.days_since_launch or '?'} 天）")
+            if s.reasoning:
+                lines.append(f"- **研判**: {s.reasoning}")
+            lines.append("")
 
-        return AggregationResult(
-            weighted_score=clip(weighted_score, -1.0, 1.0),
-            convergence=convergence,
-            dimension_contributions=contributions,
-            active_count=len(active),
-            failed_count=failed_count,
+        # ── 候补板块（top 5 caution，缩小仓位参与选股）──
+        watch_display = sorted(caution, key=lambda x: x.composite_score, reverse=True)[:5]
+        if watch_display:
+            lines.append("---")
+            lines.append(f"### 📋 候补板块（{len(caution)} 个，展示 top 5，仓位缩小至 30%/15%）")
+            lines.append("")
+            capital_emoji = {"aligned": "✅", "neutral": "⚪", "divergent": "❌"}
+            for s in watch_display:
+                cap_icon = capital_emoji.get(s.capital_check, "⚪")
+                role = getattr(s, "sector_role", "mainline")
+                role_tag = (
+                    "主线" if role == "mainline"
+                    else "埋伏" if role == "ambush"
+                    else "降温" if role == "cooling"
+                    else "独立"
+                )
+                lines.append(
+                    f"- 📋 **{s.sector_name}**（{role_tag}）"
+                    f" | {s.composite_score:.0f}分"
+                    f" | 资金{cap_icon}{s.capital_check}"
+                    f" | caution"
+                )
+                if s.tech_detail and s.tech_detail != "无详细信息":
+                    lines.append(f"  - {s.tech_detail}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_data_quality(
+        market: MarketContext,
+        sector: SectorContext,
+        capital: CapitalContext,
+        news: NewsContext,
+        sentiment: SentimentContext,
+    ) -> DataQuality:
+        """汇总数据质量"""
+        available = ["market", "sector", "capital", "news", "sentiment"]
+        failed = []
+
+        if capital.status == "failed":
+            failed.append("capital")
+            available.remove("capital")
+        if news.status == "failed":
+            failed.append("news")
+            available.remove("news")
+        if sentiment.status == "failed":
+            failed.append("sentiment")
+            available.remove("sentiment")
+
+        return DataQuality(
+            available_fields=available,
+            missing_fields=[],
+            fetch_failed_fields=failed,
         )
 
     @staticmethod
-    def _classify_convergence(
-        active: list[DimensionSignal],
-        weighted_score: float,
-    ) -> ConvergenceProfile:
-        """分类收敛剖面"""
-        if len(active) < 2:
-            return ConvergenceProfile(pattern="low_confidence", agreement_score=1.0)
+    def _detect_contradictions(
+        regime: MarketRegime,
+        sectors: list[SectorIntel],
+        sector: Optional[SectorContext] = None,
+        capital: Optional[CapitalContext] = None,
+    ) -> list[Contradiction]:
+        """检测矛盾
 
-        # 方向量化：+1 / 0 / -1
-        directions = []
-        for s in active:
-            if s.score > 0.1:
-                directions.append(1)
-            elif s.score < -0.1:
-                directions.append(-1)
-            else:
-                directions.append(0)
-
-        # 一致性 = |正向数 - 反向数| / 总数
-        positive = sum(1 for d in directions if d > 0)
-        negative = sum(1 for d in directions if d < 0)
-        neutral = sum(1 for d in directions if d == 0)
-        agreement = abs(positive - negative) / len(active)
-
-        # 分类
-        if positive == len(active) or negative == len(active):
-            pattern = "full_convergence"
-        elif neutral == len(active):
-            pattern = "low_confidence"
-        elif positive >= len(active) - 1 or negative >= len(active) - 1:
-            # 检查 lone outlier
-            outlier = AggregatorNode._find_lone_outlier(active, directions)
-            if outlier:
-                avg_conf = sum(s.confidence for s in active) / len(active)
-                investigate = outlier.confidence > avg_conf * OUTLIER_CONFIDENCE_RATIO
-                return ConvergenceProfile(
-                    pattern="lone_outlier",
-                    agreement_score=agreement,
-                    investigate_outlier=investigate,
-                )
-            pattern = "mild_divergence"
-        elif positive > 0 and negative > 0:
-            # 两派对立
-            ratio = min(positive, negative) / max(positive, negative)
-            pattern = "strong_divergence" if ratio > 0.5 else "mild_divergence"
-        else:
-            pattern = "mild_divergence"
-
-        return ConvergenceProfile(pattern=pattern, agreement_score=round(agreement, 3))
-
-    @staticmethod
-    def _find_lone_outlier(
-        active: list[DimensionSignal],
-        directions: list[int],
-    ) -> Optional[DimensionSignal]:
-        """找到孤立异见者（一个与其余方向相反的维度）"""
-        for i, d in enumerate(directions):
-            if d == 0:
-                continue
-            others = [directions[j] for j in range(len(directions)) if j != i and directions[j] != 0]
-            if others and all(o != d for o in others) and len(set(others)) == 1:
-                return active[i]
-        return None
-
-    # =========================================================================
-    # Phase B: 异常检测
-    # =========================================================================
-
-    @staticmethod
-    def _auto_detect_contradictions(signals: list[DimensionSignal]) -> list[Contradiction]:
-        """自动矛盾检测（替代硬编码 10 对）
-
-        仅在 data_confidence > 阈值 的维度间检测（数据缺失不参与矛盾判定）
+        1. regime vs 板块分歧（bear + 多 confirmed）
+        2. 主线家族 vs 资金流向错位（Node 2 top-1 家族无资金支撑 vs 低排名家族吸金）
         """
-        active = [s for s in signals if s.status != "failed" and s.data_confidence > CONTRADICTION_CONFIDENCE_THRESHOLD]
         contradictions = []
 
-        for a, b in itertools.combinations(active, 2):
-            # 方向相反且各自置信度足够
-            if a.score * b.score < CONTRADICTION_SCORE_THRESHOLD:
-                conflict_type = AggregatorNode._classify_conflict(a, b)
-                severity = "high" if min(abs(a.score), abs(b.score)) > 0.5 else "medium"
-
+        # ── 矛盾 1: Regime vs 板块分歧 ──
+        if regime.regime == "bear":
+            actionable_count = len([s for s in sectors if s.classification == "actionable"])
+            if actionable_count >= 3:
                 contradictions.append(Contradiction(
-                    pair=f"{a.name}_vs_{b.name}",
+                    pair="regime_vs_sectors",
                     timeframe="cross",
-                    description=f"{a.name}(score={a.score:.2f}) vs {b.name}(score={b.score:.2f})",
-                    severity=severity,
-                    conflict_type=conflict_type,
+                    description=f"regime=bear 但有 {actionable_count} 个确认板块",
+                    severity="medium",
+                    conflict_type="opinion",
+                ))
+
+        # ── 矛盾 2: 主线家族 vs 资金流向错位 ──
+        if sector and capital and sector.theme_families:
+            contradictions.extend(
+                AggregatorNode._detect_family_capital_mismatch(sector, capital)
+            )
+
+        return contradictions
+
+    @staticmethod
+    def _detect_family_capital_mismatch(
+        sector: SectorContext,
+        capital: CapitalContext,
+    ) -> list[Contradiction]:
+        """检测 Node 2 主线家族 vs Node 3 资金流向的错位矛盾
+
+        高阈值模式：仅在以下条件同时满足时触发——
+        ① Node 2 top-1 家族的 member_boards 在资金 top-5 中完全无匹配
+        ② 资金 top-1 对应的家族在 Node 2 家族排名中不在 top-2
+
+        错位 → high severity；排名差 ≥3 → medium severity。
+        """
+        families = sorted(sector.theme_families, key=lambda f: f.family_score, reverse=True)
+        if len(families) < 2:
+            return []
+
+        # 解析资金流 top-5
+        flows = AggregatorNode._parse_capital_flows(capital)
+        top5_flows = flows[:5]
+        if not top5_flows:
+            return []
+
+        # 为每个资金流条目找到其对应的家族
+        def _find_family_for_flow(flow_name: str) -> Optional[str]:
+            """找到资金流条目所属的家族"""
+            for family in families:
+                for board in family.member_boards:
+                    if AggregatorNode._fuzzy_match(board, flow_name):
+                        return family.family_name
+            return None
+
+        # 计算每个家族的资金流入总额
+        family_capital: dict[str, float] = {}
+        family_capital_top_flow: dict[str, str] = {}
+        for flow_name, amount in top5_flows:
+            matched_family = _find_family_for_flow(flow_name)
+            if matched_family:
+                family_capital[matched_family] = family_capital.get(matched_family, 0) + amount
+                if matched_family not in family_capital_top_flow:
+                    family_capital_top_flow[matched_family] = f"{flow_name}({amount:.0f}亿)"
+
+        # 家族排名（按 score 降序）
+        family_rank = {f.family_name: i for i, f in enumerate(families)}
+        # 资金排名（按流入额降序）
+        capital_ranked = sorted(family_capital.items(), key=lambda x: x[1], reverse=True)
+        capital_rank = {name: i for i, (name, _) in enumerate(capital_ranked)}
+
+        contradictions = []
+        top1_family = families[0].family_name
+
+        # 条件 ①: top-1 家族在资金 top-5 中完全无匹配
+        top1_has_capital = top1_family in family_capital
+        # 条件 ②: 资金 top-1 家族在 Node 2 排名中不在 top-2
+        if capital_ranked:
+            capital_top1_family = capital_ranked[0][0]
+            capital_top1_not_in_sector_top2 = family_rank.get(capital_top1_family, 99) >= 2
+        else:
+            capital_top1_family = None
+            capital_top1_not_in_sector_top2 = False
+
+        # 错位矛盾（high severity）
+        if not top1_has_capital and capital_top1_not_in_sector_top2 and capital_top1_family:
+            top1_members = ", ".join(families[0].member_boards[:3])
+            capital_top1_amount = capital_ranked[0][1]
+            contradictions.append(Contradiction(
+                pair="sector_capital_mainline_mismatch",
+                timeframe="cross_dimension",
+                description=(
+                    f"主线错位：Node 2 核心主线「{top1_family}」（{top1_members}）"
+                    f"在资金 top-5 中无匹配，而「{capital_top1_family}」"
+                    f"独占资金 top-1（{capital_top1_amount:.0f}亿）但 Node 2 排名仅第 {family_rank.get(capital_top1_family, '?') + 1}"
+                ),
+                severity="high",
+                conflict_type="factual",
+                resolution=f"建议降低「{top1_family}」置信度，关注「{capital_top1_family}」是否被技术面低估",
+            ))
+
+        # 方向矛盾（medium severity）：家族 score 排名与资金排名差 ≥3
+        elif capital_top1_family and capital_top1_not_in_sector_top2:
+            score_rank = family_rank.get(capital_top1_family, 99)
+            cap_rank = capital_rank.get(capital_top1_family, 99)
+            rank_gap = abs(score_rank - cap_rank)
+            if rank_gap >= 3:
+                contradictions.append(Contradiction(
+                    pair="sector_capital_rank_divergence",
+                    timeframe="cross_dimension",
+                    description=(
+                        f"「{capital_top1_family}」技术面排名第 {score_rank + 1} vs 资金面排名第 {cap_rank + 1}，"
+                        f"差距 {rank_gap} 位"
+                    ),
+                    severity="medium",
+                    conflict_type="opinion",
                 ))
 
         return contradictions
 
     @staticmethod
-    def _classify_conflict(a: DimensionSignal, b: DimensionSignal) -> str:
-        """矛盾分类（参考 ConflictRAG）: factual / temporal / opinion
-
-        - factual: 两个维度测量重叠现象（价量/资金都反映市场动态）
-        - temporal: 存在时间滞后效应（消息面领先情绪面，技术面领先资金面）
-        - opinion: 方法论根本不同（技术面 vs 情绪面）
-        """
-        names = frozenset({a.name, b.name})
-
-        # 时间滞后型：消息面→情绪面存在传导时滞，技术面→资金面有领先/跟随关系
-        if names == {"news", "sentiment"} or names == {"market", "capital"}:
-            return "temporal"
-        # 事实型：测量重叠现象（价量与资金、板块与大盘）
-        if names <= {"market", "sector", "capital"}:
-            return "factual"
-        # 其余为方法论分歧
-        return "opinion"
-
-    @staticmethod
-    def _adaptive_temporal_check(aggregation: AggregationResult) -> list[TemporalInconsistency]:
-        """EMA 基线时间一致性校验（替代固定阈值）"""
+    def _adaptive_temporal_check(regime: MarketRegime) -> list[TemporalInconsistency]:
+        """EMA 基线时间一致性校验"""
         ema_baseline = load_ema_baseline()
         inconsistencies = []
 
         if ema_baseline is None:
-            return inconsistencies  # 首次运行，跳过
+            return inconsistencies
 
-        prev_score = ema_baseline.get("weighted_score", 0.0)
+        prev_score = ema_baseline.get("regime_score", 0.0)
         prev_std = ema_baseline.get("score_std", 0.05)
         sample_count = ema_baseline.get("sample_count", 0)
 
-        current_score = aggregation.weighted_score
+        # 计算当前 regime_score
+        regime_score_map = {"bull": 0.5, "transition": 0.0, "bear": -0.5}
+        current_score = regime_score_map.get(regime.regime, 0.0)
 
-        # z-score 异常检测
-        std_floor = max(prev_std, 0.05)  # 防止除零
+        std_floor = max(prev_std, 0.05)
         z_score = abs(current_score - prev_score) / std_floor
 
-        # 冷启动期使用宽松阈值
         if sample_count < EMA_WARMUP_SAMPLES:
             critical_threshold = 5.0
             high_threshold = 3.5
@@ -507,7 +1247,7 @@ class AggregatorNode:
         if z_score > critical_threshold:
             inconsistencies.append(TemporalInconsistency(
                 type="sudden_trend_flip",
-                description=f"EMA z-score={z_score:.2f}: {prev_score:.3f} → {current_score:.3f} (σ={prev_std:.3f})",
+                description=f"EMA z-score={z_score:.2f}: {prev_score:.3f} → {current_score:.3f}",
                 severity="critical",
                 action="manual_review_required",
             ))
@@ -526,8 +1266,7 @@ class AggregatorNode:
         news: NewsContext,
         market: MarketContext,
     ) -> Optional[NewsOverride]:
-        """简化消息面覆盖（砍掉历史准确率表）"""
-        # 第一层：系统性政策事件 + 多源确认
+        """消息面覆盖（系统性政策事件）"""
         overridable = [
             e for e in news.major_events
             if e.event_type == "policy"
@@ -539,7 +1278,6 @@ class AggregatorNode:
         if not overridable:
             return None
 
-        # 第二层：LLM 判断
         events_text = "\n".join(f"- {e.title} ({e.summary})" for e in overridable)
         prompt = f"""技术面判断：科技成长={market.tech_growth.trend}，score={market.tech_growth.score:.2f}
 当前仓位上限：{market.position_limit:.0%}
@@ -582,320 +1320,27 @@ class AggregatorNode:
             logger.warning(f"[Node 6] 消息面覆盖 LLM 失败: {e}")
             return None
 
-    # =========================================================================
-    # Phase C: 条件 LLM 精炼
-    # =========================================================================
-
-    @staticmethod
-    def _needs_llm_refinement(
-        aggregation: AggregationResult,
-        contradictions: list[Contradiction],
-        temporal: list[TemporalInconsistency],
-        override: Optional[NewsOverride],
-    ) -> bool:
-        """判断是否需要 LLM 精炼
-
-        触发条件（任一满足即触发）：
-        1. agreement < 0.5（维度间分歧较大）
-        2. 时间异常 severity ≥ high
-        3. 消息面覆盖激活
-        4. convergence pattern 为 strong_divergence / lone_outlier
-        5. mild_divergence 且有矛盾对（维度方向不完全一致）
-        """
-        if aggregation.convergence.agreement_score < AGREEMENT_THRESHOLD:
-            return True
-        if any(c.severity in ("high", "critical") for c in temporal):
-            return True
-        if override and override.override:
-            return True
-        if aggregation.convergence.pattern in ("strong_divergence", "lone_outlier"):
-            return True
-        # mild_divergence + 存在矛盾对 → 需要 LLM 研判
-        if aggregation.convergence.pattern == "mild_divergence" and contradictions:
-            return True
-        return False
-
-    @staticmethod
-    async def _llm_generate(
-        aggregation: AggregationResult,
-        contradictions: list[Contradiction],
-        temporal: list[TemporalInconsistency],
-        override: Optional[NewsOverride],
-        signals: list[DimensionSignal],
-    ) -> dict:
-        """Phase C1: 生成阶段"""
-        # 构建信号摘要
-        signals_text = "\n".join(
-            f"- {s.name}: score={s.score:.2f}, confidence={s.confidence:.2f}, status={s.status}"
-            for s in signals
-        )
-        contradictions_text = "\n".join(
-            f"- {c.pair} ({c.conflict_type}, {c.severity}): {c.description}"
-            for c in contradictions
-        ) or "无矛盾"
-        temporal_text = "\n".join(
-            f"- [{t.severity}] {t.type}: {t.description}"
-            for t in temporal
-        ) or "无异常"
-
-        prompt = f"""你是资深投资顾问。以下是 5 维度置信度加权聚合结果。
-
-各维度信号：
-{signals_text}
-
-聚合结果：
-- 加权方向分: {aggregation.weighted_score:.3f}
-- 收敛剖面: {aggregation.convergence.pattern}
-- 一致性: {aggregation.convergence.agreement_score:.2f}
-- 活跃维度: {aggregation.active_count}, 降级: {aggregation.failed_count}
-
-矛盾检测：
-{contradictions_text}
-
-时间一致性异常：
-{temporal_text}
-
-消息面覆盖: {"有" if override else "无"}
-
-请输出 JSON（不要包含其他内容）：
-{{"unified_signal": "bullish/bearish/neutral/cautious", "overall_confidence": 0.0~1.0, "final_position_limit": 0.0~1.0, "key_risks": ["风险1", "风险2"], "key_opportunities": ["机会1", "机会2"], "reasoning": "100字以内综合研判"}}"""
-
-        raw_text = await AggregatorNode._call_llm_async(prompt, temperature=0.3, max_tokens=600)
-        try:
-            return AggregatorNode._parse_json(raw_text)
-        except Exception as e:
-            logger.warning(f"[Node 6] C1 生成阶段 JSON 解析失败: {e}")
-            return {}
-
-    @staticmethod
-    async def _llm_critique(verdict: dict, signals: list[DimensionSignal]) -> dict:
-        """Phase C2: 批判阶段（反 sycophancy）"""
-        if not verdict:
-            return verdict
-
-        signals_text = "\n".join(
-            f"- {s.name}: score={s.score:.2f} (confidence={s.confidence:.2f})"
-            for s in signals if s.status != "failed"
-        )
-
-        prompt = f"""你是严格的批判者。以下是一个初始研判和各维度原始信号。
-
-初始研判：
-- 信号: {verdict.get('unified_signal')}
-- 置信度: {verdict.get('overall_confidence')}
-- 仓位: {verdict.get('final_position_limit')}
-- 理由: {verdict.get('reasoning')}
-
-各维度原始信号：
-{signals_text}
-
-请批判性审视这个研判：
-1. 是否忽略了某个高置信度异见维度？
-2. 仓位是否过高或过低？
-3. 有什么风险被遗漏？
-
-请输出 JSON（如需调整则修改对应字段，如确认原判则原样输出）：
-{{"unified_signal": "...", "overall_confidence": 0.0~1.0, "final_position_limit": 0.0~1.0, "key_risks": [...], "key_opportunities": [...], "reasoning": "...", "critique_note": "你的批判意见（30字内）"}}"""
-
-        raw_text = await AggregatorNode._call_llm_async(prompt, temperature=0.2, max_tokens=600)
-        try:
-            result = AggregatorNode._parse_json(raw_text)
-            # 附加批判笔记到 reasoning
-            critique_note = result.pop("critique_note", None)
-            if critique_note:
-                original_reasoning = result.get("reasoning", "")
-                result["reasoning"] = f"{original_reasoning}\n[批判] {critique_note}"
-            return result
-        except Exception as e:
-            logger.warning(f"[Node 6] C2 批判阶段 JSON 解析失败: {e}，使用 C1 结果")
-            return verdict
-
-    # =========================================================================
-    # 规则输出（Phase C 不触发时）
-    # =========================================================================
-
-    @staticmethod
-    def _rule_based_verdict(
-        aggregation: AggregationResult,
-        market: MarketContext,
-        capital: CapitalContext,
-    ) -> dict:
-        """规则映射（替代 LLM 综合）"""
-        ws = aggregation.weighted_score
-        agreement = aggregation.convergence.agreement_score
-
-        # 信号判定
-        if ws > 0.3 and agreement > 0.6:
-            signal = "bullish"
-            position = clip(0.5 + ws * 0.5, 0.3, 0.8)
-        elif ws < -0.3 and agreement > 0.6:
-            signal = "bearish"
-            position = clip(0.3 + ws * 0.3, 0.0, 0.3)
-        elif agreement < 0.3:
-            signal = "cautious"
-            position = 0.2
-        else:
-            signal = "neutral"
-            position = clip(0.3 + ws * 0.2, 0.1, 0.5)
-
-        # 资金面置信度调节
-        position *= capital.confidence_multiplier
-
-        confidence = clip(agreement * 0.8 + 0.2, 0.0, 1.0)
-
-        return {
-            "unified_signal": signal,
-            "overall_confidence": round(confidence, 3),
-            "final_position_limit": round(clip(position, 0.0, 1.0), 3),
-            "key_risks": [],
-            "key_opportunities": [],
-            "reasoning": (
-                f"[规则输出] weighted_score={ws:.3f}, agreement={agreement:.2f}, "
-                f"convergence={aggregation.convergence.pattern}"
-            ),
-        }
-
-    @staticmethod
-    def _build_insufficient_data_output(
-        signals: list[DimensionSignal],
-        aggregation: AggregationResult,
-        sig_conf_avg: float,
-        news: NewsContext,
-        today: date,
-    ) -> UnifiedContext:
-        """信息充分度不足 → 空仓观望输出
-
-        当 signal_confidence_avg < 0.5 时触发，说明多数维度自评"看不清方向"。
-        这不是数据缺失（那是 data_confidence 管的），而是市场本身没有给出可操作信号。
-        """
-        # 汇总各维度的低置信原因
-        low_conf_dims = [
-            f"{s.name}(conf={s.confidence:.2f}, score={s.score:+.2f})"
-            for s in signals
-            if s.status != "failed" and s.confidence < 0.5
-        ]
-
-        reasoning = (
-            f"信号置信度均值 {sig_conf_avg:.2f} < 0.5，"
-            f"市场无可操作信号。"
-            f"低置信维度: {', '.join(low_conf_dims)}。"
-            f"建议空仓观望，等待更明确的市场方向。"
-        )
-
-        unified = UnifiedContext(
-            status="insufficient_data",
-            unified_signal="neutral",
-            overall_confidence=round(sig_conf_avg, 3),
-            final_position_limit=0.0,  # 空仓
-            contradictions=[],
-            common_root_cause=None,
-            news_override=None,
-            temporal_inconsistencies=[],
-            key_risks=["市场信号模糊，不具备操作条件"],
-            key_opportunities=[],
-            concept_suggestions=news.concept_suggestions,
-            reasoning=reasoning,
-            data_quality=AggregatorNode._build_data_quality(signals),
-            convergence_profile=aggregation.convergence,
-            weighted_score=aggregation.weighted_score,
-            dimension_contributions=aggregation.dimension_contributions,
-            llm_refinement_used=False,
-            ema_baseline=None,
-            signal_confidence_avg=round(sig_conf_avg, 3),
-            insufficient_data=True,
-        )
-
-        # 持久化（仍需保存，供次日 EMA 基线更新）
-        return unified
-
-    # =========================================================================
-    # 输出构建辅助
-    # =========================================================================
-
-    @staticmethod
-    def _has_critical(temporal: list[TemporalInconsistency]) -> bool:
-        return any(t.severity == "critical" for t in temporal)
-
-    @staticmethod
-    def _collect_key_risks(
-        news: NewsContext,
-        sentiment: SentimentContext,
-        verdict: dict,
-        temporal: list[TemporalInconsistency],
-    ) -> list[str]:
-        """汇总关键风险"""
-        risks = list(news.key_risks[:3])
-
-        # 情绪极端
-        if sentiment.sentiment_stage == "euphoria":
-            risks.append("散户情绪极度狂热（反向信号）")
-        elif sentiment.sentiment_stage == "capitulation":
-            risks.append("散户极度恐慌（市场可能超跌）")
-
-        # 时间异常
-        for t in temporal:
-            if t.severity in ("critical", "high"):
-                risks.append(f"[时间异常] {t.description}")
-
-        # LLM 输出
-        for r in verdict.get("key_risks", []):
-            if r not in risks:
-                risks.append(r)
-
-        return risks[:6]
-
-    @staticmethod
-    def _collect_key_opportunities(
-        sector: SectorContext,
-        news: NewsContext,
-        verdict: dict,
-    ) -> list[str]:
-        """汇总关键机会"""
-        opps = []
-        for s in sector.active_mainline[:2]:
-            if s.state != "neutral":
-                opps.append(f"主线板块: {s.name}（{s.state}）")
-        for s in sector.ambush[:2]:
-            opps.append(f"埋伏板块: {s.name}")
-        for o in verdict.get("key_opportunities", []):
-            if o not in opps:
-                opps.append(o)
-        return opps[:5]
-
-    @staticmethod
-    def _build_data_quality(signals: list[DimensionSignal]) -> DataQuality:
-        """汇总数据质量"""
-        available = [s.name for s in signals if s.status == "normal"]
-        missing = []  # 暂不细分
-        failed = [s.name for s in signals if s.status == "failed"]
-
-        return DataQuality(
-            available_fields=available,
-            missing_fields=missing,
-            fetch_failed_fields=failed,
-        )
-
     def _save_context(
         self,
         unified: UnifiedContext,
-        market: MarketContext,
-        sector: SectorContext,
-        aggregation: AggregationResult,
+        regime: MarketRegime,
+        sectors: list[SectorIntel],
         today: date,
     ) -> None:
         """持久化 + 更新 EMA 基线"""
         # 1. 保存当日上下文
+        regime_score_map = {"bull": 0.5, "transition": 0.0, "bear": -0.5}
+        regime_score = regime_score_map.get(regime.regime, 0.0)
+
         context_dict = {
             "date": today.isoformat(),
             "unified_signal": unified.unified_signal,
             "overall_confidence": unified.overall_confidence,
             "final_position_limit": unified.final_position_limit,
-            "weighted_score": aggregation.weighted_score,
-            "convergence_pattern": aggregation.convergence.pattern,
-            "agreement_score": aggregation.convergence.agreement_score,
-            "market_trend": market.tech_growth.trend,
-            "market_score": market.tech_growth.score,
-            "active_mainline_codes": [s.code for s in sector.active_mainline],
+            "regime": regime.regime,
+            "regime_score": regime_score,
+            "risk_budget": regime.risk_budget,
+            "confirmed_sectors": [s.sector_name for s in sectors if s.classification == "actionable"],
         }
         try:
             save_current_context(context_dict, today)
@@ -907,28 +1352,25 @@ class AggregatorNode:
             prev_baseline = load_ema_baseline()
             if prev_baseline is None:
                 new_baseline = {
-                    "weighted_score": aggregation.weighted_score,
-                    "score_std": 0.1,  # 初始标准差
+                    "regime_score": regime_score,
+                    "score_std": 0.1,
                     "last_updated": today.isoformat(),
                     "sample_count": 1,
                 }
             else:
-                prev_score = prev_baseline["weighted_score"]
+                prev_score = prev_baseline.get("regime_score", prev_baseline.get("weighted_score", 0.0))
                 prev_std = prev_baseline["score_std"]
                 prev_count = prev_baseline.get("sample_count", 1)
 
-                # EMA 更新
-                new_score = EMA_ALPHA * aggregation.weighted_score + (1 - EMA_ALPHA) * prev_score
-
-                # 滚动标准差更新（Welford 在线算法）
-                delta = aggregation.weighted_score - prev_score
-                ss = (prev_count - 1) * prev_std**2  # 当前平方偏差和
+                new_score = EMA_ALPHA * regime_score + (1 - EMA_ALPHA) * prev_score
+                delta = regime_score - prev_score
+                ss = (prev_count - 1) * prev_std**2
                 new_ss = ss + delta**2 * prev_count / (prev_count + 1)
-                new_var = new_ss / prev_count  # 样本方差（n+1 样本，除以 n）
+                new_var = new_ss / prev_count
                 new_std = max(new_var**0.5, 0.01)
 
                 new_baseline = {
-                    "weighted_score": new_score,
+                    "regime_score": new_score,
                     "score_std": new_std,
                     "last_updated": today.isoformat(),
                     "sample_count": prev_count + 1,
@@ -950,7 +1392,7 @@ class AggregatorNode:
         max_tokens: int,
         max_retries: int = 3,
     ) -> str:
-        """异步 LLM 调用（含空响应重试）"""
+        """异步 LLM 调用"""
         from src.agent.llm_adapter import LLMToolAdapter
 
         adapter = LLMToolAdapter()
@@ -976,8 +1418,7 @@ class AggregatorNode:
 
     @staticmethod
     def _parse_json(text: str) -> dict:
-        """从 LLM 输出中提取 JSON（兼容 markdown code block）"""
-        import re
+        """从 LLM 输出中提取 JSON"""
         match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
         if match:
             text = match.group(1)
@@ -988,53 +1429,77 @@ class AggregatorNode:
     # =========================================================================
 
     def _mock_output(self) -> UnifiedContext:
-        """Mock 输出（含 v2 新字段）"""
-        mock_convergence = ConvergenceProfile(
-            pattern="mild_divergence",
-            agreement_score=0.6,
+        """Mock 输出"""
+        regime = MarketRegime(
+            regime="transition",
+            risk_budget=0.5,
+            adx_value=22.0,
+            cross_index_consistency=0.6,
+            market_direction="分化",
+            mainline_count=3,
+            institutional_score=0.2,
+            news_impact_score=0.1,
+            fear_greed=0.55,
+            sentiment_stage="neutral",
+            sentiment_momentum=0.05,
+            macro_overlay="Mock regime: transition",
         )
-        mock_contributions = [
-            DimensionContribution(name="market", score=-0.2, confidence=0.3, data_confidence=1.0, contribution=-0.08),
-            DimensionContribution(name="sector", score=0.1, confidence=0.5, data_confidence=1.0, contribution=0.04),
-            DimensionContribution(name="capital", score=0.3, confidence=0.6, data_confidence=0.6, contribution=0.12),
-            DimensionContribution(name="news", score=0.1, confidence=0.8, data_confidence=1.0, contribution=0.04),
-            DimensionContribution(name="sentiment", score=-0.3, confidence=0.3, data_confidence=1.0, contribution=-0.12),
+
+        mock_sectors = [
+            SectorIntel(
+                sector_name="半导体",
+                sector_code="880422",
+                sector_type="concept",
+                tech_score=85.0,
+                tech_detail="lifecycle=launch, day4, tier=S",
+                capital_check="aligned",
+                capital_detail="净流入425亿",
+                news_check="catalyzed",
+                news_detail="韩日存储芯片暴跌",
+                sentiment_check="high",
+                sentiment_detail="3只关联股票上热榜",
+                composite_score=88.0,
+                confidence=0.85,
+                classification="actionable",
+                reasoning="半导体: actionable, 4维共振",
+            ),
+            SectorIntel(
+                sector_name="AIGC",
+                sector_code="880555",
+                sector_type="concept",
+                tech_score=72.0,
+                tech_detail="lifecycle=acceleration, day4",
+                capital_check="neutral",
+                capital_detail="不在 top",
+                news_check="catalyzed",
+                news_detail="多模态AI突破",
+                sentiment_check="medium",
+                sentiment_detail="1只关联股票上热榜",
+                composite_score=75.0,
+                confidence=0.65,
+                classification="caution",
+                reasoning="AIGC: caution, 技术面强但资金未确认",
+            ),
         ]
 
         return UnifiedContext(
             status="normal",
             unified_signal="cautious",
-            overall_confidence=0.55,
-            final_position_limit=0.20,
-            contradictions=[
-                Contradiction(
-                    pair="market_vs_capital",
-                    timeframe="cross",
-                    description="market(score=-0.20) vs capital(score=0.30)",
-                    severity="medium",
-                    conflict_type="factual",
-                    resolution="技术面偏空但机构在加仓，可能是左侧布局",
-                    confidence_adjustment=-0.05,
-                ),
-            ],
+            overall_confidence=0.65,
+            final_position_limit=0.45,
+            contradictions=[],
             common_root_cause=None,
             news_override=None,
             temporal_inconsistencies=[],
-            key_risks=["市场分歧较大，注意仓位控制"],
-            key_opportunities=["机构持续加仓，关注底部信号"],
+            key_risks=["市场分化，注意仓位控制"],
+            key_opportunities=["确认板块: 半导体（score=88）"],
             concept_suggestions=[],
-            reasoning=(
-                "[Mock v2] weighted_score=-0.01, convergence=mild_divergence, "
-                "agreement=0.60, sig_conf_avg=0.50。"
-            ),
+            reasoning="[Mock v3] regime=transition, 2个板块情报",
             data_quality=DataQuality(
                 available_fields=["market", "sector", "capital", "news", "sentiment"],
             ),
-            convergence_profile=mock_convergence,
-            weighted_score=-0.01,
-            dimension_contributions=mock_contributions,
-            llm_refinement_used=True,
+            market_regime=regime,
+            llm_refinement_used=False,
             ema_baseline=None,
-            signal_confidence_avg=0.50,
-            insufficient_data=False,
+            confirmed_sectors=mock_sectors,
         )

@@ -28,11 +28,20 @@ import pandas as pd
 from data_provider.base import DataFetcherManager
 from data_provider.tdx_board_mapping import TDX_BOARD_REGISTRY, get_boards_by_category
 from src.got.indicators import clip, calculate_macd
+from src.got.indicators import (
+    ad_distribution_signal,
+    ad_line_confirmation,
+    accumulation_score,
+    bb_width_percentile,
+    volume_vcv,
+)
 from src.got.schemas import (
     DataQuality,
     LaunchSignal,
     LifecycleInfo,
     MarketContext,
+    OverheatSeverity,
+    RRGQuadrant,
     SectorContext,
     SectorDetail,
 )
@@ -48,45 +57,68 @@ logger = logging.getLogger(__name__)
 
 FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
     ("AI硬件", [
-        "芯片", "半导体", "光刻", "EDA", "封装", "HBM", "存储芯片", "GPU",
-        "寒武纪", "昇腾", "RISC-V", "国产芯片", "算力", "光模块", "CPO",
-        "液冷", "PCB", "铜缆", "数据中心", "AIDC", "东数西算", "服务器",
-        "海思", "华为算力",
+        "芯片", "半导体", "光刻", "EDA", "封装", "HBM", "高带宽内存", "存储芯片", "GPU",
+        "寒武纪", "RISC-V", "国产芯片", "算力", "光模块", "CPO",
+        "液冷", "PCB", "铜缆", "数据中心", "AIDC", "东数西算",
+        "华为算力", "华为海思",
+        # 新增：半导体上游
+        "元件", "电子化学品", "被动元件", "IGBT", "碳化硅", "氮化镓", "玻璃基板",
     ]),
     ("AI软件", [
-        "大模型", "AIGC", "多模态", "人工智能", "AI应用", "AI Agent",
+        "大模型", "AIGC", "多模态", "人工智能", "AI应用",
         "智能体", "智算", "AI语料", "AI手机", "AI PC", "AI眼镜", "AIPC",
-        "消费电子", "MR", "AR", "VR", "OLED", "MiniLED", "折叠屏",
-        "苹果概念", "数据要素", "数据确权", "数据交易", "数据安全",
+        "消费电子", "混合现实", "OLED", "MiniLED", "折叠屏",
+        "苹果概念", "数据要素",
         "鸿蒙", "信息安全",
+        # 新增：数字经济 + 新内容
+        "数字经济", "数字孪生", "国资云", "短剧游戏", "谷子经济",
     ]),
     ("机器人", [
         "人形机器人", "人形机器", "具身智能", "机器人", "减速器", "丝杠", "伺服",
+        # 新增：核心部件
+        "机器人执行器", "执行器", "机器视觉",
     ]),
     ("智能驾驶", [
         "自动驾驶", "智能驾驶", "智能座舱", "车路云", "激光雷达",
         "无人驾驶", "车联网", "华为汽车",
+        # 新增：新能源充电
+        "高压快充", "换电",
     ]),
     ("新能源", [
-        "储能", "光伏", "锂电池", "氢能", "风电", "新能源",
-        "电力", "特高压", "智能电网", "虚拟电厂", "输变电",
-        "核电", "核能", "绿色电力", "绿电", "水利", "水电",
+        "储能", "光伏", "锂电池", "氢能", "风电",
+        "电力", "特高压", "智能电网", "虚拟电厂",
+        "核电", "绿色电力",
+        # 新增：电池技术
+        "BC电池", "钙钛矿电", "TOPCon电", "钠电池", "固态电池",
+        "麒麟电池", "刀片电池", "动力电池回收", "换电",
     ]),
     ("医药", [
         "创新药", "生物医药", "CXO", "医疗器械", "医药",
+        # 新增
+        "减肥药", "医美概念", "合成生物",
     ]),
     ("金融", [
-        "证券", "券商", "保险", "银行", "信托", "多元金融",
+        "券商", "保险", "银行", "信托", "多元金融",
     ]),
     ("周期资源", [
         "黄金", "有色", "铜", "铝", "稀土", "锂矿",
         "钢铁", "化工", "化纤",
+        # 新增：新材料
+        "PEEK", "碳纤维概", "石墨烯", "超导", "有机硅概",
     ]),
     ("军工", [
-        "军工", "航空", "船舶", "航运", "航天", "国防", "军民融合",
+        "军工", "航空", "船舶", "航运", "航天", "国防", "军民融合", "商业航天",
     ]),
     ("消费", [
-        "白酒", "食品", "家电", "旅游", "酒店", "零售",
+        "白酒", "白酒概念", "食品", "家电", "旅游", "酒店", "零售",
+        # 新增
+        "养老概念", "养老金持", "宠物经济",
+    ]),
+    ("华为生态", [
+        "华为概念", "华为欧拉", "欧拉",
+    ]),
+    ("前沿科技", [
+        "可控核聚变", "量子科技",
     ]),
 ]
 
@@ -97,58 +129,64 @@ CONCEPT_UNIVERSE: dict[str, dict[str, list[str]]] = {
     # === AI 上游：芯片/半导体 ===
     "ai_chip": {
         "semiconductor_equip": ["半导体设备", "光刻机", "刻蚀机"],
-        "ai_chip": ["AI芯片", "GPU", "寒武纪", "昇腾"],
-        "memory_chip": ["存储芯片", "HBM", "内存"],
+        "ai_chip": ["AI芯片", "GPU", "寒武纪"],
+        "memory_chip": ["存储芯片", "HBM概念", "高带宽内存"],
         "auto_chip": ["汽车芯片", "MCU芯片", "车规芯片"],
-        "semiconductor_pkg": ["先进封装", "Chiplet"],
-        "eda_ip": ["EDA", "芯片概念", "半导体概念", "第三代半导体", "第四代半导体", "RISC-V", "国产芯片"],
+        "semiconductor_pkg": ["先进封装", "Chiplet", "玻璃基板"],
+        "eda_ip": ["EDA概念", "芯片概念", "半导体概念", "第三代半导体", "第四代半导体", "RISC-V", "国产芯片"],
+        "power_semiconductor": ["IGBT概念", "碳化硅", "氮化镓"],
+        "electronic_components": ["元件", "电子化学品", "被动元件概念"],
     },
     # === AI 基建：算力/网络/散热 ===
     "ai_infra": {
-        "compute_power": ["算力", "算力租赁", "东数西算", "AI服务器", "服务器"],
-        "optical_module": ["光模块", "CPO", "共封装光学", "光通信", "光通信模块", "光纤概念"],
-        "liquid_cooling": ["液冷", "液冷服务器", "温控", "散热"],
-        "pcb_connector": ["PCB", "高速连接器", "PCB概念", "铜缆连接", "铜缆高速连接", "数据中心"],
+        "compute_power": ["算力", "算力租赁", "东数西算", "AI服务器"],
+        "optical_module": ["光模块", "CPO概念", "光通信", "光纤概念"],
+        "liquid_cooling": ["液冷概念", "液冷服务器"],
+        "pcb_connector": ["PCB概念", "高速连接器", "铜缆高速连接", "数据中心"],
     },
     # === AI 模型/平台 ===
     "ai_model": {
-        "llm": ["大模型", "AIGC", "多模态", "多模态AI", "AI语料"],
-        "ai_platform": ["人工智能", "AI应用", "AI Agent", "智算中心"],
+        "llm": ["大模型", "AIGC概念", "多模态AI", "AI语料"],
+        "ai_platform": ["人工智能", "AI应用", "AI智能体", "智算中心"],
+        "digital_economy": ["数字经济", "数字孪生", "国资云"],
     },
     # === AI 终端应用 ===
     "ai_terminal": {
-        "ai_phone_pc": ["AI手机", "AI PC", "AI眼镜", "AIPC"],
-        "consumer_elec": ["消费电子", "MR", "AR", "VR", "MIXED REALITY", "混合现实", "OLED", "MiniLED", "柔性屏"],
+        "ai_phone_pc": ["AI手机", "AI PC", "AI眼镜", "AIPC概念"],
+        "consumer_elec": ["消费电子", "混合现实", "OLED概念", "MiniLED", "柔性屏"],
         "apple_chain": ["苹果概念"],
+        "new_content": ["短剧游戏", "谷子经济"],
     },
     # === 机器人 ===
     "robot": {
         "humanoid": ["人形机器人", "具身智能", "机器人概念"],
-        "robot_parts": ["减速器", "丝杠", "传感器", "伺服", "控制器", "电机"],
+        "robot_parts": ["减速器", "丝杠", "传感器", "伺服", "控制器", "电机", "机器人执行器", "机器视觉"],
         "robot_system": ["机器人", "工业机器人", "服务机器人"],
     },
     # === 智能驾驶 ===
     "auto_drive": {
         "smart_drive": ["自动驾驶", "智能驾驶", "智能座舱", "车路云", "激光雷达"],
-        "new_energy": ["新能源汽车", "新能源车", "固态电池", "充电桩"],
+        "new_energy": ["新能源车", "固态电池", "充电桩", "高压快充", "换电概念"],
+        "battery_tech": ["BC电池", "钙钛矿电", "TOPCon电", "钠电池", "麒麟电池", "刀片电池", "动力电池回收"],
         "auto_market": ["汽车整车"],
     },
     # === 新兴主题 ===
     "emerging": {
         "low_altitude": ["低空经济", "飞行汽车", "eVTOL", "无人机"],
-        "data_element": ["数据要素", "数据确权", "数据交易", "数据安全"],
-        "huawei_chain": ["华为产业链", "鸿蒙", "昇腾", "华为手机", "海思"],
-        "satellite": ["卫星互联网", "卫星导航", "北斗", "5G概念", "6G"],
+        "data_element": ["数据要素"],
+        "huawei_chain": ["华为概念", "鸿蒙概念", "华为海思", "华为手机", "华为算力", "华为欧拉"],
+        "satellite": ["卫星互联网", "卫星导航", "北斗", "5G概念", "6G概念", "商业航天"],
+        "frontier": ["可控核聚变"],
     },
     # === 科技防守 ===
     "tech_defensive": {
-        "innovative_drug": ["创新药", "生物医药", "CXO", "医疗器械"],
-        "power_grid": ["电力", "电力设备", "特高压", "智能电网", "电力物联网", "绿色电力", "虚拟电厂", "核电", "核电概念"],
-        "energy_storage": ["储能", "光伏概念", "锂电池概念", "氢能", "风电", "新能源"],
+        "innovative_drug": ["创新药", "生物医药", "CXO概念", "医疗器械", "减肥药", "医美概念"],
+        "power_grid": ["电力", "特高压", "智能电网", "绿色电力", "虚拟电厂", "核电概念"],
+        "energy_storage": ["储能", "光伏概念", "锂电池概念", "氢能源", "风电"],
     },
     # === 金融 ===
     "finance": {
-        "securities": ["证券", "券商"],
+        "securities": ["券商"],
         "insurance": ["保险"],
         "banking": ["银行"],
         "diversified_finance": ["多元金融", "信托"],
@@ -159,24 +197,34 @@ CONCEPT_UNIVERSE: dict[str, dict[str, list[str]]] = {
     },
     # === 周期 ===
     "cyclical": {
-        "nonferrous": ["有色金属", "铜", "黄金概念", "稀土", "铝"],
-        "steel_chem": ["钢铁", "化工", "化纤", "涂料"],
+        "nonferrous": ["有色金属", "铜", "黄金概念", "稀土永磁", "铝"],
+        "steel_chem": ["钢铁", "化工", "化纤"],
+        "new_materials": ["PEEK材料", "碳纤维概", "石墨烯", "超导概念", "有机硅概", "合成生物"],
+    },
+    # === 消费 ===
+    "consumer": {
+        "beverage": ["白酒", "白酒概念"],
+        "healthcare_consumer": ["医美概念"],
+        "travel": ["旅游", "旅游概念", "酒店餐饮"],
+        "silver_economy": ["养老概念", "养老金持"],
     },
     # === 军工 ===
     "military": {
-        "aerospace": ["航天", "军工", "航空发动机", "卫星", "无人机"],
+        "aerospace": ["航天航空", "国防军工", "航空发动机", "卫星", "无人机", "军民融合"],
     },
 }
 
 # category → 标签
 _CATEGORY_GROUP: dict[str, str] = {
     # AI 上游
-    "semiconductor_equip": "半导体",
-    "ai_chip": "芯片",
+    "semiconductor_equip": "半导体设备",
+    "ai_chip": "AI芯片",
     "memory_chip": "存储芯片",
     "auto_chip": "汽车芯片",
     "semiconductor_pkg": "先进封装",
     "eda_ip": "EDA/IP",
+    "power_semiconductor": "功率半导体",
+    "electronic_components": "元器件/材料",
     # AI 基建
     "compute_power": "算力",
     "optical_module": "光模块/CPO",
@@ -185,29 +233,33 @@ _CATEGORY_GROUP: dict[str, str] = {
     # AI 模型
     "llm": "大模型",
     "ai_platform": "AI平台",
+    "digital_economy": "数字经济",
     # AI 终端
     "ai_phone_pc": "AI手机/PC",
     "consumer_elec": "消费电子",
     "apple_chain": "苹果产业链",
+    "new_content": "新内容消费",
     # 机器人
     "humanoid": "人形机器人",
     "robot_parts": "机器人零部件",
     "robot_system": "机器人整机",
     # 智能驾驶
     "smart_drive": "智能驾驶",
-    "new_energy": "新能源汽车",
+    "new_energy": "新能源车",
+    "battery_tech": "电池技术",
     "auto_market": "汽车整车",
     # 新兴主题
     "low_altitude": "低空经济",
     "data_element": "数据要素",
     "huawei_chain": "华为产业链",
-    "satellite": "卫星/6G",
+    "satellite": "卫星/商业航天",
+    "frontier": "前沿科技",
     # 科技防守
     "innovative_drug": "创新药",
     "power_grid": "电力",
     "energy_storage": "新能源",
     # 金融
-    "securities": "证券",
+    "securities": "券商",
     "insurance": "保险",
     "banking": "银行",
     "diversified_finance": "多元金融",
@@ -216,8 +268,14 @@ _CATEGORY_GROUP: dict[str, str] = {
     # 周期
     "nonferrous": "有色",
     "steel_chem": "钢铁化工",
+    "new_materials": "新材料",
+    # 消费
+    "beverage": "白酒",
+    "healthcare_consumer": "医美",
+    "travel": "旅游酒店",
+    "silver_economy": "养老",
     # 军工
-    "aerospace": "军工",
+    "aerospace": "军工航天",
 }
 
 # 所有关键词扁平列表（用于匹配）
@@ -241,71 +299,7 @@ STRENGTH_WEIGHTS: dict[str, float] = {
     "breadth_health": 0.20,
 }
 
-# 板块 → 核心成分股代码映射（mootdx TCP 获取 T-0 实时行情用）
-# key 必须与 TDX_BOARD_REGISTRY 中的 name 一致
-SECTOR_CONSTITUENTS: dict[str, list[str]] = {
-    # 周期
-    "黄金":     ["601899", "600547", "600489", "002155", "600988", "600766"],
-    "有色":     ["601899", "603993", "000630", "601168", "000878", "600362"],
-    # AI 模型/平台
-    "人工智能": ["002230", "300496", "688111", "002415", "300474", "688561"],
-    "AIGC概念": ["002230", "300496", "688111", "300474", "002415"],
-    # 算力/基建
-    "算力租赁": ["000977", "603019", "002261", "300474", "688111"],
-    "光通信":   ["300308", "300502", "002281", "300394", "688538"],
-    "液冷服务": ["002837", "300990", "002182", "300476"],
-    "PCB概念":  ["002463", "603920", "002916", "300476"],
-    # AI 上游
-    "半导体":   ["688981", "603501", "002371", "688012", "603986"],
-    "芯片":     ["688981", "603501", "002371", "688012", "603986"],
-    "存储芯片": ["603986", "688981", "002371", "688256", "688091"],
-    # 机器人
-    "人形机器": ["300124", "002747", "688169", "300024", "002527"],
-    "机器人概": ["300124", "002747", "688169", "300024"],
-    "减速器":   ["002527", "603416", "300024", "002472", "300750"],
-    # 军工
-    "国防军工": ["600893", "000768", "600760", "601989", "600150"],
-    "航空":     ["600893", "600118", "000738", "002013"],
-    "船舶":     ["600150", "601989", "600685", "600482"],
-    "航运概念": ["601919", "601866", "600428", "601872"],
-    # 科技防守
-    "创新药":   ["600276", "300347", "002821", "300759", "688180"],
-    "CXO概念":  ["300347", "300759", "688180", "300760"],
-    "电力":     ["600900", "601985", "600886", "600674", "003816"],
-    "特高压":   ["601126", "600089", "002028", "600312"],
-    # 新能源
-    "储能":     ["300750", "002074", "300274", "688390"],
-    "光伏":     ["601012", "002459", "600438", "601615"],
-    "新能源车": ["002594", "601238", "600104", "002460"],
-    "汽车整车": ["600104", "002594", "601238", "600741", "000625"],
-    # 新兴主题
-    "华为鸿蒙": ["002415", "300496", "002230", "300033"],
-    "华为海思": ["688981", "002371", "603501", "688012"],
-    "卫星导航": ["600118", "002025", "600990", "300053"],
-    "低空经济": ["002097", "688599", "300034", "002085"],
-    "飞行汽车": ["002097", "688599", "300034"],
-    "信息安全": ["002268", "300168", "002439", "300352", "300075"],
-    # 金融
-    "证券":     ["601995", "600030", "601688", "600837", "000776"],
-    "保险":     ["601318", "601628", "601601", "002736"],
-    "银行":     ["601398", "601939", "601288", "600036", "601166"],
-    "多元金融": ["600030", "000776", "600837", "000987", "601688"],
-    # 外围联动
-    "苹果概念": ["002475", "002241", "300115", "002600"],
-    "英伟达概": ["300474", "688111", "002230", "300496"],
-}
-
-# 主线分级 → 生命周期天数阈值: (launch_end, acceleration_end, mature_end)
-LIFECYCLE_THRESHOLDS: dict[str, tuple[int, int, int]] = {
-    "S": (7, 30, 60),
-    "A": (5, 15, 30),
-    "B": (3, 10, 20),
-}
-
-# 启动确认门槛：从低点涨幅超过此比例才算真正启动
-_LAUNCH_CONFIRM_THRESHOLD = 0.05  # 5%
-
-# 生命周期 → 推荐操作
+# 生命周期阶段 → 推荐操作（Node 2 v3: RRG 象限映射到 lifecycle phase 后复用此表）
 _LIFECYCLE_ACTION_MAP: dict[str, str] = {
     "launch": "aggressive_buy",
     "acceleration": "buy",
@@ -356,18 +350,20 @@ _FRAME_GROUP: dict[str, str] = {
     "semiconductor_equip": "AI产业链", "ai_chip": "AI产业链",
     "memory_chip": "AI产业链", "auto_chip": "AI产业链",
     "semiconductor_pkg": "AI产业链", "eda_ip": "AI产业链",
+    "power_semiconductor": "AI产业链", "electronic_components": "AI产业链",
     "compute_power": "AI产业链", "optical_module": "AI产业链",
     "liquid_cooling": "AI产业链", "pcb_connector": "AI产业链",
-    "llm": "AI产业链", "ai_platform": "AI产业链",
+    "llm": "AI产业链", "ai_platform": "AI产业链", "digital_economy": "AI产业链",
     "ai_phone_pc": "AI产业链", "consumer_elec": "AI产业链",
-    "apple_chain": "AI产业链",
+    "apple_chain": "AI产业链", "new_content": "AI产业链",
     # 机器人
     "humanoid": "机器人", "robot_parts": "机器人", "robot_system": "机器人",
     # 智能驾驶
-    "smart_drive": "智能驾驶", "new_energy": "智能驾驶", "auto_market": "智能驾驶",
+    "smart_drive": "智能驾驶", "new_energy": "智能驾驶", "battery_tech": "智能驾驶",
+    "auto_market": "智能驾驶",
     # 新兴主题（各自独立）
     "low_altitude": "低空经济", "data_element": "数据要素",
-    "huawei_chain": "华为系", "satellite": "卫星通信",
+    "huawei_chain": "华为系", "satellite": "卫星通信", "frontier": "前沿科技",
     # 科技防守
     "innovative_drug": "医药", "power_grid": "电力", "energy_storage": "新能源",
     # 金融
@@ -375,7 +371,9 @@ _FRAME_GROUP: dict[str, str] = {
     "diversified_finance": "金融",
     # 其他
     "nvidia": "外围联动",
-    "nonferrous": "黄金/有色", "steel_chem": "钢铁化工",
+    "nonferrous": "黄金/有色", "steel_chem": "钢铁化工", "new_materials": "新材料",
+    "consumer": "消费", "beverage": "消费", "healthcare_consumer": "消费",
+    "travel": "消费", "silver_economy": "消费",
     "aerospace": "军工",
 }
 
@@ -384,42 +382,54 @@ _FRAME_GROUP: dict[str, str] = {
 # 按优先级排列，首个命中即返回。未命中 → "其他"
 # =============================================================================
 _FRAME_GROUP_KEYWORDS: list[tuple[list[str], str]] = [
-    # AI 全产业链
-    (["芯片", "半导体", "光刻", "EDA", "封装", "HBM", "存储芯片", "GPU", "寒武纪", "昇腾", "RISC-V", "国产芯片"], "AI产业链"),
-    (["算力", "光模块", "CPO", "液冷", "PCB", "铜缆", "数据中心", "东数西算", "服务器"], "AI产业链"),
-    (["大模型", "AIGC", "多模态", "人工智能", "AI应用", "AI Agent", "智能体", "智算", "AI语料"], "AI产业链"),
-    (["AI手机", "AI PC", "AI眼镜", "AIPC", "消费电子", "MR", "AR", "VR", "OLED", "MiniLED", "折叠屏"], "AI产业链"),
+    # AI 全产业链（半导体上游优先匹配）
+    (["芯片", "半导体", "光刻", "EDA", "封装", "HBM", "高带宽内存", "存储芯片", "GPU", "寒武纪", "RISC-V", "国产芯片",
+      "元件", "电子化学品", "被动元件", "IGBT", "碳化硅", "氮化镓", "玻璃基板"], "AI产业链"),
+    (["算力", "光模块", "CPO", "液冷", "PCB", "铜缆", "数据中心", "东数西算", "华为算力", "华为海思"], "AI产业链"),
+    (["大模型", "AIGC", "多模态", "人工智能", "AI应用", "智能体", "智算", "AI语料",
+      "数字经济", "数字孪生", "国资云"], "AI产业链"),
+    (["AI手机", "AI PC", "AI眼镜", "AIPC", "消费电子", "混合现实", "OLED", "MiniLED", "折叠屏",
+      "短剧游戏", "谷子经济"], "AI产业链"),
     (["苹果概念"], "AI产业链"),
     # 机器人
-    (["人形机器人", "人形机器", "具身智能", "机器人", "减速器", "丝杠", "伺服"], "机器人"),
-    # 智能驾驶（必须在新能源/电力之前，"新能源车"优先归驾驶）
-    (["自动驾驶", "智能驾驶", "智能座舱", "车路云", "激光雷达", "无人驾驶", "车联网"], "智能驾驶"),
-    (["新能源汽车", "新能源车", "固态电池", "充电桩", "汽车整车"], "智能驾驶"),
+    (["人形机器人", "人形机器", "具身智能", "机器人", "减速器", "丝杠", "伺服", "机器人执行器", "机器视觉"], "机器人"),
+    # 智能驾驶（必须在新能源/电力之前）
+    (["自动驾驶", "智能驾驶", "智能座舱", "车路云", "激光雷达", "无人驾驶", "车联网", "高压快充", "换电"], "智能驾驶"),
+    (["新能源车", "固态电池", "充电桩", "汽车整车"], "智能驾驶"),
     # 数据要素
-    (["数据要素", "数据确权", "数据交易", "数据安全", "信息安全"], "数据要素"),
+    (["数据要素"], "数据要素"),
     # 华为系
-    (["华为", "鸿蒙", "海思"], "华为系"),
+    (["华为概念", "华为欧拉", "欧拉"], "华为系"),
+    (["鸿蒙"], "华为系"),
     # 低空经济
     (["低空经济", "飞行汽车", "eVTOL", "无人机"], "低空经济"),
     # 卫星/通信
-    (["卫星", "北斗", "5G", "6G", "商业航天", "航天"], "卫星通信"),
-    # 核电/绿电/电力（水电/水利归此处）
+    (["卫星", "北斗", "5G", "6G", "商业航天", "航天航空", "国防军工"], "卫星通信"),
+    # 前沿科技
+    (["可控核聚变", "量子科技"], "前沿科技"),
+    # 电池技术（新能源细分）
+    (["BC电池", "钙钛矿电", "TOPCon电", "钠电池", "麒麟电池", "刀片电池", "动力电池回收"], "电池技术"),
+    # 核电/绿电/电力
     (["核电", "核能"], "核电/绿电"),
-    (["绿色电力", "绿电", "水利", "水电", "清洁"], "核电/绿电"),
-    # 新能源/储能（风电/光伏/储能归此处）
-    (["储能", "光伏", "锂电池", "氢能", "风电", "新能源"], "新能源"),
-    # 电力（特高压/电网归此处，不含水电/核电）
-    (["电力", "特高压", "智能电网", "虚拟电厂", "输变电"], "电力"),
+    (["绿色电力", "绿电"], "核电/绿电"),
+    # 新能源/储能
+    (["储能", "光伏", "锂电池", "氢能", "风电"], "新能源"),
+    # 电力（特高压/电网）
+    (["电力", "特高压", "智能电网", "虚拟电厂"], "电力"),
     # 医药
-    (["创新药", "生物医药", "CXO", "医疗器械", "医药"], "医药"),
+    (["创新药", "生物医药", "CXO", "医疗器械", "医药", "减肥药", "医美概念"], "医药"),
     # 金融
-    (["证券", "券商", "保险", "银行", "信托", "多元金融"], "金融"),
+    (["券商", "保险", "银行", "信托", "多元金融"], "金融"),
     # 黄金/有色
     (["黄金", "有色", "铜", "铝", "稀土", "锂矿"], "黄金/有色"),
+    # 新材料
+    (["PEEK", "碳纤维概", "石墨烯", "超导", "有机硅概", "合成生物"], "新材料"),
     # 钢铁化工
-    (["钢铁", "化工", "化纤", "涂料"], "钢铁化工"),
+    (["钢铁", "化工", "化纤"], "钢铁化工"),
     # 军工
     (["军工", "航空", "船舶", "航运", "国防", "军民融合"], "军工"),
+    # 消费
+    (["白酒", "白酒概念", "食品", "家电", "旅游", "酒店", "零售", "养老概念", "养老金持", "宠物经济"], "消费"),
     # 外围
     (["英伟达"], "外围联动"),
 ]
@@ -482,6 +492,9 @@ class SectorAnalysisNode:
         quality = DataQuality()
 
         try:
+            # Step 0: 获取同花顺板块热度（辅助维度）
+            ths_hot_sectors = await self._fetch_ths_hot_sectors()
+
             # Step 1: 并发获取板块数据
             sectors_raw = await self._fetch_sector_data(quality)
             if not sectors_raw:
@@ -500,6 +513,11 @@ class SectorAnalysisNode:
 
             # Step 1.5: 加载板块趋势历史（跨日连续性）
             prev_trends = self._load_all_sector_trends(sectors_raw)
+
+            # Step 1.55: 提前计算市场方向（用于 regime-dependent P0 门槛）
+            # 基于板块 K 线 T-0 涨跌幅判断：普涨/普跌/分化
+            early_direction = self._early_market_direction(sectors_raw)
+            logger.info(f"[Node 2] 提前市场方向: {early_direction}")
 
             # Step 1.6: 两阶段评分（Node 2 v2）
             # Pass 1: 计算所有板块原始指标
@@ -522,6 +540,12 @@ class SectorAnalysisNode:
 
             # Pass 2: 截面百分位排名
             all_ranked = self._apply_cross_sectional_ranking(all_raw_metrics)
+
+            # Pass 2.5: 预计算全部 strength_score（供 RRG RS-Ratio 截面排名）
+            all_scores_today: list[float] = []
+            for ranked in all_ranked:
+                score = self._calc_strength_score(ranked)
+                all_scores_today.append(score)
 
             # 记录有效维度到 DataQuality
             has_breadth = any(
@@ -549,6 +573,9 @@ class SectorAnalysisNode:
                     sector_info, market_context, quality,
                     prev_trend=prev_trend,
                     ranked_indicators=ranked_indicators,
+                    ths_hot_sectors=ths_hot_sectors,
+                    market_direction=early_direction,
+                    all_scores_today=all_scores_today,
                 )
                 if detail is not None:
                     analyzed.append(detail)
@@ -574,8 +601,14 @@ class SectorAnalysisNode:
             exhausted_from_frame = self._manage_frames(frames, analyzed)
             result = self._integrate_frames(result, frames, exhausted_from_frame, analyzed)
 
-            # Step 3.4: 主线家族聚合（Node 2 v2）
-            result.theme_families = self._build_theme_families(analyzed)
+            # Step 3.4: 主线家族聚合（数据驱动相关性聚类，替代硬编码关键词）
+            result.theme_families = self._build_theme_families(analyzed, sectors_raw)
+
+            # Step 3.4a: 跨板块拥挤检测（R2）
+            crowding_warnings = self._detect_family_crowding(analyzed)
+            if crowding_warnings:
+                result.notes.extend(crowding_warnings)
+                logger.info(f"[Node 2] 家族拥挤警示: {crowding_warnings}")
 
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
@@ -695,16 +728,51 @@ class SectorAnalysisNode:
         else:
             quality.available_fields.append("sector_klines")
 
-        realtime_changes = self._fetch_sector_realtime()
+        # T-0 涨跌幅：从板块 K 线最后两根 bar 直接计算（覆盖所有有 K 线的板块）
+        # mootdx index_bars 盘中最后一根 bar 即为当日实时数据
+        t0_count = 0
         for s in sectors:
-            board_name = s.get("name", "")
-            if board_name in realtime_changes:
-                s["today_change"] = realtime_changes[board_name]
+            klines = s.get("klines", [])
+            if len(klines) >= 2:
+                today_close = klines[-1].get("close", 0)
+                prev_close = klines[-2].get("close", 0)
+                if prev_close > 0 and today_close > 0:
+                    s["today_change"] = round(
+                        (today_close - prev_close) / prev_close * 100, 2
+                    )
+                    t0_count += 1
+
+        logger.info(
+            f"[Node 2] T-0 涨跌幅: {t0_count}/{len(sectors)} 个板块（K线计算）"
+        )
 
         logger.info(
             f"[Node 2] 完成: {len(sectors)}/{len(matched)} 个板块获取成功",
         )
         return sectors
+
+    async def _fetch_ths_hot_sectors(self) -> dict[str, float]:
+        """获取同花顺板块热度排行，返回 {板块名: 热度值} 字典。
+
+        作为板块强度评分的辅助维度：高热度板块获得情绪加成。
+        降级：采集失败返回空字典（不影响主流程）。
+        """
+        try:
+            from src.services.ths_hot_list import fetch_hot_sectors
+
+            sectors = await asyncio.to_thread(fetch_hot_sectors, top_n=30)
+            if not sectors:
+                logger.warning("[Node 2] 同花顺板块热度: 0 条")
+                return {}
+
+            # 转为 {板块名: 热度值} 字典
+            hot_map = {s["name"]: s["rate"] for s in sectors if s.get("name")}
+            logger.info("[Node 2] 同花顺板块热度: %d 条", len(hot_map))
+            return hot_map
+
+        except Exception as exc:
+            logger.warning("[Node 2] 同花顺板块热度采集失败: %s", exc)
+            return {}
 
     async def _discover_boards(
         self, quality: DataQuality,
@@ -823,43 +891,6 @@ class SectorAnalysisNode:
             })
         return klines
 
-    @staticmethod
-    def _fetch_sector_realtime() -> dict[str, float]:
-        """用 mootdx TCP 获取板块核心成分股 T-0 实时涨跌幅。
-
-        Returns:
-            {板块名称: 成分股涨跌幅中位数}，如 {"黄金概念": -3.38, "金属铜": -2.15}
-            获取失败时返回空 dict。
-        """
-        result: dict[str, float] = {}
-        try:
-            from mootdx.quotes import Quotes
-            import statistics
-
-            client = Quotes.factory(market="std")
-        except Exception as exc:
-            logger.warning(f"[Node 2] mootdx 初始化失败: {exc}")
-            return result
-
-        for sector_name, constituents in SECTOR_CONSTITUENTS.items():
-            try:
-                df = client.quotes(constituents)
-                pcts = []
-                for _, row in df.iterrows():
-                    price = float(row.get("price", 0))
-                    last_close = float(row.get("last_close", 0))
-                    if last_close > 0 and price > 0:
-                        pct = (price - last_close) / last_close * 100
-                        pcts.append(pct)
-                if pcts:
-                    result[sector_name] = round(statistics.median(pcts), 2)
-            except Exception as exc:
-                logger.debug(f"[Node 2] {sector_name} T-0 获取失败: {exc}")
-
-        if result:
-            logger.info(f"[Node 2] T-0 板块涨跌幅: {result}")
-        return result
-
     # =================================================================
     # 单板块分析流水线
     # =================================================================
@@ -871,12 +902,17 @@ class SectorAnalysisNode:
         quality: DataQuality,
         prev_trend: Optional[dict] = None,
         ranked_indicators: Optional[dict[str, float]] = None,
+        ths_hot_sectors: Optional[dict[str, float]] = None,
+        market_direction: str = "分化",
+        all_scores_today: Optional[list[float]] = None,
     ) -> Optional[SectorDetail]:
-        """对单个板块执行完整分析：强度 → 信号 → 状态 → 分级 → 生命周期。
+        """对单个板块执行完整分析：强度 → RRG → 状态 → 分级 → 生命周期。
 
         Args:
             prev_trend: 前日 SQLite 趋势记录（用于连续性约束）
             ranked_indicators: 预计算的截面百分位排名指标（Node 2 v2）
+            ths_hot_sectors: 同花顺板块热度字典 {板块名: 热度值}（辅助加成）
+            all_scores_today: 当日全部板块 strength_score（供 RRG RS-Ratio 截面排名）
         """
         klines = sector_info.get("klines", [])
         df = self._klines_to_df(klines)
@@ -892,45 +928,64 @@ class SectorAnalysisNode:
             indicators = {k: clip(v, 0.0, 1.0) for k, v in raw.items()}
         strength_score = self._calc_strength_score(indicators)
 
-        # 2) 启动信号
-        launch = self._detect_launch_signal(df, sector_info)
+        # 1.5) 同花顺热度加成（辅助维度：高热度板块获得情绪加成）
+        if ths_hot_sectors:
+            sector_name = sector_info.get("name", "")
+            heat_value = ths_hot_sectors.get(sector_name, 0.0)
+            if heat_value > 0:
+                # 热度加成：Top 10 板块 +5分，Top 20 +3分，Top 30 +1分
+                # 热度值范围约 30k~150k，按分位加成
+                if heat_value >= 100000:
+                    heat_bonus = 5.0
+                elif heat_value >= 60000:
+                    heat_bonus = 3.0
+                elif heat_value > 0:
+                    heat_bonus = 1.0
+                else:
+                    heat_bonus = 0.0
+                strength_score = min(100.0, strength_score + heat_bonus)
+                logger.debug(f"[Node 2] {sector_name} 热度加成: +{heat_bonus} (热度={heat_value:.0f})")
 
-        # 3) 过热信号
+        # 1.8) RRG 四象限分类（Node 2 v3 核心）
+        rrg = self._compute_rrg(strength_score, prev_trend, all_scores_today)
+
+        # 2) 启动信号（降级为诊断指标，不再驱动状态）
+        launch = self._detect_launch_signal(df, sector_info, market_direction=market_direction)
+
+        # 3) 过热信号（降级为诊断指标）
         overheat = self._detect_overheat_signal(df, sector_info)
 
-        # 4) 状态判定（含连续性约束）
-        state = self._determine_state(
-            strength_score, indicators, launch, overheat,
+        # 4) 状态判定（RRG 驱动，替代旧的 8 分支优先级链）
+        state = self._determine_state_v3(
+            strength_score, indicators, rrg,
             sector_info, market_context, df,
             prev_trend=prev_trend,
+            market_direction=market_direction,
         )
 
-        # 5) 主线分级（仅 active/exhausted）
+        # 5) 主线分级（active/exhausted/high_position_cooling 均计算，保留曾评级）
         tier: Optional[str] = None
-        if state in ("active_mainline", "exhausted_mainline"):
+        if state in ("active_mainline", "exhausted_mainline", "high_position_cooling"):
             tier = self._classify_mainline_tier(sector_info, indicators)
 
-        # 6) 生命周期（仅 active/exhausted，继承前日天数）
+        # 6) 生命周期（RRG 象限直接映射；含 cooling 降温期）
         lifecycle: Optional[LifecycleInfo] = None
-        if state in ("active_mainline", "exhausted_mainline"):
-            prev_lifecycle = prev_trend.get("lifecycle_phase") if prev_trend else None
+        if state in ("active_mainline", "exhausted_mainline", "high_position_cooling"):
             prev_days = prev_trend.get("mainline_days") if prev_trend else None
-            lifecycle = self._classify_lifecycle(
-                df, tier, overheat, launch,
-                prev_lifecycle=prev_lifecycle,
-                prev_days=prev_days,
-            )
+            lifecycle = self._classify_lifecycle_v3(rrg, prev_days)
 
         # 7) 推荐操作
         action: Optional[str] = None
-        if launch.get("triggered"):
+        if state == "active_mainline" and rrg.quadrant in ("leading", "improving"):
             action = _LIFECYCLE_ACTION_MAP.get(
                 lifecycle.phase if lifecycle else "mature",
             )
         elif state == "exhausted_mainline":
             action = "exit"
+        elif state == "high_position_cooling":
+            action = "reduce_or_hold"  # 高位降温：防新买入，持仓者减仓/持有
 
-        # 8) 主线质量：B级标记为 weak
+        # 8) 主线质量：B级标记为 weak（仅 active/exhausted 视为"主线质量"）
         mainline_quality: Optional[str] = None
         if state in ("active_mainline", "exhausted_mainline"):
             mainline_quality = "weak" if tier == "B" else "strong"
@@ -948,6 +1003,8 @@ class SectorAnalysisNode:
             recommended_action=action,
             today_change=sector_info.get("today_change"),
             frame_group=sector_info.get("frame_group"),
+            overheat_severity=overheat.severity,
+            rrg=rrg,
         )
 
     # =================================================================
@@ -1107,18 +1164,115 @@ class SectorAnalysisNode:
         return raw * 100.0
 
     # =================================================================
-    # 启动信号: 3 硬门槛 + 5 维加权
+    # RRG 四象限计算（Node 2 v3 状态机核心）
+    # =================================================================
+
+    @staticmethod
+    def _ema_smooth(prev_value: Optional[float], raw_value: float, alpha: float = 0.5) -> float:
+        """3 日 EMA 平滑（2026-08-17 状态机校准）。
+
+        N=3 → alpha = 1 - exp(-2/(N+1)) ≈ 0.5；首日（无前值）取原始值。
+        目的：吸收日频截面排名单日噪音——StockCharts 指出日频 RRG 是周频趋势的
+        "短期 hiccup"，单日被其他板块挤压不应一次性翻转象限状态（黄金 08-13 教训）。
+        """
+        if prev_value is None:
+            return raw_value
+        return alpha * raw_value + (1.0 - alpha) * prev_value
+
+    @staticmethod
+    def _compute_rrg(
+        strength_score: float,
+        prev_trend: Optional[dict],
+        all_scores_today: Optional[list[float]],
+    ) -> RRGQuadrant:
+        """RRG 四象限分类（替代旧的 launch/overheat/lifecycle 三套状态系统）。
+
+        RS-Ratio: 当前 strength_score 在全截面中的百分位排名（趋势强度）
+        RS-Momentum: strength_score 的时序变化率（动量方向）
+
+        关键机制：动量领先趋势——momentum 转向是趋势转向的早期预警信号。
+        - Improving（低 ratio + 高 momentum）→ 即将进入 Leading
+        - Weakening（高 ratio + 低 momentum）→ 即将进入 Lagging
+
+        2026-08-17 状态机校准：rs_ratio/rs_momentum 经 3 日 EMA 平滑后再判象限，
+        原始值存 rs_ratio_raw/rs_momentum_raw 供诊断。
+
+        论文依据：
+        - Minervini 2016: Relative Rotation Graph 四象限
+        - Janssen 2020: RS 动量领先 RS 趋势（早期预警）
+        - Ekström et al.: 最优动量退出概率 P(θ≤t|data) 随持续性递增
+        """
+        # ── RS-Ratio: 截面百分位排名 ──
+        if all_scores_today and len(all_scores_today) > 1:
+            # 计算 strength_score 在全部板块中的百分位
+            below = sum(1 for s in all_scores_today if s < strength_score)
+            rs_ratio = below / len(all_scores_today)
+        else:
+            rs_ratio = 0.5  # 无截面数据时默认中位
+
+        # ── RS-Momentum: 时序变化率 ──
+        trajectory = prev_trend.get("strength_trajectory", []) if prev_trend else []
+        if len(trajectory) >= 3:
+            # 用 trajectory 的最后 3-5 天斜率估算 momentum
+            recent = trajectory[-5:] if len(trajectory) >= 5 else trajectory[-3:]
+            slope = (recent[-1] - recent[0]) / len(recent)
+            # 归一化：±5分/天 → ±1.0，映射到 [0, 1]
+            rs_momentum = max(0.0, min(1.0, 0.5 + slope / 10.0))
+        else:
+            rs_momentum = 0.5  # 无历史数据时默认中性
+
+        # ── 3 日 EMA 平滑（吸收单日截面噪音，防"一夜蒸发"）──
+        prev_ratio_ema = prev_trend.get("rrg_ratio_ema") if prev_trend else None
+        prev_momentum_ema = prev_trend.get("rrg_momentum_ema") if prev_trend else None
+        ratio_ema = SectorAnalysisNode._ema_smooth(prev_ratio_ema, rs_ratio)
+        momentum_ema = SectorAnalysisNode._ema_smooth(prev_momentum_ema, rs_momentum)
+
+        # ── 象限判定（用平滑值）──
+        if ratio_ema >= 0.5 and momentum_ema >= 0.5:
+            quadrant = "leading"
+        elif ratio_ema < 0.5 and momentum_ema >= 0.5:
+            quadrant = "improving"
+        elif ratio_ema >= 0.5 and momentum_ema < 0.5:
+            quadrant = "weakening"
+        else:
+            quadrant = "lagging"
+
+        return RRGQuadrant(
+            rs_ratio=round(ratio_ema, 3),
+            rs_momentum=round(momentum_ema, 3),
+            quadrant=quadrant,
+            rs_ratio_raw=round(rs_ratio, 3),
+            rs_momentum_raw=round(rs_momentum, 3),
+        )
+
+    # =================================================================
+    # 启动信号: 3 硬门槛 + 5 维加权（Node 2 v3: 降级为诊断指标）
     # =================================================================
 
     def _detect_launch_signal(
-        self, df: pd.DataFrame, sector_info: dict,
+        self, df: pd.DataFrame, sector_info: dict, market_direction: str = "分化",
     ) -> dict[str, Any]:
         """检测板块启动信号。
 
         硬门槛（全部通过才触发）：
-        1. 突破: close[-1] > max(high[-15:])
-        2. 放量: volume[-1] > volume_ma3 * 1.3
+        1. 突破: close[-1] > max(high[-21:-1]) × 1.005  # 20日突破 + 0.5% buffer
+        2. 放量: volume[-1] > volume_ma5 × 1.5           # 5日均量 × 1.5
         3. 站上 MA20: close[-1] > ma20
+
+        6 维软打分（新增 ad_confirmation）：
+        consolidation(0.20) + volume_expansion(0.25) + price_strength(0.15)
+        + trend_alignment(0.15) + breadth(0.10) + ad_confirmation(0.15)
+
+        R1: Regime-Dependent 阈值自适应（Mokhtarian et al. 2024; Alexiou & Tyagi 2020）
+        市场方向    启动门槛(strong)  启动门槛(weak)
+        普涨(calm)     0.50              0.35
+        分化(transition) 0.75              0.55
+        普跌(turbulent)  0.80              0.65
+
+        论文依据：
+        - Brock et al. 1992: band filter 减少 whipsaw
+        - IEEE 2026: <1.5x 量能视为假突破概率高
+        - A/D Line 确认：突破真伪的核心判据（65-72% 准确率）
         """
         if len(df) < 20:
             return {"triggered": False, "level": "none", "score": 0.0, "dimensions": {}}
@@ -1128,14 +1282,14 @@ class SectorAnalysisNode:
         volume = df["volume"]
 
         # --- 3 硬门槛 ---
-        # 1. 突破 15 日高点
-        high_15d = high.iloc[-16:-1].max() if len(high) >= 16 else high.iloc[:-1].max()
-        if close.iloc[-1] <= high_15d:
+        # L1: 突破 20 日高点 + 0.5% buffer（Brock et al. 1992: band filter）
+        high_20d = high.iloc[-21:-1].max() if len(high) >= 21 else high.iloc[:-1].max()
+        if close.iloc[-1] <= high_20d * 1.005:
             return {"triggered": False, "level": "none", "score": 0.0, "dimensions": {}}
 
-        # 2. 量能确认: 当日成交量 ≥ 3 日均量 × 1.3
-        vol_ma3 = volume.iloc[-4:-1].mean() if len(volume) >= 4 else volume.iloc[:-1].mean()
-        if vol_ma3 <= 0 or volume.iloc[-1] < vol_ma3 * 1.3:
+        # L2: 量能确认: 当日成交量 ≥ 5 日均量 × 1.5（IEEE 2026: 假突破阈值）
+        vol_ma5 = volume.iloc[-6:-1].mean() if len(volume) >= 6 else volume.iloc[:-1].mean()
+        if vol_ma5 <= 0 or volume.iloc[-1] < vol_ma5 * 1.5:
             return {"triggered": False, "level": "none", "score": 0.0, "dimensions": {}}
 
         # 3. 站上 MA20
@@ -1143,28 +1297,41 @@ class SectorAnalysisNode:
         if close.iloc[-1] <= ma20:
             return {"triggered": False, "level": "none", "score": 0.0, "dimensions": {}}
 
-        # --- 5 维软打分（各 0-1）---
+        # --- 6 维软打分（各 0-1）---
         dims = {
             "consolidation": self._calc_consolidation_score(df),
-            "volume_expansion": self._calc_volume_expansion_score(volume, vol_ma3),
+            "volume_expansion": self._calc_volume_expansion_score(volume, vol_ma5),
             "price_strength": self._calc_price_strength_score(close, high, df["low"]),
             "trend_alignment": self._calc_trend_alignment_score(close),
             "breadth": self._calc_breadth_score(sector_info),
+            "ad_confirmation": ad_line_confirmation(df),
         }
 
-        # 加权总分
+        # L6: 加权总分（新增 ad_confirmation 15% 权重）
         weights = {
-            "consolidation": 0.25,
+            "consolidation": 0.20,
             "volume_expansion": 0.25,
-            "price_strength": 0.20,
+            "price_strength": 0.15,
             "trend_alignment": 0.15,
-            "breadth": 0.15,
+            "breadth": 0.10,
+            "ad_confirmation": 0.15,
         }
         score = sum(dims[k] * weights[k] for k in weights)
 
-        if score >= 0.75:
+        # R1: Regime-Dependent 阈值
+        if market_direction == "普涨":
+            strong_threshold = 0.50
+            weak_threshold = 0.35
+        elif market_direction == "普跌":
+            strong_threshold = 0.80
+            weak_threshold = 0.65
+        else:  # 分化
+            strong_threshold = 0.75
+            weak_threshold = 0.55
+
+        if score >= strong_threshold:
             level = "strong_launch"
-        elif score >= 0.55:
+        elif score >= weak_threshold:
             level = "weak_launch"
         else:
             level = "none"
@@ -1178,36 +1345,15 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _calc_consolidation_score(df: pd.DataFrame) -> float:
-        """整理充分度: 15 日区间紧凑度 + 布林收口程度。"""
-        if len(df) < 20:
-            return 0.3
+        """整理充分度: Bollinger 带宽百分位排名。
 
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-
-        # 15 日振幅 < 8% → 满分, > 15% → 0 分
-        high_15 = high.iloc[-15:].max()
-        low_15 = low.iloc[-15:].min()
-        mid_15 = close.iloc[-15:].mean()
-        amplitude = (high_15 - low_15) / mid_15 if mid_15 > 0 else 0
-        range_score = clip((0.15 - amplitude) / (0.15 - 0.08), 0, 1)
-
-        # 布林宽度百分位（越窄越好）
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        if ma20.iloc[-1] > 0 and std20.iloc[-1] > 0:
-            bandwidth = 2 * std20.iloc[-1] / ma20.iloc[-1]
-            # 对比历史带宽
-            bw_series = 2 * std20.dropna() / ma20.dropna()
-            if len(bw_series) > 10:
-                boll_pct = 1.0 - clip(bandwidth / bw_series.quantile(0.8), 0, 1)
-            else:
-                boll_pct = 0.5
-        else:
-            boll_pct = 0.5
-
-        return clip(0.6 * range_score + 0.4 * boll_pct, 0, 1)
+        L4 优化：改为布林带宽百分位（越低 = 越压缩 = 分数越高）
+        论文依据：Bollinger squeeze 在 bottom 10-20th percentile 时突破爆发力最强
+        """
+        bb_pct = bb_width_percentile(df, period=20, lookback=252)
+        # bb_pct 越低 → 越压缩 → 分数越高
+        # bottom 20th → score=1.0, bottom 50th → score=0.0
+        return clip(1.0 - bb_pct / 0.5, 0, 1)
 
     @staticmethod
     def _calc_volume_expansion_score(volume: pd.Series, vol_ma3: float) -> float:
@@ -1245,32 +1391,35 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _calc_trend_alignment_score(close: pd.Series) -> float:
-        """均线排列度: MA5/10/20 多头排列程度。
+        """均线排列度: MA20 斜率 + MA5/MA20 偏离度的加权。
 
-        修复：旧逻辑只检查 MA5>MA10>MA20 是否满足（0/0.5/1.0 三档），
-        不看差距大小。改为计算均线间距的归一化得分，粒度更细。
+        L5 优化：从简单排列顺序改为 MA 斜率，直接衡量动量方向和强度。
+        理由：仅看 MA5>MA10>MA20 粒度太粗，斜率能区分强趋势和弱趋势。
         """
         if len(close) < 20:
             return 0.5
 
         ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
+        ma20 = close.rolling(20).mean()
 
-        if pd.isna(ma5) or pd.isna(ma10) or pd.isna(ma20):
+        if pd.isna(ma5) or len(ma20.dropna()) < 6:
             return 0.5
 
-        # 计算两组间距的归一化得分
-        # gap1: (MA5 - MA10) / MA10, 正值=多头, 负值=空头
-        # gap2: (MA10 - MA20) / MA20
-        gap1 = (ma5 - ma10) / ma10 if ma10 > 0 else 0
-        gap2 = (ma10 - ma20) / ma20 if ma20 > 0 else 0
+        ma20_last = ma20.iloc[-1]
+        ma20_5d_ago = ma20.iloc[-5] if len(ma20) >= 5 else ma20.iloc[0]
 
-        # 每组间距映射到 [0, 1]：-2% → 0, 0% → 0.5, +2% → 1.0
-        def gap_score(gap: float) -> float:
-            return clip((gap + 0.02) / 0.04, 0, 1)
+        if pd.isna(ma20_last) or pd.isna(ma20_5d_ago) or ma20_5d_ago <= 0:
+            return 0.5
 
-        return (gap_score(gap1) + gap_score(gap2)) / 2
+        # MA20 斜率：5日变化率，映射到 [-2%, +2%] → [0, 1]
+        slope = (ma20_last - ma20_5d_ago) / ma20_5d_ago
+        slope_score = clip((slope + 0.02) / 0.04, 0, 1)
+
+        # MA5/MA20 偏离度：短期动量方向
+        gap = (ma5 - ma20_last) / ma20_last if ma20_last > 0 else 0
+        gap_score = clip((gap + 0.02) / 0.04, 0, 1)
+
+        return 0.6 * slope_score + 0.4 * gap_score
 
     @staticmethod
     def _calc_breadth_score(sector_info: dict) -> float:
@@ -1284,252 +1433,468 @@ class SectorAnalysisNode:
         return clip((ratio - 0.4) / 0.3, 0, 1)
 
     # =================================================================
-    # 过热信号: 4 条件任一触发
+    # 过热信号: 渐进式评分（替代旧的 4 条件二元触发）
     # =================================================================
 
     def _detect_overheat_signal(
         self, df: pd.DataFrame, sector_info: dict,
-    ) -> dict[str, bool]:
-        """检测板块过热信号（任一触发即过热）。
+    ) -> OverheatSeverity:
+        """检测板块过热信号 — 渐进式严重度评分。
 
-        所有过热信号均需板块处于近期高位区间（距 60d 高点 ≤10%），
-        防止下跌途中的反弹日误触发过热判定。
+        每个信号输出 0~1 连续分数，加权汇总为 severity。
+        severity > 0.5 → exhausted（踢出主线框）
+        severity 0.3~0.5 → warning（过热警告，降 confidence）
+        severity < 0.3 → normal
 
-        信号:
-        - strong_divergence: 价格 20d 新高但 MACD DIF 低于前高 80%
-        - volume_divergence: 价格新高但量能不足前高 70%
-        - breadth_extreme: 价格近高位 + >80% 成分股上涨
-        - turnover_extreme: 价格近高位 + 换手率 > 60d 历史 90 分位
+        前置条件：板块距 60d 高点 ≤10%（过热信号仅在高位区间有意义）
+
+        论文依据：
+        - MACD 背离渐进式（Kang 2023）
+        - A/D Line distribution 出现在 72% 重大下跌前（TradeAlgo 2026）
+        - 天量滞涨 = 分配信号（Hsu 2016）
+        - 极端宽度（>top 15%）后 20 日收益显著低于正常宽度（Harvard SSRN）
         """
-        signals = {
-            "strong_divergence": False,
-            "volume_divergence": False,
-            "breadth_extreme": False,
-            "turnover_extreme": False,
-        }
-
         if len(df) < 20:
-            return signals
+            return OverheatSeverity()
 
         close = df["close"]
-        high = df["high"]
-        volume = df["volume"]
-
-        # 20d 价格新高判定
-        price_at_20d_high = close.iloc[-1] >= close.iloc[-20:].max()
 
         # 60d 高位判定（过热信号的通用前置条件）
-        # 板块距 60d 最高点 ≤10% 才视为"高位区间"
         lookback_60d = min(60, len(close))
         high_60d = close.iloc[-lookback_60d:].max()
         price_near_peak = close.iloc[-1] >= high_60d * 0.90
+        if not price_near_peak:
+            return OverheatSeverity()
 
-        # 1. 强背离: 价格新高 + MACD DIF 低于前高的 80%
+        # 20d 价格新高
+        price_at_20d_high = close.iloc[-1] >= close.iloc[-20:].max()
+
+        # ── 1. MACD 背离（渐进式，替代旧的 DIF < 前高×0.8 二元判定）──
+        divergence_score = 0.0
         if price_at_20d_high and len(df) >= 30:
             macd_df = calculate_macd(df)
             dif = macd_df["MACD_DIF"]
-            # 找 20d 内 DIF 最高值（排除最后一天）
+            dea = macd_df["MACD_DEA"]
             dif_20d_high = dif.iloc[-20:-1].max() if len(dif) >= 21 else dif.iloc[:-1].max()
-            if dif_20d_high > 0 and dif.iloc[-1] < dif_20d_high * 0.8:
-                signals["strong_divergence"] = True
+            if dif_20d_high > 0:
+                # DIF 下跌幅度占前高的比例（0~1）
+                dif_decline_ratio = (dif_20d_high - dif.iloc[-1]) / dif_20d_high
+                # MACD 死叉加分（DIF < DEA = 动能已转负）
+                signal_cross = 1.0 if dif.iloc[-1] < dea.iloc[-1] else 0.0
+                divergence_score = clip(dif_decline_ratio * 0.7 + signal_cross * 0.3, 0, 1)
 
-        # 2. 量能背离: 价格新高 + 量能不足前高时 70%
+        # ── 2. 量能背离（渐进式，替代旧的 volume < 前高×0.7 二元判定）──
+        volume_divergence_score = 0.0
         if price_at_20d_high and len(df) >= 20:
             price_high_idx = close.iloc[-20:].idxmax()
+            volume = df["volume"]
             vol_at_price_high = volume.loc[price_high_idx] if price_high_idx in volume.index else 0
-            if vol_at_price_high > 0 and volume.iloc[-1] < vol_at_price_high * 0.7:
-                signals["volume_divergence"] = True
+            if vol_at_price_high > 0:
+                vol_ratio = volume.iloc[-1] / vol_at_price_high
+                # 量能越不足前高，分数越高
+                if vol_ratio < 0.7:
+                    volume_divergence_score = clip((0.7 - vol_ratio) / 0.5, 0.3, 1.0)
+                elif vol_ratio < 1.0:
+                    volume_divergence_score = clip((1.0 - vol_ratio) / 0.3 * 0.3, 0, 0.3)
 
-        # 3. 宽度极端: 价格近高位 + >80% 成分股上涨
-        #    仅在板块处于高位区间时，宽度极端才有过热含义
+        # ── 3. 宽度极端（自适应百分位，替代旧的 up/total > 0.8 硬阈值）──
+        breadth_score = 0.0
         up = sector_info.get("up_count", 0)
         down = sector_info.get("down_count", 0)
         total = up + down
-        if price_near_peak and total > 0 and up / total > 0.8:
-            signals["breadth_extreme"] = True
+        if price_near_peak and total > 0:
+            today_breadth = up / total
+            # 用板块历史宽度序列做百分位排名
+            # 注：板块级 breadth 数据来自 mootdx K 线，此处用简化逻辑：
+            # 直接按 today_breadth 值分段评分（0.8→0.5, 0.9→0.8, 0.95→1.0）
+            if today_breadth >= 0.95:
+                breadth_score = 1.0
+            elif today_breadth >= 0.90:
+                breadth_score = 0.8
+            elif today_breadth >= 0.85:
+                breadth_score = 0.5
+            elif today_breadth >= 0.80:
+                breadth_score = 0.3
 
-        # 4. 换手率极端: 价格近高位 + 成交额 > 60d 90 分位
-        #    仅在板块处于高位区间时，放量才有过热含义
+        # ── 4. 换手率极端（保留原有逻辑）──
+        turnover_score = 0.0
         turnover = sector_info.get("turnover_rate", 0.0)
         if price_near_peak and turnover > 0 and len(df) >= 30:
-            # 用成交额/量近似换手率变化
             amount_series = df["amount"].iloc[-60:] if len(df) >= 60 else df["amount"]
             if len(amount_series) > 10:
                 p90 = amount_series.quantile(0.9)
                 if df["amount"].iloc[-1] > p90:
-                    signals["turnover_extreme"] = True
+                    # 渐进式：超过 P90 越多分数越高
+                    excess_ratio = (df["amount"].iloc[-1] - p90) / p90
+                    turnover_score = clip(0.5 + excess_ratio * 0.5, 0.5, 1.0)
+                elif df["amount"].iloc[-1] > amount_series.quantile(0.75):
+                    turnover_score = 0.3
 
-        return signals
+        # ── 5. A/D Line 分配信号（新增）──
+        ad_dist = ad_distribution_signal(df)
+
+        # ── 6. 天量滞涨（新增）──
+        vol_stall = False
+        if len(df) >= 20 and "amount" in df.columns:
+            amount_20d_high = df["amount"].iloc[-20:].max()
+            if df["amount"].iloc[-1] >= amount_20d_high * 0.95:
+                recent_returns = df["close"].pct_change().tail(5).mean()
+                today_return = df["close"].iloc[-1] / df["close"].iloc[-2] - 1
+                vol_stall = bool(recent_returns > 0 and today_return < recent_returns * 0.3)
+
+        # ── 加权汇总 ──
+        severity = (
+            divergence_score * 0.30
+            + volume_divergence_score * 0.20
+            + breadth_score * 0.15
+            + turnover_score * 0.15
+            + (1.0 if ad_dist else 0.0) * 0.10
+            + (1.0 if vol_stall else 0.0) * 0.10
+        )
+
+        if severity > 0.5:
+            level = "exhausted"
+        elif severity > 0.3:
+            level = "warning"
+        else:
+            level = "normal"
+
+        return OverheatSeverity(
+            divergence_score=round(divergence_score, 3),
+            volume_divergence_score=round(volume_divergence_score, 3),
+            breadth_score=round(breadth_score, 3),
+            turnover_score=round(turnover_score, 3),
+            ad_distribution=ad_dist,
+            volume_stall=vol_stall,
+            severity=round(severity, 3),
+            level=level,
+        )
 
     # =================================================================
-    # 状态判定（优先级链）
+    # 状态判定（RRG 四象限驱动，Node 2 v3）
     # =================================================================
 
-    def _determine_state(
+    def _compute_break_signals(
+        self, df: pd.DataFrame, sector_info: dict,
+    ) -> tuple[Optional[float], bool, float, str]:
+        """计算状态机的破位/未破位判据信号。
+
+        返回 (price_chg_5d, above_ma20, high20_pos, overheat_level)。
+        price_chg_5d 用真实 5 日涨幅（不随当日截面排名变），是区分
+        high_position_cooling（回调未破位）与 exhausted_mainline（破位）的主判据。
+        """
+        if df is None or len(df) == 0:
+            return None, False, 1.0, "normal"
+        close = df["close"]
+        price_chg_5d = (close.iloc[-1] / close.iloc[-5] - 1.0) if len(close) >= 5 and close.iloc[-5] > 0 else 0.0
+        above_ma20 = (
+            close.iloc[-1] > close.rolling(20).mean().iloc[-1]
+            if len(close) >= 20 else False
+        )
+        if len(close) >= 20 and max(close.iloc[-20:]) > 0:
+            high20_pos = close.iloc[-1] / max(close.iloc[-20:])
+        else:
+            high20_pos = 1.0
+        overheat = self._detect_overheat_signal(df, sector_info)
+        return price_chg_5d, above_ma20, high20_pos, overheat.level
+
+    @staticmethod
+    def _apply_state_machine(
+        prev_state: Optional[str],
+        prev_dwell: int,
+        q: str,
+        rs_momentum: float,
+        strength_score: float,
+        price_chg_5d: Optional[float],
+        above_ma20: bool,
+        high20_pos: float,
+        overheat_level: str,
+        today_change: Optional[float],
+        score_drop: float,
+        is_ambush: bool,
+        is_defensive: bool,
+    ) -> str:
+        """规则版马尔可夫状态转移矩阵（2026-08-17 文献校准，替代 P0-P5 优先级链）。
+
+        设计依据：
+        - 状态持久性：市场 regime 自转移概率 0.89-0.99（Liu&Xu&Zhao 2010）
+        - 转移路径固定：RRG 实证 Leading 92% 转 Weakening（Optuma 2万次旋转）→
+          主线只能经 高位降温/衰竭 退出，**不存在 主线→埋伏 的边**
+        - 切换需驻留/置信度门槛（HMM 后验>0.8, Procida 2026），除硬触发外
+        - 硬触发 HI1：单日 score 崩≥20 → 立即降级；HI2：单日暴涨>8%+leading → 立即进主线
+
+        破位/未破位判据（区分 高位降温(回调未坏) vs 衰竭(破位)）：
+          BROKEN = OR(5日涨幅≤0, 跌破MA20, 过热exhausted且20日高位<0.60, 单日崩≥20)
+        """
+        # HI2 硬触发：单日暴涨>8% + leading + score>70 → 当日进 active（豁免驻留）
+        if today_change is not None and today_change > 8.0 and q == "leading" and strength_score > 70:
+            return "active_mainline"
+
+        # 破位判据（含 HI1 单日崩≥20 自然落位）
+        broken = bool(
+            (price_chg_5d is not None and price_chg_5d <= 0)
+            or (not above_ma20)
+            or (overheat_level == "exhausted" and high20_pos < 0.60)
+            or (score_drop >= 20)
+        )
+
+        # ── 冷启动 / neutral：入口探测 ──
+        if prev_state in (None, "neutral"):
+            if is_ambush:
+                return "ambush"
+            if not broken and q == "leading" and strength_score > 60:
+                # 首次进入主线（后续由主线框驻留管理）
+                return "active_mainline"
+            if is_defensive:
+                return "defensive_rotation"
+            return "neutral"
+
+        # ── 主线：只有 驻留 / 高位降温 / 衰竭 三条路 ──
+        if prev_state == "active_mainline":
+            if broken:
+                return "exhausted_mainline"       # E3 破位当天踢出
+            if q in ("leading", "improving") and strength_score > 55:
+                return "active_mainline"          # E1 驻留
+            if q == "weakening":
+                return "high_position_cooling"    # E2 转弱未破位 → 高位降温
+            return "active_mainline"              # 其它中性情况保守驻留
+
+        # ── 高位降温（前主线回调未破位）：修复需 dwell≥2 confirm ──
+        if prev_state == "high_position_cooling":
+            if broken:
+                return "exhausted_mainline"       # E7 破位
+            repaired = (
+                q in ("leading", "improving")
+                and strength_score > 55
+                and (price_chg_5d is None or price_chg_5d > 0)
+            )
+            if repaired and prev_dwell >= 2:
+                return "active_mainline"          # E6 驻留确认后回主线
+            if strength_score < 45:
+                return "neutral"                  # E8 低分熄灭
+            return "high_position_cooling"        # E5 驻留（未到确认期）
+
+        # ── 衰竭：观察期上限3天，修复需连续2天 confirm ──
+        if prev_state == "exhausted_mainline":
+            if (
+                not broken
+                and q == "leading"
+                and strength_score > 60
+                and (today_change or 0) > 0
+            ):
+                if prev_dwell >= 2:
+                    return "active_mainline"      # E11 连续2天确认后回主线
+                return "exhausted_mainline"       # 未到确认期，驻留观察
+            if score_drop >= 20 or strength_score < 50 or broken:
+                if prev_dwell >= 3:
+                    return "neutral"              # E10 驻留超限 → 熄灭
+                return "exhausted_mainline"       # E9 驻留观察
+            return "exhausted_mainline"           # E9 继续观察
+
+        # ── 埋伏：低位+动量转正蓄势，只能经 leading 突破上位 ──
+        if prev_state == "ambush":
+            if not is_ambush and q == "leading" and strength_score > 60:
+                if prev_dwell >= 1:
+                    return "active_mainline"      # E13 突破上位
+                return "ambush"
+            if not is_ambush and (rs_momentum < 0.5 or strength_score < 50):
+                if prev_dwell >= 2:
+                    return "neutral"              # E14 动量转负/低分连续 → 出埋伏
+                return "ambush"
+            return "ambush"                       # E12 驻留
+
+        # ── 防守轮动：正交于 RRG ──
+        if prev_state == "defensive_rotation":
+            if is_defensive:
+                return "defensive_rotation"       # E15 驻留
+            return "neutral"                      # E16 条件转假
+
+        return "neutral"
+
+    def _determine_state_v3(
         self,
         strength_score: float,
         indicators: dict[str, float],
-        launch: dict,
-        overheat: dict[str, bool],
+        rrg: RRGQuadrant,
         sector_info: dict,
         market_context: MarketContext,
         df: pd.DataFrame,
         prev_trend: Optional[dict] = None,
+        market_direction: str = "分化",
     ) -> str:
-        """按优先级链判定板块状态。
+        """规则版马尔可夫状态机驱动（2026-08-17 文献校准，替代 P0-P5 优先级链）。
 
-        优先级: 强启动信号 > 过热信号 > 持续强势 > 高位派发 > 埋伏期 > 弱启动信号 > 防守 > 中性
-
-        连续性约束：
-        - 前日 active_mainline → 今天 score>60 且无过热 → 保持 active_mainline（防跳变）
-        - 前日 exhausted_mainline → 今天有强启动信号才翻回 active
+        核心变更：
+        - 状态记忆：读 prev_trend["state"]（精确六态快照，替代 unified_signal 三值映射，
+          修复根因 #3"主线记忆易断开"）
+        - 转移矩阵：_apply_state_machine 定义合法边，主线只能经 高位降温/衰竭 退出，
+          禁止 主线→埋伏 直接跳；切换需驻留确认（硬触发豁免）
+        - 埋伏判据：_is_ambush_candidate（低位+动量刚转正+结构吸筹），
+          替代旧 _check_momentum_ambush"score>阈值即埋伏"（根因 #2）
+        - 破位判据 price_chg_5d 用真实 5 日涨幅，不随当日截面排名变
+          （修复根因 #1"一夜蒸发"，黄金 08-13 不再直接消失）
         """
-        prev_state = prev_trend.get("unified_signal") if prev_trend else None
-        # 将 unified_signal 映射回 state
-        _signal_to_state = {
-            "bullish": "active_mainline",
-            "bearish": "exhausted_mainline",
-            "neutral": None,
-        }
-        prev_mainline_state = _signal_to_state.get(prev_state) if prev_state else None
+        prev_state = (prev_trend or {}).get("state")
+        prev_dwell = int((prev_trend or {}).get("dwell_days") or 0)
+        q = rrg.quadrant
 
-        launch_level = launch.get("level", "none")
+        # 破位/未破位判据信号
+        price_chg_5d, above_ma20, high20_pos, overheat_level = self._compute_break_signals(df, sector_info)
 
-        # P0: 连续性保护 — 前日主线不因单日波动跳变
-        if prev_mainline_state == "active_mainline":
-            if strength_score > 60 and not any(overheat.values()):
-                return "active_mainline"
+        # 单日分数回落（硬触发 HI1 信号源）
+        trajectory = (prev_trend or {}).get("strength_trajectory", [])
+        prev_score = trajectory[-1] if trajectory else strength_score
+        score_drop = prev_score - strength_score
 
-        # P1: 强启动信号 → active_mainline
-        if launch_level == "strong_launch":
-            return "active_mainline"
+        # 防守 + 埋伏（新判据）
+        is_defensive = self._check_defensive(sector_info, market_context, df, strength_score)
+        is_ambush = self._is_ambush_candidate(
+            df, indicators, rrg, strength_score, prev_trend, is_defensive,
+        )
 
-        # P2: 过热信号触发 → exhausted_mainline（必须先曾是主线）
-        if prev_mainline_state == "active_mainline" and any(overheat.values()):
-            return "exhausted_mainline"
-
-        # P3: 持续强势 (score>70, turnover_expansion>0.6, breadth_health>0.6)
-        # Node 2 v2：使用百分位排名指标（0-1），0.6 ≈ 前 40%
-        if (
-            strength_score > 70
-            and indicators.get("turnover_expansion", 0) > 0.6
-            and indicators.get("breadth_health", 0) > 0.6
-            and launch_level != "weak_launch"
-        ):
-            return "active_mainline"
-
-        # P4: 高位派发 (20d 涨幅 >15% 但量能萎缩 → 主力出货信号，必须先曾是主线)
-        close = df["close"]
-        if len(close) >= 20:
-            gain_20d = close.iloc[-1] / close.iloc[-20] - 1
-            if prev_mainline_state == "active_mainline" and gain_20d > 0.15 and indicators.get("turnover_expansion", 0.5) < 0.3:
-                return "exhausted_mainline"
-
-        # P5: 埋伏期（技术形态）
-        if self._check_ambush(df, indicators):
-            return "ambush"
-
-        # P5b: 分数动量埋伏（连续上涨 + 强度达标）
-        if self._check_momentum_ambush(strength_score, prev_trend):
-            return "ambush"
-
-        # P5.5: 弱启动信号但不满足埋伏条件 → neutral（而非主线）
-        # 弱启动 = 整理不充分或量能不足，即使强度高也不应算主线
-        if launch_level == "weak_launch":
-            return "neutral"
-
-        # P6: 防守轮动
-        if self._check_defensive(sector_info, market_context, df, strength_score):
-            return "defensive_rotation"
-
-        return "neutral"
+        return self._apply_state_machine(
+            prev_state=prev_state,
+            prev_dwell=prev_dwell,
+            q=q,
+            rs_momentum=rrg.rs_momentum,
+            strength_score=strength_score,
+            price_chg_5d=price_chg_5d,
+            above_ma20=above_ma20,
+            high20_pos=high20_pos,
+            overheat_level=overheat_level,
+            today_change=sector_info.get("today_change"),
+            score_drop=score_drop,
+            is_ambush=is_ambush,
+            is_defensive=is_defensive,
+        )
 
     @staticmethod
-    def _check_ambush(df: pd.DataFrame, indicators: dict[str, float]) -> bool:
-        """埋伏期条件（需满足 ≥2/4，且量能条件 ② 必须满足）。
+    def _compute_ambush_score(df: pd.DataFrame, indicators: dict[str, float]) -> float:
+        """结构吸筹加权分（0-1）— 从 _check_ambush 拆分，供状态机新埋伏判据复用。
 
-        条件：
-        1. 20 日波动率 < 35%（年化）— 科技板块普遍 35-50%，旧 25% 过严
-        2. 最新成交量 > 1.3× MA20 量 — 量能必要条件，不满足直接排除
-        3. 布林宽度 < 历史 40 分位
-        4. 试盘模式：放量(vp>0.7) + 日内窄幅震荡(<2%) + 宽度不极端
+        4 维加权：波动率压缩25% + 机构积累35% + 量能特征25% + 试盘15%，A5 乘法加成。
+        返回纯加权分（不含"近3日不跌/量能放大"硬门槛），调用方自行叠加方向/位置条件。
+
+        论文依据：
+        - Bollinger squeeze bottom 10-20th percentile = spring coiling
+        - 机构积累（量增价平）出现在 68% 的拉升前（TradeAlgo 2026）
+        - VCV 上升 = 知情资金介入（Boone & White 2015, Kyle 1985）
+        - 压缩 + 量能异常同时出现 → 启动概率最高（spike_scanner 开源项目）
         """
         if len(df) < 20:
-            return False
+            return 0.0
 
         close = df["close"]
         volume = df["volume"]
 
-        # 条件 2（必要前提）：量能温和放大 — 无量则直接排除
-        vol_ma20 = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else volume.mean()
-        cond_volume = vol_ma20 > 0 and volume.iloc[-1] > vol_ma20 * 1.3
-        if not cond_volume:
-            return False
+        # ① 波动率压缩评分 (25%)
+        bb_pct = bb_width_percentile(df, period=20, lookback=252)
+        if bb_pct < 0.20:
+            compression_score = 1.0
+        elif bb_pct < 0.40:
+            compression_score = 0.5
+        else:
+            compression_score = 0.0
 
-        # 条件 1: 20d 波动率 < 35%（年化）
-        returns = close.pct_change().dropna()
-        vol_20d = returns.tail(20).std() * np.sqrt(252) if len(returns) >= 20 else 1.0
-        cond_volatility = vol_20d < 0.35
+        # ② 机构积累评分 (35%)：A/D Line 上升 + 价格横盘
+        accum_score = accumulation_score(df)
 
-        # 条件 3: 布林收口（宽度低于历史 40% 分位）
-        cond_boll = False
-        if len(close) >= 60:
-            ma20 = close.rolling(20).mean()
-            std20 = close.rolling(20).std()
-            bw_current = 2 * std20.iloc[-1] / ma20.iloc[-1] if ma20.iloc[-1] > 0 else 0
-            bw_series = (2 * std20 / ma20).dropna()
-            if len(bw_series) > 20 and not pd.isna(bw_current):
-                cond_boll = bw_current < bw_series.quantile(0.4)
+        # ③ 量能特征评分 (25%)：VCV + 量能放大
+        vcv_score = volume_vcv(df, lookback=20)
+        vol_expansion = indicators.get("turnover_expansion", 0.5)
+        volume_feature_score = clip(vcv_score * 0.6 + vol_expansion * 0.4, 0, 1)
 
-        # 条件 4: 试盘模式 — 量能温和放大 + 日内窄幅 + 宽度居中
-        cond_probe = False
+        # ④ 试盘确认评分 (15%)
         last_row = df.iloc[-1]
         te = indicators.get("turnover_expansion", 0.5)
-        intraday_range = (last_row["high"] - last_row["low"]) / last_row["close"] if last_row["close"] > 0 else 1.0
+        intraday_range = (
+            (last_row["high"] - last_row["low"]) / last_row["close"]
+            if last_row["close"] > 0 else 1.0
+        )
         bh = indicators.get("breadth_health", 0.5)
-        cond_probe = te > 0.7 and intraday_range < 0.02 and 0.3 < bh < 0.7
+        # 放宽振幅阈值（板块级数据波动天然小于个股：2% → 3%）
+        probe_score = 1.0 if (te > 0.7 and intraday_range < 0.03 and 0.3 < bh < 0.7) else 0.0
 
-        return sum([cond_volatility, cond_volume, cond_boll, cond_probe]) >= 2
+        # 加权汇总
+        ambush_score = (
+            compression_score * 0.25
+            + accum_score * 0.35
+            + volume_feature_score * 0.25
+            + probe_score * 0.15
+        )
+
+        # A5: 压缩 + 量能同时达标 → 乘法加成
+        if compression_score >= 0.5 and volume_feature_score >= 0.5:
+            ambush_score = min(1.0, ambush_score * 1.3)
+
+        return ambush_score
 
     @staticmethod
-    def _check_momentum_ambush(strength_score: float, prev_trend: Optional[dict]) -> bool:
-        """分数动量埋伏（连续上涨 + 强度达标）。
+    def _check_ambush(df: pd.DataFrame, indicators: dict[str, float]) -> bool:
+        """埋伏结构条件（布尔包装：硬门槛 + 结构吸筹分阈值）。
 
-        条件（满足任一）：
-        A. 连续 3 天上升（trajectory 2 个点 + 当前）
-        B. 单日大幅上涨 > 8 分（快速启动信号）
+        必要前提：
+        - 近 3 日不跌（价格方向门槛——近3日下跌的不是埋伏，是弱势）
+        - 量能温和放大（volume > MA20 × 1.3）
+        然后要求 _compute_ambush_score ≥ 0.5。"""
+        if len(df) < 20:
+            return False
+
+        # 价格方向门槛：近 3 日下跌的板块不是"埋伏"，是弱势
+        if len(df) >= 3:
+            recent_close = df["close"].iloc[-3:]
+            if recent_close.iloc[-1] < recent_close.iloc[0]:
+                return False
+
+        # 必要前提：量能温和放大
+        volume = df["volume"]
+        vol_ma20 = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else volume.mean()
+        if vol_ma20 <= 0 or volume.iloc[-1] <= vol_ma20 * 1.3:
+            return False
+
+        return SectorAnalysisNode._compute_ambush_score(df, indicators) >= 0.5
+
+    @staticmethod
+    def _is_ambush_candidate(
+        df: pd.DataFrame,
+        indicators: dict[str, float],
+        rrg: RRGQuadrant,
+        strength_score: float,
+        prev_trend: Optional[dict],
+        is_defensive: bool,
+    ) -> bool:
+        """埋伏新判据（2026-08-17 状态机校准，替代 _check_momentum_ambush）。
+
+        文献依据：埋伏的本质 = RRG improving 象限起点（RS-Momentum 刚上穿、RS-Ratio 仍在低位）
+        而非"高分数残留"（旧实现方向反了）。Optuma 2万次旋转统计：
+        埋伏是"蓄势"，只能从低位起，正在走弱/高位回落的板块不是埋伏。
+
+        IS_AMBUSH = AND(
+          rrg.rs_ratio_ema < 0.55,                 # 截面中低位（对应 improving 前夜）
+          rrg.rs_momentum_ema >= 0.5,              # 动量已转正
+          动量刚转正（prev_momentum_ema 缺失视为首次观察放宽）,
+          _check_ambush(df, indicators),            # 结构吸筹：近3日不跌+量能放大+加权≥0.5
+          45 <= strength_score <= 72,               # 分数带，排除高残余（黄金 08-17 score78 被拒）
+          not is_defensive,                         # 防守轮动正交
+        )
         """
-        if not prev_trend:
+        if rrg is None:
             return False
-
-        trajectory = prev_trend.get("strength_trajectory", [])
-        if not trajectory:
+        if rrg.rs_ratio >= 0.55:
+            return False  # 截面高位残留不是埋伏（黄金 08-17 ratio 0.922 被拒）
+        if rrg.rs_momentum < 0.5:
+            return False  # 动量未转正（趋势仍在恶化）
+        # 动量"刚"转正：前日 EMA 缺失（首次观察）或前日仍在 0.5 以下
+        prev_momentum_ema = prev_trend.get("rrg_momentum_ema") if prev_trend else None
+        if prev_momentum_ema is not None and prev_momentum_ema >= 0.5:
+            return False  # 动量已正多日 → 是持续改善而非埋伏起点
+        if not SectorAnalysisNode._check_ambush(df, indicators):
             return False
-
-        prev_score = trajectory[-1]
-        ambush_days = prev_trend.get("ambush_days", 0)
-
-        # 埋伏连续性加分：历史埋伏天数 ≥ 2 → 降低准入门槛
-        # 普通板块：score > 60 才进入动量埋伏
-        # 老埋伏板块：score > 50 即可（已在框内持续追踪）
-        score_threshold = 50 if ambush_days >= 2 else 60
-
-        if strength_score <= score_threshold:
+        if strength_score < 45 or strength_score > 72:
             return False
-
-        # 条件 A: 连续上升（trajectory 至少 2 个点）
-        if len(trajectory) >= 2:
-            recent = trajectory[-2:]
-            recent.append(strength_score)
-            increases = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
-            if increases >= 2:
-                return True
-
-        # 条件 B: 单日大幅上涨 > 8 分
-        if strength_score - prev_score > 8:
-            return True
-
-        return False
+        if is_defensive:
+            return False
+        return True
 
     @staticmethod
     def _check_defensive(
@@ -1653,99 +2018,72 @@ class SectorAnalysisNode:
     # 生命周期
     # =================================================================
 
-    def _classify_lifecycle(
+    def _classify_lifecycle_v3(
         self,
-        df: pd.DataFrame,
-        tier: Optional[str],
-        overheat: dict[str, bool],
-        launch: dict,
-        prev_lifecycle: Optional[str] = None,
+        rrg: RRGQuadrant,
         prev_days: Optional[int] = None,
     ) -> LifecycleInfo:
-        """按主线等级映射生命周期阈值，判断当前阶段。
+        """RRG 象限直接映射生命周期阶段（Node 2 v3，替代旧的天数驱动）。
 
-        连续性：如果前日有 lifecycle 且 prev_days > 0，继承 days_since_launch = prev_days + 1，
-        而非从 K 线重算（避免窗口滑动导致的天数跳变）。
+        象限 → 阶段映射：
+        - Leading   → acceleration（领涨加速期）
+        - Improving → launch（启动改善期）
+        - Weakening → mature（成熟衰退期）
+        - Lagging   → late_stage（晚期停滞）
+
+        连续性：继承前日天数 +1，不依赖 K 线重算。
+
+        论文依据：
+        - RRG 四象限天然对应板块生命周期（Minervini 2016）
+        - 动量领先趋势：Improving→Leading 转换比旧版 launch 硬门槛更早（Janssen 2020）
         """
-        effective_tier = tier or "B"
-        launch_end, accel_end, mature_end = LIFECYCLE_THRESHOLDS[effective_tier]
-        thresholds = {
-            "launch_end": launch_end,
-            "acceleration_end": accel_end,
-            "mature_end": mature_end,
+        _quadrant_to_phase = {
+            "leading": "acceleration",
+            "improving": "launch",
+            "weakening": "mature",
+            "lagging": "late_stage",
         }
-
-        # 过热 → mature_exhausted
-        if any(overheat.values()):
-            days = self._inherit_or_calc_days(df, prev_lifecycle, prev_days)
-            return LifecycleInfo(
-                phase="mature_exhausted",
-                days_since_launch=days,
-                thresholds=thresholds,
-            )
-
-        # 继承前日天数（连续性核心）
-        days = self._inherit_or_calc_days(df, prev_lifecycle, prev_days)
-
-        if days <= launch_end:
-            phase = "launch"
-        elif days <= accel_end:
-            phase = "acceleration"
-        elif days <= mature_end:
-            phase = "mature"
-        else:
-            phase = "late_stage"
+        phase = _quadrant_to_phase[rrg.quadrant]
+        days = (prev_days or 0) + 1
 
         return LifecycleInfo(
             phase=phase,
             days_since_launch=days,
-            thresholds=thresholds,
+            thresholds={},  # RRG 不需要天数阈值
         )
 
-    @staticmethod
-    def _inherit_or_calc_days(
-        df: pd.DataFrame,
-        prev_lifecycle: Optional[str],
-        prev_days: Optional[int],
-    ) -> int:
-        """优先继承前日天数，无前日记录才从 K 线计算。
-
-        连续性逻辑：前日是 launch/acceleration/mature → 今天 +1。
-        前日是 late_stage/mature_exhausted 或无记录 → 从 K 线重算。
-        """
-        _inheriting_phases = {"launch", "acceleration", "mature"}
-        if prev_lifecycle in _inheriting_phases and prev_days is not None and prev_days > 0:
-            return prev_days + 1
-        return SectorAnalysisNode._calc_days_since_launch(df)
+    # =================================================================
+    # 跨板块拥挤检测（R2）
+    # =================================================================
 
     @staticmethod
-    def _calc_days_since_launch(df: pd.DataFrame) -> int:
-        """从 K 线数据估算启动以来天数。
+    def _detect_family_crowding(analyzed: list[SectorDetail]) -> list[str]:
+        """检测家族级拥挤信号。
 
-        寻找近期最低收盘价作为启动起点，但必须验证从低点涨幅超过
-        _LAUNCH_CONFIRM_THRESHOLD（5%）才算真正启动。
+        当同一 frame_group 内 ≥3 个板块的 overheat_severity > 0.3 → 拥挤信号。
+        论文依据：Acharya & Marks (2019) — 因子拥挤导致流动性枯竭。
 
-        修复：旧逻辑只算"从低点到今天的天数"，不验证是否真正涨起来。
-        阴跌 20 天 + 反弹 3 天会被误判为 late_stage（23天 > mature_end=20）。
+        返回警示信息列表，注入到 SectorContext.notes。
         """
-        if len(df) < 5:
-            return 0
-        close = df["close"]
-        tail = close.tail(60) if len(close) >= 60 else close
-        min_idx = tail.idxmin()
-        min_val = close.loc[min_idx]
-        min_pos = df.index.get_loc(min_idx)
+        warnings: list[str] = []
+        family_overheat: dict[str, list[str]] = {}  # frame_group → [板块名]
 
-        # 从低点往后找第一个涨幅超过门槛的日期（启动确认日）
-        launch_threshold = min_val * (1 + _LAUNCH_CONFIRM_THRESHOLD)
-        after_low = close.iloc[min_pos:]
-        breakout_mask = after_low >= launch_threshold
-        if not breakout_mask.any():
-            # 从未真正涨起来过，不算启动
-            return 0
-        breakout_idx = breakout_mask.idxmax()  # 第一次超过门槛的日期
-        breakout_pos = df.index.get_loc(breakout_idx)
-        return len(df) - 1 - breakout_pos
+        for sector in analyzed:
+            fg = sector.frame_group or "其他"
+            severity = sector.overheat_severity or 0.0
+            if severity > 0.3:
+                family_overheat.setdefault(fg, []).append(
+                    f"{sector.name}({severity:.2f})"
+                )
+
+        for family, members in family_overheat.items():
+            if len(members) >= 3:
+                warnings.append(
+                    f"⚠️ 家族拥挤: [{family}] 有 {len(members)} 个板块过热 "
+                    f"({', '.join(members[:5])})，追高风险显著"
+                )
+
+        return warnings
 
     # =================================================================
     # 分类汇总
@@ -1778,6 +2116,7 @@ class SectorAnalysisNode:
         exhausted = pick_by_state("exhausted_mainline", 3)
         ambush = pick_by_state("ambush", 5)
         defensive = pick_by_state("defensive_rotation", 2)
+        cooling = pick_by_state("high_position_cooling", 3)
 
         # 兜底：空列用评分最高的未分配板块填充（但标注为兜底）
         # 修复：主线（active/exhausted）不再兜底填充，无达标板块就留空
@@ -1785,8 +2124,8 @@ class SectorAnalysisNode:
             remaining = len(target)
             if remaining >= limit:
                 return
-            # 排除已分入主线/衰竭的板块，防止 active_mainline 板块被重复拉入埋伏
-            _excluded_states = {"active_mainline", "exhausted_mainline"}
+            # 排除已分入主线/衰竭/冷却的板块，防止被重复拉入埋伏
+            _excluded_states = {"active_mainline", "exhausted_mainline", "high_position_cooling"}
             candidates = sorted(
                 [s for s in sectors if s.code not in used_codes and s.state not in _excluded_states],
                 key=lambda s: s.strength_score, reverse=True,
@@ -1817,20 +2156,48 @@ class SectorAnalysisNode:
             exhausted_mainline=exhausted,
             ambush=ambush,
             defensive_rotation=defensive,
+            cooling_down=cooling,  # 由 _integrate_frames 覆盖为权威结果
             top_by_score=top_by_score,
             market_direction=direction,
             notes=notes,
         )
 
     @staticmethod
-    def _classify_market_direction(sectors: list[SectorDetail]) -> str:
-        """市场方向: 普涨(>60%上涨) / 普跌(>60%下跌) / 分化。"""
-        up = sum(1 for s in sectors if s.indicators.get("price_momentum", 0) > 0.2)
-        down = sum(1 for s in sectors if s.indicators.get("price_momentum", 0) < -0.2)
-        total = len(sectors)
+    def _early_market_direction(sectors_raw: list[dict]) -> str:
+        """提前计算市场方向（基于原始板块 dict 的 T-0 涨跌幅）。
 
-        if total == 0:
+        在逐板块分析前调用，用于 Regime-Dependent P0 门槛。
+        逻辑与 _classify_market_direction 相同，但操作 dict 而非 SectorDetail。
+        """
+        with_data = [s for s in sectors_raw if s.get("today_change") is not None]
+        if not with_data:
             return "分化"
+
+        up = sum(1 for s in with_data if s["today_change"] > 0)
+        down = sum(1 for s in with_data if s["today_change"] < 0)
+        total = len(with_data)
+
+        if up / total > 0.6:
+            return "普涨"
+        elif down / total > 0.6:
+            return "普跌"
+        return "分化"
+
+    @staticmethod
+    def _classify_market_direction(sectors: list[SectorDetail]) -> str:
+        """市场方向: 普涨(>60%上涨) / 普跌(>60%下跌) / 分化。
+
+        使用 T-0 真实涨跌幅（today_change），而非百分位排名（price_momentum）。
+        百分位排名值域 [0,1]，>0.2 永远 ≈80% 满足，导致永远输出"普涨"。
+        """
+        # 仅统计有真实涨跌幅数据的板块
+        with_data = [s for s in sectors if s.today_change is not None]
+        if not with_data:
+            return "分化"
+
+        up = sum(1 for s in with_data if s.today_change > 0)
+        down = sum(1 for s in with_data if s.today_change < 0)
+        total = len(with_data)
 
         if up / total > 0.6:
             return "普涨"
@@ -1839,7 +2206,7 @@ class SectorAnalysisNode:
         return "分化"
 
     # =================================================================
-    # 框系统：主线框 + 埋伏框（持久化进出管理）
+    # 框系统：主线框（持久化进出管理）
     # =================================================================
 
     # 主线框常量
@@ -1848,17 +2215,10 @@ class SectorAnalysisNode:
     _MAINLINE_WEAK_TOLERANCE_DAYS = 1    # 弱组（全 B 成员）零容忍
     _MAINLINE_LATE_STAGE_SCORE_THRESHOLD = 60
 
-    # 埋伏框常量
-    _AMBUSH_EXIT_SCORE_THRESHOLD = 50
-    _AMBUSH_EXIT_CONSECUTIVE_DECLINE_DAYS = 5
-    _AMBUSH_PROMOTE_CONSECUTIVE_RISE_DAYS = 3
-    _AMBUSH_PROMOTE_SCORE_THRESHOLD = 70
-
     def _load_frames(self) -> dict[str, dict]:
-        """从 SQLite 加载所有活跃框记录。
+        """从 SQLite 加载所有活跃主线框记录。
 
         主线框 key = frame_group（产业主题名）
-        埋伏框 key = sector_code（个股级）
 
         Returns:
             {key: {frame_type, frame_group, entry_date, member_codes,
@@ -1895,7 +2255,7 @@ class SectorAnalysisNode:
         frames: dict[str, dict],
         analyzed: list[SectorDetail],
     ) -> list[SectorDetail]:
-        """框进出管理（主线框 + 埋伏框均为板块个体级）。
+        """主线框进出管理（板块个体级）。
 
         Node 2 v2 修正：主线框从家族级改为板块个体级。
         家族仅用于聚合视图（_build_theme_families），不参与进出管理。
@@ -1941,6 +2301,12 @@ class SectorAnalysisNode:
                 logger.info(f"[Node 2] 主线框踢出 [{sector.name}]: 过热/衰竭")
                 continue
 
+            # 高位降温 → 软化移出主线框（区别于衰竭：进入 cooling_down 输出而非 exhausted）
+            if sector.state == "high_position_cooling":
+                mainline_keys_to_remove.append(key)
+                logger.info(f"[Node 2] 主线框软化移出 [{sector.name}]: 高位降温")
+                continue
+
             # 低分检查（强板块容忍 3 天，弱板块 1 天）
             tolerance = (
                 self._MAINLINE_STRONG_TOLERANCE_DAYS
@@ -1959,6 +2325,24 @@ class SectorAnalysisNode:
                     continue
             else:
                 frame["consecutive_low_days"] = 0
+
+            # T-0 硬止损（Teplova 2017: Stop-Loss）
+            # 板块单日大跌 → 加速踢出，不等待连续低分累积
+            # 仅主线框加 T-0 止损（弱势蓄势是正常行为，不应加速踢出）
+            today_chg = sector.today_change
+            if today_chg is not None:
+                if today_chg < -3.0:
+                    frame["consecutive_low_days"] += 2  # 暴跌：扣 2 天容忍度
+                    logger.debug(
+                        f"[Node 2] 主线框硬止损 [{sector.name}]: "
+                        f"T-0={today_chg:+.2f}% → consecutive_low_days={frame['consecutive_low_days']}"
+                    )
+                elif today_chg < -1.5:
+                    frame["consecutive_low_days"] += 1  # 明显下跌：扣 1 天
+                    logger.debug(
+                        f"[Node 2] 主线框止损加速 [{sector.name}]: "
+                        f"T-0={today_chg:+.2f}% → consecutive_low_days={frame['consecutive_low_days']}"
+                    )
 
             frame["last_update"] = today
 
@@ -1999,121 +2383,6 @@ class SectorAnalysisNode:
             }
             existing_mainline_codes.add(sector.code)
             logger.info(f"[Node 2] 主线框纳入 [{sector.name}] score={sector.strength_score:.1f}")
-
-        # ── 第三步：埋伏框（逻辑不变，个体级）──
-        ambush_codes_to_remove: list[str] = []
-        ambush_frame_keys = [k for k, v in frames.items() if v["frame_type"] == "ambush"]
-
-        for key in ambush_frame_keys:
-            frame = frames[key]
-            member_codes = frame.get("member_codes", [])
-            if not member_codes:
-                continue
-            sector = analyzed_by_code.get(member_codes[0])
-            if sector is None:
-                continue
-
-            te = sector.indicators.get("turnover_expansion", 0.5)
-            prev_score = frame["group_score"]
-            score = sector.strength_score
-
-            # 晋升检查
-            launch_level = sector.launch_signal.level if sector.launch_signal else "none"
-            if launch_level == "strong_launch":
-                # 晋升 → 转为主线框（以 board code 为 key）
-                frames.pop(key, None)
-                frames[sector.code] = {
-                    "frame_type": "mainline",
-                    "frame_group": sector.frame_group or _build_frame_group(sector.name),
-                    "entry_date": today,
-                    "last_update": today,
-                    "member_codes": [sector.code],
-                    "group_score": score,
-                    "has_strong_member": sector.tier in ("S", "A"),
-                    "consecutive_low_days": 0,
-                    "consecutive_rise_days": 0,
-                }
-                logger.info(f"[Node 2] 埋伏→主线晋升 {sector.name}: strong_launch")
-                continue
-
-            if score > prev_score and prev_score > 0:
-                frame["consecutive_rise_days"] += 1
-            else:
-                frame["consecutive_rise_days"] = 0
-
-            if (
-                frame["consecutive_rise_days"] >= self._AMBUSH_PROMOTE_CONSECUTIVE_RISE_DAYS
-                and score > self._AMBUSH_PROMOTE_SCORE_THRESHOLD
-            ):
-                frames.pop(key, None)
-                frames[sector.code] = {
-                    "frame_type": "mainline",
-                    "frame_group": sector.frame_group or _build_frame_group(sector.name),
-                    "entry_date": today,
-                    "last_update": today,
-                    "member_codes": [sector.code],
-                    "group_score": score,
-                    "has_strong_member": sector.tier in ("S", "A"),
-                    "consecutive_low_days": 0,
-                    "consecutive_rise_days": 0,
-                }
-                logger.info(f"[Node 2] 埋伏→主线晋升 {sector.name}: 连续动量")
-                continue
-
-            # 退出检查
-            if score < self._AMBUSH_EXIT_SCORE_THRESHOLD:
-                ambush_codes_to_remove.append(key)
-                logger.info(f"[Node 2] 埋伏框踢出 {sector.name}: score<{self._AMBUSH_EXIT_SCORE_THRESHOLD}")
-                continue
-            if te < 0.3:
-                ambush_codes_to_remove.append(key)
-                logger.info(f"[Node 2] 埋伏框踢出 {sector.name}: 量能萎缩(te<0.3)")
-                continue
-            prev_traj = sector.strength_trajectory or []
-            if len(prev_traj) >= self._AMBUSH_EXIT_CONSECUTIVE_DECLINE_DAYS:
-                recent = prev_traj[-self._AMBUSH_EXIT_CONSECUTIVE_DECLINE_DAYS:]
-                if all(recent[i] > recent[i+1] for i in range(len(recent)-1)):
-                    ambush_codes_to_remove.append(key)
-                    logger.info(f"[Node 2] 埋伏框踢出 {sector.name}: 连续{self._AMBUSH_EXIT_CONSECUTIVE_DECLINE_DAYS}天走弱")
-                    continue
-
-            frame["group_score"] = score
-            frame["last_update"] = today
-
-        for key in ambush_codes_to_remove:
-            frames.pop(key, None)
-
-        # ── 第四步：新埋伏入框 ──
-        # 收集当前活跃的主线板块 code，防止同板块误入埋伏
-        active_mainline_codes = {
-            f.get("member_codes", [None])[0]
-            for f in frames.values()
-            if f["frame_type"] == "mainline"
-        }
-
-        for sector in analyzed:
-            if sector.state != "ambush":
-                continue
-            if sector.code in {
-                c for f in frames.values() for c in f.get("member_codes", [])
-            }:
-                continue
-            # 若该板块已在主线框，不进入埋伏
-            if sector.code in active_mainline_codes:
-                continue
-            key = sector.code
-            frames[key] = {
-                "frame_type": "ambush",
-                "frame_group": sector.frame_group or _build_frame_group(sector.name),
-                "entry_date": today,
-                "last_update": today,
-                "member_codes": [sector.code],
-                "group_score": sector.strength_score,
-                "has_strong_member": False,
-                "consecutive_low_days": 0,
-                "consecutive_rise_days": 0,
-            }
-            logger.info(f"[Node 2] 埋伏框纳入 {sector.name}")
 
         return exhausted_from_frame
 
@@ -2166,29 +2435,42 @@ class SectorAnalysisNode:
             best_tier = family_tiers.get(fg, "B")
             group_score = max(b.strength_score for b in boards)
             has_strong = best_tier in ("S", "A")
+            # 使用最强板块的名称作为 group_name（避免家族名重复）
+            sorted_boards = sorted(boards, key=lambda s: s.strength_score, reverse=True)
+            display_name = sorted_boards[0].name
             mainline_groups.append(MainlineGroup(
-                group_name=fg,
+                group_name=display_name,
                 group_score=group_score,
                 tier=best_tier,
                 mainline_quality="strong" if has_strong else "weak",
-                members=sorted(boards, key=lambda s: s.strength_score, reverse=True),
+                members=sorted_boards,
             ))
         mainline_groups.sort(key=lambda g: g.group_score, reverse=True)
 
-        # 埋伏框 → SectorDetail 列表
-        ambush_from_frame: list[SectorDetail] = []
-        for key, frame in frames.items():
-            if frame["frame_type"] != "ambush":
-                continue
-            for code in frame.get("member_codes", []):
-                sector = analyzed_by_code.get(code)
-                if sector:
-                    ambush_from_frame.append(sector)
-                    used_codes.add(code)
+        # 埋伏输出：直接从当日 state 取，按分数排序截断 Top 10
+        ambush_list = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
+        ambush_list.sort(key=lambda s: s.strength_score, reverse=True)
+        if len(ambush_list) > 10:
+            logger.info(f"[Node 2] 埋伏截断: {len(ambush_list)}→10 个")
+        ambush_list = ambush_list[:10]
+        for s in ambush_list:
+            used_codes.add(s.code)
 
         # 衰竭主线
         exhausted_mainline = list(exhausted_from_frame)
         used_codes.update(s.code for s in exhausted_from_frame)
+
+        # 高位降温（前主线回调未破位）：从当日 state 过滤，Top 5
+        cooling_list = [
+            s for s in analyzed
+            if s.state == "high_position_cooling" and s.code not in used_codes
+        ]
+        cooling_list.sort(key=lambda s: s.strength_score, reverse=True)
+        if len(cooling_list) > 5:
+            logger.info(f"[Node 2] 高位降温截断: {len(cooling_list)}→5 个")
+        cooling_list = cooling_list[:5]
+        for s in cooling_list:
+            used_codes.add(s.code)
 
         # defensive_rotation
         defensive = [
@@ -2206,8 +2488,9 @@ class SectorAnalysisNode:
         return SectorContext(
             active_mainline=mainline_groups,
             exhausted_mainline=exhausted_mainline,
-            ambush=ambush_from_frame,
+            ambush=ambush_list,
             defensive_rotation=defensive,
+            cooling_down=cooling_list,
             top_by_score=top_by_score,
             market_direction=raw_result.market_direction,
             notes=[n for n in raw_result.notes if "埋伏板块" not in n],
@@ -2272,39 +2555,131 @@ class SectorAnalysisNode:
     # =================================================================
 
     def _build_theme_families(
-        self, analyzed: list[SectorDetail],
+        self,
+        analyzed: list[SectorDetail],
+        sectors_raw: list[dict],
     ) -> list:
-        """将板块按 FAMILY_KEYWORDS 归入主线家族，计算家族强度和题材地位。
+        """数据驱动的板块家族聚类（替代硬编码 FAMILY_KEYWORDS 分桶）。
+
+        使用板块 90 日收益相关性矩阵 + 层次聚类（average linkage，numpy 实现）
+        将相关性高的板块自然聚为一族。不同驱动逻辑的板块（如黄金 vs 稀土）
+        因收益相关性低而分入不同族。
+
+        参考：Boubaker et al. (2022) — 按收益相关性合并行业，Sharpe 0.71→1.16。
+
+        Args:
+            analyzed: 已分析的 SectorDetail 列表
+            sectors_raw: 原始板块数据（含 K 线）
 
         Returns: list[ThemeFamily]
         """
         from src.got.schemas import ThemeFamily
 
-        # 按家族分组
-        family_members: dict[str, list[SectorDetail]] = {name: [] for name, _ in FAMILY_KEYWORDS}
-        family_members["其他"] = []
+        if len(analyzed) < 3:
+            return []
 
-        for sector in analyzed:
-            frame_group = sector.frame_group or _build_frame_group(sector.name)
-            if frame_group in family_members:
-                family_members[frame_group].append(sector)
-            else:
-                family_members["其他"].append(sector)
+        # ── Step 1: 构建收益相关性矩阵 ──
+        raw_by_code = {s["code"]: s for s in sectors_raw}
+        returns_list = []
+        valid_indices = []  # analyzed 中有有效收益数据的索引
 
-        # 计算家族评分和题材地位
-        families = []
-        for family_name, members in family_members.items():
-            if not members:
+        for i, sector in enumerate(analyzed):
+            raw = raw_by_code.get(sector.code)
+            if not raw or not raw.get("klines") or len(raw["klines"]) < 10:
+                returns_list.append(None)
                 continue
-            if family_name == "其他":
-                continue  # "其他" 不参与主线家族输出
+            closes = [k["close"] for k in raw["klines"] if k.get("close", 0) > 0]
+            if len(closes) < 10:
+                returns_list.append(None)
+                continue
+            rets = [(closes[j] - closes[j - 1]) / closes[j - 1]
+                    for j in range(1, len(closes)) if closes[j - 1] > 0]
+            if len(rets) < 5:
+                returns_list.append(None)
+                continue
+            returns_list.append(rets)
+            valid_indices.append(i)
 
-            family_score = sum(m.strength_score for m in members) / len(members)
-            active_count = sum(
-                1 for m in members
-                if m.state in ("active_mainline", "exhausted_mainline")
+        n_valid = len(valid_indices)
+        if n_valid < 3:
+            logger.warning("[Node 2] 有效收益数据不足，回退到关键词分组")
+            return self._build_theme_families_fallback(analyzed)
+
+        # 对齐收益序列长度
+        min_len = min(len(r) for r in returns_list if r is not None)
+
+        # 计算相关系数矩阵
+        corr_matrix = np.zeros((n_valid, n_valid))
+        for a in range(n_valid):
+            corr_matrix[a, a] = 1.0
+            ra = np.array(returns_list[valid_indices[a]][:min_len])
+            for b in range(a + 1, n_valid):
+                rb = np.array(returns_list[valid_indices[b]][:min_len])
+                if ra.std() > 1e-10 and rb.std() > 1e-10:
+                    c = float(np.corrcoef(ra, rb)[0, 1])
+                    if not np.isnan(c):
+                        corr_matrix[a, b] = c
+                        corr_matrix[b, a] = c
+
+        # ── Step 2: 层次聚类（complete linkage，纯 numpy）──
+        corr_threshold = 0.65  # 相关性 > 0.65 的板块聚为一族（complete linkage 保守）
+        cluster_labels = self._hierarchical_cluster(corr_matrix, corr_threshold)
+
+        # ── Step 3: 计算板块一致性评分（Fix 2）──
+        coherence_scores = self._compute_all_coherence(corr_matrix, cluster_labels, n_valid)
+
+        # 写回 SectorDetail
+        for vi_idx, analyzed_idx in enumerate(valid_indices):
+            analyzed[analyzed_idx].coherence_score = coherence_scores[vi_idx]
+
+        # ── Step 4: 构建家族 ──
+        clusters: dict[int, list[int]] = {}
+        for vi_idx, label in enumerate(cluster_labels):
+            clusters.setdefault(label, []).append(vi_idx)
+
+        # 按簇内最强板块命名（数据驱动，不依赖关键词 frame_group）
+        families = []
+
+        for cluster_id, vi_members in sorted(clusters.items()):
+            member_sectors = [analyzed[valid_indices[vi]] for vi in vi_members]
+            if not member_sectors:
+                continue
+
+            # 家族命名：用最强板块的真实名称
+            # 清理 null 字符（mootdx 板块名编码问题）
+            sorted_members = sorted(
+                member_sectors, key=lambda s: s.strength_score, reverse=True,
             )
-            family_resonance = active_count / len(members)
+            top_name = sorted_members[0].name.replace("\x00", "").strip()
+            if len(sorted_members) == 1:
+                family_name = top_name
+            elif len(sorted_members) <= 3:
+                names = [s.name.replace("\x00", "").strip() for s in sorted_members[:3]]
+                family_name = "/".join(names)
+            else:
+                family_name = f"{top_name}等{len(sorted_members)}板块"
+
+            # 家族评分（coherence 加权）
+            weights = [
+                max(coherence_scores[vi], 0.1) if vi in range(n_valid) else 0.5
+                for vi in vi_members
+            ]
+            total_w = sum(weights)
+            family_score = sum(
+                s.strength_score * w for s, w in zip(member_sectors, weights)
+            ) / total_w if total_w > 0 else 0
+
+            # 共振度
+            active_count = sum(
+                1 for s in member_sectors
+                if s.state in ("active_mainline", "exhausted_mainline")
+            )
+            family_resonance = active_count / len(member_sectors)
+
+            # 混合驱动检测（Fix 3）
+            mixed = self._detect_mixed_drivers(
+                vi_members, corr_matrix, corr_threshold,
+            )
 
             # 题材地位判定
             if family_score > 70 and family_resonance > 0.5:
@@ -2314,14 +2689,178 @@ class SectorAnalysisNode:
             elif family_score > 50:
                 theme_status = "独立异动"
             else:
-                # 检查动量变化（需要轨迹数据）
+                has_rising = any(
+                    m.trend_direction == "increasing" for m in member_sectors
+                )
+                theme_status = "修复观察" if has_rising else "高位降温"
+
+            if mixed:
+                theme_status = f"混合驱动"
+
+            families.append(ThemeFamily(
+                family_name=family_name,
+                family_score=round(family_score, 1),
+                family_resonance=round(family_resonance, 2),
+                theme_status=theme_status,
+                member_boards=[s.name for s in member_sectors],
+                member_count=len(member_sectors),
+                mixed_driver=mixed,
+            ))
+
+        families.sort(key=lambda f: f.family_score, reverse=True)
+        logger.info(
+            f"[Node 2] 相关性聚类: {n_valid} 个板块 → {len(families)} 个家族"
+            f"（阈值 r>{corr_threshold}）"
+        )
+        return families
+
+    @staticmethod
+    def _hierarchical_cluster(
+        corr_matrix: np.ndarray, threshold: float,
+    ) -> list[int]:
+        """层次聚类（complete linkage），纯 numpy 实现。
+
+        complete linkage: 两簇距离 = 簇间最小相关性（最弱环节）。
+        只有当两簇 ALL 板块对的相关性都 > threshold 时才合并。
+        比 average linkage 更保守，避免不相关板块被大簇裹挟。
+
+        Returns:
+            每个有效板块的簇标签（0-indexed）。
+        """
+        n = corr_matrix.shape[0]
+        if n == 0:
+            return []
+
+        # 初始化：每个板块一个簇
+        cluster_boards: dict[int, list[int]] = {i: [i] for i in range(n)}
+        next_id = n
+
+        while len(cluster_boards) > 1:
+            cluster_ids = sorted(cluster_boards.keys())
+
+            # 找 complete-linkage 相关性最高的簇对
+            # complete: min correlation across all pairs (最弱环节)
+            best_pair = None
+            best_min_corr = -2.0
+
+            for ii in range(len(cluster_ids)):
+                for jj in range(ii + 1, len(cluster_ids)):
+                    ci, cj = cluster_ids[ii], cluster_ids[jj]
+                    min_corr = min(
+                        corr_matrix[a, b]
+                        for a in cluster_boards[ci]
+                        for b in cluster_boards[cj]
+                    )
+                    if min_corr > best_min_corr:
+                        best_min_corr = min_corr
+                        best_pair = (ci, cj)
+
+            # 合并后最弱环节低于阈值 → 停止
+            if best_min_corr < threshold or best_pair is None:
+                break
+
+            # 合并
+            ci, cj = best_pair
+            new_id = next_id
+            next_id += 1
+            cluster_boards[new_id] = cluster_boards.pop(ci) + cluster_boards.pop(cj)
+
+        # 生成标签（连续 0-indexed）
+        labels = [0] * n
+        for new_label, (_, boards) in enumerate(cluster_boards.items()):
+            for b in boards:
+                labels[b] = new_label
+
+        return labels
+
+    @staticmethod
+    def _compute_all_coherence(
+        corr_matrix: np.ndarray,
+        cluster_labels: list[int],
+        n_valid: int,
+    ) -> list[float]:
+        """计算每个板块的一致性评分。
+
+        一致性 = 该板块与同簇其他板块的平均相关性。
+        >0.7: 高一致性（真实主题）
+        <0.4: 噪声/混合概念
+        """
+        scores = []
+        for i in range(n_valid):
+            same_cluster = [
+                j for j in range(n_valid)
+                if cluster_labels[j] == cluster_labels[i] and j != i
+            ]
+            if not same_cluster:
+                scores.append(0.5)  # 单板块族 → 中等一致性
+            else:
+                avg_corr = np.mean([corr_matrix[i, j] for j in same_cluster])
+                scores.append(round(float(avg_corr), 3))
+        return scores
+
+    @staticmethod
+    def _detect_mixed_drivers(
+        vi_members: list[int],
+        corr_matrix: np.ndarray,
+        threshold: float,
+    ) -> bool:
+        """家族内驱动混合检测。
+
+        对家族内板块计算平均两两相关性。
+        若平均相关性 < threshold * 0.6 → 标记为混合驱动。
+        """
+        if len(vi_members) < 3:
+            return False
+
+        corrs = []
+        for ii in range(len(vi_members)):
+            for jj in range(ii + 1, len(vi_members)):
+                corrs.append(corr_matrix[vi_members[ii], vi_members[jj]])
+
+        avg_corr = np.mean(corrs) if corrs else 0
+        return bool(avg_corr < threshold * 0.6)
+
+    def _build_theme_families_fallback(
+        self, analyzed: list[SectorDetail],
+    ) -> list:
+        """回退到硬编码 FAMILY_KEYWORDS 分组（聚类数据不足时使用）。"""
+        from src.got.schemas import ThemeFamily
+
+        family_members: dict[str, list[SectorDetail]] = {
+            name: [] for name, _ in FAMILY_KEYWORDS
+        }
+        family_members["其他"] = []
+
+        for sector in analyzed:
+            frame_group = sector.frame_group or _build_frame_group(sector.name)
+            if frame_group in family_members:
+                family_members[frame_group].append(sector)
+            else:
+                family_members["其他"].append(sector)
+
+        families = []
+        for family_name, members in family_members.items():
+            if not members or family_name == "其他":
+                continue
+
+            family_score = sum(m.strength_score for m in members) / len(members)
+            active_count = sum(
+                1 for m in members
+                if m.state in ("active_mainline", "exhausted_mainline")
+            )
+            family_resonance = active_count / len(members)
+
+            if family_score > 70 and family_resonance > 0.5:
+                theme_status = "主线核心"
+            elif family_score > 60 and family_resonance > 0.3:
+                theme_status = "主线扩散"
+            elif family_score > 50:
+                theme_status = "独立异动"
+            else:
                 has_rising = any(
                     m.trend_direction == "increasing" for m in members
                 )
-                if has_rising:
-                    theme_status = "修复观察"
-                else:
-                    theme_status = "高位降温"
+                theme_status = "修复观察" if has_rising else "高位降温"
 
             families.append(ThemeFamily(
                 family_name=family_name,
@@ -2492,6 +3031,11 @@ class SectorAnalysisNode:
                         "ambush_days": latest.ambush_days or 0,
                         "unified_signal": latest.unified_signal,
                         "lifecycle_phase": latest.lifecycle_phase,
+                        # 2026-08-17 状态机新增字段（老库缺列时默认值兜底）
+                        "state": getattr(latest, "state", None),
+                        "dwell_days": int(getattr(latest, "dwell_days", 0) or 0),
+                        "rrg_ratio_ema": getattr(latest, "rrg_ratio_ema", None),
+                        "rrg_momentum_ema": getattr(latest, "rrg_momentum_ema", None),
                     }
 
             if result:
@@ -2501,12 +3045,34 @@ class SectorAnalysisNode:
 
         return result
 
+    @staticmethod
+    def _load_prev_state(session, sector_code: str) -> tuple[Optional[str], int]:
+        """读取板块前一日精确状态与驻留天数（状态机 dwell 记忆源）。
+
+        Returns:
+            (prev_state, prev_dwell_days)。无历史或旧库缺列时返回 (None, 0)。
+        """
+        rec = (
+            session.query(Node2SectorTrendRecord)
+            .filter(
+                Node2SectorTrendRecord.sector_code == sector_code,
+                Node2SectorTrendRecord.tracking_date < date.today(),
+            )
+            .order_by(Node2SectorTrendRecord.tracking_date.desc())
+            .first()
+        )
+        if rec is None:
+            return None, 0
+        return getattr(rec, "state", None), int(getattr(rec, "dwell_days", 0) or 0)
+
     def _save_sector_trends(self, sectors: list[SectorDetail]) -> None:
         """保存板块趋势到 SQLite，支持跨日追踪。
 
-        追踪目标：
+        追踪目标（2026-08-17 状态机校准扩展）：
         - strength_score 日度变化（7 天轨迹）
-        - 主线持续时间（mainline_days，用于检测 late_stage）
+        - 精确状态快照（state）与驻留天数（dwell_days）—— 马尔可夫转移矩阵的记忆
+        - RRG 3日EMA 平滑值（rrg_ratio_ema / rrg_momentum_ema）—— 次日状态判定的前值
+        - 主线持续时间（mainline_days，含 cooling/exhausted 衍生期，保住"曾是主线 N 天"）
         """
         if not sectors:
             return
@@ -2520,13 +3086,23 @@ class SectorAnalysisNode:
                     # 计算强度趋势
                     trend_data = self._calc_strength_trend(session, sector.code, sector.strength_score)
 
-                    # 计算主线持续时间
-                    is_mainline = sector.state in ("active_mainline", "exhausted_mainline")
+                    # 计算主线持续时间（含高位降温/衰竭衍生期：is_mainline 扩展）
+                    is_mainline = sector.state in (
+                        "active_mainline", "exhausted_mainline", "high_position_cooling",
+                    )
                     mainline_days = self._calc_mainline_days(session, sector.code, is_mainline)
 
                     # 计算埋伏持续时间
                     is_ambush = sector.state == "ambush"
                     ambush_days = self._calc_ambush_days(session, sector.code, is_ambush)
+
+                    # 驻留天数：同状态累加、跨状态归 1（HMM 持久性：切换需驻留确认）
+                    prev_state, prev_dwell = self._load_prev_state(session, sector.code)
+                    dwell_days = (prev_dwell + 1) if prev_state == sector.state else 1
+
+                    # RRG EMA 平滑值（供次日作为 prev_ratio_ema/prev_momentum_ema）
+                    rrg_ratio_ema = sector.rrg.rs_ratio if sector.rrg else None
+                    rrg_momentum_ema = sector.rrg.rs_momentum if sector.rrg else None
 
                     # 回填到 SectorDetail（确保 JSON 输出不为 null）
                     sector.strength_trajectory = trend_data["trajectory"]
@@ -2541,6 +3117,10 @@ class SectorAnalysisNode:
 
                     if db_record:
                         # 更新已有记录
+                        db_record.state = sector.state
+                        db_record.dwell_days = dwell_days
+                        db_record.rrg_ratio_ema = rrg_ratio_ema
+                        db_record.rrg_momentum_ema = rrg_momentum_ema
                         db_record.unified_signal = self._state_to_signal(sector.state)
                         db_record.lifecycle_phase = sector.lifecycle.phase if sector.lifecycle else None
                         db_record.strength_score = sector.strength_score
@@ -2555,6 +3135,10 @@ class SectorAnalysisNode:
                             sector_code=sector.code,
                             sector_name=sector.name,
                             tracking_date=today,
+                            state=sector.state,
+                            dwell_days=dwell_days,
+                            rrg_ratio_ema=rrg_ratio_ema,
+                            rrg_momentum_ema=rrg_momentum_ema,
                             unified_signal=self._state_to_signal(sector.state),
                             lifecycle_phase=sector.lifecycle.phase if sector.lifecycle else None,
                             strength_score=sector.strength_score,
@@ -2665,10 +3249,15 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _state_to_signal(state: str) -> str:
-        """将板块状态转换为信号方向。"""
+        """将板块状态转换为对外信号方向（三值 bullish/bearish/neutral）。
+
+        注意：状态机主记忆已改用精确 state 列（不再依赖本函数回映射，2026-08-17 校准）。
+        本函数仅用于归档/对外展示，保持三值兼容。
+        """
         mapping = {
             "active_mainline": "bullish",
             "exhausted_mainline": "bearish",
+            "high_position_cooling": "neutral",
             "ambush": "neutral",
             "defensive_rotation": "neutral",
         }
@@ -2685,6 +3274,7 @@ class SectorAnalysisNode:
 
         lines = ["板块近期强度轨迹（个股级，非主线框历史）："]
         has_trend_data = False
+        max_history_days = 0  # 追踪实际历史天数
 
         for sector in sectors[:5]:  # 最多 5 个板块
             trend_data = self._load_sector_trend_history(sector.code, days=7)
@@ -2693,6 +3283,7 @@ class SectorAnalysisNode:
 
             has_trend_data = True
             trajectory = trend_data["strength_trajectory"]
+            max_history_days = max(max_history_days, len(trajectory))
 
             # 格式化轨迹
             trajectory_str = " → ".join(f"{s:.0f}" for s in trajectory)
@@ -2702,15 +3293,36 @@ class SectorAnalysisNode:
         if not has_trend_data:
             return ""
 
-        lines.append(
-            "\n注意：以上轨迹是个股级强度评分历史，不代表主线框持续性。"
-            "主线框刚建立，尚无组级历史数据。禁止推断'连续N日主线'等结论。"
-        )
+        # 根据实际历史天数动态调整提示
+        if max_history_days < 3:
+            lines.append(
+                "\n注意：以上轨迹是个股级强度评分历史，不代表主线框持续性。"
+                f"主线框刚建立（仅 {max_history_days} 天数据），尚无组级历史数据。"
+                "禁止推断'连续N日主线'等结论。"
+            )
+        else:
+            lines.append(
+                f"\n注意：以上轨迹是个股级强度评分历史（共 {max_history_days} 天），"
+                "不代表主线框组级持续性。禁止推断'连续N日主线'等组级结论。"
+            )
         return "\n".join(lines)
 
     # =================================================================
     # LLM reasoning 生成
     # =================================================================
+
+    @staticmethod
+    def _rrg_label(sector: SectorDetail) -> str:
+        """RRG 象限短标签（供 reasoning prompt 使用）。"""
+        if sector.rrg is None:
+            return ""
+        _labels = {
+            "leading": "领涨",
+            "improving": "改善",
+            "weakening": "走弱",
+            "lagging": "落后",
+        }
+        return _labels.get(sector.rrg.quadrant, "")
 
     async def _generate_reasoning(self, ctx: SectorContext) -> Optional[str]:
         """调用 LLM 生成板块分析 reasoning 文本（纯总结，不影响信号）。"""
@@ -2721,10 +3333,11 @@ class SectorAnalysisNode:
             return self._fallback_reasoning(ctx)
 
         mainline_names = ", ".join(
-            f"{g.group_name}({g.group_score:.0f}分)" for g in ctx.active_mainline
+            f"{g.group_name}({g.group_score:.0f}分,{self._rrg_label(g.members[0]) if g.members else ''})"
+            for g in ctx.active_mainline
         ) or "无"
         exhausted_names = ", ".join(
-            f"{s.name}({s.strength_score:.0f}分)" for s in ctx.exhausted_mainline
+            f"{s.name}({s.strength_score:.0f}分,{self._rrg_label(s)})" for s in ctx.exhausted_mainline
         ) or "无"
         ambush_names = ", ".join(
             f"{s.name}({s.strength_score:.0f}分)" for s in ctx.ambush

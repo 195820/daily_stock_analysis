@@ -1,3165 +1,1649 @@
-# 炒股 Agent 设计文档（CoT + GOT 混合架构）
+# A股智能分析系统 GOT 架构设计文档
 
-> 创建日期：2026-07-21
-> 最后更新：2026-07-22
-> 状态：草案（Draft）
-> 版本：v0.4
-
-### v0.4 变更记录（2026-07-22 实现阶段修复）
-
-**数据获取层 Bug 修复：**
-- **A 股指数数据获取 KeyError 修复**：`data_provider/base.py` 的 `normalize_stock_code()` 在传给 akshare fetcher 前剥掉了 `.SH/.SZ` 后缀，导致 akshare fetcher 的 `_is_index_code()` 无法识别指数代码，错误调用 `ak.stock_zh_a_hist()` 而非 `ak.stock_zh_index_daily()`，返回数据缺少 `volume` 列引发 KeyError。修复方案：在 `get_daily_data()` 中归一化前检测 A 股指数（`_is_a_share_index()`），归一化后恢复后缀（`stock_code + suffix`），确保 akshare fetcher 能正确路由到 `_fetch_index_data()`。涉及文件：`data_provider/base.py`、`data_provider/akshare_fetcher.py`
-
-**Node 1 多时间框架信号修复：**
-- **5 日评分为 0 的 Bug**：初始实现用 `df.tail(5)` 切片后计算指标，但 5 行数据无法计算 MA60/MA120/MA250、MACD(12,26,9)、ADX(14) 等需要较长历史窗口的指标，全部返回 0。修复方案：使用**完整数据集**计算指标，不同时间框架通过**不同参数敏感度**区分：
-  - 短期（5日）：MA 周期 `[5, 10, 20]`，量价 lookback 5 日 → 对近期波动敏感
-  - 中期（20日）：MA 周期 `[5, 10, 20, 60]`，量价 lookback 20 日 → 确认趋势方向
-  - 长期（60日）：MA 周期 `[10, 20, 60, 120, 250]`，量价 lookback 60 日 → 反映大级别趋势
-- **真实数据验证结果**（2026-07-22）：短期 bearish(-0.65)、中期 bearish(-0.65)、长期 neutral(-0.34)，信号分层合理，统一趋势 bearish
-
-**涉及文件：** `src/got/nodes/market_analysis.py`、`src/got/indicators.py`
-
-### v0.3 变更记录（2026-07-22 设计审查修复）
-
-**Bug 修复：**
-- 资金面 `confidence_multiplier` 分母从 4 修正为 5（适配 P3-5 大宗交易维度）
-- 板块防守轮动逻辑移除对不存在字段 `market_context.tech_growth.capital_flow` 的引用，改为 `trend == "bearish"`
-- 大盘 `index_codes` 中 `000905.SZ` 修正为 `000905.SH`
-- 删除 `classify_macd_phase()` 重复调用（变量 `macd_phase` 未使用）
-- 板块强度 `price_momentum` / `relative_strength` 添加 `clip(-0.15, 0.15)` 防止极端值主导评分
-
-**架构补全：**
-- 聚合节点新增路径级输入校验（`validate_path_inputs`），任一路径失败直接报错，不做降级
-- 聚合节点矛盾检测从 8 对扩展至 10 对（新增 `medium_tech_vs_news`、`long_tech_vs_capital`）
-- 大盘 LLM Prompt 补充多时间框架信号 + 市场状态元数据（ADX/regime/volatility_regime）
-- 情绪反身性阈值添加说明（初始值，运行 3 个月后回测调整）
-- Node 1 内部新增**时间框架 mini GOT**：short/medium/long 三路并行信号 → 规则检测跨框架矛盾（pullback_in_uptrend / bear_market_rally 等 5 种模式）→ 有矛盾时 LLM 研判 → 输出 `unified_trend` + `timeframe_confidence` 驱动仓位上限，替代旧的单一 trend 硬编码逻辑
-- 消息面评分归一化重构：采用**阈值过滤 + 显著度加权**策略（参考 [MANA-Net, Wang et al. 2024](https://arxiv.org/abs/2409.05698) 的反均质化思路），low-impact 事件不参与评分计算，medium/high 按 impact_level 加权，分母为加权事件数而非原始事件数，避免大量噪音事件稀释高影响信号
-- 时间一致性校验持久化方案明确：JSON 文件按交易日日期存储于 `data/aggregator_contexts/`，跨节假日取最近交易日数据，首日运行跳过校验
-
-**设计决策：**
-- 非交易日（周末/法定节假日/临时休市）不触发分析，系统自动跳过
-- 板块精选概念列表仅覆盖科技成长方向，不做消费/地产/周期扩展
-
-### v0.2 变更记录（2026-07-22 设计评审）
-
-**P0 必修（3 项）：**
-- **P0-1 情绪评分 Bug 修复**：LLM 输出改为 count 基础，后处理计算 ratio；消除 `total_posts` 恒等于 1.0 的无效归一化
-- **P0-2 资金面增加北向资金**：新增沪/深股通维度（权重 0.25），龙虎榜降权至 0.30
-- **P0-3 启动信号重构**：`all()` 12 条件 → 3 硬门槛 + 5 维加权打分，两级分级（strong_launch ≥ 0.75 / weak_launch ≥ 0.55）
-
-**P1 核心架构（5 项）：**
-- **P1-1 短板逻辑优化**：`min(创业板, 科创50)` → 加权平均（60/40）+ 一致性折扣（反向 7 折）
-- **P1-2 多时间框架**：每个节点输出 short/medium/long 三套信号，聚合节点按时间框架分组检测矛盾
-- **P1-3 ADX 动态调权**：引入 ADX 判断趋势/震荡状态，动态调整 5 指标权重（经典阈值 30/20/20）
-- **P1-4 消息面 LLM 拆分**：单次调用 → 3 个独立 prompt 并发执行（事件提取/概念发现/风险总结），风格差异化
-- **P1-5 消息面覆盖三层防护**：系统性政策筛选 + ≥3 家多源确认 + 历史验证（准确率 > 60%）+ 仓位日限幅 ±0.2
-
-**P2 增强（5 项）：**
-- **P2-1 板块生命周期 + 主线分级**：active_mainline 内部分 launch/acceleration/mature/late_stage 四阶段；主线 S/A/B 三级（系统输出依据，人工定级）
-- **P2-2 情绪反身性逻辑**：5 阶段分类（euphoria/optimism/neutral/pessimism/capitulation），极端情绪为反向信号
-- **P2-3 矛盾批处理**：LLM 逐对分析 → 一次调用处理所有矛盾，识别共同根因
-- **P2-4 数据降级机制**：权重自动归一化 + 置信度按可用维度比例下调；降级维度不参与矛盾检测
-- **P2-5 时间一致性校验**：4 类异常检测（趋势翻转/置信度波动/主线切换/仓位变化），critical 强制人工审核，仓位日限幅 ±20%
-
-**P3 可选（逐项决策中）：**
-- **P3-1 MACD 阶段标记**：`classify_macd_phase()` 四阶段分类（emerging_golden_cross / running_bullish / divergence_warning / death_cross_confirmed），输出含 `phase` + `phase_since_days`，聚合节点可据此做更精细判断
-- **P3-2 Volume Profile**：新增 `calculate_volume_profile()` 函数，按价格 bin 聚合 60 日成交量，输出 POC（筹码最密集价格）+ Value Area（70% 成交量覆盖区间），整合到 `key_levels` 输出
-- **P3-3 数据源切换**：NGA 板块关闭，情绪面数据源从 NGA 切换为雪球（API 相对友好，覆盖价值高）
-- **P3-4 置信度校准**：暂不做。待运行 3-6 个月积累历史数据后，用 Platt Scaling 或 Isotonic Regression 对 LLM 输出的 confidence 做离线校准（需 100+ 样本）。当前用 P2-4 `confidence_multiplier` 过渡
-- **P3-5 大宗交易维度**：新增第 5 个资金面维度（权重 0.10），折价 > 5% 为甩货信号、溢价 > 2% 为抢筹信号；缺失时复用降级机制。权重调整：龙虎榜 0.30→0.25、融资 0.20→0.15
+> **版本**: v1.0（2026-08-11）  
+> **基于代码实际实现**（非历史设计稿）  
+> **最后更新**: 根据 2026-08-11 代码状态
 
 ---
 
-## 1. 概述
+## 目录
 
-本文档定义一个基于 **Chain-of-Thought（CoT）** 和 **Graph of Thought（GOT）** 混合架构的炒股 Agent。
-
-**核心思路：**
-- **前半段（GOT）**：两路并行 → 聚合
-  - **独立数据路**：消息面 + 情绪面（并行采集，不依赖其他节点）
-  - **技术分析路**：大盘 → 板块 → 资金面（串行，后者依赖前者）
-- **后半段（CoT）**：线性流水线（持仓判断→选股评分→交易建议）
-
-**交易风格：**
-- A股为主，聚焦科技成长（AI、机器人、半导体）
-- 中短线持仓（数周），全仓追随主线，不做T
-
-**运行条件：**
-- **仅交易日运行**：非交易日（周末、法定节假日、临时休市）不触发分析，系统自动跳过
-- **板块精选概念列表**：仅覆盖科技成长相关板块（AI、机器人、半导体及其产业链），不做消费/地产/周期等方向
-
-**输出：**
-- 市场分析报告（给人看，Markdown 格式）
-- 交易建议（买入/卖出/持有，人工审核后执行）
+1. [架构总览](#1-架构总览)
+2. [Phase 1: GOT 六节点](#2-phase-1-got-六节点)
+   - [Node 1: 大盘分析](#21-node-1-大盘分析)
+   - [Node 2: 板块分析](#22-node-2-板块分析)
+   - [Node 3: 资金面分析](#23-node-3-资金面分析)
+   - [Node 4: 消息面分析](#24-node-4-消息面分析)
+   - [Node 5: 情绪面分析](#25-node-5-情绪面分析)
+   - [Node 6: 聚合节点](#26-node-6-聚合节点)
+3. [Phase 2: 统一决策节点](#3-phase-2-统一决策节点)
+4. [GOT 选股系统](#4-got-选股系统)
+5. [数据层架构](#5-数据层架构)
+6. [编排器与执行流程](#6-编排器与执行流程)
+7. [历史档系统](#7-历史档系统)
 
 ---
 
-## 2. 整体架构
+## 1. 架构总览
+
+### 1.1 核心理念
+
+**GOT (Graph of Thought)**：前半段图结构并行处理，后半段线性流水线决策
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  输入层                                                      │
-│  - 用户指令（"分析今天市场" / "推荐短线机会"）                │
-│  - 市场数据（通过工具获取）                                   │
+│  Phase 1: GOT 六节点（并行 + 串行混合）                       │
+│                                                             │
+│  独立数据路（并行）        技术分析路（串行）                   │
+│  ┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐ ┌──────────┐
+│  │ 消息面   │ │ 情绪面   │   │ 大盘     │→│ 板块     │→│ 资金面   │
+│  │ Node 4   │ │ Node 5   │   │ Node 1   │ │ Node 2   │ │ Node 3   │
+│  │ 7源采集  │ │ 6维评分  │   │ 4维技术  │ │ 4维百分位│ │ 3维资金  │
+│  │ 4次LLM   │ │ 反身性   │   │ 多时间框 │ │ 启动检测 │ │ 降级机制 │
+│  └──────────┘ └──────────┘   └──────────┘ └──────────┘ └──────────┘
+│        ↓              ↓              ↓            ↓            ↓
+│     news_ctx    sentiment_ctx   market_ctx   sector_ctx   capital_ctx
+│                                                        ↓
+│                                              ┌──────────────────┐
+│                                              │   Node 6: 聚合    │
+│                                              │  分层 GOT 架构    │
+│                                              │  L0: 全局环境     │
+│                                              │  L1: 板块mini-GOT │
+│                                              │  L2: 组合决策     │
+│                                              └──────────────────┘
+│                                                        ↓
+│                                                unified_context
 └─────────────────────────────────────────────────────────────┘
-                            ↓
+                              ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  Phase 1: GOT 市场分析（两路并行 + 聚合）                     │
-│                                                              │
-│  ┌─────────────── 独立数据路（并行） ───────────────┐       │
-│  │  ┌──────────┐         ┌──────────┐              │       │
-│  │  │ 消息面   │         │ 情绪面   │              │       │
-│  │  │  Node 4  │         │  Node 5  │              │       │
-│  │  │ 3并发LLM │         │ 反身性   │              │       │
-│  │  │ +多源确认 │         │ 阶段分类  │              │       │
-│  │  └──────────┘         └──────────┘              │       │
-│  │       ↓                      ↓                  │       │
-│  │  news_context         sentiment_context          │       │
-│  │  (含source_count)     (含sentiment_stage)        │       │
-│  └──────────────────────────────────────────────────┘       │
-│                                                              │
-│  ┌─────────────── 技术分析路（串行） ───────────────┐       │
-│  │  ┌──────────┐    ┌──────────┐    ┌──────────┐  │       │
-│  │  │ 大盘分析  │ → │ 板块分析  │ → │ 资金面   │  │       │
-│  │  │  Node 1  │    │  Node 2  │    │  Node 3  │  │       │
-│  │  │ ADX调权  │    │ 启动分级  │    │ 北向资金  │  │       │
-│  │  │ 多时间框架│    │ 生命周期  │    │ 降级机制  │  │       │
-│  │  │ 一致性折扣│    │ 主线分级  │    │ 4维重构   │  │       │
-│  │  │ mini-GOT │    │          │    │          │  │       │
-│  │  │(时间框架  │    │          │    │          │  │       │
-│  │  │ 矛盾检测) │    │          │    │          │  │       │
-│  │  └──────────┘    └──────────┘    └──────────┘  │       │
-│  │       ↓               ↓               ↓        │       │
-│  │  market_context   sector_context  capital_ctx   │       │
-│  │  (unified_trend/  (lifecycle/     (northbound/  │       │
-│  │   contradiction/   tier/phase)     degraded)    │       │
-│  │   timeframe_got)                                │       │
-│  └──────────────────────────────────────────────────┘       │
-│                                                              │
-│      ┌──────────────────────────────────────┐               │
-│      │         聚合节点（Node 6）            │               │
-│      │  - 8对矛盾检测（多时间框架对齐）      │               │
-│      │  - LLM 批处理分析矛盾                 │               │
-│      │  - 消息面三层覆盖防护                 │               │
-│      │  - 时间一致性校验（4类异常）          │               │
-│      │  - 降级感知 + 仓位日限幅±0.2          │               │
-│      └──────────────────────────────────────┘               │
-│                      ↓                                      │
-│              unified_context                                │
+│  Phase 2: 统一决策节点（FINCON 风格）                         │
+│                                                             │
+│  Step 1: 风险评估（约束设定）→ 仓位/止损/板块限制              │
+│  Step 2: 统一打分（持仓 + 候选股一起评）→ 消除循环依赖        │
+│  Step 3: 组合优化（规则驱动）→ 在约束下生成最优配置            │
+│  Step 4: 轮动检测 + 拥挤检查 → 吃鱼身 + 高切低策略            │
+│  Step 5: LLM 精炼（1次调用）→ 生成可追溯推理总结              │
 └─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Phase 2: CoT 决策流水线（线性）                              │
-│                                                              │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐              │
-│  │ 持仓判断  │ → │ 选股评分  │ → │ 交易建议  │              │
-│  │  Node    │    │  Node    │    │  Node    │              │
-│  └──────────┘    └──────────┘    └──────────┘              │
-└─────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────┐
-│  输出层                                                      │
-│  - 市场分析报告（Markdown）                                   │
-│  - 交易建议列表（股票 + 方向 + 仓位 + 理由）                  │
-└─────────────────────────────────────────────────────────────┘
+                              ↓
+                        PortfolioDecision
 ```
 
----
+### 1.2 关键设计决策
 
-## 3. Phase 1: GOT 市场分析节点
-
-### 3.1 节点 1：大盘分析（v2 — 4 维评分 + 跨指数一致性）
-
-**职责：** 基于技术指标规则，判断各风格方向趋势，决定仓位上限。
-
-**设计理念（v2 改进）：**
-- **4 维评分**（原 5 维）：移除 market_breadth（涨跌家数数据源被封），MA/MACD/量价/布林归一化
-- **跨指数一致性**（替代 market_breadth）：5 指数方向分类（broad_advance/decline/growth_lead/value_lead/divergent）
-- **三因素 confidence**：跨指数一致性 35% + 时间框架一致性 35% + ADX 强度 30%（替代旧版 |score|）
-- **score 级矛盾检测**：时间框架 mini GOT 改为 score 幅度差异检测 + 模式分类（pullback_in_uptrend 等）
-- **T-0 实时修正**：技术面方向与当日实际方向不一致 → confidence ×0.7
-- **LLM reasoning**：1 次调用生成 100 字研判（失败降级到规则拼接）
-- **score→trend 阈值收窄**：±0.5 → ±0.3（提高区分度）
-
-**覆盖指数：**
-- 上证指数（000001.SH）：纯展示，不参与评分
-- 沪深300（000300.SH）：大盘蓝筹方向
-- 中证500（000905.SH）：中小盘方向
-- 创业板指（399006.SZ）：科技成长方向（核心）
-- 科创50（000688.SH）：科技成长方向（核心）
-
-**风格分组：**
-```yaml
-style_groups:
-  tech_growth:        # 科技成长（核心关注）
-    indices: ["399006.SZ", "000688.SH"]  # 创业板指 + 科创50
-    weights: {chinext: 0.6, star50: 0.4}  # 按市场影响力加权
-    aggregation: weighted_average_with_consistency  # 加权平均 + 一致性折扣
-  mid_small_cap:      # 中小盘
-    indices: ["000905.SH"]  # 中证500
-    aggregation: single
-  large_cap:          # 大盘蓝筹
-    indices: ["000300.SH"]  # 沪深300
-    aggregation: single
-  display:            # 纯展示
-    indices: ["000001.SH"]  # 上证指数
-    aggregation: none
-```
-
-**输入 Schema：**
-```yaml
-market_analysis_input:
-  lookback_days: int  # 250（一年，确保MA250等长周期指标可算）
-```
-
-**工具调用：**
-```python
-# 获取5个指数的K线和成交量数据
-# 注意：指数代码必须带 .SH/.SZ 后缀，否则 akshare fetcher 无法识别为指数
-# 详见 v0.4 变更记录中的数据获取层 Bug 修复
-index_codes = ["000001.SH", "000300.SH", "000905.SH", "399006.SZ", "000688.SH"]
-index_data = await DataFetcher.get_index_kline(index_codes, lookback_days=250)
-volume_data = await DataFetcher.get_index_volume(index_codes, lookback_days=250)
-
-# 获取全市场涨跌家数和涨停/跌停统计（市场宽度）
-market_breadth = await DataFetcher.get_market_breadth(lookback_days=5)
-```
-
-> **数据获取实现说明（v0.4）：**
-> - `DataFetcherManager.get_daily_data()` 内部先检测 A 股指数（`_is_a_share_index()`），归一化后恢复 `.SH/.SZ` 后缀
-> - akshare fetcher 通过后缀识别指数，路由到 `_fetch_index_data()` → `ak.stock_zh_index_daily(symbol="sz399006")`
-> - efinance fetcher 不支持指数代码（带后缀会报错），自动降级到 akshare fetcher
-> - 当前 5 个指数均通过 akshare fetcher 的新浪指数接口成功获取（2026-07-22 验证）
-
-**技术指标计算（每个指数独立计算）：**
-
-> **前置步骤：计算 ADX 判断市场状态，动态调整指标权重（P1-3 决策）**
-
-```python
-def calculate_adaptive_weights(index_data):
-    """根据 ADX 判断趋势/震荡状态，动态调整指标权重"""
-
-    adx_value = calculate_adx(index_data, period=14)
-
-    if adx_value > 30:
-        regime = "strong_trending"
-        weights = {
-            "ma_alignment": 0.20,    # 趋势中 MA 已充分反映，降权
-            "macd": 0.30,            # 趋势持续性判断最重要
-            "volume_price": 0.25,    # 量能验证趋势健康度
-            "market_breadth": 0.15,
-            "bollinger": 0.10,
-        }
-    elif adx_value > 20:
-        regime = "mild_trending"
-        weights = {
-            "ma_alignment": 0.25,
-            "macd": 0.25,
-            "volume_price": 0.20,
-            "market_breadth": 0.15,
-            "bollinger": 0.15,
-        }
-    else:
-        regime = "ranging"
-        weights = {
-            "ma_alignment": 0.10,    # 震荡市 MA 频繁翻转，大幅降权
-            "macd": 0.20,
-            "volume_price": 0.20,
-            "market_breadth": 0.15,
-            "bollinger": 0.35,       # 布林收口→张口是震荡市最可靠信号
-        }
-
-    # 极端波动率修正
-    vol_regime = classify_volatility_regime(index_data)
-    if vol_regime == "extreme_high":
-        weights["market_breadth"] = min(weights["market_breadth"] + 0.10, 0.40)
-    elif vol_regime == "extreme_low":
-        weights["bollinger"] = min(weights["bollinger"] + 0.10, 0.45)
-
-    # 归一化确保权重和为 1
-    total = sum(weights.values())
-    weights = {k: v / total for k, v in weights.items()}
-
-    return weights, regime, adx_value, vol_regime
-
-
-def calculate_adx(index_data, period=14):
-    """ADX：趋势强度指标（0-100）
-    - >30: 强趋势
-    - 20-30: 温和趋势
-    - <20: 震荡
-    """
-    # ... True Range / +DM / -DM / DX / ADX 标准计算
-    # 使用 Wilder's smoothing（RMA）
-    pass  # 实现省略
-
-
-def classify_volatility_regime(index_data, lookback=60):
-    """波动率状态分类（当前 HV vs 历史百分位）"""
-    returns = np.log(index_data.close / index_data.close.shift(1))
-    current_hv = returns.tail(20).std() * np.sqrt(252)
-    percentile = percentile_rank(current_hv, lookback)
-
-    if percentile > 80:
-        return "extreme_high"
-    elif percentile < 20:
-        return "extreme_low"
-    else:
-        return "normal"
-
-
-def classify_macd_phase(index_data):
-    """MACD 四阶段分类
-    区分"刚金叉"与"金叉已运行多日"，为聚合节点提供更精细的信号语义。
-    """
-    macd_line = index_data.macd
-    signal_line = index_data.macd_signal
-    histogram = index_data.macd_hist
-    close = index_data.close
-
-    # 金叉/死叉判定（当前 vs 前一日）
-    golden_cross = (macd_line.iloc[-1] > signal_line.iloc[-1] and
-                    macd_line.iloc[-2] <= signal_line.iloc[-2])
-    death_cross = (macd_line.iloc[-1] < signal_line.iloc[-1] and
-                   macd_line.iloc[-2] >= signal_line.iloc[-2])
-
-    if golden_cross:
-        return {"phase": "emerging_golden_cross", "since_days": 1}
-    elif death_cross:
-        return {"phase": "death_cross_confirmed", "since_days": 1}
-    elif macd_line.iloc[-1] > signal_line.iloc[-1]:
-        # 检查顶背离：价格近 20 日新高，但 MACD 柱未创新高
-        price_new_high = close.iloc[-1] >= close.tail(20).max()
-        macd_not_new_high = histogram.iloc[-1] < histogram.tail(20).max()
-        if price_new_high and macd_not_new_high:
-            return {"phase": "divergence_warning", "since_days": 1}
-        # 计算当前多头阶段持续天数（从最近一次死叉/金叉算起）
-        since = count_days_since_cross(macd_line, signal_line, direction="up")
-        return {"phase": "running_bullish", "since_days": since}
-    else:
-        since = count_days_since_cross(macd_line, signal_line, direction="down")
-        return {"phase": "running_bearish", "since_days": since}
-```
-
-**技术指标计算（每个指数独立计算）：**
-
-```python
-def calculate_indicators(index_data, market_breadth):
-    """计算 5 个技术指标 + ADX 动态调权，返回加权得分"""
-
-    # 前置：ADX 动态调权
-    weights, regime, adx_value, vol_regime = calculate_adaptive_weights(index_data)
-
-    # 1. MA排列
-    ma_score = calculate_ma_alignment(
-        data=index_data,
-        periods=[5, 10, 20, 60, 120, 250]
-    )
-    # 多头排列（MA5>10>20>60>120）→ +1
-    # 空头排列（MA5<10<20<60<120）→ -1
-    # 混乱纠缠 → 0
-
-    # 2. MACD - 分层判断 + 阶段标记（权重由 ADX 动态决定）
-    macd_score = calculate_macd_layered(index_data)
-    macd_phase_info = classify_macd_phase(index_data)  # 返回 {"phase": "...", "since_days": N}
-    # 第一层：0轴位置
-    #   双线在0轴上方 → 偏多
-    #   双线在0轴下方 → 偏空
-    # 第二层：红绿柱动能
-    #   红柱扩张 → +0.5
-    #   红柱缩短 → 0
-    #   绿柱缩短 → 0
-    #   绿柱扩张 → -0.5
-    # 第三层：金叉死叉确认
-    #   0轴上方金叉 → 额外+0.5
-    #   0轴下方死叉 → 额外-0.5
-    # 第四层：阶段标记（新增）
-    #   emerging_golden_cross → 即将/刚金叉，关注后续确认
-    #   running_bullish       → 金叉后持续运行，趋势延续
-    #   divergence_warning    → 价格新高但 MACD 未新高，顶背离风险
-    #   death_cross_confirmed → 死叉确认，趋势转弱
-
-    # 3. 量价关系
-    volume_price_score = calculate_volume_price(index_data)
-    # 放量上涨 / 缩量回调 → +1
-    # 放量下跌 / 缩量反弹 → -1
-    # 缩量横盘 → 0
-
-    # 4. 市场宽度
-    breadth_score = calculate_market_breadth(market_breadth)
-    # 涨停 > 跌停×3 且 涨跌比 > 2:1 → +1
-    # 跌停 > 涨停×2 → -1
-    # 正常 → 0
-
-    # 5. 布林带
-    bollinger_score = calculate_bollinger(index_data)
-    # 站上中轨 + 张口向上 → +1
-    # 跌破中轨 + 张口向下 → -1
-    # 收口 → 0
-
-    # 加权求和（使用 ADX 动态调整的权重）
-    weighted_score = (
-        ma_score * weights["ma_alignment"] +
-        macd_score * weights["macd"] +
-        volume_price_score * weights["volume_price"] +
-        breadth_score * weights["market_breadth"] +
-        bollinger_score * weights["bollinger"]
-    )
-
-    return {
-        "ma_alignment": ma_score,
-        "macd": {
-            "score": macd_score,
-            "phase": macd_phase_info["phase"],          # emerging_golden_cross / running_bullish / divergence_warning / death_cross_confirmed / running_bearish
-            "phase_since_days": macd_phase_info["since_days"],
-        },
-        "volume_price": volume_price_score,
-        "market_breadth": breadth_score,
-        "bollinger": bollinger_score,
-        "weighted_score": weighted_score,
-        # ADX 元信息（透传给下游）
-        "adx_value": adx_value,
-        "regime": regime,
-        "volatility_regime": vol_regime,
-        "weights_used": weights,  # 便于归因和回测
-    }
-```
-
-**风格组合并逻辑（加权平均 + 一致性折扣）：**
-
-```python
-def aggregate_style_group(indicator_results, style_group):
-    """风格组合并：加权平均 + 一致性折扣"""
-
-    if style_group.aggregation == "weighted_average_with_consistency":
-        # 按市场影响力加权（如 tech_growth：创业板 0.6 + 科创50 0.4）
-        weights = style_group.weights  # {chinext: 0.6, star50: 0.4}
-        scores = [indicator_results[idx].weighted_score for idx in style_group.indices]
-        weighted_scores = [s * w for s, w in zip(scores, weights.values())]
-        base_score = sum(weighted_scores) / sum(weights.values())
-
-        # 一致性检测：两者是否同向
-        signs = [1 if s > 0.1 else (-1 if s < -0.1 else 0) for s in scores]
-        same_direction = all(s == signs[0] for s in signs) and signs[0] != 0
-
-        # 同向：满分；反向：打 7 折
-        consistency_discount = 1.0 if same_direction else 0.7
-        final_score = base_score * consistency_discount
-        consistency_label = "aligned" if same_direction else "divergent"
-
-    elif style_group.aggregation == "single":
-        final_score = indicator_results[style_group.indices[0]].weighted_score
-        consistency_label = "single"
-    else:
-        final_score = None
-        consistency_label = "none"
-
-    # 趋势判断
-    if final_score > 0.5:
-        trend = "bullish"
-    elif final_score < -0.5:
-        trend = "bearish"
-    else:
-        trend = "neutral"
-
-    return {
-        "trend": trend,
-        "score": final_score,
-        "consistency": consistency_label,  # 透传一致性信息给聚合节点
-    }
-```
-
-**多时间框架信号计算（v0.4 修复）：**
-
-> **v0.4 修复说明：** 初始设计用 `df.tail(N)` 切片后计算指标，但短窗口（5日）数据不足以计算 MA60/MA250、MACD(12,26,9)、ADX(14) 等长周期指标，全部返回 0。
-> 正确方案：使用**完整数据集**计算指标，不同时间框架通过**不同参数敏感度**区分。
-
-```python
-def calculate_timeframe_signals(df: pd.DataFrame) -> dict:
-    """多时间框架信号：用完整数据，不同框架用不同参数敏感度
-
-    设计理念：
-    - 短期（5日）：MA 周期 [5, 10, 20]，量价 lookback 5 日 → 对近期波动敏感
-    - 中期（20日）：MA 周期 [5, 10, 20, 60]，量价 lookback 20 日 → 确认趋势方向
-    - 长期（60日）：MA 周期 [10, 20, 60, 120, 250]，量价 lookback 60 日 → 反映大级别趋势
-
-    真实数据验证（2026-07-22）：
-    - 短期 bearish(-0.65)、中期 bearish(-0.65)、长期 neutral(-0.34)
-    - 信号分层合理：短中期一致看空，长期偏中性（回调格局而非趋势反转）
-    """
-
-    def _score_timeframe(df, ma_periods, recent_days):
-        ma_score = calculate_ma_alignment_score(df, periods=ma_periods)
-        macd_score = calculate_macd_score(df)
-        volume_price_score = calculate_volume_price_score(df, lookback=recent_days)
-        bollinger_score = calculate_bollinger_score(df)
-        return (
-            ma_score * 0.30 +
-            macd_score * 0.30 +
-            volume_price_score * 0.25 +
-            bollinger_score * 0.15
-        )
-
-    return {
-        "short_term": _score_timeframe(df, ma_periods=[5, 10, 20], recent_days=5),
-        "medium_term": _score_timeframe(df, ma_periods=[5, 10, 20, 60], recent_days=20),
-        "long_term": _score_timeframe(df, ma_periods=[10, 20, 60, 120, 250], recent_days=60),
-    }
-```
-
-**仓位上限计算（多时间框架 mini GOT）：**
-
-> **设计理念：** 三个时间框架（short/medium/long）作为三路并行信号输入，规则检测跨框架矛盾，有矛盾时触发 LLM 研判，无矛盾时按规则合成。
-
-```python
-# === 时间框架 mini GOT 结构 ===
-#
-#  short(5d)    medium(20d)    long(60d)    ← 三路并行输入
-#       \            |            /
-#        \           |           /
-#    规则检测跨时间框架矛盾（6 对）
-#           ↓
-#      有矛盾？──否──→ 规则合成（同向取最强/最弱）
-#           ↓ 是
-#    LLM 研判（一次调用，带完整技术上下文）
-#           ↓
-#      unified_trend + confidence_adjustment
-#           ↓
-#    calculate_position_limit（风格间折扣）
-
-
-def aggregate_timeframe_signals(signals, regime_metadata):
-    """时间框架 mini GOT：跨框架矛盾检测 + LLM 合成
-
-    Args:
-        signals: {short_term: {trend, score}, medium_term: {trend, score}, long_term: {trend, score}}
-        regime_metadata: {adx_value, regime, volatility_regime}
-
-    Returns:
-        {unified_trend, unified_score, contradiction_type, llm_reasoning}
-    """
-
-    short = signals["short_term"]
-    medium = signals["medium_term"]
-    long_ = signals["long_term"]
-
-    # === 规则检测：跨时间框架矛盾 ===
-    contradictions = []
-
-    # 短期 vs 中期
-    if short["trend"] != medium["trend"] and short["trend"] != "neutral" and medium["trend"] != "neutral":
-        contradiction_type = _classify_tf_contradiction("short", short["trend"], "medium", medium["trend"])
-        contradictions.append({
-            "pair": "short_vs_medium",
-            "short": short["trend"],
-            "medium": medium["trend"],
-            "pattern": contradiction_type,
-        })
-
-    # 中期 vs 长期
-    if medium["trend"] != long_["trend"] and medium["trend"] != "neutral" and long_["trend"] != "neutral":
-        contradiction_type = _classify_tf_contradiction("medium", medium["trend"], "long", long_["trend"])
-        contradictions.append({
-            "pair": "medium_vs_long",
-            "medium": medium["trend"],
-            "long": long_["trend"],
-            "pattern": contradiction_type,
-        })
-
-    # 短期 vs 长期
-    if short["trend"] != long_["trend"] and short["trend"] != "neutral" and long_["trend"] != "neutral":
-        contradiction_type = _classify_tf_contradiction("short", short["trend"], "long", long_["trend"])
-        contradictions.append({
-            "pair": "short_vs_long",
-            "short": short["trend"],
-            "long": long_["trend"],
-            "pattern": contradiction_type,
-        })
-
-    # === 无矛盾：规则合成 ===
-    if not contradictions:
-        # 三框架同向 → 取加权分（长期权重大，短期权重小）
-        unified_score = (
-            short["score"] * 0.20 +
-            medium["score"] * 0.35 +
-            long_["score"] * 0.45
-        )
-        unified_trend = "bullish" if unified_score > 0.5 else ("bearish" if unified_score < -0.5 else "neutral")
-        return {
-            "unified_trend": unified_trend,
-            "unified_score": unified_score,
-            "contradiction_type": None,
-            "timeframe_confidence": 1.0,  # 三框架一致，置信度最高
-        }
-
-    # === 有矛盾：LLM 研判 ===
-    return _resolve_timeframe_contradiction(contradictions, signals, regime_metadata)
-
-
-def _classify_tf_contradiction(tf_a, trend_a, tf_b, trend_b):
-    """识别跨时间框架矛盾的交易语义"""
-    # 短期回调 + 中期多头 = 回调买点（看多）
-    if tf_a == "short" and trend_a == "bearish" and tf_b == "medium" and trend_b == "bullish":
-        return "pullback_in_uptrend"
-    # 短期反弹 + 中期空头 = 反弹诱多（看空）
-    if tf_a == "short" and trend_a == "bullish" and tf_b == "medium" and trend_b == "bearish":
-        return "bear_market_rally"
-    # 中期回调 + 长期多头 = 趋势内修正（偏多）
-    if tf_a == "medium" and trend_a == "bearish" and tf_b == "long" and trend_b == "bullish":
-        return "correction_in_long_uptrend"
-    # 中期多头 + 长期空头 = 逆趋势反弹（偏空）
-    if tf_a == "medium" and trend_a == "bullish" and tf_b == "long" and trend_b == "bearish":
-        return "counter_trend_rally"
-    return "unknown_divergence"
-
-
-async def _resolve_timeframe_contradiction(contradictions, signals, regime_metadata):
-    """LLM 研判跨时间框架矛盾，输出统一信号"""
-    contradictions_text = "\n".join([
-        f"- {c['pair']}: {c['short' if 'short' in c['pair'] else c['medium']]} vs "
-        f"{c.get('medium', c.get('long'))}（{c['pattern']}）"
-        for c in contradictions
-    ])
-
-    prompt = f"""
-你是资深技术分析师。检测到跨时间框架信号矛盾，请研判后给出统一判断。
-
-三框架信号：
-- 短期（5日）：{signals['short_term']['trend']}（{signals['short_term']['score']:.2f}）
-- 中期（20日）：{signals['medium_term']['trend']}（{signals['medium_term']['score']:.2f}）
-- 长期（60日）：{signals['long_term']['trend']}（{signals['long_term']['score']:.2f}）
-
-市场状态：ADX={regime_metadata.adx_value}（{regime_metadata.regime}），波动率={regime_metadata.volatility_regime}
-
-矛盾列表：
-{contradictions_text}
-
-请输出（JSON）：
-1. unified_trend: "bullish" | "bearish" | "neutral"
-2. unified_score: float（-1.0 ~ 1.0）
-3. timeframe_confidence: float（0~1，框架一致性越高越接近 1）
-4. reasoning: str（100字以内，说明为什么取这个方向）
-"""
-    result = await llm.call(prompt)
-    result["contradiction_type"] = contradictions[0]["pattern"]
-    return result
-
-
-def calculate_position_limit(timeframe_got_result, mid_small_cap_trend, large_cap_trend):
-    """基于时间框架 mini GOT 的统一信号计算仓位上限"""
-    unified_trend = timeframe_got_result["unified_trend"]
-    tf_confidence = timeframe_got_result.get("timeframe_confidence", 1.0)
-
-    # 基础仓位由 unified_trend 决定
-    if unified_trend == "bullish":
-        base_limit = 1.0
-    elif unified_trend == "neutral":
-        base_limit = 0.5
-    else:  # bearish
-        base_limit = 0.0
-
-    # 时间框架矛盾时，置信度折扣（LLM 已给 timeframe_confidence）
-    base_limit *= tf_confidence
-
-    # 极端风险折扣：仅当中小盘+大盘蓝筹同时空头（系统性风险）
-    if mid_small_cap_trend == "bearish" and large_cap_trend == "bearish":
-        base_limit *= 0.5
-
-    return base_limit
-```
-
-**置信度计算（指标一致性）：**
-
-```python
-def calculate_confidence(tech_growth_indicators):
-    """置信度 = |加权得分| / 最大可能分"""
-    max_possible_score = (
-        1.0 * 0.30 +  # MA
-        1.0 * 0.25 +  # MACD
-        1.0 * 0.20 +  # 量价
-        1.0 * 0.15 +  # 市场宽度
-        1.0 * 0.10    # 布林带
-    )  # = 1.0
-
-    confidence = abs(tech_growth_indicators.weighted_score) / max_possible_score
-    return confidence
-```
-
-**支撑/阻力位计算：**
-
-```python
-def calculate_volume_profile(index_data, lookback=60, num_bins=50):
-    """Volume Profile：按价格 bin 聚合成交量，找筹码密集区
-    - POC（Point of Control）：成交量最大的价格 → 最强支撑/阻力
-    - Value Area：覆盖 70% 成交量的价格区间（上下界）
-    """
-    highs = index_data.high.tail(lookback)
-    lows = index_data.low.tail(lookback)
-    closes = index_data.close.tail(lookback)
-    volumes = index_data.volume.tail(lookback)
-
-    price_min, price_max = lows.min(), highs.max()
-    bin_edges = np.linspace(price_min, price_max, num_bins + 1)
-    volume_profile = np.zeros(num_bins)
-
-    for i in range(lookback):
-        typical_price = (highs.iloc[i] + lows.iloc[i] + closes.iloc[i]) / 3
-        bin_idx = np.digitize(typical_price, bin_edges) - 1
-        volume_profile[bin_idx] += volumes.iloc[i]
-
-    # POC：成交量最密集的价格
-    poc_idx = np.argmax(volume_profile)
-    poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2
-
-    # Value Area：从 POC 向两侧扩展，直到覆盖 70% 总成交量
-    total_volume = volume_profile.sum()
-    va_volume = volume_profile[poc_idx]
-    va_low_idx, va_high_idx = poc_idx, poc_idx
-    while va_volume / total_volume < 0.70:
-        expand_low = volume_profile[va_low_idx - 1] if va_low_idx > 0 else 0
-        expand_high = volume_profile[va_high_idx + 1] if va_high_idx < num_bins - 1 else 0
-        if expand_low >= expand_high and va_low_idx > 0:
-            va_low_idx -= 1
-            va_volume += volume_profile[va_low_idx]
-        elif va_high_idx < num_bins - 1:
-            va_high_idx += 1
-            va_volume += volume_profile[va_high_idx]
-        else:
-            break
-
-    return {
-        "poc": poc_price,
-        "value_area_high": bin_edges[va_high_idx + 1],
-        "value_area_low": bin_edges[va_low_idx],
-    }
-
-
-def calculate_key_levels(index_data):
-    """短期（1-2周）+ 中期（1-3月）两组支撑阻力 + Volume Profile"""
-
-    # 短期支撑阻力
-    short_term_support = max(
-        calculate_ma(index_data, period=20),  # MA20
-        min(index_data.close[-20:])           # 近20日最低价
-    )
-    short_term_resistance = max(
-        index_data.high[-20:],                # 近20日最高价
-        calculate_bollinger_upper(index_data) # 布林上轨
-    )
-
-    # 中期支撑阻力
-    mid_term_support = min(
-        calculate_ma(index_data, period=60),  # MA60
-        find_volume_dense_zone(index_data, direction="support")  # 成交密集区下沿
-    )
-    mid_term_resistance = max(
-        max(index_data.high[-60:]),           # 近60日最高价
-        find_volume_dense_zone(index_data, direction="resistance")  # 成交密集区上沿
-    )
-
-    # Volume Profile（P3-2 决策）
-    volume_profile = calculate_volume_profile(index_data, lookback=60)
-
-    return {
-        "short_term": {
-            "support": short_term_support,
-            "resistance": short_term_resistance
-        },
-        "mid_term": {
-            "support": mid_term_support,
-            "resistance": mid_term_resistance
-        },
-        "volume_profile": volume_profile,  # poc / value_area_high / value_area_low
-    }
-```
-
-**输出 Schema：**
-```yaml
-market_analysis_output:
-  tech_growth:
-    trend: str          # "bullish" | "bearish" | "neutral"
-    score: float        # 加权得分（-1.0 ~ 1.0）
-    indicators:
-      ma_alignment: float
-      macd:
-        score: float            # 分层评分（-1.0 ~ 1.0）
-        phase: str              # "emerging_golden_cross" | "running_bullish" | "divergence_warning" | "death_cross_confirmed" | "running_bearish"
-        phase_since_days: int   # 当前阶段已持续天数
-      volume_price: float
-      market_breadth: float
-      bollinger: float
-    constituents:
-      chinext: float    # 创业板指得分
-      star50: float     # 科创50得分
-    consistency: str    # "aligned" | "divergent"（创业板/科创一致性）
-
-    # === 多时间框架信号（P1-2 决策）===
-    signals:
-      short_term:       # 5 日
-        trend: str
-        score: float
-      medium_term:      # 20 日
-        trend: str
-        score: float
-      long_term:        # 60 日
-        trend: str
-        score: float
-    # === 时间框架 mini GOT 输出（v0.3 新增）===
-    timeframe_got:
-      unified_trend: str              # 经矛盾检测后的统一趋势（bullish/bearish/neutral）
-      unified_score: float            # 统一评分（-1.0 ~ 1.0）
-      contradiction_type: str | null  # "pullback_in_uptrend" | "bear_market_rally" | "correction_in_long_uptrend" | "counter_trend_rally" | null
-      timeframe_confidence: float     # 框架一致性置信度（0~1，三框架同向=1.0）
-      llm_reasoning: str              # 有矛盾时的 LLM 研判理由（无矛盾时为空）
-
-    # === 市场状态元信息（P1-3 决策）===
-    regime_metadata:
-      adx_value: float             # ADX 数值（0-100）
-      regime: str                  # "strong_trending" | "mild_trending" | "ranging"
-      volatility_regime: str       # "extreme_high" | "normal" | "extreme_low"
-      weights_used:                # 实际使用的权重，便于归因
-        ma_alignment: float
-        macd: float
-        volume_price: float
-        market_breadth: float
-        bollinger: float
-
-  mid_small_cap:
-    trend: str
-    score: float
-    signals:                       # 多时间框架（同上结构）
-      short_term: {trend, score}
-      medium_term: {trend, score}
-      long_term: {trend, score}
-  large_cap:
-    trend: str
-    score: float
-    signals:
-      short_term: {trend, score}
-      medium_term: {trend, score}
-      long_term: {trend, score}
-  display:              # 纯展示，不参与评分
-    shanghai_composite:
-      current: float
-      change_pct: float
-      trend_desc: str
-  position_limit: float # 最终仓位上限（经时间框架 mini GOT + 风格风险折扣后）
-  confidence: float     # 指标一致性（0.0 ~ 1.0）
-  key_levels:
-    short_term:
-      support: float
-      resistance: float
-    mid_term:
-      support: float
-      resistance: float
-    volume_profile:           # P3-2 决策：筹码密集区
-      poc: float              # Point of Control（成交量最密集价格，核心支撑/阻力）
-      value_area_high: float  # Value Area 上界（覆盖 70% 成交量）
-      value_area_low: float   # Value Area 下界
-  reasoning: str        # LLM生成的推理文本（基于上述数值结论）
-```
-
-**LLM Prompt 模板（仅生成推理文本）：**
-```
-你是一个专业的大盘分析师。根据以下技术分析结果，撰写一段简洁的推理报告。
-
-技术分析结果：
-- 科技成长：{tech_growth.trend}（得分：{tech_growth.score}）
-  - 创业板指得分：{tech_growth.constituents.chinext}
-  - 科创50得分：{tech_growth.constituents.star50}
-  - MA排列：{tech_growth.indicators.ma_alignment}
-  - MACD：{tech_growth.indicators.macd}
-  - 量价关系：{tech_growth.indicators.volume_price}
-  - 市场宽度：{tech_growth.indicators.market_breadth}
-  - 布林带：{tech_growth.indicators.bollinger}
-  - 市场状态：ADX={tech_growth.regime_metadata.adx_value}，{tech_growth.regime_metadata.regime}，波动率={tech_growth.regime_metadata.volatility_regime}
-  - 多时间框架信号：
-    - 短期（5日）：{tech_growth.signals.short_term.trend}（{tech_growth.signals.short_term.score}）
-    - 中期（20日）：{tech_growth.signals.medium_term.trend}（{tech_growth.signals.medium_term.score}）
-    - 长期（60日）：{tech_growth.signals.long_term.trend}（{tech_growth.signals.long_term.score}）
-    - 主导框架：{tech_growth.primary_timeframe}
-- 中小盘：{mid_small_cap.trend}（得分：{mid_small_cap.score}）
-- 大盘蓝筹：{large_cap.trend}（得分：{large_cap.score}）
-- 上证指数：{display.shanghai_composite.trend_desc}
-- 建议仓位上限：{position_limit * 100}%
-- 短期支撑/阻力：{key_levels.short_term.support} / {key_levels.short_term.resistance}
-- 中期支撑/阻力：{key_levels.mid_term.support} / {key_levels.mid_term.resistance}
-- 筹码密集区（Volume Profile）：POC = {key_levels.volume_profile.poc}，Value Area = {key_levels.volume_profile.value_area_low} ~ {key_levels.volume_profile.value_area_high}
-
-请输出：
-1. 一段200字以内的推理文本，解释为什么得出这个结论
-2. 重点说明科技成长方向的趋势判断依据
-3. 说明多时间框架信号是否一致，如有矛盾需解释
-4. 提示关键风险点
-
-输出格式：纯文本（不要JSON）
-```
-
----
-
-### 3.2 节点 2：板块分析
-
-**职责：** 识别板块状态（主线/衰竭/埋伏/防守），判断启动和过热信号，为选股提供方向。
-
-**设计理念：**
-- **分状态输出**：不是简单按强度排序，而是按4种状态分层
-- **核心目标**：找主线（判断持续性）+ 找埋伏（高切低提前布局）
-- **纯规则驱动**：强度评分、状态判断、信号识别均由规则计算，LLM只生成推理文本
-- **龙头识别后置**：龙头股需要舆情数据，放到聚合节点统一计算
-
-**精选概念列表（按产业链组织）：**
-```yaml
-concept_universe:
-  # === AI主线（进攻） ===
-  ai_mainline:
-    upstream:
-      - semiconductor_equipment  # 半导体设备
-      - semiconductor_materials  # 半导体材料
-      - ai_chips                 # AI芯片
-
-    infrastructure:
-      - server_hardware          # 服务器/算力
-      - aidc                     # AI数据中心
-      - liquid_cooling           # 液冷散热
-      - computing_power_electricity # 算电协同
-
-    midstream:
-      - llm_models               # 大模型
-      - embodied_ai              # 具身智能
-
-    downstream:
-      - humanoid_robots          # 人形机器人整机
-      - ai_applications          # AI应用
-      - ai_agents                # AI Agent
-
-    components:
-      - reducers                 # 减速器
-      - screws                   # 丝杠
-      - sensors                  # 传感器
-      - motors                   # 电机
-
-  # === 科技防守板块 ===
-  tech_defensive:
-    - innovative_drugs           # 创新药
-    - power_grid                 # 电网
-    - electricity                # 电力
-    - energy_storage             # 储能
-```
-
-**输入 Schema：**
-```yaml
-sector_analysis_input:
-  market_context:          # 来自"大盘分析"节点的输出
-    tech_growth:
-      trend: str
-      score: float
-    position_limit: float
-  concept_list: list[str]  # 精选概念列表（约25-30个）
-```
-
-**工具调用：**
-```python
-# 获取每个概念板块的K线、成交量、成分股数据
-sector_data = {}
-for concept in concept_list:
-    kline = await DataFetcher.get_sector_kline(concept, lookback_days=60)
-    volume = await DataFetcher.get_sector_volume(concept, lookback_days=60)
-    constituents = await DataFetcher.get_sector_constituents(concept)
-    sector_data[concept] = {"kline": kline, "volume": volume, "constituents": constituents}
-```
-
-**板块强度评分（5维加权）：**
-```python
-def calculate_sector_strength(sector_data, market_context):
-    """计算板块综合强度分"""
-
-    # 1. 量价关系（权重0.30）
-    volume_price_score = calculate_volume_price(sector_data)
-    # 放量上涨/缩量回调 → +1
-    # 放量下跌/缩量反弹 → -1
-
-    # 2. 价格动量（权重0.25）
-    price_momentum = clip(
-        sector_data.kline.close[-1] / sector_data.kline.close[-5] - 1,  # 近5日涨幅
-        -0.15, 0.15  # clip 到合理范围，避免极端值主导评分
-    )
-
-    # 3. 市场宽度（权重0.20）
-    breadth_score = (
-        sum(1 for stock in sector_data.constituents if stock.close > stock.ma20)
-        / len(sector_data.constituents)
-    )
-
-    # 4. 相对强度（权重0.15）
-    relative_strength = clip(
-        (sector_data.kline.close[-1] / sector_data.kline.close[-20] - 1)  # 板块近20日涨幅
-        - (market_context.tech_growth.index_close[-1] / market_context.tech_growth.index_close[-20] - 1),  # 大盘同期涨幅
-        -0.15, 0.15
-    )
-
-    # 5. 资金流向（权重0.10，辅助参考）
-    capital_flow_score = calculate_capital_flow(sector_data)
-
-    # 加权求和
-    strength_score = (
-        volume_price_score * 0.30 +
-        price_momentum * 0.25 +
-        breadth_score * 0.20 +
-        relative_strength * 0.15 +
-        capital_flow_score * 0.10
-    )
-
-    return {
-        "volume_price": volume_price_score,
-        "price_momentum": price_momentum,
-        "market_breadth": breadth_score,
-        "relative_strength": relative_strength,
-        "capital_flow": capital_flow_score,
-        "strength_score": strength_score
-    }
-```
-
-**板块分析完整流程：**
-```python
-def analyze_sector(sector_data, market_context):
-    """板块分析：指标→信号→状态"""
-    
-    # Step 1: 计算5维强度指标
-    indicators = calculate_sector_strength(sector_data, market_context)
-    
-    # Step 2: 计算启动信号（三维共振）
-    launch_signal = detect_launch_signal(sector_data)
-    
-    # Step 3: 计算过热信号
-    overheat_signal, overheat_type = detect_overheat_signal(sector_data)
-    
-    # Step 4: 综合判断状态（信号作为输入参数）
-    state = determine_sector_state(
-        indicators=indicators,
-        launch_signal=launch_signal,
-        overheat_signal=overheat_signal,
-        sector_data=sector_data,
-        market_context=market_context
-    )
-    
-    # Step 5: 组装输出
-    return {
-        "state": state,
-        "indicators": indicators,
-        "days_since_launch": calculate_days_since_launch(sector_data) if state == "active_mainline" else None,
-        "days_in_exhaustion": calculate_days_since_overheat(sector_data) if state == "exhausted_mainline" else None,
-        # ... other state-specific fields
-    }
-```
-
-**板块状态判断（适配新启动信号 + 生命周期，P2-1 决策）：**
-```python
-def determine_sector_state(indicators, launch_signal, overheat_signal, sector_data, market_context):
-    """状态判断逻辑（适配新的启动信号格式）"""
-
-    # 优先级：启动信号 > 过热信号 > 其他条件
-
-    # 1. 启动信号触发 → 刚进入 active_mainline
-    if launch_signal["triggered"]:
-        return "active_mainline", launch_signal["level"]  # 返回 strong_launch/weak_launch
-
-    # 2. 过热信号触发 → 进入 exhausted_mainline
-    if overheat_signal:
-        return "exhausted_mainline", None
-
-    # 3. 持续强势（非刚启动）→ active_mainline
-    if (
-        indicators.strength_score > 70
-        and indicators.volume_price > 0.5
-        and indicators.market_breadth > 0.7
-    ):
-        return "active_mainline", "sustained"
-
-    # 4. 持续衰弱（非刚过热）→ exhausted_mainline
-    if (
-        sector_data.kline.close[-1] / sector_data.kline.close[-20] > 1.15
-        and indicators.volume_price < -0.3
-    ):
-        return "exhausted_mainline", None
-
-    # 5. 埋伏条件
-    if (
-        calculate_volatility(sector_data, days=20) < 0.10
-        and sector_data.volume[-1] > sector_data.volume_ma20 * 1.3
-        and calculate_bollinger_width(sector_data) < percentile_20_60d
-    ):
-        return "ambush", None
-
-    # 6. 防守轮动（仅用 Node 1 已有信号，资金面数据在 Node 3 尚未产生）
-    if (
-        market_context.tech_growth.trend == "bearish"
-        and indicators.capital_flow > 2e8
-        and calculate_correlation(sector_data, market_context.tech_growth) < 0.3
-    ):
-        return "defensive_rotation", None
-
-    return "neutral", None
-
-
-def classify_mainline_tier(sector_data, news_context):
-    """主线级别判定（系统输出依据，人工最终定级，P2-1 决策）"""
-    score = 0
-    reasons = []
-
-    # 政策支撑（+3 分 = S 级候选）
-    if has_national_policy_support(sector_data, news_context):
-        score += 3
-        reasons.append("国家级政策驱动")
-
-    # 市场空间（+2 分 = 千亿级以上）
-    if estimated_market_size(sector_data) > 1e11:
-        score += 2
-        reasons.append("市场空间>千亿")
-
-    # 产业链长度（+1 分 = 跨 3 个以上子产业）
-    if count_sub_industries(sector_data) >= 3:
-        score += 1
-        reasons.append("产业链长度≥3")
-
-    # 龙头公司市值（+1 分 = 有千亿市值龙头）
-    if has_mega_cap_leader(sector_data):
-        score += 1
-        reasons.append("有千亿市值龙头")
-
-    # 持续性（+1 分 = 已运行 > 20 天且仍强势）
-    if sector_data.days_since_launch > 20 and sector_data.strength_score > 70:
-        score += 1
-        reasons.append("已运行>20天仍强势")
-
-    if score >= 5:
-        suggested_tier = "S"
-    elif score >= 3:
-        suggested_tier = "A"
-    else:
-        suggested_tier = "B"
-
-    return {"suggested_tier": suggested_tier, "score": score, "reasons": reasons}
-
-
-def get_lifecycle_thresholds(tier):
-    """根据主线级别返回生命周期阈值"""
-    return {
-        "S": {"launch": 7, "acceleration": 30, "mature": 60},
-        "A": {"launch": 5, "acceleration": 15, "mature": 30},
-        "B": {"launch": 3, "acceleration": 10, "mature": 20},
-    }[tier]
-
-
-def classify_lifecycle_phase(days_since_launch, tier, overheat_signals):
-    """板块生命周期分层（P2-1 决策）"""
-    if overheat_signals:
-        return "mature_exhausted"
-
-    thresholds = get_lifecycle_thresholds(tier)
-    if days_since_launch <= thresholds["launch"]:
-        return "launch"
-    elif days_since_launch <= thresholds["acceleration"]:
-        return "acceleration"
-    elif days_since_launch <= thresholds["mature"]:
-        return "mature"
-    else:
-        return "late_stage"
-```
-
-**启动信号检测（3 硬门槛 + 5 维加权，P0-3 决策）：**
-```python
-def detect_launch_signal(sector_data):
-    """启动信号：核心门槛 + 加权打分（替代旧 all() 逻辑）"""
-
-    # === 核心门槛条件（必须全部满足，否则直接 False）===
-    hard_gates = [
-        # 必须脱离横盘（已突破）
-        sector_data.kline.close[-1] > max(sector_data.kline.high[-15:]),
-        # 必须有量能配合（不能是缩量上涨，放宽到 1.3 倍）
-        sector_data.volume[-1] > sector_data.volume_ma3 * 1.3,
-        # 必须站上 MA20
-        sector_data.kline.close[-1] > sector_data.ma20,
-    ]
-    if not all(hard_gates):
-        return {"triggered": False, "score": 0.0, "level": "none"}
-
-    # === 软性维度打分（0~1 之间的分数）===
-    dimensions = {
-        "consolidation": calculate_consolidation_score(sector_data),
-        "volume_expansion": calculate_volume_expansion_score(sector_data),
-        "price_strength": calculate_price_strength_score(sector_data),
-        "trend_alignment": calculate_trend_alignment_score(sector_data),
-        "breadth": calculate_breadth_score(sector_data),
-    }
-
-    weights = {
-        "consolidation": 0.25,
-        "volume_expansion": 0.25,
-        "price_strength": 0.20,
-        "trend_alignment": 0.15,
-        "breadth": 0.15,
-    }
-    launch_score = sum(dimensions[k] * weights[k] for k in dimensions)
-
-    # 阈值分级（P0-3 决策：两级分级）
-    if launch_score >= 0.75:
-        level = "strong_launch"    # 强启动（可重仓追）
-    elif launch_score >= 0.55:
-        level = "weak_launch"      # 弱启动（试探性买入）
-    else:
-        level = "none"
-
-    return {
-        "triggered": level != "none",
-        "score": launch_score,
-        "level": level,
-        "dimensions": dimensions,  # 透传维度明细供下游参考
-    }
-
-
-def calculate_consolidation_score(sector_data):
-    """横盘整理度：近 15-30 日波动越小、时间越长 → 分数越高"""
-    range_15d = (max(sector_data.kline.high[-15:]) -
-                 min(sector_data.kline.low[-15:])) / sector_data.kline.close[-15]
-    # 15 日振幅 < 8% 得满分，> 15% 得 0 分
-    range_score = clip((0.15 - range_15d) / 0.07, 0, 1)
-    # 布林带宽也作为横盘参考
-    boll_width = calculate_bollinger_width(sector_data)
-    boll_percentile = percentile_rank(boll_width, lookback=60)
-    boll_score = clip((30 - boll_percentile) / 30, 0, 1)
-    return 0.6 * range_score + 0.4 * boll_score
-
-
-def calculate_volume_expansion_score(sector_data):
-    """量能扩张度：倍量但非天量"""
-    volume_ratio = sector_data.volume[-1] / sector_data.volume_ma3
-    if volume_ratio < 1.5:
-        return 0.0
-    elif volume_ratio <= 3.0:
-        return (volume_ratio - 1.5) / 1.5
-    elif volume_ratio <= 5.0:
-        return 1.0
-    else:
-        return max(0, 1.0 - (volume_ratio - 5.0) / 5.0)  # 天量扣分
-
-
-def calculate_breadth_score(sector_data):
-    """广度：成分股站上 MA20 的比例"""
-    ratio = (sum(1 for s in sector_data.constituents
-                 if s.close > s.ma20)
-             / len(sector_data.constituents))
-    # 0.4 起步，0.7 满分
-    return clip((ratio - 0.4) / 0.3, 0, 1)
-```
-
-**过热信号检测（任一触发）：**
-```python
-def detect_overheat_signal(sector_data):
-    """过热信号（任一触发即返回True）"""
-    signals = []
-
-    # 强MACD背离
-    if (
-        sector_data.kline.close[-1] > max(sector_data.kline.close[-20:])  # 价格新高
-        and sector_data.macd_dif[-1] < max(sector_data.macd_dif[-20:]) * 0.8  # DIF明显走低
-    ):
-        signals.append("strong_divergence")
-
-    # 量价背离
-    if (
-        sector_data.kline.close[-1] > max(sector_data.kline.close[-20:])
-        and sector_data.volume[-1] < sector_data.volume_at_previous_high * 0.7
-    ):
-        signals.append("volume_divergence")
-
-    # 广度极端（80%以上创新高）
-    new_high_ratio = sum(1 for s in sector_data.constituents if s.close == max(s.close[-20:])) / len(sector_data.constituents)
-    if new_high_ratio > 0.8:
-        signals.append("breadth_extreme")
-
-    # 换手极端
-    if sector_data.turnover[-1] > percentile_90_60d:
-        signals.append("turnover_extreme")
-
-    # 返回结果
-    if signals:
-        return True, signals[0]  # 返回第一个触发的信号类型
-    else:
-        return False, None
-```
-
-**输出 Schema：**
-```yaml
-sector_analysis_output:
-  active_mainline: list[          # 活跃主线（最多2个）
-    code: str
-    name: str
-    state: "active_mainline"
-    strength_score: float         # 综合强度分（0-100）
-    indicators:
-      volume_price: float
-      price_momentum: float
-      market_breadth: float
-      relative_strength: float
-      capital_flow: float
-
-    # === 启动信号（P0-3 决策）===
-    launch_signal:
-      level: "strong_launch" | "weak_launch" | "sustained"
-      score: float
-      dimensions:                  # 5 维打分明细
-        consolidation: float
-        volume_expansion: float
-        price_strength: float
-        trend_alignment: float
-        breadth: float
-
-    # === 主线级别（P2-1 决策：系统输出依据，人工定级）===
-    tier_evidence:
-      has_national_policy: bool
-      estimated_market_size: float    # 亿
-      sub_industry_count: int
-      max_leader_market_cap: float    # 亿
-      consecutive_strong_days: int
-    mainline_tier: "S" | "A" | "B"   # 人工最终定级
-    system_suggested_tier: "S" | "A" | "B"  # 系统建议
-
-    # === 生命周期（P2-1 决策）===
-    lifecycle_phase: "launch" | "acceleration" | "mature" | "late_stage" | "mature_exhausted"
-    days_since_launch: int
-    lifecycle_thresholds:
-      launch_end: int
-      acceleration_end: int
-      mature_end: int
-
-    # === 交易建议（基于生命周期）===
-    adjusted_strength_score: float    # 生命周期调整后的强度分
-    recommended_action:
-      launch: "aggressive_buy"
-      acceleration: "buy"
-      mature: "reduce_or_hold"
-      late_stage: "exit_only"
-      mature_exhausted: "exit"
-  ]
-  exhausted_mainline: list[       # 衰竭主线（最多2个）
-    code: str
-    name: str
-    state: "exhausted_mainline"
-    strength_score: float
-    indicators: ...               # 同上
-    days_in_exhaustion: int
-    mainline_tier: "S" | "A" | "B"
-  ]
-  ambush: list[                   # 埋伏期（最多4个）
-    code: str
-    name: str
-    state: "ambush"
-    strength_score: float
-    indicators: ...
-    consolidation_days: int
-    volume_expansion_ratio: float
-  ]
-  defensive_rotation: list[       # 防守轮动（最多1个）
-    code: str
-    name: str
-    state: "defensive_rotation"
-    strength_score: float
-    indicators: ...
-    correlation_with_mainline: float
-  ]
-  market_direction: str           # "分化" | "普涨" | "普跌"
-  reasoning: str                  # LLM生成的推理文本
-```
-
-**LLM Prompt 模板（仅生成推理文本）：**
-```
-你是一个专业的板块分析师。根据以下板块分析结果，撰写一段简洁的分析报告。
-
-板块分析结果：
-- 活跃主线：{active_mainline}
-- 衰竭主线：{exhausted_mainline}
-- 埋伏期：{ambush}
-- 防守轮动：{defensive_rotation}
-- 市场方向：{market_direction}
-
-请输出：
-1. 一段200字以内的分析文本，解释当前板块轮动格局
-2. 重点说明哪些板块是主线、持续性如何
-3. 提示哪些板块处于埋伏期，可能成为下一个主线
-4. 风险提示（哪些板块过热需要回避）
-
-输出格式：纯文本（不要JSON）
-```
-
----
-
-### 3.3 节点 3：资金面分析
-
-**职责：** 追踪机构资金行为，为其他节点提供辅助验证信号。
-
-**设计理念：**
-- **精简聚焦**：砍掉噪音大的主力资金流向数据，只保留高价值维度
-- **机构视角**：所有维度都指向机构行为——龙虎榜机构席位、ETF申赎（机构配置）、融资融券（杠杆资金参考）
-- **信号聚合**：输出统一的"机构态度"结论 + 支撑证据，方便聚合节点交叉验证
-- **游资不跟踪**：游资已被量化收割，信号价值低
-
-**数据维度（P0-2 决策：增加北向资金）：**
-
-| 维度 | 机构信号 | 权重 | 噪音 |
-|------|---------|------|------|
-| 龙虎榜机构席位 | 机构专用席位净买入额 | 0.25（↓） | 低 |
-| 北向资金（沪深股通） | 日度净流入，覆盖面广 | 0.25 | 低 |
-| ETF申赎 | 净申购额（机构配置意图） | 0.25 | 低 |
-| 融资融券 | 融资余额变化（杠杆资金方向） | 0.15（↓） | 中 |
-| 大宗交易 | 折价甩货 / 溢价抢筹 | 0.10（P3-5 新增） | 中 |
-
-**输入 Schema：**
-```yaml
-capital_flow_input:
-  market_context:          # 来自"大盘分析"
-    tech_growth:
-      trend: str
-  sector_context:          # 来自"板块分析"
-    active_mainline: list  # 主线板块列表（用于过滤龙虎榜个股）
-```
-
-**工具调用：**
-```python
-# 北向资金（沪深股通）
-north_flow = await DataFetcher.get_northbound_flow(lookback_days=5)
-
-# 龙虎榜（重点关注机构席位）
-dragon_tiger = await DataFetcher.get_dragon_tiger_list(lookback_days=5)
-institutional_trades = filter_institutional_seats(dragon_tiger)
-
-# ETF申赎
-etf_flow = await DataFetcher.get_etf_shares_change(lookback_days=5)
-
-# 融资融券
-margin_data = await DataFetcher.get_margin_data(lookback_days=5)
-
-# 大宗交易（P3-5 新增，缺失时 block_trade=None）
-block_trade = await DataFetcher.get_block_trade(lookback_days=5)
-```
-
-**机构态度评分（P0-2 + P2-4 + P3-5 决策：五维度 + 降级机制）：**
-```python
-def calculate_institutional_score(north_flow, dragon_tiger, etf_flow, margin_data, block_trade=None):
-    """综合机构态度评分（-1 ~ 1），支持降级模式"""
-
-    evidence = {}
-    available_scores = []
-    available_weights = []
-    missing_dimensions = []
-
-    # 维度 1：北向资金（权重 0.25）
-    try:
-        cumulative_5d = sum(d.net_buy for d in north_flow[-5:])
-        base_score = clip(cumulative_5d / 5e9, -1, 1)
-        today = north_flow[-1].net_buy
-        avg_5d = cumulative_5d / 5
-        acceleration = clip((today - avg_5d) / 2e9, -0.3, 0.3)
-        concentration_bonus = 0.1 if today > 1e10 else 0
-        north_score = clip(base_score + acceleration + concentration_bonus, -1, 1)
-
-        evidence["northbound"] = {
-            "score": north_score,
-            "cumulative_5d": cumulative_5d / 1e8,
-            "today": today / 1e8,
-            "acceleration": "加速流入" if acceleration > 0.1 else ("减速" if acceleration < -0.1 else "稳定"),
-        }
-        available_scores.append(north_score)
-        available_weights.append(0.25)
-    except DataFetchError as e:
-        missing_dimensions.append("北向资金")
-        logger.warning(f"北向资金数据获取失败: {e}")
-
-    # 维度 2：龙虎榜机构净买入（权重 0.25）
-    try:
-        dt_score = clip(dragon_tiger.institutional_net_buy / 5e8, -1, 1)
-        evidence["dragon_tiger"] = {"score": dt_score, "net_buy": dragon_tiger.institutional_net_buy / 1e8}
-        available_scores.append(dt_score)
-        available_weights.append(0.25)
-    except DataFetchError as e:
-        missing_dimensions.append("龙虎榜")
-        logger.warning(f"龙虎榜数据获取失败: {e}")
-
-    # 维度 3：ETF净申购（权重 0.25）
-    try:
-        etf_score = clip(etf_flow.net_subscription / 1e9, -1, 1)
-        evidence["etf_flow"] = {"score": etf_score, "net_subscription": etf_flow.net_subscription / 1e8}
-        available_scores.append(etf_score)
-        available_weights.append(0.25)
-    except DataFetchError as e:
-        missing_dimensions.append("ETF 申赎")
-        logger.warning(f"ETF 申赎数据获取失败: {e}")
-
-    # 维度 4：融资余额变化（权重 0.15）
-    try:
-        margin_score = clip(margin_data.balance_change / 2e9, -0.5, 0.5)
-        evidence["margin_trading"] = {"score": margin_score, "balance_change": margin_data.balance_change / 1e8}
-        available_scores.append(margin_score)
-        available_weights.append(0.15)
-    except DataFetchError as e:
-        missing_dimensions.append("融资融券")
-        logger.warning(f"融资融券数据获取失败: {e}")
-
-    # 维度 5：大宗交易（权重 0.10，P3-5 新增）
-    # 折价 > 5% → "甩货"信号（看空）；溢价 → "抢筹"信号（看多）
-    # 缺失时该维度权重归零，其余自动归一化（复用 P2-4 降级机制）
-    if block_trade is not None:
-        try:
-            premium_ratio = block_trade.premium_to_close  # 正=溢价，负=折价
-            if premium_ratio < -0.05:
-                # 大幅折价 → 甩货信号
-                block_score = clip(premium_ratio * 10, -1, -0.3)
-                signal_type = "甩货（折价 > 5%）"
-            elif premium_ratio > 0.02:
-                # 溢价 → 抢筹信号
-                block_score = clip(premium_ratio * 8, 0.3, 1)
-                signal_type = "抢筹（溢价）"
-            else:
-                block_score = clip(premium_ratio * 5, -0.3, 0.3)
-                signal_type = "平价成交"
-            evidence["block_trade"] = {
-                "score": block_score,
-                "premium_ratio": premium_ratio,
-                "signal_type": signal_type,
-                "amount": block_trade.amount / 1e8,
-            }
-            available_scores.append(block_score)
-            available_weights.append(0.10)
-        except DataFetchError as e:
-            missing_dimensions.append("大宗交易")
-            logger.warning(f"大宗交易数据获取失败: {e}")
-    else:
-        missing_dimensions.append("大宗交易")
-
-    # === 降级处理（P2-4 决策）===
-    if len(available_scores) < 2:
-        return {
-            "status": "failed",
-            "reason": f"可用数据不足（仅 {len(available_scores)} 个维度）",
-            "missing_dimensions": missing_dimensions,
-        }
-
-    # 权重归一化
-    total_weight = sum(available_weights)
-    normalized_weights = [w / total_weight for w in available_weights]
-    institutional_score = sum(s * w for s, w in zip(available_scores, normalized_weights))
-
-    # 置信度乘数（可用维度比例，总分母为 5：北向/龙虎榜/ETF/融资/大宗）
-    confidence_multiplier = len(available_scores) / 5
-    degraded = len(missing_dimensions) > 0
-
-    # 态度判断
-    if institutional_score > 0.3:
-        attitude = "bullish"
-    elif institutional_score < -0.3:
-        attitude = "bearish"
-    else:
-        attitude = "neutral"
-
-    return {
-        "status": "degraded" if degraded else "normal",
-        "institutional_score": institutional_score,
-        "institutional_attitude": attitude,
-        "evidence": evidence,
-        "missing_dimensions": missing_dimensions,
-        "confidence_multiplier": confidence_multiplier,
-        "degraded": degraded,
-    }
-```
-
-**输出 Schema：**
-```yaml
-capital_flow_output:
-  status: "normal" | "degraded" | "failed"  # P2-4 降级状态
-  institutional_attitude: str        # "bullish" | "bearish" | "neutral"
-  institutional_score: float         # 综合评分（-1.0 ~ 1.0）
-  confidence_multiplier: float       # 置信度乘数（0-1，= 可用维度/5）
-  missing_dimensions: list[str]      # 缺失的数据维度
-  evidence:
-    northbound:                      # P0-2 新增
-      score: float
-      cumulative_5d: float           # 5 日累计净流入（亿）
-      today: float                   # 今日净流入（亿）
-      acceleration: str              # "加速流入" | "稳定" | "减速"
-    dragon_tiger:
-      score: float
-      institutional_net_buy: float   # 机构席位净买入（亿）
-      mainline_stocks_bought: list[str]
-    etf_flow:
-      score: float
-      net_subscription: float        # ETF净申购额（亿份）
-      top_etf_changes: list[
-        etf_code: str
-        etf_name: str
-        shares_change: float
-        direction: str               # "申购" | "赎回"
-      ]
-    margin_trading:
-      score: float
-      balance_change: float          # 融资余额日变化（亿）
-    block_trade:                     # P3-5 新增（缺失时可能不存在）
-      score: float
-      premium_ratio: float           # 溢价率（正=溢价，负=折价）
-      signal_type: str               # "甩货（折价 > 5%）" | "抢筹（溢价）" | "平价成交"
-      amount: float                  # 成交额（亿）
-  reasoning: str                     # LLM生成的推理文本
-```
-
-**LLM Prompt 模板（仅生成推理文本）：**
-```
-你是一个专业的资金流分析师。根据以下机构资金数据，撰写一段简洁的分析报告。
-
-机构态度评分：{institutional_score}（{institutional_attitude}）
-
-支撑证据：
-- 龙虎榜：机构席位净买入 {dragon_tiger.institutional_net_buy} 亿
-  - 主线板块被机构买入的个股：{dragon_tiger.mainline_stocks_bought}
-- ETF申赎：净申购 {etf_flow.net_subscription} 亿份
-  - 头部ETF变化：{etf_flow.top_etf_changes}
-- 融资融券：融资余额变化 {margin_trading.balance_change} 亿
-- 大宗交易：{block_trade.signal_type}（溢价率 {block_trade.premium_ratio}%，成交额 {block_trade.amount} 亿）
-
-大盘背景：{market_context}
-板块背景：{sector_context}
-
-请输出：
-1. 一段150字以内的分析文本，解释机构资金的整体态度
-2. 重点说明机构对主线板块的态度（是否在加仓）
-3. 提示风险信号（如有）
-
-输出格式：纯文本（不要JSON）
-```
-
----
-
-### 3.4 节点 4：消息面分析
-
-**职责：** 采集和分析影响市场的政策、行业、国际新闻，评估整体影响，发现新概念建议。
-
-**设计理念：**
-- **LLM是核心分析引擎**：新闻是非结构化数据，必须由LLM提取事件、判断影响、识别情绪
-- **聚焦4类来源**：政策、行业、国际市场、新概念发现（公司公告砍掉，留给选股节点）
-- **信号聚合输出**：整体影响评分 + 事件列表 + 新概念建议
-- **新概念反馈管道**：消息面 → 板块节点精选概念列表（人工审核后加入）
-
-**数据来源：**
-
-| 来源 | 关注点 | 示例 |
-|------|--------|------|
-| 政策 | 国务院/工信部/科技部产业政策、财政货币政策 | "人形机器人产量2026年突破10万台" |
-| 行业 | AI/机器人/半导体产业链动态 | "特斯拉Optimus Gen-3启动量产" |
-| 国际市场 | 美股三大指数 + 费城半导体 + 纳斯达克、地缘冲突 | "英伟达财报超预期，费半指数涨3%" |
-| 公司公告 | ❌ 不采集 | — |
-
-**⚠️ 已知问题（2026-07-27）：**
-
-当前 Node 4 只依赖 `SearchService.search_market_news()`（Web 搜索引擎），存在两个缺陷：
-1. **搜索词太泛**：全是科技/AI 方向，没有覆盖 IPO、宏观经济、具体公司事件等
-2. **无热门信息流**：所有新闻获取都是"搜索型"（需传入 query），没有"当日热门消息"信息流
-
-**后果**：2026-07-27 Phase 1 运行中，"长鑫上市"这种当日最大消息完全没有被 Node 4 捕获，`major_events=[]`。
-
----
-
-**方案二：接入热门信息流（理想方案）**
-
-**目标**：先获取当日热门消息（信息流），再做 LLM 事件提取。不再依赖搜索词覆盖度。
-
-**新增数据源（3 层）：**
-
-| 层级 | 数据源 | 接口 | 优先级 | 说明 |
-|------|--------|------|--------|------|
-| **L1 实时快讯** | 财联社电报 | `https://www.cls.cn/nodeapi/updateTelegraph` | P0 | 实时快讯流（分钟级），覆盖所有重大事件 |
-| **L2 新闻聚合** | akshare 新闻 API | `stock_news_em()` / `js_news()` / `news_economic_baidu()` | P0 | 东财个股新闻 + 金十宏观 + 百度财经 |
-| **L3 搜索补充** | SearchService | `search_market_news()` | P1 | 保留现有搜索，作为补充和深度采集 |
-
-**改造后的 Node 4 流程：**
-
-```
-Step 1: 热门信息流采集（并发）
-├── L1: 财联社电报（实时快讯，最近 50 条）
-├── L2: akshare 新闻 API（3 个接口并发）
-│   ├── stock_news_em() — 东财热门股新闻
-│   ├── js_news() — 金十数据（宏观经济）
-│   └── news_economic_baidu() — 百度财经
-└── L3: 搜索补充（保留现有 6 个 query）
-
-Step 2: 去重 + 合并
-- 基于 title 相似度去重（阈值 0.45）
-- 多源确认（同一事件被财联社 + 东财 + 搜索同时报道 → source_count=3）
-
-Step 3: LLM 事件提取（不变）
-Step 4: 评分计算（不变）
-Step 5: reasoning 生成（不变）
-```
-
-**实现步骤：**
-
-1. **新建 `src/got/news_feeds.py`**（~200 行）
-   - `fetch_cls_telegraph(limit=50)` — 财联社电报实时快讯
-   - `fetch_akshare_news()` — akshare 3 个新闻接口并发采集
-   - `merge_news(cls_news, ak_news, search_news)` — 多源合并 + 去重
-
-2. **修改 `src/got/nodes/news_analysis.py`**
-   - `_fetch_news()` 新增 L1/L2 采集，与 L3 搜索并发
-   - 保留现有 `SEARCH_QUERIES` 作为 L3 补充
-
-3. **新建 `src/patches/cls_patch.py`**（可选）
-   - 财联社反爬补丁（User-Agent + 请求间隔）
-
-4. **更新 `src/got/schemas.py`**
-   - `NewsEvent` 新增 `source_type: str` 字段（`"cls"` / `"eastmoney"` / `"jin10"` / `"search"`）
-   - `DataQuality` 的 `available_fields` 记录哪些数据源成功
-
-**文件改动清单：**
-
-| 文件 | 类型 | 改动 |
+| 决策 | 选择 | 理由 |
 |------|------|------|
-| `src/got/news_feeds.py` | 新建 | 热门信息流采集模块（~200 行） |
-| `src/got/nodes/news_analysis.py` | 修改 | `_fetch_news()` 集成 L1/L2 采集 |
-| `src/got/schemas.py` | 修改 | `NewsEvent` 新增 `source_type` 字段 |
-| `src/patches/cls_patch.py` | 新建（可选） | 财联社反爬补丁 |
-
-**验证方案：**
-
-```powershell
-# 1. 跑 Phase 1
-python main.py --got
-
-# 2. 检查 news.json 中 major_events 非空
-python -c "import json; d=json.load(open('data/got_daily/YYYYMMDD/news.json')); print(f'events: {len(d[\"major_events\"])}'); [print(f'  - {e[\"title\"]}') for e in d['major_events'][:5]]"
-
-# 3. 检查 source_type 字段
-python -c "import json; d=json.load(open('data/got_daily/YYYYMMDD/news.json')); sources=set(e.get('source_type','?') for e in d['major_events']); print(f'sources: {sources}')"
-
-# 4. 检查 reasoning.md 是否包含具体事件（如"长鑫上市"）
-grep -i "长鑫\|上市\|IPO" data/got_daily/YYYYMMDD/reasoning.md
-```
-
-**已知风险：**
-
-- 财联社电报可能有反爬限制（需测试可用性）
-- akshare 新闻 API 可能不稳定（需降级处理）
-- 多源合并后数据量可能过大（限制 L1=50 条 + L2=30 条 + L3=20 条）
+| **数据源优先级** | mootdx TCP P0 → efinance HTTP P0 → akshare P1 | TCP 不受 HTTP 反爬影响 |
+| **评分归一化** | 截面百分位排名（Node 2）| 自适应牛熊市，避免 clip 硬阈值 |
+| **矛盾检测** | 规则决策树（Node 6）| 比 LLM 推断更稳定、可解释 |
+| **仓位计算** | 连续函数（波动率×状态缩放）| 比离散映射更平滑 |
+| **选股消息面** | LLM 板块映射 + 规则股票匹配 | 1次LLM评100板块，非40次LLM评40只股 |
+| **框系统** | SQLite 持久化（主线框个体级进出）| 比硬编码更灵活、可回溯 |
 
 ---
 
-**输入 Schema：**
-```yaml
-news_analysis_input:
-  concept_list: list[str]  # 当前板块精选概念列表（用于匹配新闻中的概念关键词）
-  lookback_hours: int      # 回溯小时数（默认 24）
-```
+## 2. Phase 1: GOT 六节点
 
-**工具调用：**
-```python
-# 采集4类新闻
-policy_news = await NewsService.get_policy_news(lookback_hours)
-industry_news = await NewsService.get_industry_news(lookback_hours)
-global_news = await NewsService.get_global_market_news(lookback_hours)  # 国际市场
+### 2.1 Node 1: 大盘分析
 
-# 新概念发现：从政策和行业新闻中提取
-all_news = policy_news + industry_news
-```
+**职责**：基于纯技术指标规则，判断各风格方向趋势，决定仓位上限
 
-**LLM 核心分析（P1-4 决策：拆 3 个并发调用，独立 prompt 风格差异化）：**
-```python
-async def analyze_news_with_llm(all_news, concept_list):
-    """三个任务拆分为三个并发 LLM 调用（P1-4 决策）"""
+**文件**：`src/got/nodes/market_analysis.py`
 
-    # 任务 1：事件提取（严谨、结构化）
-    events_task = asyncio.create_task(
-        llm.call(EVENT_EXTRACTION_PROMPT.format(
-            news_data=all_news,
-            concept_list=concept_list
-        ))
-    )
+#### 2.1.1 指数配置
 
-    # 任务 2：新概念发现（发散、创造性）
-    concepts_task = asyncio.create_task(
-        llm.call(CONCEPT_DISCOVERY_PROMPT.format(
-            news_data=all_news,
-            current_concepts=concept_list
-        ))
-    )
+| 风格组 | 指数代码 | 聚合方式 | 权重 |
+|--------|---------|---------|------|
+| `tech_growth` | `399006.SZ`(创业板) + `000688.SH`(科创50) | 加权平均 + 一致性折扣 | chinext=0.6, star50=0.4 |
+| `mid_small_cap` | `000905.SH`(中证500) | 单指数 | — |
+| `large_cap` | `000300.SH`(沪深300) | 单指数 | — |
+| `display` | `000001.SH`(上证指数) | 纯展示 | — |
 
-    # 任务 3：风险总结（审慎、权衡）
-    risks_task = asyncio.create_task(
-        llm.call(RISK_SUMMARY_PROMPT.format(
-            news_data=all_news
-        ))
-    )
+**一致性折扣**：两指数加权平均后，检测方向一致性；若反向（sign 均 >0.1 或均 <-0.1），打 **7 折**
 
-    # 并发执行，独立失败不影响其他
-    results = await asyncio.gather(events_task, concepts_task, risks_task, return_exceptions=True)
+#### 2.1.2 4 维技术指标评分
 
-    # 降级处理
-    major_events = results[0] if not isinstance(results[0], Exception) else []
-    concept_suggestions = results[1] if not isinstance(results[1], Exception) else []
-    key_risks = results[2] if not isinstance(results[2], Exception) else ["新闻分析部分失败"]
+**实现位置**：`src/got/indicators.py` → `calculate_all_indicators()`
 
-    # 多源确认（P1-5 决策）：为每个事件统计独立来源数
-    for event in major_events:
-        event["source_count"] = count_independent_sources(event)
+| 维度 | 权重 | 说明 |
+|------|------|------|
+| `ma_alignment` | 0.29 | 均线排列度 |
+| `macd` | 0.29 | MACD 金叉/死叉 + DIF 力度 |
+| `volume_price` | 0.24 | 量价配合度 |
+| `bollinger` | 0.18 | 布林带位置 |
 
-    return major_events, concept_suggestions, key_risks
+**⚠️ 重要差异**：设计文档描述 ADX 动态调权，实际代码中 ADX 仅作为元信息透传（`regime_metadata.adx_value`），不参与权重调整
 
+#### 2.1.3 多时间框架 Mini GOT
 
-# === 三个独立 Prompt ===
+| 框架 | MA 周期 | 量价 lookback | 用途 |
+|------|---------|-------------|------|
+| **短期** (short) | `[5, 10, 20]` | 5 日 | 对近期波动敏感 |
+| **中期** (medium) | `[5, 10, 20, 60]` | 20 日 | 确认趋势方向 |
+| **长期** (long) | `[10, 20, 60, 120, 250]` | 60 日 | 反映大级别趋势 |
 
-EVENT_EXTRACTION_PROMPT = """
-你是严谨的新闻编辑。从以下新闻中提取影响A股的重要事件。
+所有框架共用完整数据集（250日 K 线），通过 MA 周期和量价 lookback 区分敏感度
 
-当前板块精选概念列表：{concept_list}
+**矛盾检测**：`|short_score - long_score| > 0.3` → 标记矛盾
 
-要求：
-- 每个事件必须包含：title、summary（2-3句）、event_type（policy/industry/global）、
-  impact_level（high/medium/low）、sentiment（positive/negative/neutral）、affected_sectors
-- 不要遗漏重要事件，也不要重复
-- 同一事件被多家媒体报道时，合并为一个事件并记录 source_count
-- 输出 JSON 格式
-
-新闻数据：
-{news_data}
-"""
-
-CONCEPT_DISCOVERY_PROMPT = """
-你是敏锐的市场观察者。从以下新闻中识别近期频繁提及但不在当前概念列表中的新主题。
-
-当前概念列表：{current_concepts}
-
-要求：
-- 只输出真正的新概念（近 30 天内首次出现或突然升温）
-- 不要输出已有概念的变体（如"AI芯片"不算新概念，如果"AI"已在列表中）
-- 对每个概念说明：concept_name、evidence（引用具体新闻）、mention_frequency
-- 输出 JSON 格式
-
-新闻数据：
-{news_data}
-"""
-
-RISK_SUMMARY_PROMPT = """
-你是审慎的风险管理师。根据以下新闻，总结当前市场的 2-3 个关键风险点。
-
-要求：
-- 每个风险点说明：description、probability（high/medium/low）、impact（high/medium/low）
-- 优先输出概率高且影响大的风险
-- 不要输出"投资需谨慎"这类套话
-- 输出 JSON 格式
-
-新闻数据：
-{news_data}
-"""
-```
-
-**综合影响评分（规则计算，v0.3 采用阈值过滤+显著度加权，参考 MANA-Net 反均质化思路）：**
-
-> **设计理念（参考 [MANA-Net, Wang et al. 2024](https://arxiv.org/abs/2409.05698)）：**
-> 传统等权聚合会导致"情绪均质化"——大量 low-impact 中性事件稀释少数 high-impact 信号的强度。
-> 本方案采用**阈值过滤 + 显著度加权**：low-impact 事件直接不参与评分（仅保留在事件列表中），
-> medium/high 事件按 impact_level 加权，分母为加权事件数而非原始事件数。
+#### 2.1.4 Confidence 三因素加权
 
 ```python
-def calculate_impact_score(major_events):
-    """基于LLM提取的事件列表，阈值过滤 + 显著度加权计算综合影响评分
-
-    策略（v0.3）：
-    - low-impact 事件：直接丢弃（不影响分数，仅保留在事件列表供展示）
-    - medium/high-impact 事件：按 impact_level 加权（high=1.0, medium=0.5）
-    - 归一化分母为加权事件数（sum of weights），而非原始事件数
-    """
-    # 显著度权重映射（low 不参与评分）
-    IMPACT_WEIGHTS = {"high": 1.0, "medium": 0.5}
-    SENTIMENT_VALUES = {"positive": 1, "negative": -1, "neutral": 0}
-
-    # 过滤 low-impact，只对 medium/high 事件计算
-    significant_events = [e for e in major_events if e.impact_level in IMPACT_WEIGHTS]
-
-    if not significant_events:
-        return 0.0, "neutral"
-
-    weighted_score_sum = 0.0
-    weight_sum = 0.0
-
-    for event in significant_events:
-        weight = IMPACT_WEIGHTS[event.impact_level]
-        sentiment = SENTIMENT_VALUES[event.sentiment]
-        weighted_score_sum += weight * sentiment
-        weight_sum += weight
-
-    # 归一化到 -1 ~ 1（分母为加权事件数，low-impact 不参与稀释）
-    normalized_score = clip(weighted_score_sum / weight_sum, -1, 1)
-
-    # 态度判断
-    if normalized_score > 0.3:
-        impact = "positive"
-    elif normalized_score < -0.3:
-        impact = "negative"
-    else:
-        impact = "neutral"
-
-    return normalized_score, impact
+confidence = (
+    cross_index_consistency * 0.35 +   # 5 指数方向一致性 (0~1)
+    tf_conf * 0.35 +                    # 时间框架一致性
+    adx_factor * 0.30                   # ADX 趋势强度: min(adx/40, 1.0)
+)
+# clip(0.05, 1.0)
 ```
 
-**输出 Schema：**
-```yaml
-news_analysis_output:
-  overall_impact: str            # "positive" | "negative" | "neutral"
-  impact_score: float            # 综合影响评分（-1.0 ~ 1.0）
-  major_events: list[            # 重要事件列表（按影响级别排序）
-    event_type: str              # "policy" | "industry" | "global"
+#### 2.1.5 T-0 实时修正
+
+**方法**：`_apply_realtime_adjustment()`
+
+1. 获取腾讯接口 T-0 涨跌幅 → `{"sh": pct, "sz": pct, "cy": pct}`
+2. 计算技术面方向：`signal_score > 0 → +1, < 0 → -1`
+3. 计算今日方向：`today_avg > 0.5% → +1, < -0.5% → -1, else 0`
+4. **反向** → confidence × 0.7
+5. **同向** → confidence × 1.1（上限 1.0）
+
+**市场宽度修正**：`_apply_breadth_adjustment()`
+- 技术面看空但红盘占优（up > down）→ confidence × 0.7
+- 技术面看多但绿盘占优 → confidence × 0.7
+
+#### 2.1.6 仓位上限计算（连续函数）
+
+**两层决策系统** `_calculate_position_limit_v2()`：
+
+```
+Layer 1: 波动率调整
+  realized_vol = std(log_returns[-20:]) × √252    (年化，最低 5%)
+  vol_adjusted = target_vol(15%) / realized_vol    clip(0.5, 1.5)
+
+Layer 2: 状态感知缩放
+  regime_scale = tf_factor × 0.40 + cross_factor × 0.30 + direction_factor × 0.30
+    tf_factor = timeframe_got.timeframe_confidence
+    cross_factor = cross_index_consistency
+    direction_factor = clip((unified_score + 1) / 2, 0.3, 1.0)
+  regime_scale clip(0.2, 1.0)
+
+最终: position_limit = vol_adjusted × regime_scale    clip(0.2, 1.5)
+```
+
+**⚠️ 与设计文档差异**：设计文档是 `base_limit = trend → {1.0/0.5/0.0}` 的离散映射，实际是连续函数
+
+#### 2.1.7 输出 Schema
+
+```python
+class MarketContext(BaseModel):
+    tech_growth: TechGrowthSignal          # 核心：含 trend/score/signals/timeframe_got/regime_metadata
+    mid_small_cap: StyleSignal             # 中小盘
+    large_cap: StyleSignal                 # 大盘蓝筹
+    position_limit: float                  # 0.0 ~ 1.5
+    confidence: float                      # 0.0 ~ 1.0
+    key_levels: KeyLevels                  # short_term/mid_term/volume_profile
+    reasoning: Optional[str]
+    data_quality: DataQuality
+    today_change: dict[str, float]         # {"sh": -1.08, "sz": -1.43, "cy": -1.38}
+    market_breadth: Optional[dict]         # {up_count, down_count, limit_up_count, limit_down_count}
+    realized_volatility: Optional[float]   # 年化波动率
+    vol_adjusted_position: Optional[float] # Layer 1 输出
+    regime_scale: Optional[float]          # Layer 2 输出 (0.2~1.0)
+```
+
+#### 2.1.8 LLM 调用
+
+**1 次调用**：`_generate_llm_reasoning()`
+- **用途**：生成 ≤100 字市场研判文本
+- **输入**：tech_growth trend/score、时间框架信号、跨指数模式、今日实时、市场宽度
+- **参数**：temperature=0.3, max_tokens=200
+- **降级策略**：失败 → `_rule_based_reasoning()` 规则拼接
+
+---
+
+### 2.2 Node 2: 板块分析
+
+**职责**：识别板块状态（主线/衰竭/埋伏/防守），判断启动和过热信号，为选股提供方向
+
+**文件**：`src/got/nodes/sector_analysis.py`
+
+#### 2.2.1 板块发现（两阶段动态发现）
+
+**阶段 1**：`stock_all()` 全量获取 → 快筛（关键词匹配）→ Top N
+
+**阶段 2**：注册表保底（`TDX_BOARD_REGISTRY`）
+
+**CONCEPT_UNIVERSE**：14 大类、~50 子类、~200 个关键词
+
+| 大类 | 子类 | 代表关键词 |
+|------|------|-----------|
+| `ai_chip` | semiconductor_equip, ai_chip, memory_chip, auto_chip, semiconductor_pkg, eda_ip, power_semiconductor, electronic_components | 半导体设备、AI芯片、HBM、EDA、IGBT… |
+| `ai_infra` | compute_power, optical_module, liquid_cooling, pcb_connector | 算力、光模块、液冷、PCB… |
+| `ai_model` | llm, ai_platform, digital_economy | 大模型、AIGC、数字经济… |
+| `ai_terminal` | ai_phone_pc, consumer_elec, apple_chain, new_content | AI手机、消费电子、苹果、短剧… |
+| `robot` | humanoid, robot_parts, robot_system | 人形机器人、减速器、伺服… |
+| `auto_drive` | smart_drive, new_energy, battery_tech, auto_market | 自动驾驶、固态电池、快充… |
+| `emerging` | low_altitude, data_element, huawei_chain, satellite, frontier | 低空经济、华为、卫星、核聚变… |
+| `tech_defensive` | innovative_drug, power_grid, energy_storage | 创新药、电力、储能… |
+| `finance` | securities, insurance, banking, diversified_finance | 券商、保险、银行… |
+| `external` | nvidia | 英伟达 |
+| `cyclical` | nonferrous, steel_chem, new_materials | 有色、钢铁化工、新材料… |
+| `consumer` | beverage, healthcare_consumer, travel, silver_economy | 白酒、医美、旅游、养老… |
+| `military` | aerospace | 军工航天 |
+
+#### 2.2.2 4 维评分（截面百分位排名）
+
+**两阶段流程**：
+1. **Pass 1**：`_calculate_raw_metrics()` 计算原始值（未归一化）
+2. **Pass 2**：`_apply_cross_sectional_ranking()` 将每个维度的原始值转为**截面百分位排名（0~1）**
+3. **加权汇总**：`_calc_strength_score()` → `sum(percentile × weight) × 100` → 0-100 分
+
+| 维度 | 权重 | 原始指标定义 |
+|------|------|------------|
+| `price_momentum` | **0.30** | 5 日涨幅 (`close[-1]/close[-5] - 1`) |
+| `turnover_expansion` | **0.25** | 5d 均值 / 20d 均值（成交额比） |
+| `relative_strength` | **0.25** | 20 日涨幅 (`close[-1]/close[-20] - 1`) |
+| `breadth_health` | **0.20** | 上涨家数占比 (`up_count / total`) |
+
+**⚠️ 与设计文档差异**：设计文档是 5 维（volume_price/price_momentum/breadth/relative_strength/capital_flow），clip 归一化。实际是 **4 维** percentile rank，无 capital_flow
+
+#### 2.2.3 启动信号检测（降级为诊断指标）
+
+> **Node 2 v3 变更**：启动信号不再驱动状态判定，降级为诊断指标。状态由 RRG 四象限统一驱动（见 §2.2.5）。启动信号的 `quality_score` 仍用于 `_classify_mainline_tier()` 的主线质量判定。
+
+**3 硬门槛（全部通过才继续）**：
+1. **突破**：`close[-1] > max(high[-21:-1]) × 1.005`（20日突破 + 0.5% buffer）
+2. **放量**：`volume[-1] > volume_ma5 × 1.5`（5日均量 × 1.5）
+3. **站上 MA20**：`close[-1] > ma20`
+
+**6 维软打分**：
+
+| 维度 | 权重 | 计算方式 |
+|------|------|---------|
+| `consolidation` | 0.20 | Bollinger 带宽百分位 → `1.0 - bb_pct/0.5` |
+| `volume_expansion` | 0.25 | 量比分段：1.5x→0, 3.0x→1.0, 5.0x→1.0, >5x→衰减 |
+| `price_strength` | 0.15 | 20日区间位置 `(close-low20)/(high20-low20)` |
+| `trend_alignment` | 0.15 | MA20 斜率×0.6 + MA5/MA20 偏离×0.4 |
+| `breadth` | 0.10 | `(up_ratio - 0.4) / 0.3` |
+| `ad_confirmation` | 0.15 | A/D Line 确认（`ad_line_confirmation(df)`）|
+
+**Regime-Dependent 阈值（R1）**：
+
+| 市场方向 | strong_launch | weak_launch |
+|---------|--------------|-------------|
+| 普涨 (calm) | ≥ 0.50 | ≥ 0.35 |
+| 分化 (transition) | ≥ 0.75 | ≥ 0.55 |
+| 普跌 (turbulent) | ≥ 0.80 | ≥ 0.65 |
+
+#### 2.2.4 过热信号检测（降级为诊断指标）
+
+> **Node 2 v3 变更**：过热信号不再驱动状态判定，降级为诊断指标。过热 severity 仍用于 `_detect_family_crowding()` 的家族拥挤预警。
+
+**前置条件**：`close[-1] >= high_60d × 0.90`（距 60日高点 ≤10%）
+
+| 信号 | 权重 | 计算逻辑 |
+|------|------|---------|
+| MACD 背离 | **0.30** | DIF 下跌幅度占前高比例 ×0.7 + 死叉 ×0.3 |
+| 量能背离 | **0.20** | 当前量/前高量 <0.7 → 渐进分 |
+| 宽度极端 | **0.15** | 0.80→0.3, 0.85→0.5, 0.90→0.8, 0.95→1.0 |
+| 换手极端 | **0.15** | 超过 P90 → 渐进分 |
+| A/D Line 分配 | **0.10** | 布尔值 → 0 或 1 |
+| 天量滞涨 | **0.10** | 20日成交额高点的 95% + 近5日均涨>0 + 今日涨幅<均值×30% |
+
+**加权汇总 severity**：
+- `> 0.5` → `"exhausted"`（踢出主线框）
+- `0.3 ~ 0.5` → `"warning"`
+- `< 0.3` → `"normal"`
+
+#### 2.2.5 状态机判定（Node 2 v3.1，2026-08-17 文献校准）
+
+> 替代 P0~P5 优先级链 + 旧版"分数动量埋伏"。基于 17 日运行数据暴露的问题 + 外网论文校准：
+> - **状态必须持久**：市场 regime 自转移概率 0.89-0.99（Liu & Xu & Zhao 2010），切换需驻留确认
+> - **转移路径固定**：RRG 实测 Leading 92% 转 Weakening（Optuma 2万次旋转）→ **主线只能经 高位降温/衰竭 退出，不存在 主线→埋伏 的边**
+> - **埋伏=improving 象限起点**：RS-Momentum 刚上穿、RS-Ratio 低位（不是"高分数残留"）
+> - **日频截面过敏感**：RS-Ratio/Momentum 经 3 日 EMA 平滑，吸收单日截面噪音（黄金 08-13 类"一夜蒸发"根除）
+
+**计算方式（`_compute_rrg`，含 3 日 EMA 平滑）**：
+
+| 指标 | 计算 | 含义 |
+|------|------|------|
+| `RS-Ratio` | `strength_score` 的截面百分位排名 → **3日EMA** | 板块在全市场的相对趋势强度 |
+| `RS-Momentum` | RS-Ratio 的 5 日变化斜率（归一化 0-1）→ **3日EMA** | 趋势正在加速还是减速 |
+
+**六状态转移矩阵**（`_apply_state_machine`，核心）：
+
+```
+active_mainline ──[转弱未破位: weakening/score回落>15]──► high_position_cooling(新增)
+      │  ▲                                                    │              │
+      │  │[修复确认: leading/improving+score>55, 驻留≥2天]    │[破位]        │[score<45 连续2天/驻留≥5]
+      │  └────────────────────┐                               ▼              ▼
+      │                       │                        exhausted_mainline   neutral(熄灭)
+      │  ┌──────────────┐     │                              │  ▲
+      │  │ [破位: 5日涨幅≤0/跌破MA20/过热+高位<0.6/单日崩≥20]─┴──┤[修复需连续2天确认] ─┐
+      └──┴──────────────┴──────────────────────────────────────┘                          ▼
+                                                                                     neutral
+ambush ──[leading 突破+score>60, 驻留≥1天]──► active_mainline
+  ▲      ▲
+  └──[低位(<0.55)+动量刚转正+结构吸筹≥0.5（_check_ambush）]◄── neutral
+```
+
+**关键规则**：
+- **禁止边**：`active→ambush`、`cooling→ambush`、`exhausted→ambush` 一律不存在（RRG 顺时针转移证据）
+- **破位/未破位判据**（区分 `high_position_cooling` 与 `exhausted_mainline`）：
+  - 破位 BROKEN = 5日涨幅≤0 或 跌破MA20 或 过热exhausted且20日高位<0.60 或 单日分数崩≥20
+  - 主判据 `price_chg_5d` 是真实5日涨幅，**不随当日截面排名变**（黄金 08-13 被医药挤压到 50 分但5日涨仍正 → 走冷却而非消失）
+- **驻留/置信度门槛**：切换需连续驻留（cooling→active 需2天、exhausted→active 需2天、ambush 持续值≥2天动量转负才出局）；**硬触发豁免**：单日崩≥20分立即降级、单日涨>8%+leading 立即进主线
+- **埋伏判据**（`_is_ambush_candidate`，替代旧 `_check_momentum_ambush`）：`ratio<0.55 + 动量≥0.5 且刚转正 + 近3日不跌 + 结构吸筹≥0.5 + 45≤score≤72 + 非防守`。高位残留分(黄金 08-17 ratio 0.922/78分)被直接拒绝
+- **状态记忆**：`Node2SectorTrendRecord` 新增 `state`/`dwell_days`/`rrg_ratio_ema`/`rrg_momentum_ema` 4 列，替代 unified_signal 三值回映射（修复"主线记忆易断开"）
+
+**学术依据**：
+- de Kempenaer 2016: Relative Rotation Graph 四象限系统；StockCharts RRG chart school（周频/日频敏感性）
+- Liu & Xu & Zhao 2010: 市场 regime 马尔可夫自转移概率（对冲基金 Sector ETF 研究）
+- Ntantamis 2010: Duration-HMM（状态时长随机变量，转移概率依赖驻留时间）
+- Procida 2026: HMM 亚洲市场 regime 检测（切换需后验概率置信度门槛）
+- Optuma "Buying outperformers is too late": RRG 2 万次旋转转移统计
+
+#### 2.2.6 主线分级 S/A/B
+
+| 标准 | 分值 |
+|------|------|
+| 国家级政策支持（`_POLICY_SUPPORTED_CHAINS = {"AI硬件", "AI软件", "新能源"}`） | **+3** |
+| 家族成员名非"其他" | **+1** |
+| 量能扩张（turnover_expansion > 0.6） | **+2** |
+| 量能扩张（turnover_expansion > 0.4） | **+1** |
+| 连续强势（pm>0.6 且 rs>0.6） | **+1** |
+
+**分级**：S ≥ 5, A ≥ 3, B < 3
+
+#### 2.2.7 生命周期（RRG 象限驱动，Node 2 v3）
+
+> 替代旧的天数驱动系统（`LIFECYCLE_THRESHOLDS`）。旧版用纯天数（launch_end/acceleration_end/mature_end）判定阶段，经常与启动/过热信号矛盾。新版直接由 RRG 象限映射。
+
+**象限 → 阶段映射**：
+
+| RRG 象限 | 生命周期阶段 | 含义 |
+|----------|------------|------|
+| Leading | `acceleration` | 趋势强+动量强 → 加速上涨 |
+| Improving | `launch` | 动量先转强 → 启动初期 |
+| Weakening | `mature` | 趋势仍强但动量衰减 → 成熟期（**对应 high_position_cooling 降温态**） |
+| Lagging | `late_stage` | 趋势弱+动量弱 → 衰退末期 |
+
+**连续性**：`days_since_launch = prev_days + 1`（继承前日天数，保持阶段连续性）。
+
+**2026-08-17 扩展**：high_position_cooling（高位降温）也计算生命周期（weakening→mature），使降温期在 reasoning 中可见，不再是"标签跳变"。
+
+**已删除**：`LIFECYCLE_THRESHOLDS` 常量、`_inherit_or_calc_days()`、`_calc_days_since_launch()`。
+
+#### 2.2.8 主线家族（层次聚类）
+
+**方法**：`_build_theme_families()`
+
+1. **构建收益矩阵**：90日 K 线收盘价 → 日收益率序列
+2. **相关性矩阵**：两两 Pearson 相关系数
+3. **层次聚类**：complete linkage（最弱环节），阈值 `r > 0.65`
+4. **一致性评分**：板块与同簇成员的平均相关性
+5. **家族命名**：用最强板块的真实名称
+6. **混合驱动检测**：平均两两相关性 < `0.65 × 0.6 = 0.39` → 标记混合驱动
+
+**回退**：数据不足时用 `FAMILY_KEYWORDS` 硬编码分组
+
+#### 2.2.9 行业/概念双视角分离
+
+**行业板块**：使用 mootdx `881xxx` K 线数据，与概念板块**完全独立的截面百分位排名**（行业板块内部独立排名），取 Top 10 输出到 `SectorContext.industry_top`
+
+**行业板块不做状态分类**（`state="neutral"`），仅提供评分排名
+
+#### 2.2.10 框系统（SQLite 持久化）
+
+**主线框常量**：
+- 出框阈值：`score < 50`
+- S/A 级容忍天数：**3 天**
+- B 级容忍天数：**1 天**
+- T-0 硬止损：单日跌 >3% → consecutive_low_days +=2；跌 >1.5% → +=1
+- 入框门槛：S/A 级 ≥50，B 级 ≥80
+
+> 埋伏板块不使用框系统。每日 state=ambush 由 `_is_ambush_candidate()` 实时判定（2026-08-17 新判据：
+> 截面低位 ratio<0.55 + 动量刚转正 + 近3日不跌 + 结构吸筹≥0.5 + 45≤score≤72 + 非防守），输出截断 Top 10。
+> 旧 `_check_momentum_ambush`（"score>阈值即埋伏"，无方向门槛）已废弃——它是黄金 08-17 类"高位回调前主线被误标埋伏"的根因。
+
+**框进出（2026-08-17 校准）**：
+- **exhausted_mainline**（真破位）→ 立即踢出主线框，进入 exhausted 输出
+- **high_position_cooling**（回调未破位）→ **软化移出主线框**（区别于衰竭），进入 cooling_down 输出，
+  避免冷却板块继续占用主线框位置；修复确认（驻留≥2天）后再重新入框
+- S/A 级容忍 3 天低分、B 级 1 天；T-0 硬止损不变
+
+**持久化**：SQLite `SectorFrameRecord` 表（仅主线框）；`Node2SectorTrendRecord` 表新增
+`state`/`dwell_days`/`rrg_ratio_ema`/`rrg_momentum_ema` 4 列（状态机记忆 + EMA 前值，PRAGMA 幂等迁移）
+
+#### 2.2.11 输出 Schema
+
+```python
+class SectorContext(BaseModel):
+    active_mainline: list[MainlineGroup]      # 活跃主线（按 frame_group 聚合）
+    exhausted_mainline: list[SectorDetail]     # 衰竭主线
+    ambush: list[SectorDetail]                 # 埋伏期
+    defensive_rotation: list[SectorDetail]     # 防守轮动
+    cooling_down: list[SectorDetail]           # 高位降温（state=high_position_cooling，2026-08-17 新增）
+    top_by_score: list[SectorDetail]           # 评分最高 N 个
+    industry_top: list[SectorDetail]           # 行业板块 Top 10（独立评分）
+    theme_families: list[ThemeFamily]          # 主线家族（相关性聚类）
+    market_direction: str                      # "分化" / "普涨" / "普跌"
+    notes: list[str]                           # 附加说明
+    reasoning: Optional[str]
+    data_quality: DataQuality
+    confidence_level: str                      # "high" / "medium" / "low"
+```
+> `SectorDetail.state` 六态：`active_mainline / high_position_cooling / exhausted_mainline / ambush / defensive_rotation / neutral`
+> `SectorDetail.rrg` 新增 `rs_ratio_raw`/`rs_momentum_raw`（当日原始值，诊断用）
+
+#### 2.2.12 LLM 调用
+
+**1 次调用**：生成 reasoning 文本（纯文本总结，不影响信号逻辑）
+
+---
+
+### 2.3 Node 3: 资金面分析
+
+**职责**：追踪盘中实时资金流向，为其他节点提供辅助验证信号
+
+**文件**：`src/got/nodes/capital_analysis.py`
+
+#### 2.3.1 3 维评分体系
+
+| 维度 | 权重 | 数据源 |
+|------|------|--------|
+| `sector_flow` | **0.50** | akshare `stock_fund_flow_concept/industry("即时")` |
+| `dde` | **0.35** | DdeFetcher (Playwright → push2.eastmoney.com) |
+| `northbound_realtime` | **0.15** | akshare `stock_hsgt_fund_min_em` (2024-08后全0自动降级) |
+
+**⚠️ 与设计文档差异巨大**：
+- 设计文档 5 维：北向资金(0.25)/龙虎榜(0.25)/ETF申赎(0.25)/融资(0.15)/大宗交易(0.10)
+- 实际 **3 维**：板块资金流(0.50)/DDE大单(0.35)/北向资金(0.15)
+- 龙虎榜、ETF申赎、融资融券、大宗交易 **均未实现**
+
+#### 2.3.2 维度 1：板块资金流评分
+
+**方法**：`_score_sector_flow()`
+
+- 概念板块 Top 20 净流入均值 → `clip(avg/200亿, -1, 1)` × 权重 0.65
+- 行业板块 Top 10 净流入均值 → `clip(avg/100亿, -1, 1)` × 权重 0.35
+- 加权合并 → 主线板块在概念 Top 10 中 → **+0.15 加分**
+
+#### 2.3.3 维度 2：DDE 大单净流入评分
+
+**方法**：`_score_dde()`
+
+- 全市场大单净流入合计 → `clip(total_net/1000亿, -1, 1)`
+
+#### 2.3.4 维度 3：北向资金实时评分
+
+**方法**：`_score_northbound_realtime()`
+
+- 累计净流入(万元) → `clip(cumulative/50亿, -1, 1)`
+- 最后30分钟趋势 → `clip(recent_30m/10万, -0.2, 0.2)` 作为 bonus
+- 最终 = 基础分 + 趋势 bonus
+
+#### 2.3.5 北向资金自动降级
+
+**检测逻辑**：
+```python
+df = ak.stock_hsgt_fund_min_em(symbol="北向资金")
+last_col = df.columns[-1]
+non_zero = df[last_col].dropna()
+non_zero = non_zero[non_zero != 0]
+if non_zero.empty:
+    # 全 0 → 返回 None → 自动标记为缺失维度
+    return None
+```
+
+#### 2.3.6 降级后的权重归一化
+
+```python
+# 仅使用可用维度
+available_scores = [s1, s2, ...]    # 实际有数据的维度分数
+available_weights = [w1, w2, ...]   # 对应权重
+
+total_weight = sum(available_weights)
+institutional_score = sum(s * w / total_weight for s, w in zip(scores, weights))
+# clip(-1, 1)
+
+confidence_multiplier = len(available_scores) / len(DIMENSION_WEIGHTS)  # = 可用数/3
+```
+
+**态度判定**：
+- `score > 0.3` → `"bullish"`
+- `score < -0.3` → `"bearish"`
+- else → `"neutral"`
+
+#### 2.3.7 输出 Schema
+
+```python
+class CapitalContext(BaseModel):
+    status: str                             # "normal" / "degraded" / "failed"
+    institutional_attitude: str             # "bullish" / "bearish" / "neutral"
+    institutional_score: float              # -1.0 ~ 1.0
+    confidence_multiplier: float            # 0.0 ~ 1.0 (= 可用维度/3)
+    evidence: CapitalEvidence               # sector_flow / northbound_realtime / dde
+    missing_dimensions: list[str]           # 缺失维度中文名
+    reasoning: Optional[str]
+    data_quality: DataQuality
+```
+
+#### 2.3.8 LLM 调用
+
+**1 次调用**：`_generate_reasoning()`
+- **用途**：150 字资金面分析报告
+- **输入**：evidence 摘要 + 大盘趋势 + 活跃主线名 + 交易时段感知
+- **参数**：temperature=0.3, max_tokens=300
+- **降级策略**：失败 → `_fallback_reasoning()` 规则拼接
+
+---
+
+### 2.4 Node 4: 消息面分析
+
+**职责**：采集和分析影响市场的政策、行业、国际新闻
+
+**文件**：`src/got/nodes/news_analysis.py` + `src/got/news_feeds.py`
+
+#### 2.4.1 7 源推送型采集
+
+| # | 源名 | 端点 | 采集方式 | 覆盖窗口 | 反爬 |
+|---|------|------|----------|----------|------|
+| S1 | 新浪文章流 | `feed.sina.com.cn/api/roll/get` | 4 栏目并发（财经/股票/国内财经/国际财经），每栏 30-50 条 | 21+ 小时 | UA 轮换 |
+| S2 | 财联社电报 | `cls.cn/v1/roll/get_roll_list` | 签名认证 + 分页拉取（最多 10 页×20 条=120 条），`MD5(SHA1(sorted_qs))` 签名 | ~1-3 小时 | 专用限流 0.8s+抖动 + UA 轮换 + Session+Retry |
+| S3 | 华尔街见闻 | `api-one.wallstcn.com/apiv1/content/lives` | GET `channel=global-channel&limit=30` | 实时窗口 | UA + Referer + Origin |
+| S4 | 东财快讯 | `np-listapi.eastmoney.com/comm/web/getNewsByColumns` | `column=350,35,466,467`，`page_size=30` | 实时窗口 | UA |
+| S5 | NewsNow 热榜 | `newsnow.busiyi.world/api/s` | 8 平台串行（微博/百度/知乎/澎湃/头条/财联社热/抖音/B站） | 热榜快照 | UA |
+| S6 | NGA 论坛 | 复用 `ForumSentimentService.fetch_hot_stocks()` | 热门股关联帖子标题 | 论坛热帖 | Cookie |
+| S7 | 同花顺热榜 | `src.services.ths_hot_list.fetch_hot_topics()` | `page_size=30` 话题 | 实时热榜 | 内部封装 |
+
+**核心方法**：`fetch_all_news()` — 串行 7 源（避免并发触发反爬），`merge_news()` 合并
+
+#### 2.4.2 权重排序公式
+
+```
+total = source_score × 0.30 + time_score × 0.25 + hot_score × 0.20 + count_score × 0.25
+```
+
+- **source_score** (0-28): `_SOURCE_WEIGHTS` 字典 — sina=22, cls=20, wallstreetcn=25, eastmoney=20, newsnow=26, nga_forum=16, ths_hot=28, cctv=28, caixin=24
+- **time_score** (5-25): ≤1h→25, ≤4h→20, ≤8h→15, ≤16h→10, >16h→5
+- **hot_score**: `_HOT_KEYWORDS` 取单标题最高匹配词分值（~50 词，涨停=20, 制裁=18, 政策=15 等）
+- **count_score**: `min(source_count × 10, 30)`
+
+排序后截断至 `MAX_MERGED_NEWS = 150` 条
+
+#### 2.4.3 4 次 LLM 串行调用
+
+| # | 调用点 | Prompt 模板 | Temperature | Max Tokens | 方法/行号 |
+|---|--------|------------|-------------|------------|-----------|
+| 1 | 事件提取 | `EVENT_EXTRACTION_PROMPT` — 注入 concept_list + historical_context + news_data | 0.2 | 4000 | `_analyze_with_llm` |
+| 2 | 概念发现 | `CONCEPT_DISCOVERY_PROMPT` — 注入 current_concepts + historical_context + news_data | 0.5 | 800 | 同上 |
+| 3 | 风险总结 | `RISK_SUMMARY_PROMPT` — 仅 news_data | 0.3 | 300 | 同上 |
+| 4 | Reasoning | `REASONING_PROMPT` — 注入 overall_impact/score/events/concepts/risks | 0.3 | 400 | `_generate_reasoning` |
+
+**底层调用**：`_call_llm()` — `LLMToolAdapter.call_text()`，含 3 次空响应重试。每次调用通过 `asyncio.to_thread()` 异步化
+
+**降级策略**：
+- 风险总结 LLM 失败 → `_parse_risks()` 从负面事件提取
+- Reasoning LLM 失败 → `_fallback_reasoning()` 规则拼接
+- JSON 解析失败 → `_repair_truncated_json()` 修复截断 JSON
+
+#### 2.4.4 去重逻辑
+
+| 场景 | 阈值 | 方法 |
+|------|------|------|
+| 原始新闻去重 | `TITLE_SIMILARITY_THRESHOLD = 0.45` | `_deduplicate()` — `SequenceMatcher.ratio()` |
+| 跨源确认匹配 | 0.35 | `_apply_source_count()` — 原始新闻→LLM 事件 |
+| 持久化去重 | 0.6 | `_save_events_to_db()` — 事件标题 vs 历史事件 |
+
+#### 2.4.5 source_count 计算（两层机制）
+
+1. **新闻级**：每条新闻标题 vs 7 源标题列表做 `SequenceMatcher`，≥0.45 则该源计为匹配，`source_count = len(matched_sources)`
+2. **事件级**：LLM 事件提取已合并同事件多源报道，但输出 `source_count=1`。本方法反向匹配：每条原始新闻→最相似 LLM 事件（阈值 0.35），然后 `event.source_count = len(unique_source_types)`
+
+#### 2.4.6 事件持久化（SQLite `node4_events` 生命周期状态机）
+
+**表结构**（`Node4EventRecord`）：
+- PK: `event_id` = `MD5(title + date)`
+- 字段: title, source, first_seen, last_seen, mention_count, sources_seen(JSON), lifecycle_state, sentiment_trajectory(JSON), category, significance_score
+
+**状态机**：
+```
+archived: last_seen < today - 7 days
+peak:     mention_count ≥ 10 AND source_count ≥ 3 AND days_span ≥ 3
+fermenting: mention_count ≥ 3 AND days_span ≥ 2
+emerging: first_seen == today AND mention_count == 1
+fading:   last_seen < today（其他条件不满足时）
+```
+
+**更新逻辑**：
+- 匹配已有事件（标题相似度 ≥0.6）→ `mention_count += 1`, 更新 `last_seen`, 追加 `sources_seen`, 追加 `sentiment_trajectory`（保留最近 7 天）
+- 新事件 → INSERT，初始 `lifecycle_state = "emerging"`
+
+#### 2.4.7 评分公式
+
+```python
+# 过滤: 仅 high/medium 参与评分（low 被丢弃）
+for event in scored_events:
+    base_weight = IMPACT_WEIGHTS[event.impact_level]  # high=2.0, medium=1.0
+    source_mult = 1.5 if event.source_count ≥ 3 else 1.0
+    sentiment_val = {positive: 1.0, negative: -1.0, neutral: 0.0}[event.sentiment]
+    effective_weight = base_weight × source_mult
+    weighted_sum += sentiment_val × effective_weight
+    weight_total += effective_weight
+
+score = weighted_sum / weight_total  # clamp [-1, 1]
+```
+
+**阈值映射**：
+- `score > 0.15` → "positive"
+- `score < -0.15` → "negative"
+- else → "neutral"
+
+#### 2.4.8 输出 Schema
+
+```python
+class NewsContext:
+    status: str                        # "normal" / "degraded" / "failed"
+    overall_impact: str                # "positive" / "negative" / "neutral"
+    impact_score: float                # [-1, 1]
+    major_events: list[NewsEvent]      # 已过滤 low-impact
+    concept_suggestions: list[dict]    # [{concept_name, evidence, mention_frequency}]
+    key_risks: list[str]
+    reasoning: Optional[str]
+    data_quality: DataQuality
+```
+
+**NewsEvent**：
+```python
+class NewsEvent:
+    event_type: str          # "policy" / "industry" / "global"
     title: str
     summary: str
-    impact_level: str            # "high" | "medium" | "low"
-    sentiment: str               # "positive" | "negative" | "neutral"
-    affected_sectors: list[str]  # 受影响板块（映射到概念列表）
-    timestamp: str
-    source_count: int            # P1-5 新增：独立报道来源数（用于多源确认）
-  ]
-  concept_suggestions: list[     # 新概念建议（人工审核后加入板块精选列表）
-    concept_name: str
-    evidence: str
-    mention_frequency: int
-  ]
-  key_risks: list[str]           # 关键风险点
-  reasoning: str                 # LLM生成的推理文本
-```
-
-**LLM Prompt 模板（推理文本 + 完整分析）：**
-```
-消息面分析结果：
-- 整体影响：{overall_impact}（评分：{impact_score}）
-- 重要事件：{major_events}
-- 新概念建议：{concept_suggestions}
-- 关键风险：{key_risks}
-
-请输出：
-1. 一段200字以内的分析文本，解释当前消息面的整体格局
-2. 重点说明哪些事件对市场影响最大
-3. 提示新概念机会和关键风险
-
-输出格式：纯文本（不要JSON）
+    impact_level: str        # "high" / "medium" / "low"
+    sentiment: str           # "positive" / "negative" / "neutral"
+    affected_sectors: list[str]
+    affected_stocks: list[str]
+    timestamp: Optional[str]
+    source_count: int        # ≥1
+    source_type: str         # "professional" / "retail_forum"
+    lifecycle_state: Optional[str]
+    mention_count: Optional[int]
+    first_seen: Optional[str]
 ```
 
 ---
 
-### 3.5 节点 5：情绪分析
+### 2.5 Node 5: 情绪面分析
 
-**职责：** 采集论坛舆情，量化散户情绪，输出情绪评分和正面热门股。
+**职责**：采集散户情绪数据，量化散户情绪，输出反身性信号
 
-**设计理念：**
-- **聚焦散户情绪**：资金面追踪机构行为，情绪面追踪散户情绪，两者在聚合节点形成对照
-- **纯原始数据 + LLM分析**：不依赖其他节点输出，独立采集分析
-- **信号聚合输出**：情绪评分 + 正面热门股 + 热门话题
-- **排除黑天鹅**：热门股只输出正面讨论 + 有行情配合的，排除暴雷/暴跌讨论
+**文件**：`src/got/nodes/sentiment_analysis.py`
 
-**数据源（P3-3 决策：NGA 板块关闭，切换为雪球）：** 雪球热帖（API 相对友好，覆盖价值高）
+#### 2.5.1 6 维置信度加权评分
 
-**输入 Schema：**
-```yaml
-sentiment_analysis_input:
-  lookback_hours: int  # 回溯小时数（默认 24）
-```
+| 维度 | key | weight | confidence | 数据源 | 归一化方式 |
+|------|-----|--------|------------|--------|-----------|
+| D1 东财千股千评 | eastmoney | 0.25 | 0.90 | `ak.stock_comment_em()` | `(avg(综合得分) - 50) / 50` |
+| D2 市场宽度 | breadth | 0.15 | 0.85 | `DataFetcherManager.get_market_breadth()` | `0.6×breadth_score + 0.4×limit_score` |
+| D3 NGA 论坛 | nga | 0.20 | 0.80 | `ForumSentimentService` | 直接 `market_sentiment ∈ [-1,1]` |
+| D4 搜索舆情 | news | 0.15 | 0.70 | `SearchService.search_market_news()` | 关键词正负计数（含否定检测） |
+| D5 评论详情 | detail | 0.10 | 0.60 | `stock_comment_detail_scrd_desire_em()` | `avg(参与意愿变化) / 30` |
+| D6 时序动量 | momentum | 0.15 | 0.80 | 历史 `sentiment.json` 文件 | EMA(5) 偏差 |
 
-**工具调用：**
+**加权公式**：
 ```python
-# 采集论坛舆情数据
-forum_data = await ForumSentimentService.get_sentiment(lookback_hours)
-# 返回：帖子列表、评论列表、点赞/踩数据等
+effective_weight_i = weight_i × confidence_i
+score = Σ(score_i × eff_weight_i) / Σ(eff_weight_i)   # 缺失维度自动重分配
 ```
 
-**LLM 核心分析（情绪量化 + 热门股提取）：**
+#### 2.5.2 东财千股千评采集
+
+- **端点**：`akshare.stock_comment_em()` → `datacenter-web.eastmoney.com`
+- 返回 ~5190 只股票的 DataFrame，含列: 代码/名称/综合得分/涨跌幅/关注指数/机构参与度
+- 实测耗时 ~3s
+
+#### 2.5.3 评论详情采样
+
+- **采样数**：`COMMENT_DETAIL_SAMPLE_N = 15` — 按"关注指数" `nlargest(15)`
+- **4 个 detail API**：
+  - `ak.stock_comment_detail_scrd_desire_em` — 参与意愿
+  - `ak.stock_comment_detail_scrd_focus_em` — 关注度
+  - `ak.stock_comment_detail_zlkp_jgcyd_em` — 机构参与度
+  - `ak.stock_comment_detail_zhpj_lspf_em` — 综合得分历史
+- **超时**：`COMMENT_DETAIL_TIMEOUT = 60s`
+- 15 只股并发调用
+
+#### 2.5.4 市场宽度
+
+- **数据源**：`DataFetcherManager.get_market_breadth()` — 支持多源降级
+- **派生指标**：`breadth_score = (up_count - down_count) / total`
+- **降级**：异常时返回空 dict，该维度权重自动不参与加权
+
+#### 2.5.5 搜索舆情关键词匹配
+
+- **3 条查询**：`"A股 今日 散户 情绪 恐贪"`, `"股市 市场情绪 多空 资金"`, `"股吧 热门讨论 散户"`
+- **正面词库** (20 词)：看涨/看多/反弹/突破/利好/放量/强势/大涨/新高/牛市/加仓/爆发/拉升/金叉/多头/量价齐升/超预期/底部放量/主力吸筹
+- **负面词库** (20 词)：看空/看跌/暴跌/利空/减持/套牢/割肉/大跌/新低/熊市/崩盘/出逃/恐慌/跳水/砸盘/死叉/量价背离/主力出货/爆雷
+- **否定检测**：否定词（不/没/难以/不再/未）出现在情感词前 3 字符内 → 翻转方向
+- **评分**：`(pos_count - neg_count) / (pos_count + neg_count)`
+
+#### 2.5.6 反身性 5 阶段分类
+
 ```python
-def analyze_sentiment_with_llm(forum_data):
-    """LLM 分析论坛数据"""
+# 常量
+EUPHORIA_SCORE_THRESHOLD = 0.5
+EUPHORIA_ATTENTION_THRESHOLD = 0.75   # 东财关注指数均值 / 80
+OPTIMISM_SCORE_THRESHOLD = 0.2
+PESSIMISM_SCORE_THRESHOLD = -0.2
+CAPITULATION_SCORE_THRESHOLD = -0.5
 
-    prompt = f"""
-你是一个专业的A股市场情绪分析师。根据以下论坛数据，完成三项任务。
-
-论坛数据（近24小时）：
-{forum_data}
-
-请完成以下任务：
-
-任务1：量化整体情绪（P0-1 决策：输出 count 而非 ratio）
-请统计（数量，不是比例）：
-- positive_count: 正面帖子数量
-- negative_count: 负面帖子数量
-- neutral_count: 中性帖子数量
-- very_positive_count: 极度乐观帖子数（如"冲""梭哈""满仓干"）
-- very_negative_count: 极度悲观帖子数（如"崩了""割肉""牛市结束了"）
-- forum_mood: "极度乐观" | "乐观" | "中性" | "悲观" | "极度悲观"
-
-任务2：提取正面热门股
-从论坛中提取被正面讨论的热门股票，排除黑天鹅（暴雷/暴跌/负面事件）：
-对每只股票输出：
-- stock_code: 股票代码
-- stock_name: 股票名称
-- mention_count: 提及次数
-- sentiment: "positive"（只输出正面讨论的）
-- associated_sectors: 关联板块（映射到概念列表）
-
-任务3：提取热门话题
-列出论坛中2-3个热门话题关键词
-
-输出格式：JSON
-"""
-
-    llm_output = await llm.call(prompt)
-    return llm_output
+# 优先级判定
+if score > 0.5 AND attention_ratio > 0.75:  → "euphoria", "contrarian_sell", confidence=0.7
+if score > 0.2:                               → "optimism", "trend_following", confidence=0.5
+if |score| ≤ 0.2:                             → "neutral",  "neutral",        confidence=0.3
+if score < -0.5 AND attention_ratio > 0.5:    → "capitulation", "contrarian_buy", confidence=0.7
+if score < -0.2:                              → "pessimism", "trend_following", confidence=0.5
 ```
 
-**情绪评分计算（P0-1 修复 Bug + P2-2 反身性逻辑）：**
+`attention_ratio = min(avg(关注指数) / 80, 1.0)`
+
+#### 2.5.7 情绪分歧度
+
 ```python
-def calculate_sentiment_score(llm_output):
-    """情绪评分 + 反身性阶段分类"""
-
-    # P0-1 修复：基于 count 计算，而非直接使用 LLM 的 ratio
-    positive_count = llm_output.positive_count
-    negative_count = llm_output.negative_count
-    neutral_count = llm_output.neutral_count
-    total = positive_count + negative_count + neutral_count
-
-    positive_ratio = positive_count / max(total, 1)
-    negative_ratio = negative_count / max(total, 1)
-
-    # 基础情绪分
-    raw_score = positive_ratio - negative_ratio  # -1 ~ 1
-
-    # 极端情绪统计
-    very_positive_count = llm_output.very_positive_count
-    very_negative_count = llm_output.very_negative_count
-    extreme_positive_ratio = very_positive_count / max(total, 1)
-    extreme_negative_ratio = very_negative_count / max(total, 1)
-
-    # === P2-2 反身性：情绪阶段分类 ===
-    # 阈值说明：0.5/0.2 为初始值，运行 3 个月后需根据历史数据回测调整
-    # 避免边界跳变：极端情绪占比 < 阈值时不触发，而非硬切
-
-    # 极度乐观 → 反向卖出信号（散户狂热 = 顶部信号）
-    if raw_score > 0.5 and extreme_positive_ratio > 0.25:
-        sentiment_stage = "euphoria"
-        trading_signal = "contrarian_sell"
-        signal_confidence = 0.7
-
-    # 温和乐观 → 趋势跟随（含边界平滑：接近 euphoria 阈值时 confidence 递减）
-    elif raw_score > 0.2:
-        sentiment_stage = "optimism"
-        trading_signal = "trend_following"
-        signal_confidence = 0.5
-
-    # 中性
-    elif abs(raw_score) <= 0.2:
-        sentiment_stage = "neutral"
-        trading_signal = "neutral"
-        signal_confidence = 0.3
-
-    # 温和悲观 → 趋势跟随
-    elif raw_score < -0.2:
-        sentiment_stage = "pessimism"
-        trading_signal = "trend_following"
-        signal_confidence = 0.5
-
-    # 极度悲观 → 反向买入信号（散户恐慌出清 = 底部信号）
-    else:
-        sentiment_stage = "capitulation"
-        trading_signal = "contrarian_buy"
-        signal_confidence = 0.7
-
-    # 态度判断
-    if raw_score > 0.3:
-        overall_sentiment = "bullish"
-    elif raw_score < -0.3:
-        overall_sentiment = "bearish"
-    else:
-        overall_sentiment = "neutral"
-
-    return {
-        "raw_score": raw_score,
-        "overall_sentiment": overall_sentiment,
-        "sentiment_stage": sentiment_stage,
-        "trading_signal": trading_signal,
-        "signal_confidence": signal_confidence,
-        "extreme_positive_ratio": extreme_positive_ratio,
-        "extreme_negative_ratio": extreme_negative_ratio,
-    }
+dispersion = std(综合得分) / abs(mean(综合得分))   # 变异系数
+up_down_gap = mean(涨股综合得分) - mean(跌股综合得分)
+contrarian_signal = (dispersion < 0.35) AND (mean_score > 70 OR mean_score < 30)
 ```
 
-**输出 Schema：**
-```yaml
-sentiment_analysis_output:
-  status: "normal" | "degraded" | "failed"  # P2-4 降级状态
-  overall_sentiment: str         # "bullish" | "bearish" | "neutral"
-  sentiment_score: float         # 情绪评分（-1.0 ~ 1.0）
+低分歧 + 高分 = 一致看多 → 见顶反向信号；低分歧 + 低分 = 一致看空 → 见底反向信号
 
-  # === P2-2 反身性（核心新增）===
-  sentiment_stage: str           # "euphoria" | "optimism" | "neutral" | "pessimism" | "capitulation"
-  trading_signal: str            # "contrarian_sell" | "trend_following" | "neutral" | "contrarian_buy"
-  signal_confidence: float       # 信号置信度（0-1）
+#### 2.5.8 时序动量 EMA
 
-  # 极端情绪占比
-  extreme_positive_ratio: float  # 极度乐观帖子占比
-  extreme_negative_ratio: float  # 极度悲观帖子占比
+```python
+# 加载 data/got_daily/{date}/sentiment.json 最近 10 天（倒序）
+alpha = 2.0 / (min(len(scores), 5) + 1)   # EMA(5) 的 α
+ema = scores[0]   # 最近一天
+for s in scores[1:]:
+    ema = alpha × s + (1 - alpha) × ema
 
-  forum_mood: str                # "极度乐观" | "乐观" | "中性" | "悲观" | "极度悲观"
-  hot_stocks: list[              # 正面热门股（排除黑天鹅）
+return current_score - ema   # 正=升温, 负=降温
+```
+
+#### 2.5.9 恐贪指数映射
+
+```python
+fear_greed_index = (sentiment_score + 1) / 2   # [-1, 1] → [0, 1]
+# 0 = 极度恐惧, 1 = 极度贪婪
+```
+
+#### 2.5.10 hot_stocks 提取逻辑
+
+**优先级**：
+1. **东财优先**（`em_data`）：按"关注指数" `nlargest(50)`，情绪由"综合得分"判定（≥70→positive, ≤30→negative, else neutral），`mention_count = 关注指数 × 1000`
+2. **雪球降级**（`xueqiu`）：合并 3 榜（follow/deal/tweet），按 `total_attention` 降序取 top 50，sentiment 固定 "neutral"（雪球无情绪数据）
+
+**雪球采集**：
+- `ak.stock_hot_follow_xq("最热门")` / `stock_hot_deal_xq` / `stock_hot_tweet_xq`
+- 科技成长过滤：`TECH_GROWTH_KEYWORDS` (~80 关键词)
+- 超时：`XUEQIU_TIMEOUT = 90s`
+
+#### 2.5.11 输出 Schema
+
+```python
+class SentimentContext:
+    status: str                        # "normal" / "degraded" / "failed"
+    overall_sentiment: str             # "bullish" / "bearish" / "neutral"
+    sentiment_score: float             # [-1, 1]
+    sentiment_stage: str               # "euphoria" / "optimism" / "neutral" / "pessimism" / "capitulation"
+    trading_signal: str                # "contrarian_sell" / "trend_following" / "neutral" / "contrarian_buy"
+    signal_confidence: float           # 0.7 / 0.5 / 0.3
+    forum_mood: str                    # "极度乐观" / "乐观" / "偏乐观" / "中性" / "偏悲观" / "悲观" / "极度悲观"
+    hot_stocks: list[HotStock]
+    hot_topics: list[str]
+    retail_attention_count: int        # 东财关注指数总量
+    market_temperature: float          # [0, 1] 冰点→沸点
+    news_drift: str                    # "positive" / "negative" / "neutral"
+    reasoning: Optional[str]
+    data_quality: DataQuality
+    fear_greed_index: float            # [0, 1]
+    sentiment_dispersion: float        # 变异系数
+    contrarian_signal: bool            # 一致看多/空反向信号
+    sentiment_momentum: float          # EMA(5) 偏差
+```
+
+**HotStock**：
+```python
+class HotStock:
     stock_code: str
     stock_name: str
     mention_count: int
-    sentiment: str               # "positive"
+    sentiment: str             # "positive" / "negative" / "neutral"
     associated_sectors: list[str]
-  ]
-  hot_topics: list[str]          # 论坛热门话题
-  missing_data_sources: list[str]  # P2-4：缺失的数据源
-  reasoning: str                 # LLM生成的推理文本
 ```
 
-**LLM Prompt 模板（推理文本）：**
-```
-情绪分析结果：
-- 整体情绪：{overall_sentiment}（评分：{sentiment_score}）
-- 论坛情绪：{forum_mood}
-- 极端情绪占比：{extreme_emotion_ratio}
-- 正面热门股：{hot_stocks}
-- 热门话题：{hot_topics}
+#### 2.5.12 LLM 调用
 
-请输出：
-1. 一段150字以内的情绪分析文本
-2. 重点说明散户情绪状态（是否过热/过冷）
-3. 提示热门股和热门话题
-
-输出格式：纯文本（不要JSON）
-```
+**1 次调用**：reasoning + hot_topics 生成（JSON 输出，失败时规则降级）
 
 ---
 
-### 3.6 节点 6：聚合节点（v2 — 置信度加权聚合 + 条件迭代精炼）
+### 2.6 Node 6: 聚合节点（v3 分层 GOT 架构）
 
-**职责：** 交叉验证多维度分析结果，生成统一市场上下文（unified_context）供Phase 2使用。
+**职责**：聚合 5 个节点的输出，检测矛盾，生成统一的交易信号和仓位建议
 
-**设计理念（基于 15+ 篇论文）：**
-- **投票优于辩论**（Debate-or-Vote, NeurIPS 2025）：置信度加权投票覆盖多轮辩论大部分收益
-- **质量评估优于计数**（AoR, LREC 2024）：正确结论可能在少数，需评估推理质量
-- **概率聚合在 LLM 外部完成**（ThinkSum, ACL 2023）：规则推断比 LLM 推断更稳定
-- **反 Sycophancy**（ConsensAgent, ACL 2025）：LLM 精炼阶段引入批判者角色
+**文件**：`src/got/nodes/aggregator.py`
 
-**v2 三阶段流水线：**
-```
-Phase A: 信号标准化 + 置信度加权聚合（纯规则，零 LLM）
-  5 个 ctx → 统一信号空间投影 → 置信度加权 → 收敛剖面分类
-       ↓
-Phase B: 异常检测（规则 + 自适应阈值）
-  自动矛盾检测（替代硬编码 10 对）+ 矛盾分类（factual/temporal/opinion）
-  EMA 时间一致性（替代固定 ±0.4 阈值）
-  消息面覆盖（简化：关键词 + 多源确认 + LLM 判断）
-       ↓
-Phase C: 条件 LLM 精炼（最多 2 次调用）
-  触发条件：agreement < 0.6 OR high 异常 OR 消息面覆盖
-  ├─ C1 生成：聚合结论 + 分歧模式 → 初始研判
-  └─ C2 批判：初始研判 → 找盲点 → 最终调整
-  不触发时：直接规则输出，省掉 LLM 调用
-       ↓
-  unified_context
-```
+**设计理念**：
+- 全局环境感知（Level 0）：使用 5 个节点的全局聚合字段判断市场 regime
+- 板块级情报整合（Level 1）：对每个候选板块做 4 维 mini GOT 交叉验证
+- 组合决策（Level 2）：基于 regime + confirmed_sectors 计算仓位和信号
 
-**输入 Schema：**
-```yaml
-aggregator_input:
-  market_context:          # 来自"大盘分析"
-    tech_growth:
-      trend: str
-      score: float
-      indicators: dict
-    mid_small_cap:
-      trend: str
-      score: float
-    large_cap:
-      trend: str
-      score: float
-    position_limit: float
-    confidence: float
-    key_levels: dict
-  sector_context:          # 来自"板块分析"
-    active_mainline: list
-    exhausted_mainline: list
-    ambush: list
-    defensive_rotation: list
-    market_direction: str
-  capital_context:         # 来自"资金面分析"
-    institutional_attitude: str
-    institutional_score: float
-    evidence: dict
-  news_context:            # 来自"消息面分析"
-    overall_impact: str
-    impact_score: float
-    major_events: list
-    concept_suggestions: list
-    key_risks: list
-  sentiment_context:       # 来自"情绪分析"
-    overall_sentiment: str
-    sentiment_score: float
-    extreme_emotion_ratio: float
-    forum_mood: str
-    hot_stocks: list
-    hot_topics: list
-```
+**参考论文**：
+- ICLR 2025: Top-Down Sector Allocation（板块配置即决策）
+- FINCON NeurIPS 2024: Manager-Analyst 层级（Analyst 输出 insight 而非 score）
+- FinCoT ACL 2025: 推理结构匹配领域工作流
 
-**Step 1：规则检测矛盾（P1-2：按时间框架分组 + 扩展到 8 对 + P2-4：降级维度跳过）：**
-```python
-# === 路径级失败检测（任一主路径失败则直接报错，不做降级）===
-def validate_path_inputs(market, sector, capital, news, sentiment):
-    """两路并行 + 聚合架构中，任一路径失败直接报错退出"""
-    errors = []
+#### 2.6.1 Level 0: 全局环境感知
 
-    # 技术分析路：大盘 → 板块 → 资金面（串行依赖）
-    tech_path_failed = False
-    if market is None or getattr(market, "error", None):
-        errors.append(f"大盘分析节点失败: {getattr(market, 'error', '输入为空')}")
-        tech_path_failed = True
-    if sector is None or getattr(sector, "error", None):
-        errors.append(f"板块分析节点失败: {getattr(sector, 'error', '输入为空')}")
-        tech_path_failed = True
-    if capital is None or getattr(capital, "status", "") == "failed":
-        errors.append(f"资金面分析节点失败: {getattr(capital, 'error', '状态为 failed')}")
-        tech_path_failed = True
-
-    # 独立数据路：消息面 + 情绪面（并行，不依赖技术路）
-    data_path_failed = False
-    if news is None or getattr(news, "error", None):
-        errors.append(f"消息面分析节点失败: {getattr(news, 'error', '输入为空')}")
-        data_path_failed = True
-    if sentiment is None or getattr(sentiment, "error", None):
-        errors.append(f"情绪面分析节点失败: {getattr(sentiment, 'error', '输入为空')}")
-        data_path_failed = True
-
-    # 任一路径失败 → 直接报错，不做降级
-    if tech_path_failed or data_path_failed:
-        raise AggregatorInputError(
-            f"聚合节点输入校验失败（不做降级）:\n" + "\n".join(errors)
-        )
-
-
-def detect_contradictions(market, sector, capital, news, sentiment):
-    """规则检测维度间矛盾（多时间框架 + 降级感知）"""
-    contradictions = []
-
-    # === P2-4：降级维度不参与矛盾检测 ===
-    capital_available = capital.status != "failed"
-    news_available = news.status != "failed" if hasattr(news, "status") else True
-    sentiment_available = sentiment.status != "failed" if hasattr(sentiment, "status") else True
-
-    # === 短期矛盾（5 日技术 vs 24 小时消息/情绪）===
-    if capital_available:
-        # ① 短期技术面 vs 消息面
-        if market.tech_growth.signals.short_term.trend == "bearish" and news.impact_score > 0.3:
-            contradictions.append({
-                "pair": "short_tech_vs_news",
-                "timeframe": "short_term",
-                "description": "短期技术面偏空但消息面利好",
-                "severity": "high",
-            })
-
-        # ② 短期技术面 vs 资金面（机构）
-        if market.tech_growth.signals.short_term.trend == "bearish" and capital.institutional_score > 0.3:
-            contradictions.append({
-                "pair": "short_tech_vs_capital",
-                "timeframe": "short_term",
-                "description": "短期技术面偏空但机构在加仓",
-                "severity": "medium",
-            })
-
-    if sentiment_available:
-        # ③ 短期技术面 vs 情绪面（散户）
-        if market.tech_growth.signals.short_term.trend == "bullish" and sentiment.sentiment_score < -0.3:
-            contradictions.append({
-                "pair": "short_tech_vs_sentiment",
-                "timeframe": "short_term",
-                "description": "技术面偏多但散户恐慌",
-                "severity": "low",
-            })
-
-    # === 中期矛盾（20 日技术 vs 5 日资金 / 24 小时消息）===
-    if capital_available:
-        # ④ 中期技术面 vs 资金面
-        if market.tech_growth.signals.medium_term.trend == "bearish" and capital.institutional_score > 0.3:
-            contradictions.append({
-                "pair": "medium_tech_vs_capital",
-                "timeframe": "medium_term",
-                "description": "中期技术面偏空但机构在加仓",
-                "severity": "high",
-            })
-
-    if news_available:
-        # ④b 中期技术面 vs 消息面
-        if market.tech_growth.signals.medium_term.trend == "bearish" and news.impact_score > 0.3:
-            contradictions.append({
-                "pair": "medium_tech_vs_news",
-                "timeframe": "medium_term",
-                "description": "中期技术面偏空但消息面持续利好（可能是底部反转前兆）",
-                "severity": "medium",
-            })
-
-    # === 长期矛盾（60 日技术 vs 资金面）===
-    if capital_available:
-        # ④c 长期技术面 vs 资金面
-        if market.tech_growth.signals.long_term.trend == "bearish" and capital.institutional_score > 0.3:
-            contradictions.append({
-                "pair": "long_tech_vs_capital",
-                "timeframe": "long_term",
-                "description": "长期趋势偏空但机构仍在加仓（可能是左侧布局或机构误判）",
-                "severity": "high",
-            })
-
-    # === 跨维度矛盾 ===
-    if capital_available and sentiment_available:
-        # ⑤ 机构 vs 散户（最有价值的矛盾）
-        if capital.institutional_attitude == "bullish" and sentiment.overall_sentiment == "bearish":
-            contradictions.append({
-                "pair": "institutional_vs_retail",
-                "timeframe": "cross",
-                "description": "机构看多但散户恐慌（可能是底部信号）",
-                "severity": "high",
-            })
-        if capital.institutional_attitude == "bearish" and sentiment.overall_sentiment == "bullish":
-            contradictions.append({
-                "pair": "institutional_vs_retail",
-                "timeframe": "cross",
-                "description": "机构在卖但散户在追（可能是顶部信号）",
-                "severity": "high",
-            })
-
-        # ⑥ 资金 vs 情绪（新增，P1-2 扩展）
-        if capital.institutional_score > 0.3 and sentiment.sentiment_stage == "euphoria":
-            contradictions.append({
-                "pair": "capital_vs_euphoria",
-                "timeframe": "cross",
-                "description": "机构买入但散户极度狂热（高位接盘风险）",
-                "severity": "high",
-            })
-
-    if news_available:
-        # ⑦ 消息 vs 板块（新增）
-        if news.impact_score > 0.3 and len(sector.active_mainline) == 0:
-            contradictions.append({
-                "pair": "news_vs_sector",
-                "timeframe": "cross",
-                "description": "利好政策但无活跃主线板块（利好出尽？）",
-                "severity": "medium",
-            })
-
-    # === 跨时间框架背离（作为独立信号，不是矛盾）===
-    if (market.tech_growth.signals.long_term.trend == "bullish" and
-        market.tech_growth.signals.short_term.trend == "bearish"):
-        contradictions.append({
-            "pair": "long_short_divergence",
-            "timeframe": "cross_timeframe",
-            "description": "长期多头但短期回调（可能是回调买点）",
-            "severity": "low",
-            "signal_type": "pullback_opportunity",
-        })
-
-    return contradictions
-```
-
-**Step 2：LLM 批处理分析所有矛盾（P2-3 决策：一次调用代替逐个串行）：**
-```python
-async def analyze_contradictions_batch(contradictions, all_contexts):
-    """所有矛盾合并为一个 prompt，一次 LLM 调用"""
-
-    if not contradictions:
-        return []
-
-    contradictions_text = "\n\n".join([
-        f"矛盾 {i+1}（{c['pair']}，严重度: {c['severity']}，时间框架: {c['timeframe']}）:\n"
-        f"  描述: {c['description']}"
-        for i, c in enumerate(contradictions)
-    ])
-
-    prompt = f"""
-你是资深投资顾问。检测到以下 {len(contradictions)} 个维度间矛盾，请逐一分析并寻找可能的共同根因。
-
-完整市场数据：
-{all_contexts}
-
-矛盾列表：
-{contradictions_text}
-
-请输出：
-1. 对每个矛盾的分析（resolution / confidence_adjustment / reasoning）
-2. 这些矛盾是否有共同根因？如果有，说明
-3. 综合所有矛盾后，对整体市场判断的影响
-
-输出 JSON：
-{{
-  "analyses": [
-    {{"pair": "...", "resolution": "...", "confidence_adjustment": 0.0, "reasoning": "..."}},
-    ...
-  ],
-  "common_root_cause": "..." | null,
-  "overall_impact": "..."
-}}
-"""
-
-    result = await llm.call(prompt)
-    return result.analyses
-```
-
-**Step 3：消息面覆盖检查（P1-5 决策：三层防护）：**
-```python
-async def check_news_override(contradictions, news_context, market_context):
-    """判断是否有重大事件需要覆盖技术面判断（三层防护）"""
-
-    # === 第一层：系统性政策筛选 ===
-    systemic_keywords = [
-        "降息", "降准", "加息", "IPO", "注册制", "退市",
-        "禁止", "禁令", "监管", "制裁", "关税", "财政刺激", "国债",
-    ]
-    overridable_events = []
-    for event in news_context.major_events:
-        is_systemic = (
-            event.event_type == "policy" and
-            event.impact_level == "high" and
-            any(kw in event.title or kw in event.summary for kw in systemic_keywords)
-        )
-        # 多源确认（P1-5 决策：≥ 3 家独立媒体）
-        has_multi_source = event.source_count >= 3
-        if is_systemic and has_multi_source:
-            overridable_events.append(event)
-
-    if not overridable_events:
-        return None
-
-    # === 第二层：历史验证 ===
-    historical_db = {
-        "降息": {"accuracy": 0.85},
-        "行业禁令": {"accuracy": 0.75},
-        "IPO政策": {"accuracy": 0.65},
-        "产业利好": {"accuracy": 0.30},  # 低准确率，不应覆盖
-    }
-    validated_events = [
-        e for e in overridable_events
-        if historical_db.get(classify_event_type(e), {}).get("accuracy", 0.5) > 0.6
-    ]
-    if not validated_events:
-        return None
-
-    # === 第三层：LLM 判断（带幅度限制）===
-    original_limit = market_context.position_limit
-    prompt = f"""
-技术面判断：{market_context.tech_growth}
-当前仓位上限：{original_limit}
-
-经过验证的重大事件：{validated_events}
-
-问题：这些事件是否足以覆盖技术面判断？
-
-约束：
-- 仓位调整幅度不得超过 ±0.2
-- 必须说明历史先例
-- 如果不确定，维持技术面判断
-
-输出 JSON：
-{{
-  "override": bool,
-  "overridden_position_limit": float,
-  "reason": str,
-  "historical_precedent": str
-}}
-"""
-    llm_result = await llm.call(prompt)
-
-    # 硬性约束：幅度限制 ±0.2
-    proposed = llm_result.overridden_position_limit
-    clamped = clip(proposed, original_limit - 0.2, original_limit + 0.2)
-
-    return {
-        "override": llm_result.override,
-        "overridden_position_limit": clamped,
-        "original_position_limit": original_limit,
-        "validated_events": validated_events,
-        "historical_precedent": llm_result.historical_precedent,
-        "reason": llm_result.reason,
-        "amplitude_clamped": clamped != proposed,
-    }
-```
-
-**Step 4：时间一致性校验（P2-5 决策：4 类异常检测）：**
-
-> **持久化方案（v0.3 决策）：**
-> - 存储介质：JSON 文件，按交易日日期命名（如 `previous_context_20260721.json`），存放在 `data/aggregator_contexts/` 目录
-> - 跨节假日处理：仅取交易日数据，周一运行自动加载上周五的 JSON；节假日休市日不触发分析，不产生新 JSON
-> - 首日运行：无 `previous_context` 文件，跳过时间一致性校验（当天不保护，仅记录基线）
+**方法**：`_compute_market_regime()`
 
 ```python
-import json
-from pathlib import Path
+regime_score = 0.0
 
-CONTEXTS_DIR = Path("data/aggregator_contexts")
+# Node 1: ADX + 趋势方向
+if adx_value > 25:  # 有趋势
+    regime_score += 0.3 if tech_growth.score > 0.3 else -0.3
+else:  # 无趋势
+    regime_score += tech_growth.score × 0.2
 
+# Node 2: 板块方向
+regime_score += {"普涨": 0.3, "普跌": -0.3, "分化": 0.0}[market_direction]
 
-def load_previous_context(trading_date: str) -> dict | None:
-    """加载最近一个交易日的聚合输出
+# Node 3: 资金面
+regime_score += institutional_score × 0.2
 
-    Args:
-        trading_date: 当前交易日 YYYYMMDD，用于查找前一交易日文件
-                      （由调用方通过交易日历确定前一交易日日期）
+# Node 4: 消息面
+regime_score += news_impact_score × 0.1
 
-    Returns:
-        前一交易日的 unified_context，不存在时返回 None
-    """
-    filepath = CONTEXTS_DIR / f"previous_context_{trading_date}.json"
-    if not filepath.exists():
-        return None
-    with open(filepath, "r", encoding="utf-8") as f:
-        return json.load(f)
+# Node 5: 情绪面
+regime_score += 0.1 if fear_greed > 0.7 else -0.1 if fear_greed < 0.3
+# sentiment_stage 修正
+regime_score += {"euphoria": -0.15, "capitulation": +0.15,
+                 "optimism": +0.05, "pessimism": -0.05}[stage]
+regime_score += sentiment_momentum × 0.1
 
+# 分类
+regime = "bull" if score > 0.3 else "bear" if score < -0.3 else "transition"
 
-def save_current_context(context: dict, trading_date: str):
-    """保存当前交易日的聚合输出，供下一交易日比对"""
-    CONTEXTS_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = CONTEXTS_DIR / f"previous_context_{trading_date}.json"
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(context, f, ensure_ascii=False, indent=2)
-
-
-def detect_temporal_inconsistencies(current_context, previous_context):
-    """检测信号时间一致性（需前一交易日 JSON 文件）"""
-
-    if previous_context is None:
-        return []  # 首日运行，跳过校验，仅记录当天基线
-
-    inconsistencies = []
-
-    # 检测 1：技术面趋势翻转
-    cur_trend = current_context.market.tech_growth.trend
-    prev_trend = previous_context.market.tech_growth.trend
-    if ((cur_trend == "bullish" and prev_trend == "bearish") or
-        (cur_trend == "bearish" and prev_trend == "bullish")):
-        score_delta = abs(current_context.market.tech_growth.score -
-                         previous_context.market.tech_growth.score)
-        if score_delta > 0.8:
-            inconsistencies.append({
-                "type": "sudden_trend_flip",
-                "description": f"技术面 overnight 翻转: {prev_trend} → {cur_trend}（分差 {score_delta:.2f}）",
-                "severity": "critical",
-                "action": "manual_review_required",
-            })
-        elif score_delta > 0.5:
-            inconsistencies.append({
-                "type": "trend_flip",
-                "description": f"技术面趋势翻转: {prev_trend} → {cur_trend}",
-                "severity": "high",
-                "action": "investigate_root_cause",
-            })
-
-    # 检测 2：置信度剧烈波动
-    conf_delta = abs(current_context.overall_confidence - previous_context.overall_confidence)
-    if conf_delta > 0.4:
-        inconsistencies.append({
-            "type": "confidence_collapse",
-            "description": f"置信度剧烈波动: {previous_context.overall_confidence:.2f} → {current_context.overall_confidence:.2f}",
-            "severity": "high",
-            "action": "reduce_position",
-        })
-
-    # 检测 3：主线快速切换
-    cur_mainline = set(s.code for s in current_context.sector.active_mainline)
-    prev_mainline = set(s.code for s in previous_context.sector.active_mainline)
-    if prev_mainline:
-        overlap_ratio = len(cur_mainline & prev_mainline) / len(prev_mainline)
-        if overlap_ratio < 0.3 and len(prev_mainline) >= 2:
-            inconsistencies.append({
-                "type": "rapid_mainline_shift",
-                "description": f"主线快速切换: {prev_mainline} → {cur_mainline}",
-                "severity": "medium",
-                "action": "verify_sector_analysis",
-            })
-
-    # 检测 4：仓位上限剧烈变化
-    limit_delta = abs(current_context.final_position_limit - previous_context.final_position_limit)
-    if limit_delta > 0.4:
-        inconsistencies.append({
-            "type": "position_limit_swing",
-            "description": f"仓位上限剧烈变化: {previous_context.final_position_limit:.0%} → {current_context.final_position_limit:.0%}",
-            "severity": "high",
-            "action": "cap_adjustment",
-        })
-
-    return inconsistencies
+# 风险预算
+if bull:    risk_budget = 0.6 + 0.2 × (score - 0.3) / 0.7
+if bear:    risk_budget = 0.3 + 0.2 × (score + 1.0) / 0.7
+if transition: risk_budget = 0.4 + 0.2 × (score + 0.3) / 0.6
+risk_budget = clip(risk_budget, 0.2, 0.8)
 ```
 
-**Step 5：最终综合研判（整合所有异常信号）：**
+#### 2.6.2 Level 1: 板块 mini GOT
+
+**方法**：`_build_sector_intel()` → `_validate_single_sector()`
+
+对每个候选板块做 4 维交叉验证：
+
 ```python
-async def final_synthesis(all_contexts, contradictions, contradiction_analyses,
-                          news_override, temporal_inconsistencies, previous_context):
-    """最终综合研判（含时间一致性 + 降级信息）"""
-
-    # 降级通知
-    degradation_notice = ""
-    for name, ctx in [("资金面", all_contexts.capital),
-                      ("消息面", all_contexts.news),
-                      ("情绪面", all_contexts.sentiment)]:
-        if getattr(ctx, "degraded", False):
-            degradation_notice += f"- {name}: 缺失 {ctx.missing_dimensions}\n"
-
-    # Critical 异常 → 强制人工审核
-    critical = [i for i in temporal_inconsistencies if i["severity"] == "critical"]
-    if critical:
-        return {
-            "status": "manual_review_required",
-            "anomalies": critical,
-            "reason": "检测到 critical 级别时间异常，需人工审核",
-        }
-
-    prompt = f"""
-你是资深投资顾问。根据以下多维度分析结果，进行最终综合研判。
-
-各维度信号：
-- 大盘技术面（含多时间框架）：{all_contexts.market_context}
-- 板块状态（含生命周期）：{all_contexts.sector_context}
-- 机构态度：{all_contexts.capital_context}
-- 消息面：{all_contexts.news_context}
-- 散户情绪（含反身性信号）：{all_contexts.sentiment_context}
-
-矛盾分析（批处理）：{contradiction_analyses}
-消息面覆盖：{news_override}
-时间一致性异常：{temporal_inconsistencies}
-{"降级通知：" + degradation_notice if degradation_notice else ""}
-
-请输出最终综合判断（JSON）：
-1. unified_signal: "bullish" | "bearish" | "neutral" | "cautious"
-2. overall_confidence: float (0~1)
-3. final_position_limit: float (0~1)
-4. contradictions_summary: str
-5. key_risks: list[str]
-6. key_opportunities: list[str]
-7. reasoning: str（200字以内）
-"""
-
-    return await llm.call(prompt)
+composite = tech_score  # Node 2 的 strength_score (0-100)
+composite += 10 if capital_check == "aligned" else -15 if "divergent"
+composite += 8 if news_check == "catalyzed" else -12 if "negative"
+composite += 5 if sentiment_check == "high" else -5 if "low"
+# Lifecycle 修正
+composite += 8 if phase in ("launch", "acceleration")
+composite -= 15 if phase in ("late_stage", "mature_exhausted")
+composite = clip(composite, 0, 100)
 ```
 
-**聚合节点完整流程（v2）：**
-```
-Phase A: 信号标准化 + 置信度加权聚合
-  ├─ 5 个 ctx → DimensionSignal 投影（score × confidence）
-  ├─ failed 维度自动跳过，剩余归一化
-  ├─ 置信度加权聚合 → weighted_score
-  └─ 收敛剖面分类（full_convergence / mild_divergence / ...）
-       ↓
-Phase B: 异常检测
-  ├─ 自动矛盾检测（O(n²) 两两对比，n≤5 → 最多 10 对）
-  ├─ 矛盾分类（factual / temporal / opinion）
-  ├─ EMA 时间一致性（z-score > 2σ → high，> 3σ → critical）
-  └─ 消息面覆盖（policy + high + 多源确认 → LLM 判断）
-       ↓
-  需要 LLM 精炼？──否──→ 规则映射输出（零 LLM 调用）
-       ↓ 是
-Phase C: 条件 LLM 精炼
-  ├─ C1 生成：聚合结论 + 分歧模式 → 初始研判
-  └─ C2 批判：初始研判 → 找盲点 → 最终调整（反 sycophancy）
-       ↓
-  仓位日限幅 ±0.2 + EMA 基线更新
-       ↓
-  unified_context（含 convergence_profile + dimension_contributions）
-```
+**分类门槛**：
 
-**输出 Schema（v2）：**
-```yaml
-aggregator_output:
-  status: str                      # "normal" | "manual_review_required"
-  unified_signal: str              # "bullish" | "bearish" | "neutral" | "cautious"
-  overall_confidence: float        # 综合置信度（0.0 ~ 1.0）
-  final_position_limit: float      # 最终仓位上限（日限幅 ±0.2）
+| 分类 | 主线条件 | 埋伏条件 |
+|------|---------|---------|
+| confirmed | score≥75 + capital∈{aligned,neutral} + news≠negative; 或 score≥60 + capital=aligned | score≥75 + capital=aligned + news≠negative; 或 score≥60 + capital=aligned |
+| watch | score≥50 + 无负面信号 | 同 |
+| divergent | score≥50 + capital=divergent 或 news=negative | 同 |
+| speculative | score<40 + news=catalyzed | 同 |
+| avoid | score<40 + 无消息催化; 或晚期+negative信号 | 同 |
 
-  # === 矛盾分析（v2：自动检测 + 矛盾分类）===
-  contradictions: list[
-    pair: str                      # "market_vs_capital" 等（自动生成）
-    timeframe: str                 # "cross"
-    description: str
-    severity: str                  # "high" | "medium"
-    conflict_type: str             # "factual" | "temporal" | "opinion"（参考 ConflictRAG）
-    resolution: str
-    confidence_adjustment: float
-  ]
-  common_root_cause: str | null
+#### 2.6.3 Level 2: 组合决策
 
-  # === 消息面覆盖（v2：简化）===
-  news_override:
-    override: bool
-    overridden_position_limit: float
-    original_position_limit: float
-    validated_events: list
-    reason: str
+**方法**：`_compute_position_from_regime()` + `_determine_unified_signal()`
 
-  # === 时间一致性（v2：EMA 基线）===
-  temporal_inconsistencies: list[
-    type: str                      # "sudden_trend_flip" | "trend_flip"
-    description: str
-    severity: "critical" | "high"
-    action: str
-  ]
-
-  key_risks: list[str]
-  key_opportunities: list[str]
-  concept_suggestions: list        # 透传自消息面节点
-  reasoning: str                   # LLM 综合推理文本
-
-  # === v2 新增字段（置信度加权聚合）===
-  convergence_profile:
-    pattern: str                   # "full_convergence" | "mild_divergence" | "strong_divergence" | "lone_outlier" | "low_confidence"
-    agreement_score: float         # 0~1
-    investigate_outlier: bool      # Surprising Popularity 标记
-  weighted_score: float            # 置信度加权方向分（-1~+1）
-  dimension_contributions: list[   # 各维度贡献明细
-    name: str
-    score: float
-    confidence: float
-    contribution: float
-  ]
-  llm_refinement_used: bool        # 是否使用了 Phase C LLM 精炼
-  ema_baseline: float | null       # 当前 EMA 基线值
-```
-
----
-
-## 4. Phase 2: CoT 决策流水线
-
-### 4.1 节点 4：持仓判断
-
-**职责：** 判断当前持仓是否需要调整（加仓/减仓/换仓）。
-
-**输入 Schema：**
-```yaml
-portfolio_judgment_input:
-  unified_context:         # 来自"聚合节点"
-    unified_signal: str
-    overall_confidence: float
-    recommended_position: float
-    key_risks: list
-    key_opportunities: list
-  market_context:          # 来自"大盘分析"（保留用于细节参考）
-    trend: str
-    position_limit: float
-  sector_context:          # 来自"板块分析"
-    top_sectors: list
-  capital_context:         # 来自"资金面分析"
-    main_force_flow: dict
-  news_context:            # 来自"消息面分析"
-    major_events: list
-  sentiment_context:       # 来自"情绪分析"
-    timing_signal: str
-  current_portfolio:       # 当前持仓
-    holdings: list[
-      stock_code: str
-      stock_name: str
-      quantity: int
-      cost_price: float
-      current_price: float
-      pnl_ratio: float     # 盈亏比例
-    ]
-    total_assets: float
-    cash: float
-    position_ratio: float  # 当前仓位比例
-```
-
-**判断逻辑（混合：规则引擎 + LLM）：**
-
-**规则引擎部分：**
+**仓位计算**：
 ```python
-# 强制减仓规则
-if market_trend == "bearish" and position_ratio > 0.5:
-    return "reduce_position"
+confirmed_count = len([s for s in confirmed if classification == "confirmed"])
+avg_confidence = mean([s.confidence for s in confirmed])
 
-# 强制止损规则
-if any(stock.pnl_ratio < -0.10 for stock in holdings):
-    return "stop_loss"
+if bear:       position = 0.2 + 0.1 × confirmed_count
+if transition: position = 0.3 + 0.1 × confirmed_count + 0.1 × avg_confidence
+if bull:       position = 0.4 + 0.08 × confirmed_count + 0.1 × avg_confidence
 
-# 强制调仓规则
-if position_ratio > market_position_limit:
-    return "rebalance"
+position = min(position, risk_budget)
+final = clip(position, 0.0, 0.8)
 ```
 
-**LLM 判断部分：**
+**⚠️ 日限幅已移除**：代码注释说明"三层仓位系统（波动率调整 + 状态缩放 + 回撤保护）已提供平滑过渡。旧版日限幅 bug：当 market.position_limit=0.0 时，clip 到 [-0.2, 0.2] 导致锁死 20%"
+
+#### 2.6.4 矛盾检测（规则决策树）
+
+**方法**：`_detect_contradictions()`
+
+**不是硬编码 10 对**，而是 **2 种自动检测规则**：
+
+**矛盾 1**：`regime_vs_sectors` — bear regime + ≥3 confirmed 板块
 ```python
-# 灰色地带（规则未覆盖的情况）
-prompt = f"""
-当前持仓：
-{portfolio_summary}
-
-市场背景：
-- 大盘：{market_context}
-- 板块：{sector_context}
-- 情绪：{sentiment_context}
-
-规则引擎建议：{rule_engine_suggestion}
-
-请判断：是否需要调整持仓？如果需要，怎么调整？
-
-输出：
-1. 判断结果（持有/减仓/加仓/换仓）
-2. 调整理由
-3. 具体操作建议
-"""
+if regime == "bear" and confirmed_count >= 3:
+    → Contradiction(severity="medium", conflict_type="opinion")
 ```
 
-**输出 Schema：**
-```yaml
-portfolio_judgment_output:
-  action: str              # "hold" | "reduce" | "add" | "rebalance"
-  reason: str              # 调整理由
-  target_position_ratio: float  # 目标仓位比例
-  priority_stocks: list[str]    # 优先处理的股票
-  reasoning: str                # LLM 推理过程
-```
+**矛盾 2**：`_detect_family_capital_mismatch()` — 主线家族 vs 资金流向错位
+- **高阈值模式**：同时满足 ① Node 2 top-1 家族在资金 top-5 无匹配 AND ② 资金 top-1 家族在 Node 2 排名 ≥ top-3
+- 错位 → `severity="high"`, `conflict_type="factual"`
+- 排名差 ≥3 → `severity="medium"`, `conflict_type="opinion"`
 
----
+#### 2.6.5 LLM 精炼（板块情报）
 
-### 4.2 节点 5：选股评分
+**方法**：`_llm_refine_sectors()`
 
-**职责：** 根据市场背景和持仓情况，筛选并评分候选股票。
+**触发条件**：总是调用（只要有板块数据），非条件触发
 
-**输入 Schema：**
-```yaml
-stock_scoring_input:
-  market_context:          # 来自"大盘分析"
-  sector_context:          # 来自"板块分析"
-    top_sectors: list
-  sentiment_context:       # 来自"情绪分析"
-    hot_stocks: list
-  portfolio_action:        # 来自"持仓判断"
-    action: str
-    priority_stocks: list
-  candidate_pool:          # 候选股票池
-    source: str            # "ths_screener" | "eastmoney" | "custom"
-    filters: dict          # 筛选条件
-  top_n: int               # 返回 Top N（默认 10）
-```
-
-**工具调用：**
-```python
-# 复用现有服务
-candidates = await THSScreenerService.screen(filters)
-technical_scores = await TechnicalIndicatorService.score(candidates)
-screener_results = await StockScreenerPipeline.run(candidates, technical_scores)
-```
-
-**评分逻辑（五维综合）：**
-```python
-composite_score = (
-    strategy_score * 0.20 +
-    technical_score * 0.30 +
-    sector_score * 0.25 +
-    sentiment_score * 0.15 +
-    (100 - risk_score) * 0.10
-)
-```
-
-**输出 Schema：**
-```yaml
-stock_scoring_output:
-  recommendations: list[
-    stock_code: str
-    stock_name: str
-    composite_score: float      # 综合评分（0-100）
-    dimension_scores:
-      strategy: float
-      technical: float
-      sector: float
-      sentiment: float
-      risk: float
-    signals: list[str]          # 信号标签（"主力强攻"、"多头排列"等）
-    target_price: float         # 目标价
-    stop_loss_price: float      # 止损价
-    reasoning: str              # 推荐理由
-  ]
-  reasoning: str                # LLM 推理过程
-```
-
----
-
-### 4.3 节点 6：交易建议生成
-
-**职责：** 根据评分结果和持仓判断，生成最终交易建议。
-
-**输入 Schema：**
-```yaml
-trade_suggestion_input:
-  portfolio_judgment:        # 来自"持仓判断"
-    action: str
-    target_position_ratio: float
-  stock_recommendations:     # 来自"选股评分"
-    recommendations: list
-  current_portfolio:         # 当前持仓
-    holdings: list
-    cash: float
-```
-
-**生成逻辑：**
-```python
-if portfolio_action == "reduce":
-    # 优先卖出亏损股票
-    suggestions = generate_sell_suggestions(holdings, target_ratio)
-elif portfolio_action == "add":
-    # 优先买入高分股票
-    suggestions = generate_buy_suggestions(recommendations, cash)
-elif portfolio_action == "rebalance":
-    # 卖出弱势股票，买入强势股票
-    suggestions = generate_rebalance_suggestions(holdings, recommendations)
-else:  # hold
-    suggestions = []
-```
-
-**输出 Schema：**
-```yaml
-trade_suggestion_output:
-  suggestions: list[
-    action: str              # "buy" | "sell" | "hold"
-    stock_code: str
-    stock_name: str
-    quantity: int            # 建议数量（股）
-    price_range:             # 建议价格区间
-      min: float
-      max: float
-    reason: str              # 操作理由
-    confidence: float        # 置信度（0-1）
-    expected_return: float   # 预期收益（%）
-    risk_reward_ratio: float # 风险收益比
-  ]
-  summary: str               # 操作总结
-  warnings: list[str]        # 风险提示
-```
-
----
-
-## 5. 输出层
-
-### 5.1 市场分析报告（Markdown）
-
-```markdown
-# 市场分析报告（2026-07-21）
-
-## 一、大盘分析
-
-**趋势判断：** 震荡偏空  
-**置信度：** 65%  
-**建议仓位：** ≤ 50%
-
-**关键点位：**
-- 支撑位：3200 点
-- 阻力位：3300 点
-
-**推理过程：**  
-上证指数近 5 日成交量萎缩，MACD 死叉，短期偏弱...
-
----
-
-## 二、板块分析
-
-**市场方向：** 分化  
-
-**Top 5 强势板块：**
-1. 半导体（强度：85，轮动：流入）
-   - 龙头股：002935 天奥电子、300377 赢时胜
-2. 新能源车（强度：78，轮动：稳定）
-   - 龙头股：...
-
-**推理过程：**  
-半导体板块近 3 日资金净流入 15 亿，板块指数突破前高...
-
----
-
-## 三、情绪分析
-
-**整体情绪：** 中性  
-**情绪评分：** 52/100  
-
-**散户情绪：** 论坛情绪偏谨慎，热门股票集中在 AI 板块  
-**机构情绪：** 北向资金近 3 日净流出 20 亿  
-
-**时机信号：** 观望  
-
----
-
-## 四、持仓建议
-
-**当前仓位：** 60%  
-**建议仓位：** 50%  
-**操作：** 减仓 10%  
-
-**理由：**  
-大盘偏空，建议降低仓位...
-
----
-
-## 五、交易建议
-
-### 建议 1：买入 002935 天奥电子
-- **数量：** 1000 股
-- **价格区间：** 25.0 - 25.5 元
-- **理由：** 半导体龙头，技术面多头排列，主力资金净流入
-- **预期收益：** 10%
-- **止损价：** 23.5 元
-- **风险收益比：** 2.5
-
-### 建议 2：卖出 603335 迪生力
-- **数量：** 500 股
-- **理由：** 板块轮动流出，技术面破位
-
----
-
-**风险提示：**  
-本报告仅供参考，不构成投资建议。股市有风险，入市需谨慎。
-```
-
-### 5.2 交易建议（JSON，可选）
-
+**Prompt**：注入 regime + 板块情报前 10 个，要求输出：
 ```json
 {
-  "date": "2026-07-21",
-  "suggestions": [
-    {
-      "action": "buy",
-      "stock_code": "002935",
-      "stock_name": "天奥电子",
-      "quantity": 1000,
-      "price_range": {"min": 25.0, "max": 25.5},
-      "reason": "半导体龙头，技术面多头排列",
-      "confidence": 0.75,
-      "expected_return": 0.10,
-      "risk_reward_ratio": 2.5
-    }
-  ]
+  "narrative": "50字板块格局总结",
+  "cross_sector_risks": ["风险1", "风险2"],
+  "adjustments": [{"sector": "名", "new_classification": "...", "reason": "..."}]
 }
 ```
 
+**安全约束**：LLM 调整**仅允许上调**（avoid→watch→confirmed），**禁止下调**
+
+**LLM 调用**：`_call_llm_async()`, temperature=0.3, max_tokens=500, 3 次重试
+
+#### 2.6.6 消息面覆盖（条件 LLM）
+
+**方法**：`_simplified_news_override()`
+
+**筛选条件**：
+```python
+overridable = [e for e in news.major_events
+    if e.event_type == "policy"
+    and e.impact_level == "high"
+    and e.source_count >= 3
+    and any(kw in e.title or kw in e.summary for kw in SYSTEMIC_KEYWORDS)]
+```
+
+**SYSTEMIC_KEYWORDS**：`降息/降准/加息/IPO/注册制/退市/禁止/禁令/监管/制裁/关税/财政刺激/国债/印花税/暂停/熔断/救市/护盘`
+
+**LLM 决策**：提出新仓位 → clamp 到 `[position_limit - 0.2, position_limit + 0.2]`
+
+#### 2.6.7 时间一致性校验
+
+**方法**：`_adaptive_temporal_check()`
+
+```python
+regime_score_map = {"bull": 0.5, "transition": 0.0, "bear": -0.5}
+current_score = regime_score_map[regime]
+z_score = |current_score - prev_ema_score| / max(prev_std, 0.05)
+
+# 冷启动期（sample_count < 5）
+if z_score > 5.0: → critical "sudden_trend_flip"
+if z_score > 3.5: → high "trend_flip"
+
+# 稳定期
+if z_score > 3.0: → critical
+if z_score > 2.0: → high
+```
+
+**动作**：critical → `status = "manual_review_required"`
+
+#### 2.6.8 EMA 基线持久化
+
+**存储**：`data/aggregator_contexts/ema_baseline.json`
+
+**结构**：
+```json
+{
+  "regime_score": 0.123,
+  "score_std": 0.045,
+  "last_updated": "2026-08-11",
+  "sample_count": 12
+}
+```
+
+**更新公式**：
+```python
+EMA_ALPHA = 0.3
+new_score = 0.3 × current_score + 0.7 × prev_score
+# 滚动方差: Welford 在线算法
+delta = current_score - prev_score
+new_ss = (n-1) × prev_std² + delta² × n/(n+1)
+new_std = max(sqrt(new_ss / n), 0.01)
+```
+
+**冷启动**：`EMA_WARMUP_SAMPLES = 5`，样本不足时用宽松阈值（critical=5.0, high=3.5），充足后用严格阈值（critical=3.0, high=2.0）
+
+#### 2.6.9 输出 Schema
+
+```python
+class UnifiedContext:
+    status: str                           # "normal" / "manual_review_required"
+    unified_signal: str                   # "bullish" / "bearish" / "neutral" / "cautious"
+    overall_confidence: float             # [0, 1]
+    final_position_limit: float           # [0, 1]
+    contradictions: list[Contradiction]
+    common_root_cause: Optional[str]
+    news_override: Optional[NewsOverride]
+    temporal_inconsistencies: list[TemporalInconsistency]
+    key_risks: list[str]
+    key_opportunities: list[str]
+    concept_suggestions: list[dict]
+    reasoning: Optional[str]
+    data_quality: DataQuality
+    market_regime: Optional[MarketRegime]     # Level 0 输出
+    llm_refinement_used: bool
+    ema_baseline: Optional[float]
+    confirmed_sectors: list[SectorIntel]      # Level 1 板块情报
+```
+
+**MarketRegime**：
+```python
+class MarketRegime:
+    regime: str                  # "bull" / "bear" / "transition"
+    risk_budget: float           # [0.2, 0.8]
+    adx_value: Optional[float]
+    cross_index_consistency: float
+    market_direction: str        # "普涨" / "分化" / "普跌"
+    mainline_count: int
+    institutional_score: float
+    news_impact_score: float
+    fear_greed: float
+    sentiment_stage: str
+    sentiment_momentum: float
+    macro_overlay: str
+```
+
+**SectorIntel**：
+```python
+class SectorIntel:
+    sector_name: str
+    sector_code: str
+    sector_type: str              # "concept" / "industry"
+    sector_role: str              # "mainline" / "ambush" / "independent"
+    mainline_tier: Optional[str]  # S / A / B
+    mainline_quality: Optional[str]
+    mainline_days: Optional[int]
+    tech_score: float             # [0, 100]
+    tech_detail: str
+    capital_check: str            # "aligned" / "neutral" / "divergent"
+    capital_detail: str
+    news_check: str               # "catalyzed" / "neutral" / "negative"
+    news_detail: str
+    sentiment_check: str          # "high" / "medium" / "low"
+    sentiment_detail: str
+    lifecycle: Optional[LifecycleInfo]
+    composite_score: float        # [0, 100]
+    confidence: float             # [0, 1]
+    classification: str           # "confirmed" / "divergent" / "watch" / "avoid" / "speculative"
+    reasoning: str
+```
+
+#### 2.6.10 LLM 调用汇总
+
+| 调用点 | 触发条件 | 用途 | 降级策略 |
+|--------|---------|------|---------|
+| `_llm_refine_sectors()` | 总是 | 板块情报精炼 | 保持原始分类 |
+| `_simplified_news_override()` | 条件（policy+high+source_count≥3+SYSTEMIC_KEYWORDS） | 消息面覆盖 | 返回 None |
+
 ---
 
-## 6. 复用策略
+## 3. Phase 2: 统一决策节点
 
-### 6.1 直接调用（核心服务）
+**职责**：基于 Phase 1 输出，生成交易建议（买/卖/持有 + 仓位 + 止损）
 
-以下服务直接调用，不包装成 Tool：
+**文件**：`src/got/nodes/portfolio_decision.py`
 
-| 服务 | 用途 | 调用方式 |
-|------|------|---------|
-| `DataFetcher` | 获取 K 线、指数、资金流向、龙虎榜、ETF申赎 | 直接调用 |
-| `SectorRotationService` | 板块轮动分析 | 直接调用 |
-| `ForumSentimentService` | 雪球舆情采集 | 直接调用 |
-| `NewsService` | 新闻采集（政策/行业/公司/国际） | 直接调用 |
-| `THSScreenerService` | 同花顺问财选股 | 直接调用 |
-| `TechnicalIndicatorService` | 技术指标评分 | 直接调用 |
-| `StockScreenerPipeline` | 选股流水线 | 直接调用 |
-| `PortfolioService` | 持仓管理 | 直接调用 |
+**架构评审**（2026-08-03）：
+- 原串行设计（持仓判断 → 选股 → 建议）存在循环依赖
+- 改为统一决策节点（3 Step 封装在 1 个节点，1 次 LLM 调用）
+- 学术依据：FINCON (NeurIPS 2024), RAPTOR (NeurIPS 2025)
 
-**理由：** 这些服务的输入输出已经是结构化数据，直接调用效率最高。
+### 3.1 5 步流水线
 
-### 6.2 包装成 Tool（复杂分析）
+```
+Step 1: 风险评估 (L146-228) → 约束设定
+Step 2: 统一打分 (L315-520, L1206-1336) → 持仓+候选股一起评
+Step 3: 组合优化 (L1340-1514) → 规则驱动仓位分配
+Step 4: 轮动检测 + 拥挤检查 (L109-112) → 吃鱼身+高切低策略
+Step 5: LLM 精炼 (L1518-1611) → 生成可追溯推理总结
+```
 
-以下场景包装成 LLM 可调用的 Tool：
+### 3.2 Step 1: 风险评估
 
-| Tool | 输入 | 输出 | 用途 |
-|------|------|------|------|
-| `analyze_market` | 指数数据 | 市场趋势判断 | 大盘分析节点 |
-| `analyze_sector` | 板块数据 + 市场背景 | 强势板块列表 | 板块分析节点 |
-| `analyze_capital_flow` | 资金数据 + 市场背景 | 资金流向判断 | 资金面分析节点 |
-| `analyze_news` | 新闻数据 + 市场背景 | 事件影响评估 | 消息面分析节点 |
-| `analyze_sentiment` | 舆情 + 资金流 + 新闻 | 情绪评分 | 情绪分析节点 |
-| `aggregate_contexts` | 多维度分析结果 | 综合研判 | 聚合节点 |
-| `judge_portfolio` | 持仓 + 市场背景 | 调整建议 | 持仓判断节点 |
-| `score_stocks` | 候选股 + 市场背景 | 评分列表 | 选股评分节点 |
-| `generate_suggestions` | 评分 + 持仓 | 交易建议 | 交易建议节点 |
+**方法**：`_assess_risk()`
 
-**理由：** 这些节点需要 LLM 推理，包装成 Tool 可以让 LLM 灵活调用。
+**输出约束**：
+- **position_limit**：从 `unified.final_position_limit` 提取，经回撤缩放调整
+- **stop_loss_threshold**：基于 market_regime 动态调整
+  - bear → -5%, transition → -7%, bull → -10%
+- **sector_exposure_limits**：动态计算（Shen 2026 + Bayesian Kelly + Conviction-Tier）
+  - 公式：`base × regime乘数 × role乘数 × confidence`
+  - 效果：bull+主线+高确信 ≈ 36%，bear+埋伏 ≈ 5%
+- **risk_budget**：从 `unified.market_regime.risk_budget` 映射 [0.03, 0.08]
+
+**回撤缩放逻辑**：
+```python
+0-5% 回撤: multiplier = 1.0
+5-10% 回撤: 线性减到 75%
+10-15% 回撤: 75% → 50%
+>15% 回撤: 固定 50%
+最低保留 20% 仓位
+```
+
+### 3.3 Step 2: 统一打分
+
+**方法**：`_score_holdings()` + `_score_candidates()`
+
+**持仓评分**：
+- 五维打分：资金面(30%) + 消息面(20%) + 板块强度(20%) + 技术面(15%) + 风险面(15%)
+- 资金面/消息面：复用 `stock_screener._score_capital()` 和 `_score_news()`
+- 板块强度：从 `sector_context` 获取，利用 Node 6 v3 的 4 维验证调整
+- 技术面：优先使用 `TechnicalIndicatorService` 真实指标，降级为 P&L 代理
+- 动作建议：生命周期驱动（launch/acceleration=鱼身持有，mature_exhausted=清仓）
+
+**候选股评分**：
+- 调用 `stock_screener._extract_got_universe()` 提取候选池
+- 调用 `stock_screener._filter_got_finalists()` 执行 5 轮漏斗筛选
+- 重新计算综合评分（用板块级别评分替代个股级别评分）
+- 使用生命周期优先级排序（而非单纯按 composite_score）
+
+**板块情报调整**：
+```python
+classification: confirmed +10(主线)/+5(埋伏), avoid -20
+capital_check: aligned +5, divergent -10
+news_check: catalyzed +5, negative -10
+sentiment_check: high +3, low -5
+```
+
+### 3.4 Step 3: 组合优化
+
+**方法**：`_allocate()`
+
+**流程**：
+1. **生成卖出建议**：根据 `action_recommendation` 决定 sell/reduce/hold
+2. **计算买入预算**：
+   - 可用资金 = 现有现金 + 卖出释放的资金
+   - 高切低策略：即使仓位已达标，也用卖出释放资金的 80% 买入新股
+3. **生成买入建议**：
+   - 最多买 3 只
+   - 差异化仓位：主线仓标准止损(-7%)，埋伏仓缩小 45% + 更紧止损(-5%)
+
+### 3.5 Step 4: 轮动检测 + 拥挤检查
+
+**方法**：`_detect_rotation_opportunity()` + `_check_family_crowding()`
+
+**轮动时机**： sentiment_momentum 由负转正 + 板块处于 launch/acceleration 阶段
+
+**拥挤检查**：同一主线家族内持仓过多 → 警告
+
+### 3.6 Step 5: LLM 精炼
+
+**方法**：`_llm_refinement()`
+
+**次数**：1 次（仅用于精炼总结）
+
+**Prompt**：包含风险评估、持仓盈亏、Top 5 评分、初步分配建议
+
+**输出**：300 字以内的推理总结（整体决策理由 + 逐只持仓分析）
+
+### 3.7 输出 Schema
+
+```python
+class PortfolioDecision:
+    status: str                           # "normal"
+    risk_assessment: PortfolioRiskAssessment
+    unified_scoring: list[UnifiedScoringResult]  # 持仓+候选股统一评分
+    allocation: list[TradeAllocation]     # 交易建议
+    summary: str                          # 操作总结
+    warnings: list[str]                   # 风险提示
+    reasoning: str                        # LLM 推理总结
+    rotation_signals: list[dict]          # 轮动建议
+    crowding_warnings: list[dict]         # 家族拥挤警告
+```
 
 ---
 
-## 7. MVP 规划
+## 4. GOT 选股系统
 
-### 7.1 Phase 1：跑通数据流（2-3 天）
+**职责**：基于 Phase 1 GOT 输出，从主线/埋伏板块成分股中精选 Top 2-3 只，用于波段操作（持仓周期约 2 周）
 
-**目标：** 验证"大盘→板块→资金面→消息面→情绪→聚合"串行链能跑通。
+**文件**：`src/services/stock_screener.py`
 
-**任务：**
-1. 定义所有节点的输入输出 Schema（本文档已完成）
-2. 实现"大盘分析"节点（mock 数据）
-3. 实现"板块分析"节点（mock 数据）
-4. 实现"资金面分析"节点（mock 数据）
-5. 实现"消息面分析"节点（mock 数据）
-6. 实现"情绪分析"节点（mock 数据）
-7. 实现"聚合节点"（mock 数据）
-8. 串联六个节点，打印输出
+### 4.1 run_got_mode() 完整流程
 
-**验收标准：**
-- 能跑通完整流程
-- 输出格式符合 Schema
-- 聚合节点能检测维度间矛盾
+```
+1. 加载 GOT 上下文 (L909-949)
+2. 提取主线/埋伏板块成分股 (L951-1047)
+3. 执行 5 轮漏斗筛选 (L1166-1258)
+4. 构建输出 + 保存结果 (L894-897)
+```
 
-### 7.2 Phase 2：接入真实数据（2-3 天）
+### 4.2 _load_got_context()
 
-**目标：** 用真实数据替换 mock 数据。
+**加载文件**：
+- 优先：`data/got_daily/YYYYMMDD/` 目录下的 6 个节点 JSON
+  - market.json, sector.json, capital.json, news.json, sentiment.json, unified.json
+- 降级：`data/aggregator_contexts/previous_context_YYYYMMDD.json`（仅 unified）
 
-**任务：**
-1. 接入 `DataFetcher` 获取指数数据
-2. 接入 `SectorRotationService` 获取板块数据
-3. 接入 `ForumSentimentService` 获取舆情数据
-4. 调优 LLM Prompt
+### 4.3 _extract_got_universe()
 
-**验收标准：**
-- 能输出真实的市场分析报告
+**提取逻辑**：
+1. 识别"兜底填充"板块并排除
+2. 展开 MainlineGroup → 成员板块
+3. 从达标的主线/埋伏板块获取成分股
+4. 去重（同一股票可能在多个板块）
 
-### 7.3 Phase 3：接入持仓和选股（2-3 天）
+### 4.4 _get_sector_constituents_filtered() DDE 策略
 
-**目标：** 实现后半段流水线。
+**主线板块**（active_mainline）：
+```sql
+1个交易日前的dde大单净量>=0.8%，近2个交易日的dde大单净量>=0.8%
+```
 
-**任务：**
-1. 实现"持仓判断"节点
-2. 实现"选股评分"节点
-3. 实现"交易建议"节点
-4. 生成最终报告
+**埋伏板块**（ambush）：
+```sql
+近5个交易日的dde大单净量合计>0
+```
 
-**验收标准：**
-- 能输出完整的交易建议
+**行业过滤**：
+- 概念→行业关键词映射（防止蹭概念的票）
+- 例："数据要素" → ["计算机", "软件", "数据处理", ...]
 
-### 7.4 Phase 4：优化和测试（持续）
+### 4.5 5 轮漏斗筛选
 
-**目标：** 调优规则、测试准确性。
+```
+轮次 1: 信号过滤 → 排除衰竭板块
+轮次 2: 资金面评分 Top 20 → DDE + 板块资金流
+轮次 3: 波段技术确认 Top 15 → MA20/布林带/RSI/MACD
+轮次 4: 风险排雷 Top 8 → RSI>80(-30), 5日涨幅>20%(-25), 波动率>0.05(-15)
+轮次 5: 板块分散 Top N → 每个板块最多 1 只
+```
 
-**任务：**
-1. 调优规则引擎的阈值
-2. 回测历史数据，验证准确率
-3. 收集用户反馈，迭代优化
+### 4.6 _score_capital() 实际维度和权重
+
+**维度 1**：DDE 大单净量百分位 (0-50分)
+
+**维度 2**：板块资金流百分位 (0-50分)
+
+**总计**：0-100分
+
+### 4.7 _score_news() 实际逻辑
+
+**流程**：
+1. **LLM 语义匹配**：
+   - 将 Node 4 事件 + CONCEPT_UNIVERSE 板块名列表交给 LLM
+   - LLM 输出：每个受影响板块的 sentiment × relevance
+   - 同一板块多事件取绝对值最大的
+2. **降级方案**：子串匹配（用 CONCEPT_UNIVERSE 展开）
+3. **评分**：基础分 40 + 板块情感分 × 60
+
+**⚠️ 重要澄清**：不是"每只候选股 1 次 LLM"，而是"1 次 LLM 评 100 板块 + 字典查找"
+
+### 4.8 _score_technical_wave() 波段指标
+
+**8 个维度**：
+1. **MA20 趋势** (20分)：偏离度 12 + 斜率 8
+2. **布林带位置** (15分)：最优区间 0.5~0.85
+3. **RSI12** (10分)：50-70 最优
+4. **20日突破** (10分)：突破程度连续
+5. **量比** (10分)：1.5-3.0 最优
+6. **换手率** (10分)：3%-8% 最优
+7. **MACD 状态** (10分)：金叉/死叉/方向 + DIF 力度
+8. **均线排列** (15分)：MA 间距连续
+
+### 4.9 _score_risk() 排雷逻辑
+
+**扣分项**：
+- RSI > 80（超买）：-30分
+- 近 5 日涨幅 > 20%：-25分
+- 波动率 > 0.05：-15分
+
+### 4.10 _compute_got_composite_score() 权重分配
+
+```python
+composite = (
+    capital * 0.30 +      # 资金面
+    news * 0.20 +         # 消息面
+    sector_score * 0.20 + # 板块强度
+    tech_score * 0.15 +   # 技术面(波段)
+    risk_score * 0.15     # 风险因子(反向)
+)
+```
+
+### 4.11 输出格式和存储位置
+
+**输出**：`ScreenerRunResult` 包含 `List[ScreenerStock]`
+
+**存储**：`data/got_screener/YYYYMMDD.json`
 
 ---
 
-## 8. 待讨论事项
+## 5. 数据层架构
 
-以下事项需要在实现过程中逐步明确：
+### 5.1 DataFetcherManager 故障切换机制
 
-1. **节点间数据传递：** 每个节点的具体输出字段，下游如何使用？
-2. **规则引擎阈值：** 强制减仓/止损的具体数值？
-3. **评分权重：** 五维综合评分的权重是否需要动态调整？
-4. **LLM 降级策略：** LLM 不可用时，是否用规则引擎替代？
-5. **异常处理：** 数据获取失败时，如何处理？
+**文件**：`data_provider/base.py`
+
+**优先级链**：
+```python
+_DAILY_MARKET_FETCHER_SUPPORT = {
+    "MootdxFetcher": {"cn"},           # P0, TCP 7709
+    "EfinanceFetcher": {"cn"},         # P1
+    "AkshareFetcher": {"cn", "hk"},    # P1
+    "TushareFetcher": {"cn", "hk"},    # P2
+    "PytdxFetcher": {"cn"},            # P2
+    "BaostockFetcher": {"cn"},         # P3
+    "YfinanceFetcher": {"cn", "hk", "us"},  # P4
+    "LongbridgeFetcher": {"hk", "us"},      # P5
+    "FinnhubFetcher": {"us"},          # P2
+    "AlphaVantageFetcher": {"us"},     # P3
+}
+```
+
+**故障切换策略**：
+1. 美股指数/美股股票直接路由到 YfinanceFetcher
+2. A 股指数跳过 MootdxFetcher 和 EfinanceFetcher（间歇失败/反爬严格）
+3. 从最高优先级数据源开始尝试
+4. 捕获异常后自动切换到下一个
+5. 记录每个数据源的失败原因（record_provider_run）
+6. 所有数据源失败后抛出 DataFetchError
+
+**美股专用路由**：
+```python
+# 配置长桥凭据后
+prefer_lb: Longbridge → Finnhub → AlphaVantage → Yfinance
+# 未配置长桥
+default: Finnhub → AlphaVantage → Yfinance → Longbridge
+# 美股指数
+index: Yfinance → Finnhub
+```
+
+### 5.2 mootdx_fetcher.py TCP 数据获取
+
+**核心特点**：
+- 优先级：P0（最高）
+- 协议：TCP 7709（通达信行情服务器）
+- 优势：TCP 协议不受 HTTP 反爬影响，免费、无需 Token
+- 支持市场：仅 A 股（沪深）
+
+**关键策略**：
+1. **BESTIP 自动探测**：`Quotes.factory(market='std', timeout=10)`
+2. **连接冷却**：失败后 15 秒内跳过
+3. **指数退避重试**：使用 tenacity 库
+4. **不支持的市场**：直接抛异常触发降级
+
+### 5.3 em_rate_limiter.py 限流参数
+
+**限流参数**：
+```python
+EM_MIN_INTERVAL = 1.0        # 最小请求间隔（秒）
+EM_JITTER_MIN = 0.1          # 抖动下限
+EM_JITTER_MAX = 0.5          # 抖动上限
+EM_TIMEOUT = 15              # 请求超时（秒）
+```
+
+**限流策略**：
+1. **串行化**：`threading.Lock` 保证同一时刻只有一个请求在执行
+2. **最小间隔**：1.0s + 随机 0.1-0.5s 抖动
+3. **连接池**：`HTTPAdapter(maxsize=5)` 复用 TCP 连接
+4. **自动重试**：`urllib3.Retry(total=3, 指数退避, 429/5xx 强制重试)`
+5. **UA 随机化**：5 个浏览器 UA 轮换
+
+**统一入口**：`em_get()` / `em_post()`
+
+### 5.4 东财反爬补丁
+
+**文件**：`src/patches/eastmoney_patch.py`
+
+**核心实现**：
+1. **全局替换**：`requests.Session.request = patched_request`
+2. **目标域名**：fund.eastmoney.com, push2.eastmoney.com, push2his.eastmoney.com
+3. **NID 令牌**：
+   - 向 `https://anonflow2.eastmoney.com/backend/api/webreport` 请求
+   - 缓存 20 秒，失败后缓存 5 分钟
+   - 生成随机 UUID MD5 + SHA256 st_nvi
+4. **随机 UA**：`fake_useragent.UserAgent().random`
+5. **Referer**：push2his 需要 `https://quote.eastmoney.com/`
+6. **随机休眠**：1-4 秒
 
 ---
 
-## 9. 附录
+## 6. 编排器与执行流程
 
-### 9.1 相关文档
+**文件**：`src/got/orchestrator.py`
 
-- 选股系统设计：`docs/custom/screener_design.md`
-- 项目总览：`CLAUDE.md`
+### 6.1 两路并行的实际调度方式
 
-### 9.2 参考代码
+**执行流程**：
+```
+1. 交易日检查 (L65-66)
+2. 并行启动两路 (L72-79):
+   - 技术分析路: Node 1 → Node 2 → Node 3 (串行依赖)
+   - 独立数据路: Node 4 ‖ Node 5 (并行)
+3. 两路都完成后 → Node 6 聚合 (L92-100)
+4. 自动存档 (L105-123)
+5. Phase 2 统一决策 (L125-156)
+```
 
-- 板块轮动：`src/services/sector_rotation.py`
-- 舆情服务：`src/services/forum_sentiment.py`
-- 选股流水线：`src/services/stock_screener.py`
-- 技术指标：`src/services/technical_indicator.py`
-- 持仓管理：`src/services/portfolio.py`
+**技术分析路**：
+```python
+market_ctx = await self.market_node.run()
+sector_ctx = await self.sector_node.run(market_context=market_ctx)
+capital_ctx = await self.capital_node.run(market_context=market_ctx, sector_context=sector_ctx)
+```
+
+**独立数据路**：
+```python
+news_ctx, sentiment_ctx = await asyncio.gather(
+    self.news_node.run(),
+    self.sentiment_node.run(),
+)
+```
+
+### 6.2 Phase 1 → Phase 2 的衔接点
+
+**触发时机**：Phase 1 聚合完成后，且 `use_mock=False`（真实数据）
+
+**衔接方式**：
+```python
+decision_node = PortfolioDecisionNode(use_mock=False)
+decision = await decision_node.run(
+    unified_context=unified,
+    market_context=market_ctx,
+    sector_context=sector_ctx,
+    capital_context=capital_ctx,
+    news_context=news_ctx,
+    sentiment_context=sentiment_ctx,
+)
+```
+
+### 6.3 archive 的触发时机
+
+**Phase 1 存档**：
+- 触发：`use_mock=False` 且 Phase 1 完成
+- 位置：`data/got_daily/YYYYMMDD/`
+- 包含：6 个节点 JSON + unified.json
+
+**Phase 2 存档**：
+- 触发：Phase 2 完成
+- 调用：`archive_phases2(decision, run_date=target_date)`
+
+### 6.4 错误处理策略
+
+**Phase 1 错误**：
+- 两路并行失败：抛出异常，终止流程
+- 存档失败：`logger.warning`，不阻断主流程
+
+**Phase 2 错误**：
+- Phase 2 失败：`logger.warning`，不阻断 Phase 1
+- Phase 2 存档失败：`logger.warning`，不阻断主流程
+
+---
+
+## 7. 历史档系统
+
+**文件**：`src/got/archive.py`
+
+### 7.1 目录结构
+
+```
+data/got_daily/YYYYMMDD/
+├── market.json          # Node 1 输出
+├── sector.json          # Node 2 输出
+├── capital.json         # Node 3 输出
+├── news.json            # Node 4 输出
+├── sentiment.json       # Node 5 输出
+├── unified.json         # Node 6 输出
+├── reasoning.md         # 所有节点的 LLM reasoning 汇总
+└── meta.json            # 运行元数据（耗时/数据质量/LLM模型/git commit）
+```
+
+### 7.2 存档内容
+
+每个 JSON = `ctx.model_dump(mode="json")` 全量存档（含 None 字段，方便分析数据缺失模式）
+
+**reasoning.md**：汇总所有 6 个节点的 LLM 推理文本（人读友好）
+
+**meta.json**：记录运行元数据（耗时 / 数据质量摘要 / 缺失维度 / LLM 模型 / git commit）
+
+### 7.3 保留策略
+
+永久保留（单档 ~50KB，一年 ~12MB）
+
+`data/got_daily/` 已被 `.gitignore` 的 `/data/` 规则覆盖
+
+---
+
+## 附录 A: 跨节点 LLM 调用汇总
+
+| 节点 | 调用数 | 调用点 | 降级策略 |
+|------|--------|--------|---------|
+| Node 1 | 1 次 | reasoning | 规则拼接 |
+| Node 2 | 1 次 | reasoning | 规则拼接 |
+| Node 3 | 1 次 | reasoning | 规则拼接 |
+| Node 4 | 4 次 | 事件提取 + 概念发现 + 风险总结 + reasoning | 风险→规则从负面事件提取；reasoning→规则拼接 |
+| Node 5 | 1 次 | reasoning + hot_topics | 规则拼接 |
+| Node 6 | 2 次（1 次总是 + 1 次条件） | 板块精炼（总是）+ 消息面覆盖（条件） | 板块精炼失败→保持原始分类；覆盖失败→返回 None |
+| Phase 2 | 1 次 | 精炼总结 | 无（失败则 decision.reasoning 为空） |
+| **总计** | **11 次** | | |
+
+---
+
+## 附录 B: 关键常量速查
+
+### Node 1
+- **K 线长度**：250 日
+- **score→trend 阈值**：±0.3（收窄，非旧版 ±0.5）
+- **confidence 下限**：0.05
+
+### Node 2
+- **启动信号硬门槛**：20日突破+0.5%、量能 1.5x、站上 MA20
+- **过热前置条件**：距 60日高点 ≤10%
+- **主线框出框阈值**：score < 50
+- **家族聚类阈值**：r > 0.65
+
+### Node 3
+- **板块资金流归一化**：概念 200亿→1.0，行业 100亿→1.0
+- **DDE 归一化**：1000亿→1.0
+- **态度阈值**：±0.3
+
+### Node 4
+- **去重阈值**：0.45（原始新闻）、0.35（跨源确认）、0.6（持久化）
+- **评分权重**：high=2.0, medium=1.0, low=0.0
+- **多源确认奖励**：source_count≥3 → ×1.5
+- **影响阈值**：±0.15
+
+### Node 5
+- **反身性阈值**：euphoria>0.5, optimism>0.2, pessimism<-0.2, capitulation<-0.5
+- **恐贪指数**：(score+1)/2
+- **分歧度反向信号**：dispersion<0.35 AND (mean>70 OR mean<30)
+
+### Node 6
+- **regime 阈值**：bull>0.3, bear<-0.3, else transition
+- **仓位上限**：clip(0.0, 0.8)
+- **EMA_ALPHA**：0.3
+- **冷启动样本数**：5
+
+### Phase 2
+- **止损阈值**：bear=-5%, transition=-7%, bull=-10%
+- **回撤缩放**：0-5%=1.0, 5-10%=75%, 10-15%=50%, >15%=50%, 最低20%
+- **最多买入**：3 只
+- **埋伏仓缩小**：45%
+
+### GOT 选股
+- **DDE 阈值**：主线>=0.8%, 埋伏>0(5日累计)
+- **风险阈值**：RSI>80(-30), 5日涨幅>20%(-25), 波动率>0.05(-15)
+- **权重分配**：资金30% + 消息20% + 板块20% + 技术15% + 风险15%
+- **每板块最多**：1 只
+
+### 数据层
+- **Mootdx 冷却**：15 秒
+- **东财限流**：1.0s + 0.1-0.5s 抖动
+- **东财重试**：3 次指数退避
+- **NID 缓存**：20 秒，失败 5 分钟
+
+---
+
+## 附录 C: 设计文档 vs 实际代码差异总结
+
+| 项目 | 设计文档（旧） | 实际代码（新） |
+|------|--------------|--------------|
+| **Node 1 评分维度** | 5 维 + ADX 动态调权 | 4 维（无 market_breadth），ADX 仅作元信息透传 |
+| **Node 1 仓位上限** | 离散映射 (bullish→1.0/neutral→0.5/bearish→0.0) × tf_confidence × 极端风险折扣 | 连续函数：波动率调整(target_vol/realized_vol) × 状态缩放(tf×0.4+cross×0.3+direction×0.3) |
+| **Node 1 score→trend 阈值** | ±0.5 | **±0.3**（收窄） |
+| **Node 2 强度评分** | 5 维 clip 归一化 | **4 维截面百分位排名**（无 capital_flow） |
+| **Node 2 启动信号** | 5 维软打分 | **6 维**（新增 ad_confirmation 15%权重），且阈值 regime-dependent |
+| **Node 2 过热信号** | 4 条件二元触发 | **6 信号渐进式加权** severity（MACD背离+量能背离+宽度+换手+A/D分配+天量滞涨）|
+| **Node 2 板块发现** | 硬编码 ~30 个 | **两阶段动态发现**：stock_all() 全量 → 快筛 → Top N + registry 保底 |
+| **Node 2 状态判定** | 8 分支优先级链（P0~P6） | **RRG 四象限**（Leading/Improving/Weakening/Lagging），5 分支，启动+过热+持续强势+高位派发统一 |
+| **Node 2 生命周期** | 天数驱动（LIFECYCLE_THRESHOLDS） | **RRG 象限映射**（Leading→acceleration, Improving→launch, Weakening→mature, Lagging→late_stage） |
+| **Node 2 启动/过热信号** | 状态驱动器 | **降级为诊断指标**（启动 quality_score 供分级用，过热 severity 供拥挤预警用） |
+| **Node 2 框系统** | 无 | **SQLite 持久化**的主线框（个体级进出管理）；埋伏板块不持久化，每日 state 实时判定 |
+| **Node 2 家族聚类** | 硬编码关键词 | **90日收益相关性矩阵 + 层次聚类**(complete linkage, r>0.65) |
+| **Node 3 维度数** | 5 维（北向/龙虎榜/ETF/融资/大宗） | **3 维**（板块资金流/DDE/北向） |
+| **Node 3 权重分配** | 0.25/0.25/0.25/0.15/0.10 | **0.50/0.35/0.15** |
+| **Node 4 数据源** | 搜索型（SearchService） | **7 源推送型**（新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺热榜） |
+| **Node 4 LLM 调用** | 3 次 | **4 次**（事件提取+概念发现+风险总结+reasoning） |
+| **Node 5 评分维度** | 3 维（雪球/宽度/搜索） | **6 维**（东财/宽度/NGA/搜索/详情/动量） |
+| **Node 5 核心数据源** | 雪球热榜 | **东财千股千评**（雪球降级为备用） |
+| **Node 6 架构** | 10 对硬编码矛盾 + 3 次 LLM | **3 层分级 GOT**（L0 全局/L1 板块 mini-GOT/L2 组合决策）+ 2 次 LLM |
+| **Node 6 矛盾检测** | 10 对硬编码 | **2 种自动检测规则**（regime_vs_sectors + family_capital_mismatch） |
+| **Node 6 仓位日限幅** | ±0.2 | **已移除**（三层仓位系统已提供平滑过渡） |
+| **Phase 2 架构** | 串行（持仓判断→选股→建议） | **统一决策**（风险评估→统一打分→组合优化→轮动检测→LLM精炼） |
+| **选股消息面** | 每只候选股 1 次 LLM | **1 次 LLM 评 100 板块 + 字典查找** |
+| **选股评分权重** | 资金30% + 消息20% + 板块20% + 技术15% + 风险15% | **同左**（已优化） |
+
+---
+
+## 附录 D: 学术依据
+
+| 设计决策 | 论文依据 |
+|---------|---------|
+| Node 2 启动信号 Regime-Dependent 阈值 | Mokhtarian et al. 2024; Alexiou & Tyagi 2020; Brock et al. 1992 (band filter); IEEE 2026 (<1.5x 量能视为假突破) |
+| Node 2 A/D Line 确认 | A/D Line 确认突破真伪（65-72% 准确率） |
+| Node 2 家族聚类 | 层次聚类 (complete linkage) |
+| Node 2 RRG 四象限状态判定 | Minervini 2016 (Relative Rotation Graph); Janssen 2020 (RS-Momentum 领先 RS-Ratio) |
+| Node 5 6 维置信度加权 | fffinstill Fear & Greed Index; 国金证券舆情选股; 清华投资者情绪 |
+| Node 5 情绪分歧度 | 国金证券研究：低分歧+极端均值 → 反向信号 |
+| Node 6 分层 GOT | ICLR 2025: Top-Down Sector Allocation; FINCON NeurIPS 2024: Manager-Analyst 层级; FinCoT ACL 2025: 推理结构匹配领域工作流 |
+| Phase 2 统一决策 | FINCON NeurIPS 2024; RAPTOR NeurIPS 2025 (组合构建是优化问题，不是顺序决策流水线) |
+| Phase 2 板块暴露限制 | Shen 2026 + Bayesian Kelly + Conviction-Tier |
+| Phase 2 回撤缩放 | Moreira & Muir (2017), AlgoKing "Dynamic Position Sizing with Kelly + Regime" |
+
+---
+
+**文档结束**

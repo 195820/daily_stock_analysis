@@ -102,7 +102,7 @@ class MarketContext(BaseModel):
     tech_growth: TechGrowthSignal
     mid_small_cap: StyleSignal
     large_cap: StyleSignal
-    position_limit: float = Field(..., ge=0.0, le=1.0)
+    position_limit: float = Field(..., ge=0.0, le=1.5, description="仓位上限（新版：0.2 ~ 1.5）")
     confidence: float = Field(..., ge=0.0, le=1.0)
     key_levels: KeyLevels
     reasoning: Optional[str] = None
@@ -115,14 +115,56 @@ class MarketContext(BaseModel):
         default=None,
         description="市场宽度（涨跌家数）: {up_count, down_count, limit_up_count, limit_down_count}",
     )
+    # 三层仓位系统中间值（用于调试和透明度）
+    realized_volatility: Optional[float] = Field(
+        default=None,
+        description="实现波动率（年化，用于波动率调整）",
+    )
+    vol_adjusted_position: Optional[float] = Field(
+        default=None,
+        description="波动率调整后仓位（Layer 1 输出）",
+    )
+    regime_scale: Optional[float] = Field(
+        default=None,
+        description="状态缩放因子（Layer 2 输出，0.2 ~ 1.0）",
+    )
 
 
 # =============================================================================
 # Node 2: 板块分析
 # =============================================================================
 
+class RRGQuadrant(BaseModel):
+    """RRG 四象限分类（Node 2 状态机核心）。
+
+    RS-Ratio: 板块 strength_score 在截面中的百分位排名（趋势强度）
+    RS-Momentum: RS-Ratio 的时序变化率（动量方向）
+
+    ⚠️ rs_ratio / rs_momentum 为 3 日 EMA 平滑值（2026-08-17 状态机校准）：
+    - 日频截面排名受单日噪音影响大（StockCharts: 日频 RRG 是周频趋势的"短期 hiccup"）
+    - EMA 吸收单日截面挤压，防止黄金 08-13 类"单日被其他板块挤压→一夜蒸发"
+    - 原始值保留在 rs_ratio_raw/rs_momentum_raw 供诊断
+
+    四象限：
+    - leading:     ratio≥0.5, momentum≥0.5 → 趋势强且加速 → active_mainline
+    - improving:   ratio<0.5,  momentum≥0.5 → 趋势弱但改善 → 埋伏/启动候选
+    - weakening:   ratio≥0.5, momentum<0.5  → 趋势强但减速 → 高位降温/衰竭
+    - lagging:     ratio<0.5,  momentum<0.5  → 趋势弱且恶化 → neutral
+
+    论文依据：
+    - Minervini 2016: Relative Rotation Graph 四象限
+    - Janssen 2020: RS-Momentum 领先 RS-Ratio（早期预警）
+    - Optuma 2万次旋转统计: Leading 92% 转 Weakening → 主线只能先降温/衰竭，无 主线→埋伏 边
+    """
+    rs_ratio: float = Field(..., ge=0.0, le=1.0, description="RS-Ratio 3日EMA: 趋势强度百分位")
+    rs_momentum: float = Field(..., ge=0.0, le=1.0, description="RS-Momentum 3日EMA: 动量百分位")
+    quadrant: str = Field(..., description="leading / improving / lagging / weakening")
+    rs_ratio_raw: Optional[float] = Field(default=None, description="RS-Ratio 当日原始值（未平滑，诊断用）")
+    rs_momentum_raw: Optional[float] = Field(default=None, description="RS-Momentum 当日原始值（未平滑，诊断用）")
+
+
 class LaunchSignal(BaseModel):
-    """启动信号"""
+    """启动信号（Node 2 v3 降级为诊断指标，不再驱动状态）"""
     triggered: bool
     level: str = Field(..., description="strong_launch / weak_launch / sustained / none")
     score: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -136,11 +178,35 @@ class LifecycleInfo(BaseModel):
     thresholds: dict[str, int] = Field(default_factory=dict)
 
 
+class OverheatSeverity(BaseModel):
+    """过热严重度（渐进式评分，替代旧的 dict[str, bool]）。
+
+    severity 计算：加权 sum of all signals（0~1）
+    level 判定：
+      severity > 0.5 → "exhausted"（踢出主线框）
+      severity 0.3~0.5 → "warning"（过热警告，降 confidence）
+      severity < 0.3 → "normal"
+
+    论文依据：
+    - MACD 背离渐进式（Kang 2023）
+    - A/D Line distribution（72% 重大下跌前出现）
+    - 天量滞涨 = 分配信号（Hsu 2016）
+    """
+    divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="MACD 背离强度（渐进式）")
+    volume_divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="量能背离强度")
+    breadth_score: float = Field(default=0.0, ge=0.0, le=1.0, description="宽度极端强度")
+    turnover_score: float = Field(default=0.0, ge=0.0, le=1.0, description="换手极端强度")
+    ad_distribution: bool = Field(default=False, description="A/D Line 分配信号")
+    volume_stall: bool = Field(default=False, description="天量滞涨信号")
+    severity: float = Field(default=0.0, ge=0.0, le=1.0, description="加权总严重度")
+    level: str = Field(default="normal", description="normal / warning / exhausted")
+
+
 class SectorDetail(BaseModel):
     """板块详情"""
     code: str
     name: str
-    state: str = Field(..., description="active_mainline / exhausted_mainline / ambush / defensive_rotation")
+    state: str = Field(..., description="active_mainline / high_position_cooling / exhausted_mainline / ambush / defensive_rotation / neutral")
     strength_score: float = Field(..., ge=0.0, le=100.0)
     indicators: dict[str, float] = Field(default_factory=dict)
     launch_signal: Optional[LaunchSignal] = None
@@ -154,6 +220,10 @@ class SectorDetail(BaseModel):
     today_change: Optional[float] = Field(
         default=None,
         description="T-0 板块涨跌幅（mootdx 成分股中位数），如 -3.38",
+    )
+    coherence_score: Optional[float] = Field(
+        default=None,
+        description="板块一致性评分（与同簇成员的平均相关性）。>0.7=高一致性, <0.4=噪声/混合概念",
     )
     # 趋势追踪字段（跨日记忆）
     strength_trajectory: Optional[list[float]] = Field(
@@ -171,6 +241,15 @@ class SectorDetail(BaseModel):
     frame_group: Optional[str] = Field(
         default=None,
         description="所属产业主题组名（如 AI产业链 / 黄金 / 华为系）",
+    )
+    overheat_severity: Optional[float] = Field(
+        default=None,
+        ge=0.0, le=1.0,
+        description="过热严重度（0~1）。>0.5=exhausted, 0.3~0.5=warning, <0.3=normal",
+    )
+    rrg: Optional[RRGQuadrant] = Field(
+        default=None,
+        description="RRG 四象限分类（Node 2 v3 状态机核心）",
     )
 
 
@@ -198,6 +277,10 @@ class ThemeFamily(BaseModel):
     )
     member_boards: list[str] = Field(default_factory=list, description="命中的板块名称")
     member_count: int = Field(default=0, description="命中板块数")
+    mixed_driver: bool = Field(
+        default=False,
+        description="家族内是否存在不同驱动逻辑的子群（二次聚类检测到 ≥2 个子簇且子簇间相关性 <0.3）",
+    )
 
 
 class SectorContext(BaseModel):
@@ -207,6 +290,10 @@ class SectorContext(BaseModel):
     exhausted_mainline: list[SectorDetail] = Field(default_factory=list)
     ambush: list[SectorDetail] = Field(default_factory=list)
     defensive_rotation: list[SectorDetail] = Field(default_factory=list)
+    cooling_down: list[SectorDetail] = Field(
+        default_factory=list,
+        description="高位降温（前主线回调但未破位，state=high_position_cooling）— 状态机 2026-08-17 新增",
+    )
     top_by_score: list[SectorDetail] = Field(
         default_factory=list,
         description="评分最高的 N 个板块（参考用，不代表达标）",
@@ -270,6 +357,7 @@ class NewsEvent(BaseModel):
     impact_level: str = Field(..., description="high / medium / low")
     sentiment: str = Field(..., description="positive / negative / neutral")
     affected_sectors: list[str] = Field(default_factory=list)
+    affected_stocks: list[str] = Field(default_factory=list, description="事件中明确提到的个股名称或代码")
     timestamp: Optional[str] = None
     source_count: int = Field(default=1, ge=1)
     source_type: str = Field(default="search", description="cls / eastmoney / cctv / caixin / search")
@@ -372,75 +460,78 @@ class TemporalInconsistency(BaseModel):
 
 
 # =============================================================================
-# Node 6 v2: 聚合中间类型（Phase A 产物）
+# Node 6 v3: 分层 GOT 架构（全局环境 + 板块 mini GOT + 组合决策）
 # =============================================================================
 
-class DimensionSignal(BaseModel):
-    """统一信号空间投影结果（Phase A 内部用）"""
-    name: str = Field(..., description="market / sector / capital / news / sentiment")
-    score: float = Field(..., ge=-1.0, le=1.0, description="统一方向分")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="信号置信度（节点自评，衡量市场方向清晰度）")
-    data_confidence: float = Field(..., ge=0.0, le=1.0, description="数据置信度（数据完整度，用于聚合权重衰减）")
-    status: str = Field(default="normal", description="normal / degraded / failed")
+class MarketRegime(BaseModel):
+    """全局市场环境判断（Level 0 输出）
+
+    使用 5 个节点的全局聚合字段（非板块级字段），判断当前市场"天气"。
+    """
+    regime: str = Field(..., description="bull / bear / transition")
+    risk_budget: float = Field(..., ge=0.0, le=1.0, description="风险预算（决定最大仓位暴露）")
+    # ── 5 个节点的输入汇总 ──
+    adx_value: Optional[float] = Field(default=None, description="Node 1: 趋势强度")
+    cross_index_consistency: float = Field(default=0.0, description="Node 1: 多指数一致性")
+    market_direction: str = Field(default="分化", description="Node 2: 普涨/分化/普跌")
+    mainline_count: int = Field(default=0, description="Node 2: 活跃主线数量")
+    institutional_score: float = Field(default=0.0, description="Node 3: 整体机构态度")
+    news_impact_score: float = Field(default=0.0, description="Node 4: 消息影响")
+    fear_greed: float = Field(default=0.5, description="Node 5: 恐贪指数（0=恐惧, 1=贪婪）")
+    sentiment_stage: str = Field(default="neutral", description="Node 5: 反身性阶段")
+    sentiment_momentum: float = Field(default=0.0, description="Node 5: 情绪动量")
+    # ── 输出 ──
+    macro_overlay: str = Field(default="", description="一句话宏观判断（LLM 或规则生成）")
 
 
-class ConvergenceProfile(BaseModel):
-    """收敛剖面（多维度一致性分析）"""
-    pattern: str = Field(
-        ...,
-        description=(
-            "full_convergence / mild_divergence / strong_divergence "
-            "/ lone_outlier / low_confidence"
-        ),
-    )
-    agreement_score: float = Field(..., ge=0.0, le=1.0, description="0=完全分裂, 1=完全一致")
-    investigate_outlier: bool = Field(
-        default=False,
-        description="Surprising Popularity: 孤立异见置信度异常高时需调查",
-    )
+class SectorIntel(BaseModel):
+    """板块级情报（Level 1 板块 mini GOT 输出）
 
-
-class DimensionContribution(BaseModel):
-    """各维度对最终聚合结果的贡献明细"""
-    name: str
-    score: float = Field(..., description="该维度投影分")
-    confidence: float = Field(..., description="信号置信度（节点自评）")
-    data_confidence: float = Field(..., description="数据置信度（数据完整度）")
-    contribution: float = Field(..., description="对 weighted_score 的贡献值")
-
-
-class AggregationResult(BaseModel):
-    """Phase A 聚合结果"""
-    weighted_score: float = Field(..., ge=-1.0, le=1.0, description="置信度加权方向分")
-    convergence: ConvergenceProfile
-    dimension_contributions: list[DimensionContribution] = Field(default_factory=list)
-    active_count: int = Field(..., description="参与聚合的维度数")
-    failed_count: int = Field(default=0, description="降级的维度数")
-
-
-class ConfirmedSector(BaseModel):
-    """Node 6 四维交叉验证后的板块推荐（Phase 2 直接消费）"""
-    sector_name: str = Field(..., description="板块名称")
-    sector_type: str = Field(..., description="confirmed / divergent / watch / avoid / speculative")
-    action: str = Field(..., description="buy_trend / buy_dip / watch / avoid")
-    position_hint: float = Field(default=0.0, ge=0.0, le=1.0, description="仓位权重 0~1，归一化用")
-
-    # 四维验证结果
+    对每个候选板块做 4 维交叉验证（技术面+资金面+消息面+情绪面），
+    替代旧版 ConfirmedSector，增加 lifecycle 信息和更丰富的细节。
+    """
+    sector_name: str
+    sector_code: str = ""
+    sector_type: str = Field(default="concept", description="concept / industry")
+    # ── 板块角色（主线/埋伏区分）──
+    sector_role: str = Field(default="mainline", description="mainline / ambush / independent")
+    mainline_tier: Optional[str] = Field(default=None, description="S / A / B（仅 mainline，来自 Node 2 MainlineGroup.tier）")
+    mainline_quality: Optional[str] = Field(default=None, description="strong / weak（仅 mainline）")
+    mainline_days: Optional[int] = Field(default=None, description="连续主线天数（仅 mainline）")
+    # ── mini GOT 4 维交叉验证 ──
+    tech_score: float = Field(default=0.0, ge=0.0, le=100.0, description="技术面评分（来自 Node 2）")
+    tech_detail: str = Field(default="", description="技术面详情（lifecycle/tier/trajectory）")
     capital_check: str = Field(default="neutral", description="aligned / neutral / divergent")
     capital_detail: str = Field(default="", description="资金面验证细节")
-    trend_check: str = Field(default="stable", description="rising / stable / declining / cliff_drop")
-    trend_detail: str = Field(default="", description="趋势验证细节（含 trajectory）")
-    environment_check: str = Field(default="neutral", description="supportive / neutral / hostile")
-    environment_detail: str = Field(default="", description="环境验证细节")
     news_check: str = Field(default="neutral", description="catalyzed / neutral / negative")
-    news_detail: Optional[str] = Field(default=None, description="消息催化细节")
+    news_detail: str = Field(default="", description="消息催化细节")
+    sentiment_check: str = Field(default="low", description="high / medium / low（散户热度）")
+    sentiment_detail: str = Field(default="", description="散户热度细节")
+    # ── 生命周期 ─
+    lifecycle: Optional[LifecycleInfo] = Field(default=None, description="生命周期信息（来自 Node 2）")
+    # ── 聚合 ──
+    composite_score: float = Field(default=0.0, ge=0.0, le=100.0, description="综合评分（lifecycle-aware）")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="数据完整度 × 信号一致性")
+    classification: str = Field(
+        default="watch",
+        description="confirmed / divergent / watch / avoid / speculative",
+    )
+    reasoning: str = Field(default="", description="一句话推理")
 
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="综合置信度")
-    reasoning: str = Field(default="", description="一句话逻辑")
+
+class Contradiction(BaseModel):
+    """矛盾（v2：新增 conflict_type 分类）"""
+    pair: str
+    timeframe: str
+    description: str
+    severity: str = Field(..., description="high / medium / low")
+    conflict_type: str = Field(default="opinion", description="factual / temporal / opinion（参考 ConflictRAG）")
+    resolution: Optional[str] = None
+    confidence_adjustment: float = Field(default=0.0)
 
 
 class UnifiedContext(BaseModel):
-    """Node 6 输出：GOT 最终输出"""
+    """Node 6 输出：GOT 最终输出（v3 分层架构）"""
     status: str = Field(..., description="normal / manual_review_required")
     unified_signal: str = Field(..., description="bullish / bearish / neutral / cautious")
     overall_confidence: float = Field(..., ge=0.0, le=1.0)
@@ -455,40 +546,24 @@ class UnifiedContext(BaseModel):
     reasoning: Optional[str] = None
     data_quality: DataQuality = Field(default_factory=DataQuality)
 
-    # ── v2 新增字段（置信度加权聚合） ──
-    convergence_profile: Optional[ConvergenceProfile] = Field(
+    # ── v3 新增：分层 GOT 架构 ──
+    market_regime: Optional[MarketRegime] = Field(
         default=None,
-        description="收敛剖面：多维度一致性分析结果",
-    )
-    weighted_score: Optional[float] = Field(
-        default=None,
-        description="置信度加权方向分（-1~+1）",
-    )
-    dimension_contributions: list[DimensionContribution] = Field(
-        default_factory=list,
-        description="各维度对最终聚合的贡献明细",
+        description="全局市场环境判断（Level 0: 5 个节点聚合字段 → bull/bear/transition）",
     )
     llm_refinement_used: bool = Field(
         default=False,
-        description="是否使用了 LLM 精炼（Phase C）",
+        description="是否使用了 LLM 精炼（板块 narrative）",
     )
     ema_baseline: Optional[float] = Field(
         default=None,
         description="当前 EMA 基线值（用于时间一致性校验）",
     )
-    signal_confidence_avg: Optional[float] = Field(
-        default=None,
-        description="信号置信度均值（各维度节点自评平均，衡量市场方向清晰度）",
-    )
-    insufficient_data: bool = Field(
-        default=False,
-        description="信息充分度不足：信号置信度均值 < 0.5 时置 true，建议空仓观望",
-    )
 
-    # ── Phase D: 四维板块交叉验证 ──
-    confirmed_sectors: list[ConfirmedSector] = Field(
+    # ── 板块情报（Level 1 板块 mini GOT 输出，替代旧 confirmed_sectors） ──
+    confirmed_sectors: list[SectorIntel] = Field(
         default_factory=list,
-        description="四维交叉验证后的板块推荐（资金+趋势+环境+消息），Phase 2 直接消费",
+        description="板块 mini GOT 情报（4 维交叉验证 + lifecycle + 分类），Phase 2 直接消费",
     )
 
 
@@ -515,6 +590,11 @@ class UnifiedScoringResult(BaseModel):
     action_recommendation: str = Field(description="buy_trend/buy_dip/hold/sell/avoid")
     confidence: float = Field(ge=0.0, le=1.0, description="评分置信度")
     reasoning: str = Field(description="一句话理由")
+    # 生命周期字段（用于 Step 3 吃鱼身+高切低策略）
+    lifecycle_phase: Optional[str] = Field(default=None, description="板块生命周期阶段: launch/acceleration/mature/late_stage/mature_exhausted")
+    lifecycle_day: Optional[int] = Field(default=None, description="生命周期已运行天数")
+    overheat_severity: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="过热严重度")
+    family_name: Optional[str] = Field(default=None, description="所属主线家族名称")
 
 
 class TradeAllocation(BaseModel):
@@ -544,3 +624,6 @@ class PortfolioDecision(BaseModel):
     warnings: list[str] = Field(default_factory=list, description="风险提示")
     reasoning: str = Field(description="LLM 推理过程（可追溯）")
     data_quality: DataQuality = Field(default_factory=DataQuality)
+    # 轮动信号（吃鱼身+高切低策略）
+    rotation_signals: list[dict] = Field(default_factory=list, description="轮动建议信号")
+    crowding_warnings: list[dict] = Field(default_factory=list, description="家族拥挤警告")
