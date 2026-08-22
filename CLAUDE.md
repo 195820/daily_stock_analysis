@@ -24,8 +24,9 @@
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │  GOT 层（市场分析）                                              │
-│  Phase 1: GOT 六节点（大盘→板块→资金‖消息‖情绪 → 聚合）         │
-│  Phase 2: 统一决策节点（风险评估→统一打分→组合优化）              │
+│  Phase 1: GOT 七节点（大盘→板块→资金‖消息‖情绪 → 聚合）         │
+│  Phase 2: 统一决策节点（风险评估→统一打分→组合优化→埋伏退出）    │
+│  催化剂系统: 日历构建(P1) + 关联度重排(P5) + 兑现追踪(P6)       │
 │  src/got/                                                        │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -69,10 +70,13 @@ daily_stock_analysis/
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数）
 │   │   │   ├── aggregator.py         # Node 6: 聚合（3层分级GOT/L0全局/L1板块/L2组合）
 │   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线）
-│   │   ├── schemas.py           # 节点输入输出 Pydantic Schema
+│   │   ├── catalyst_calendar.py   # 催化剂日历构建（5源事件/全量5日刷新/增量更新）
+│   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/常量/宏观日历规则）
+│   │   ├── catalyst_realization.py # P6: 催化兑现追踪（事后验证/故事寿命/参数校准源）
+│   │   ├── schemas.py           # 节点输入输出 Pydantic Schema（~40 模型）
 │   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度）
-│   │   ├── indicators.py        # 纯规则指标函数
-│   │   ├── persistence.py       # 上下文持久化（data/aggregator_contexts/，Node 6 时间一致性用）
+│   │   ├── indicators.py        # 纯规则指标函数（ADX/MACD/A-D线/截面百分位）
+│   │   ├── persistence.py       # 上下文持久化（data/aggregator_contexts/，EMA 基线）
 │   │   ├── archive.py           # 每日历史档（data/got_daily/YYYYMMDD/，全量 ctx + reasoning）
 │   │   └── news_feeds.py        # Node 4 新闻采集（7源推送型：新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）
 │   │
@@ -86,6 +90,9 @@ daily_stock_analysis/
 │   │   ├── risk_assessment.py        # 风险评估
 │   │   ├── strategy_filter.py        # YAML 策略筛选
 │   │   ├── dde_fetcher.py            # DDE 大单净量
+│   │   ├── board_name_resolver.py    # 板块名解析（TDX→THS 三层：清洗/别名表/模糊匹配）
+│   │   ├── ths_hot_list.py           # 同花顺热榜（4端点：热门股/板块/话题/期货）
+│   │   ├── portfolio_ocr_import.py   # 持仓OCR导入（券商截图→PaddleOCR→交易事件）
 │   │   └── ...
 │   │
 │   ├── core/                    # 核心引擎
@@ -133,45 +140,160 @@ daily_stock_analysis/
 ## GOT 架构概览
 
 > **详细设计文档**：[`agent_cot_design.md`](agent_cot_design.md)（v1.0，2026-08-11）  
-> 本文档仅保留高层架构速览，节点级详细设计（评分维度、阈值、LLM 调用、Schema）见设计文档。
+> 本文档保留高层架构速览 + 数据流转全图 + 编排流程 + 持久化层。节点级详细设计（评分维度、阈值、LLM 调用、Schema 字段）见设计文档。
 
 ### 核心理念
 
-前半段 GOT（并行+聚合），后半段 CoT（线性流水线）
+前半段 GOT（并行+聚合），后半段 CoT（线性流水线），外围催化剂系统（前向+回溯）
 
 ```
-独立数据路（并行）          技术分析路（串行）
-┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐ ┌──────────┐
-│ 消息面   │ │ 情绪面   │   │ 大盘     │→│ 板块     │→│ 资金面   │
-│ Node 4   │ │ Node 5   │   │ Node 1   │ │ Node 2   │ │ Node 3   │
-│ 7源采集  │ │ 6维评分  │   │ 4维技术  │ │ 4维百分位│ │ 3维资金  │
-│ 4次LLM   │ │ 反身性   │   │ 多时间框 │ │ 启动检测 │ │ 降级机制 │
-└──────────┘ └──────────┘   └──────────┘ └──────────┘ └──────────┘
-      ↓              ↓              ↓            ↓            ↓
-   news_ctx    sentiment_ctx   market_ctx   sector_ctx   capital_ctx
-                                                        ↓
-                                              ┌──────────────────┐
-                                              │  Node 6: 聚合     │
-                                              │  3层分级 GOT 架构  │
-                                              │  L0: 全局环境     │
-                                              │  L1: 板块mini-GOT │
-                                              │  L2: 组合决策     │
-                                              └──────────────────┘
-                                                        ↓
-                                                unified_context
-                                                        ↓
-                                              ┌──────────────────┐
-                                              │  Phase 2: 统一决策 │
-                                              │  5步流水线        │
-                                              │  Step 1: 风险评估  │
-                                              │  Step 2: 统一打分  │
-                                              │  Step 3: 组合优化  │
-                                              │  Step 4: 轮动检测  │
-                                              │  Step 5: LLM精炼  │
-                                              └──────────────────┘
-                                                        ↓
-                                                PortfolioDecision
+                          ┌─────────────────────────────────────────────────┐
+                          │              数据源层                             │
+                          │  指数K线 · 板块K线 · 资金流 · 7源新闻 · 论坛 · 热榜│
+                          └────────────────────┬────────────────────────────┘
+                                               │
+                  ┌────────────────────────────┼────────────────────────────┐
+                  │                            │                            │
+     ┌────────────┴────────────┐  ┌────────────┴────────────┐              │
+     │  技术分析路（串行）      │  │  独立数据路（并行）      │              │
+     │                         │  │                         │              │
+     │  ┌─────────┐            │  │  ┌─────────┐ ┌────────┐│              │
+     │  │ Node 1  │←─ 5指数   │  │  │ Node 4  │ │ Node 5 ││              │
+     │  │ 大盘    │   250d K线 │  │  │ 消息面  │ │ 情绪面 ││              │
+     │  │         │   + breadth│  │  │ 7源推送 │ │ 6维评分││              │
+     │  └────┬────┘            │  │  │ 3次LLM  │ │ 恐贪指 ││              │
+     │       │ MarketContext   │  │  └────┬────┘ └───┬────┘│              │
+     │       ▼                 │  │       │NewsCtx   │SentimentCtx        │
+     │  ┌─────────┐            │  │       │          │      │              │
+     │  │ Node 2  │←─ attack_ │  │       ▼          │      │              │
+     │  │ 板块    │   power   │  │  ┌──────────────┐│      │              │
+     │  │         │           │  │  │催化剂日历    ││      │              │
+     │  │ 4维百分位│           │  │  │CatalystCal   ││      │              │
+     │  │ RRG状态机│           │  │  │Builder       ││      │              │
+     │  │ 主线框   │           │  │  │(5源事件+    ││      │              │
+     │  │ 埋伏检测 │           │  │  │ LLM叙事)    ││      │              │
+     │  └────┬────┘            │  │  └──────┬───────┘│      │              │
+     │       │ SectorContext   │  │         │        │      │              │
+     │       ▼                 │  │         ▼        │      │              │
+     │  ┌─────────┐            │  │  catalyst_calendar│  │              │
+     │  │ Node 3  │←─ mainline│  │  嵌入 NewsContext │  │              │
+     │  │ 资金面  │   名称    │  │                         │              │
+     │  │         │           │  └─────────────────────────┘              │
+     │  │ 3维资金  │           │                                           │
+     │  │ 降级机制 │           │                                           │
+     │  └────┬────┘            │                                           │
+     │       │ CapitalContext  │                                           │
+     └───────┴─────────────────┘                                           │
+                  │              │            │            │                │
+                  ▼              ▼            ▼            ▼                │
+            MarketCtx     SectorCtx    CapitalCtx   NewsCtx   SentimentCtx │
+                  └──────────────┬──────────────────────┘                │
+                                 ▼                                        │
+                    ┌──────────────────────────┐                          │
+                    │     Node 6: 聚合          │                          │
+                    │                          │                          │
+                    │  L0: 全局环境研判         │                          │
+                    │   (regime_score → bull/bear/transition)             │
+                    │                          │                          │
+                    │  L1: 板块 mini-GOT        │                          │
+                    │   (4维交叉验证: tech+capital+news+sentiment)        │
+                    │                          │                          │
+                    │  L1': 埋伏通道 (P3)       │◄── catalyst_calendar    │
+                    │   (3层闸门 + B公式排序    │                          │
+                    │    + 蓄水池)              │                          │
+                    │                          │                          │
+                    │  L2: 组合级决策           │                          │
+                    │   (矛盾检测 + 仓位日限幅) │                          │
+                    └────────────┬─────────────┘                          │
+                                 │ UnifiedContext                         │
+                                 │ (regime + confirmed_sectors            │
+                                 │  + ambush_pool + ambush_reservoir)     │
+                                 ▼                                        │
+                    ┌──────────────────────────┐                          │
+                    │   Node 7: 统一决策 (Phase 2)                        │
+                    │                          │                          │
+                    │  Step 1: 风险评估         │                          │
+                    │   (仓位上限/止损/板块限)   │                          │
+                    │                          │                          │
+                    │  Step 2: 统一打分         │                          │
+                    │   (持仓+候选 5维评分)      │                          │
+                    │   + P5: 催化剂关联度重排   │◄── catalyst_calendar    │
+                    │   + P4: 埋伏退出信号       │                          │
+                    │                          │                          │
+                    │  Step 3: 组合优化         │                          │
+                    │   (卖→预算→买 Top 3)      │                          │
+                    │                          │                          │
+                    │  Step 4: 轮动+拥挤检测    │                          │
+                    │                          │                          │
+                    │  Step 5: LLM 精炼        │                          │
+                    └────────────┬─────────────┘                          │
+                                 │                                        │
+                                 ▼                                        │
+                        PortfolioDecision                                 │
+                    (trades + ambush_exit_signals                         │
+                     + reasoning + warnings)                              │
+                                                                          │
+                    ┌──────────────────────────┐                          │
+                    │   P6: 催化兑现追踪        │                          │
+                    │   (事后验证: 预期 vs 实际) │                          │
+                    │   (故事寿命统计)           │                          │
+                    │   → CatalystRealization   │                          │
+                    │     Record (SQLite)       │                          │
+                    └──────────────────────────┘                          │
 ```
+
+### 编排流程
+
+`GOTOrchestrator.run()` 入口，`asyncio.gather` 分组并行：
+
+```
+run()
+ ├─ asyncio.gather(
+ │    tech_path:  Node 1 → Node 2 → Node 3     （串行，后者消费前者输出）
+ │    data_path:  Node 4 ‖ Node 5               （并行，独立采集）
+ │  )
+ ├─ Node 6: 聚合（消费全部 5 个 context）
+ ├─ archive_daily_run()（Phase 1 归档 → data/got_daily/YYYYMMDD/）
+ ├─ Phase 2: PortfolioDecision（消费 6 个 context）
+ ├─ archive_phase2()（Phase 2 归档）
+ └─ CatalystRealizationTracker.check_and_record_realization()（P6，失败不阻塞）
+```
+
+**催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（消费 `Node4EventRecord`）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排
+
+### 节点 Schema 数据流
+
+| 节点 | 输入 | 输出 Schema | 关键输出字段 | 持久化 |
+|------|------|-------------|-------------|--------|
+| **Node 1** 大盘 | 无（直取 5 指数 250d K线 + breadth + T-0 行情） | `MarketContext` | `tech_growth.score/trend`, `market_state.attack_power/regime`, `position_limit`, `confidence` | — |
+| **Node 2** 板块 | `MarketContext`（`attack_power` → 主线数量限制, `today_change` → 弱市检测） | `SectorContext` | `active_mainline[]`, `ambush[]`, `cooling_down[]`, `industry_top[]`, `theme_families[]` | `node2_sector_trends`（RRG 状态机）, `sector_frames`（主线框） |
+| **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound`, `status` | — |
+| **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT） |
+| **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
+| **Node 6** 聚合 | 全部 5 个 context | `UnifiedContext` | `market_regime`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]` | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]` | `ambush_position_snapshots`（买入/退出快照） |
+
+### 持久化层总览
+
+**SQLite 表（`data/stock_analysis.db`）**：
+
+| 表名 | 写入方 | 用途 |
+|------|--------|------|
+| `node2_sector_trends` | Node 2 | 板块轨迹追踪（6 态状态机 + RRG EMA + 生命周期 + 强度轨迹 JSON） |
+| `sector_frames` | Node 2 | 主线框管理（框名/成员/进出时间/驻留天数/is_active） |
+| `node4_events` | Node 4 | 事件生命周期（emerging→fermenting→peak→fading→archived, 7 日自动归档） |
+| `catalyst_events` | CatalystCalendar | 催化剂日历事件（event_id UPSERT, 14 日窗口） |
+| `catalyst_refresh` | CatalystCalendar | 日历刷新节奏（单行表, 全量 5 日 / 增量其余） |
+| `ambush_position_snapshots` | Phase 2 (P4) | 埋伏仓位快照（买入价 + 退出信号 + 退出价 + is_open） |
+| `catalyst_realizations` | P6 | 催化兑现归档（预期 vs 实际收益 + 方向正确性 + 故事寿命天数） |
+
+**文件持久化**：
+
+| 路径 | 写入方 | 内容 |
+|------|--------|------|
+| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总）+ `meta.json` + `portfolio_decision.json` + `trading_recommendations.md` |
+| `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准） |
+| `data/aggregator_contexts/ema_baseline.json` | `persistence.py` | EMA 基线（α=0.3, regime_score + 滚动标准差, 冷启动 5 日预热） |
 
 ### 关键设计决策速览
 
@@ -183,13 +305,33 @@ daily_stock_analysis/
 | 仓位计算 | 连续函数（波动率×状态缩放） | 比离散映射更平滑 |
 | 选股消息面 | 1次LLM评100板块 + 字典查找 | 比40次LLM评40只股快10倍 |
 | 框系统 | SQLite 持久化（主线框个体级进出）| 比硬编码更灵活、可回溯；埋伏板块不持久化，每日实时判定 |
+| 埋伏仓位 | 类型化系数（drift×1.0 / fade×0.7 / binary×0.4）| 二元事件限仓压缩（Yee 2025）；漂移型给最大仓位 |
+| 催化剂排序 | B 公式（影响权重×临近度×置信度 + 冗余加成封顶 40%）| 事件驱动前瞻维度注入选股，仅 ambush 板块参与重排 |
+| 兑现追踪 | 事后验证 + 故事寿命统计（P6, 零 LLM）| 所有可配参数的 A 股本地化校准源（0.7 阈值/10 日衰竭/4 周除名） |
+| 板块名解析 | 三层：清洗→别名表（自动学习）→模糊匹配 | TDX 与 THS 板块名不一致是选股流水线的常见故障源 |
 
-### 候选股筛选优化
+### GOT 驱动选股流水线
 
-- ✅ 问财初筛改为 DDE 策略（`dde大单净量>=0.8%`，替代宽松的`主力资金净流入>0`）
-- ✅ 移除无意义的"最低价"条件（限制波动在 0-2%，过滤掉活跃股）
-- ✅ 每板块从 10 只降到 5 只，总候选从 80-100 降到 30-40
-- ✅ Stage 2 耗时从 100s 降到 ~50s
+> 入口：`StockScreenerPipeline.run_got_mode(got_date, top_n)`  
+> 消费：`data/got_daily/YYYYMMDD/` 下 6 个节点 JSON
+
+**问财初筛策略**：
+- 主线板块：`dde大单净量>=0.8%`（确认主力当日介入）
+- 埋伏板块：`dde连续3天为正`（持续吸筹信号，不要求当天爆发）
+
+**5 轮漏斗 + P5 催化重排**：
+
+| 轮次 | 过滤逻辑 | 保留数 |
+|------|---------|--------|
+| Round 0 | 去除涨停股（无法买入） | ~30-40 |
+| Round 1 | 排除 exhausted 板块 + 多窗口停滞过滤 | ~20-30 |
+| Round 2 | 资金面评分 Top 20（DDE 百分位 + 板块资金流） | 20 |
+| Round 3 | 波段技术评分 Top 15（8 维连续评分：MA20/布林/RSI/MACD 等） | 15 |
+| Round 4 | 风险评分 Top 8（RSI 超买/5 日涨幅/波动率） | 8 |
+| **P5** | **催化剂关联度重排**（仅 ambush 板块, confidence≥0.7） | 不变 |
+| Round 5 | 板块分散（每板块最多 1 只）→ Top N | 2-3 |
+
+**5 维评分权重**：资金面 15% + 消息面 15% + 板块强度 25% + 技术面(波段) 25% + 风险因子 20%
 
 ---
 
