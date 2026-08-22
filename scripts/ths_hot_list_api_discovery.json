@@ -1,0 +1,104 @@
+[
+  {
+    "url": "https://eq.10jqka.com.cn/webpage/ths-hot-list/index.html?showStatusBar=true",
+    "method": "GET",
+    "status": 200,
+    "content_type": "text/html; charset=utf-8"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/eq_hot_list_huidu/hot_list/v1/hot_list_huidu",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock?stock_type=a&type=hour&list_type=normal",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://eq.10jqka.com.cn/open/api/hot_list/rank/v1/new_stock.txt",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json; charset=UTF-8"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/plate?type=concept",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://cbasspider.10jqka.com.cn:8443/spider/api/v1/access_token",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://cbasspider.10jqka.com.cn:8443/spider/api/v1/report/track_config",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://cbasspider.10jqka.com.cn:8443/spider/api/v1/report/track_info",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://fund.10jqka.com.cn/quotation/fund_pool/v2/query",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://fund.10jqka.com.cn/quotation/temp/data_api/fetch/v1/specific_data",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/topic?page=1&page_size=30",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://ai.iwencai.com/index/urp/getdata/basic?tag=%E5%90%8C%E8%8A%B1%E9%A1%BA%E7%83%AD%E6%A6%9C_%E6%96%B0%E7%83%AD%E6%96%87&userid=0&appName=thsHotList",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json;charset=UTF-8"
+  },
+  {
+    "url": "https://t.10jqka.com.cn/lgt/vote/open/api/v1/batch_get_vote_info?vote_ids=35928,35927,35153",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json;charset=UTF-8"
+  },
+  {
+    "url": "https://dataq.10jqka.com.cn/dataapi/tagservice/fetch/v1/tag_data",
+    "method": "POST",
+    "status": 200,
+    "content_type": "application/json; charset=UTF-8"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/bond",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/future",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json"
+  },
+  {
+    "url": "https://baoxian.10jqka.com.cn/insurance/v3/rank/v1/hot_list",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json;charset=UTF-8"
+  }
+]

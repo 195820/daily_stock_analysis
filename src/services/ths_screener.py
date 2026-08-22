@@ -38,6 +38,14 @@ class THSStock:
     code: str
     name: str
     rank: int = 0
+    # 从问财 JSON API 提取的额外字段
+    price: float = 0.0
+    change_pct: float = 0.0
+    dde_net_pct: float = 0.0
+    turnover_rate: float = 0.0
+    volume: float = 0.0
+    sector: str = ""  # 概念板块
+    industry: str = ""  # 行业板块（同花顺行业分类）
 
 
 @dataclass
@@ -103,7 +111,7 @@ class THSScreenerService:
         return result
 
     def _do_query(self, question: str) -> THSScreenerResult:
-        """执行实际的问财查询"""
+        """执行实际的问财查询（含 JSON API 数据提取）"""
         from playwright.sync_api import sync_playwright
 
         result = THSScreenerResult(
@@ -118,6 +126,9 @@ class THSScreenerService:
 
             logger.info(f"[问财] 查询: {question[:50]}...")
 
+            # 用于捕获 JSON API 响应
+            captured_json = {"data": None}
+
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
@@ -130,6 +141,15 @@ class THSScreenerService:
                 page = context.new_page()
                 page.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined})')
 
+                # 监听 get-parser-data JSON API
+                def handle_response(response):
+                    if 'get-parser-data' in response.url and captured_json["data"] is None:
+                        try:
+                            captured_json["data"] = response.json()
+                        except Exception:
+                            pass
+
+                page.on('response', handle_response)
                 page.goto(url, timeout=30000)
                 page.wait_for_timeout(3000)
 
@@ -138,24 +158,16 @@ class THSScreenerService:
                     page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                     page.wait_for_timeout(800)
 
-                # 解析页面
+                # 如果 JSON API 未捕获，降级到文本解析
                 text = page.inner_text('body')
                 browser.close()
 
-            # 提取股票列表
-            pattern = r'(\d+)\s*\n\s*\n\s*([^\n]+?)\s*\n\s*(\d{6})\s*\n'
-            matches = re.findall(pattern, text)
-
-            seen_codes = set()
-            for match in matches:
-                rank, name, code = match
-                if code not in seen_codes:
-                    seen_codes.add(code)
-                    result.stocks.append(THSStock(
-                        code=code,
-                        name=name.strip(),
-                        rank=int(rank)
-                    ))
+            # 优先使用 JSON API 数据（包含完整量价+DDE）
+            if captured_json["data"] is not None:
+                self._parse_json_api(captured_json["data"], result)
+            else:
+                # 降级：从文本提取（仅 code/name/rank）
+                self._parse_text(text, result)
 
             result.total_count = len(result.stocks)
             logger.info(f"[问财] 获取到 {result.total_count} 只股票")
@@ -165,6 +177,89 @@ class THSScreenerService:
             logger.error(f"[问财] {result.error}")
 
         return result
+
+    def _parse_json_api(self, json_data: dict, result: THSScreenerResult) -> None:
+        """从问财 JSON API 解析完整数据（量价 + DDE + 板块）"""
+        data = json_data.get('data', {})
+        rows = data.get('data', [])
+
+        seen_codes = set()
+        for rank, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                continue
+
+            # 提取代码（格式: 002131.SZ → 002131）
+            raw_code = row.get('股票代码', '')
+            code = raw_code.split('.')[0] if '.' in raw_code else raw_code
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+
+            # 提取各字段（键名带日期后缀，需模糊匹配）
+            name = row.get('股票简称', '')
+            price = self._safe_float(row.get('现价', 0))
+            change_pct = self._find_float_field(row, '涨跌幅:前复权')
+            dde_net = self._find_float_field(row, 'dde大单净量')
+            turnover = self._safe_float(row.get('换手率', 0))
+            volume = self._safe_float(row.get('成交量', 0))
+            sector = row.get('所属板块', '')
+
+            # 动态查找行业字段（问财的 key 可能有编码差异）
+            industry = ''
+            for k in row.keys():
+                if '行业' in k and '涨跌' not in k:
+                    industry = row.get(k, '')
+                    break
+
+            result.stocks.append(THSStock(
+                code=code,
+                name=name,
+                rank=rank,
+                price=price,
+                change_pct=change_pct,
+                dde_net_pct=dde_net,
+                turnover_rate=turnover,
+                volume=volume,
+                sector=sector,
+                industry=industry,
+            ))
+
+        if result.stocks:
+            logger.info(f"[问财-JSON] 解析到 {len(result.stocks)} 只（含量价+DDE）")
+
+    def _parse_text(self, text: str, result: THSScreenerResult) -> None:
+        """降级：从页面文本提取（仅 code/name/rank）"""
+        pattern = r'(\d+)\s*\n\s*\n\s*([^\n]+?)\s*\n\s*(\d{6})\s*\n'
+        matches = re.findall(pattern, text)
+
+        seen_codes = set()
+        for match in matches:
+            rank, name, code = match
+            if code not in seen_codes:
+                seen_codes.add(code)
+                result.stocks.append(THSStock(
+                    code=code,
+                    name=name.strip(),
+                    rank=int(rank)
+                ))
+
+    @staticmethod
+    def _find_float_field(row: dict, key_prefix: str) -> float:
+        """在 row 中模糊匹配带日期后缀的字段名并提取数值"""
+        for key, val in row.items():
+            if key.startswith(key_prefix):
+                return THSScreenerService._safe_float(val)
+        return 0.0
+
+    @staticmethod
+    def _safe_float(val) -> float:
+        """安全转换为 float"""
+        if val is None:
+            return 0.0
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
 
     def get_dde_screener(self, use_cache: bool = True) -> THSScreenerResult:
         """

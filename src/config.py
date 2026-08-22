@@ -716,7 +716,9 @@ class Config:
     forum_sentiment_enabled: bool = False
     forum_sentiment_nga_uid: Optional[str] = None          # NGA Cookie: ngaPassportUid
     forum_sentiment_nga_cid: Optional[str] = None          # NGA Cookie: ngaPassportCid
-    forum_sentiment_nga_fid: int = 706                     # NGA 版面 ID（大时代=706）
+    forum_sentiment_nga_stid: int = 47206901               # NGA 帖子合集 ID
+    forum_sentiment_nga_username: Optional[str] = None     # NGA 用户名（自动续期用）
+    forum_sentiment_nga_password: Optional[str] = None     # NGA 密码（自动续期用）
     forum_sentiment_pages: int = 3                         # 帖子列表抓取页数
     forum_sentiment_high_rise_threshold: int = 500         # 高楼帖回复数阈值
     forum_sentiment_high_rise_extra_pages: int = 2         # 高楼帖额外抓取页数
@@ -1536,7 +1538,9 @@ class Config:
             forum_sentiment_enabled=parse_env_bool(os.getenv('FORUM_SENTIMENT_ENABLED'), default=False),
             forum_sentiment_nga_uid=os.getenv('FORUM_SENTIMENT_NGA_UID') or None,
             forum_sentiment_nga_cid=os.getenv('FORUM_SENTIMENT_NGA_CID') or None,
-            forum_sentiment_nga_fid=parse_env_int(os.getenv('FORUM_SENTIMENT_NGA_FID'), 706, field_name='FORUM_SENTIMENT_NGA_FID', minimum=1),
+            forum_sentiment_nga_stid=parse_env_int(os.getenv('FORUM_SENTIMENT_NGA_STID'), 47206901, field_name='FORUM_SENTIMENT_NGA_STID', minimum=1),
+            forum_sentiment_nga_username=os.getenv('FORUM_SENTIMENT_NGA_USERNAME') or None,
+            forum_sentiment_nga_password=os.getenv('FORUM_SENTIMENT_NGA_PASSWORD') or None,
             forum_sentiment_pages=parse_env_int(os.getenv('FORUM_SENTIMENT_PAGES'), 3, field_name='FORUM_SENTIMENT_PAGES', minimum=1, maximum=10),
             forum_sentiment_high_rise_threshold=parse_env_int(os.getenv('FORUM_SENTIMENT_HIGH_RISE_THRESHOLD'), 500, field_name='FORUM_SENTIMENT_HIGH_RISE_THRESHOLD', minimum=50),
             forum_sentiment_high_rise_extra_pages=parse_env_int(os.getenv('FORUM_SENTIMENT_HIGH_RISE_EXTRA_PAGES'), 2, field_name='FORUM_SENTIMENT_HIGH_RISE_EXTRA_PAGES', minimum=1, maximum=5),

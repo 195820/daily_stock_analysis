@@ -29,6 +29,9 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880637": {"name": "EDA概念",    "category": "eda_ip"},
     "880608": {"name": "第三代半",   "category": "eda_ip"},
     "880716": {"name": "光刻机",     "category": "semiconductor_equip"},
+    # 新增：半导体上游
+    "880547": {"name": "玻璃基板",   "category": "semiconductor_pkg"},
+    # 注：元件/电子化学品/被动元件/IGBT/碳化硅/氮化镓/高带宽内存 在 TDX 概念板块中不存在独立代码
 
     # === AI 基建：算力/网络/散热 (ai_infra) ===
     "880669": {"name": "算力租赁",   "category": "compute_power"},
@@ -39,13 +42,18 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880685": {"name": "液冷服务",   "category": "liquid_cooling"},
     "880550": {"name": "PCB概念",    "category": "pcb_connector"},
     "880523": {"name": "铜缆高速",   "category": "pcb_connector"},
+    # 新增：充电设施
+    "880658": {"name": "高压快充",   "category": "compute_power"},
 
     # === AI 模型/平台 (ai_model) ===
     "880948": {"name": "人工智能",   "category": "ai_platform"},
     "880645": {"name": "AIGC概念",   "category": "llm"},
     "880693": {"name": "多模态AI",   "category": "llm"},
-    "880654": {"name": "ChatGPT",    "category": "llm"},
     "880732": {"name": "AI智能体",   "category": "ai_platform"},
+    # 新增：数字经济
+    "880738": {"name": "数字孪生",   "category": "digital_economy"},
+    "880746": {"name": "国资云",     "category": "digital_economy"},
+    # 注：数字经济 在 TDX 概念板块中不存在独立代码
 
     # === AI 终端应用 (ai_terminal) ===
     "880541": {"name": "AI手机PC",   "category": "ai_phone_pc"},
@@ -56,21 +64,33 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880725": {"name": "MiniLED",    "category": "consumer_elec"},
     "880561": {"name": "折叠屏",     "category": "consumer_elec"},
     "880574": {"name": "苹果概念",   "category": "apple_chain"},
+    # 新增：新内容消费
+    "880692": {"name": "短剧游戏",   "category": "new_content"},
+    # 注：谷子经济 在 TDX 概念板块中不存在独立代码
 
     # === 机器人 (robot) ===
     "880703": {"name": "人形机器",   "category": "humanoid"},
     "880904": {"name": "机器人概",   "category": "robot_system"},
     "880675": {"name": "减速器",     "category": "robot_parts"},
     "880664": {"name": "机器视觉",   "category": "robot_parts"},
+    # 注：机器人执行器 在 TDX 概念板块中不存在独立代码
 
     # === 智能驾驶 (auto_drive) ===
     "880944": {"name": "无人驾驶",   "category": "smart_drive"},
     "880552": {"name": "车联网",     "category": "smart_drive"},
     "880686": {"name": "华为汽车",   "category": "smart_drive"},
     "880951": {"name": "新能源车",   "category": "new_energy"},
-    "880742": {"name": "固态电池",   "category": "new_energy"},
+    "880742": {"name": "固态电池",   "category": "battery_tech"},
     "880583": {"name": "充电桩",     "category": "new_energy"},
     "880391": {"name": "汽车整车",   "category": "auto_market"},
+    # 新增：电池技术 + 充电设施
+    "880684": {"name": "BC电池",     "category": "battery_tech"},
+    "880655": {"name": "钙钛矿电",   "category": "battery_tech"},
+    "880638": {"name": "TOPCon电",   "category": "battery_tech"},
+    "880755": {"name": "钠电池",     "category": "battery_tech"},
+    "880632": {"name": "动力电池",   "category": "battery_tech"},
+    "880759": {"name": "换电概念",   "category": "new_energy"},
+    # 注：麒麟电池/刀片电池/动力电池回收 在 TDX 概念板块中不存在独立代码
 
     # === 新兴主题 (emerging) ===
     "880522": {"name": "低空经济",   "category": "low_altitude"},
@@ -86,6 +106,7 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880548": {"name": "商业航天",   "category": "satellite"},
     "880506": {"name": "5G概念",     "category": "satellite"},
     "880661": {"name": "6G概念",     "category": "satellite"},
+    # 注：华为欧拉/可控核聚变 在 TDX 概念板块中不存在独立代码
 
     # === 科技防守 (tech_defensive) ===
     "880652": {"name": "创新药",     "category": "innovative_drug"},
@@ -103,9 +124,12 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880534": {"name": "锂电池概",   "category": "energy_storage"},
     "880705": {"name": "氢能源",     "category": "energy_storage"},
     "880582": {"name": "风电",       "category": "energy_storage"},
+    # 新增：减肥药 + 医美
+    "880681": {"name": "减肥药",     "category": "innovative_drug"},
+    "880973": {"name": "医美概念",   "category": "innovative_drug"},
 
     # === 金融 (finance) ===
-    "880472": {"name": "证券",       "category": "securities"},
+    "880472": {"name": "券商",       "category": "securities"},
     "880473": {"name": "保险",       "category": "insurance"},
     "880471": {"name": "银行",       "category": "banking"},
     "880474": {"name": "多元金融",   "category": "diversified_finance"},
@@ -123,6 +147,21 @@ TDX_BOARD_REGISTRY: dict[str, dict] = {
     "880318": {"name": "钢铁",       "category": "steel_chem"},
     "880335": {"name": "化工",       "category": "steel_chem"},
     "880330": {"name": "化纤",       "category": "steel_chem"},
+    # 新增：新材料
+    "880695": {"name": "PEEK材料",   "category": "new_materials"},
+    "880571": {"name": "碳纤维概",   "category": "new_materials"},
+    "880584": {"name": "石墨烯",     "category": "new_materials"},
+    "880905": {"name": "超导概念",   "category": "new_materials"},
+    "880975": {"name": "有机硅概",   "category": "new_materials"},
+    "880530": {"name": "合成生物",   "category": "new_materials"},
+
+    # === 消费 (consumer) ===
+    "880381": {"name": "白酒",       "category": "beverage"},
+    "880564": {"name": "白酒概念",   "category": "beverage"},
+    "880423": {"name": "酒店餐饮",   "category": "travel"},
+    "880424": {"name": "旅游",       "category": "travel"},
+    "880597": {"name": "养老概念",   "category": "silver_economy"},
+    "880894": {"name": "养老金持",   "category": "silver_economy"},
 
     # === 军工 (military) ===
     "880507": {"name": "国防军工",   "category": "aerospace"},

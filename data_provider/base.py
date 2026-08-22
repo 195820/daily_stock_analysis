@@ -538,8 +538,8 @@ class BaseFetcher(ABC):
         self,
         codes: list[str],
         concurrency: int = 20,
-    ) -> dict[str, float]:
-        """批量获取板块当日涨跌幅（快筛用，仅取 2 天 K 线）。"""
+    ) -> dict[str, dict]:
+        """批量获取板块快筛数据（B-lite：取 11 天 K 线，返回多时间框架动量）。"""
         return {}
 
     def get_board_constituents(

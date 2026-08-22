@@ -82,6 +82,8 @@ _SOURCE_WEIGHTS = {
     "wallstreetcn": 25,  # 国际视野，信息密度高
     "eastmoney": 20,     # 散户关注
     "newsnow": 26,       # 跨平台热榜，多源交叉验证
+    "nga_forum": 16,     # 散户论坛帖子，信息密度低但有早期信号
+    "ths_hot": 28,       # 同花顺热榜，投资者关注焦点，高价值
     "cctv": 28,          # 权威
     "caixin": 24,        # 专业
 }
@@ -98,6 +100,10 @@ _HOT_KEYWORDS = {
     "固态电池": 14, "光伏": 11, "锂电": 11,
     "美联储": 10, "降息": 12, "加息": 12,
     "熔断": 16, "重挫": 15, "跳水": 14,
+    # 地缘政治/贸易制裁（2026-08-05 补充，防止遗漏重大政策风险）
+    "禁止": 18, "制裁": 18, "关税": 16, "贸易战": 18,
+    "出口管制": 17, "光模块": 15, "美国": 14, "中国": 12,
+    "进口": 13, "封锁": 16, "实体清单": 17,
 }
 
 
@@ -540,15 +546,20 @@ def _count_cross_source(
     news_items: List[Dict],
     sina: List[Dict], wallstreetcn: List[Dict],
     cls_news: List[Dict], eastmoney: List[Dict],
-    newsnow: List[Dict],
+    newsnow: List[Dict], nga_forum: Optional[List[Dict]] = None,
+    ths_hot: Optional[List[Dict]] = None,
 ) -> None:
     """跨源标记 source_count。"""
+    nga_forum = nga_forum or []
+    ths_hot = ths_hot or []
     sources_by_type = {
         "sina": sina,
         "wallstreetcn": wallstreetcn,
         "cls": cls_news,
         "eastmoney": eastmoney,
         "newsnow": newsnow,
+        "nga_forum": nga_forum,
+        "ths_hot": ths_hot,
     }
 
     for item in news_items:
@@ -569,24 +580,48 @@ def merge_news(
     wallstreetcn: List[Dict],
     eastmoney: List[Dict],
     newsnow: List[Dict],
+    nga_forum: Optional[List[Dict]] = None,
+    ths_hot: Optional[List[Dict]] = None,
 ) -> List[Dict]:
-    """5 源合并 + 去重 + 跨源标记 + 权重排序。"""
-    all_news = sina + cls_news + wallstreetcn + eastmoney + newsnow
+    """7 源合并 + 去重 + 跨源标记 + 权重排序。"""
+    nga_forum = nga_forum or []
+    ths_hot = ths_hot or []
+    all_news = sina + cls_news + wallstreetcn + eastmoney + newsnow + nga_forum + ths_hot
     if not all_news:
         return []
 
     deduped = _deduplicate(all_news)
-    _count_cross_source(deduped, sina, wallstreetcn, cls_news, eastmoney, newsnow)
+    _count_cross_source(deduped, sina, wallstreetcn, cls_news, eastmoney, newsnow, nga_forum, ths_hot)
 
     # 计算权重并排序
     for item in deduped:
         item["weight"] = _calculate_weight(item)
     deduped.sort(key=lambda x: x.get("weight", 0), reverse=True)
 
+    # NGA 保底：确保至少 5 条论坛帖子进入合并结果（散户视角不应被专业媒体完全淹没）
+    NGA_MIN_ITEMS = 5
+    if nga_forum and len(deduped) > MAX_MERGED_NEWS:
+        nga_in = sum(1 for d in deduped[:MAX_MERGED_NEWS] if d.get("source_type") == "nga_forum")
+        if nga_in < NGA_MIN_ITEMS:
+            nga_items_sorted = sorted(
+                [d for d in deduped if d.get("source_type") == "nga_forum"],
+                key=lambda x: x.get("weight", 0), reverse=True,
+            )
+            bottom = MAX_MERGED_NEWS - 1
+            for nga_item in nga_items_sorted[:NGA_MIN_ITEMS]:
+                if nga_item in deduped[:MAX_MERGED_NEWS]:
+                    continue
+                # 替换底部最低权重的非 NGA 条目
+                while bottom >= 0 and deduped[bottom].get("source_type") == "nga_forum":
+                    bottom -= 1
+                if bottom >= 0:
+                    deduped[bottom] = nga_item
+                    bottom -= 1
+
     if len(deduped) > MAX_MERGED_NEWS:
         deduped = deduped[:MAX_MERGED_NEWS]
 
-    active = sum(1 for s in [sina, cls_news, wallstreetcn, eastmoney, newsnow] if s)
+    active = sum(1 for s in [sina, cls_news, wallstreetcn, eastmoney, newsnow, nga_forum] if s)
     logger.info(
         "[news_feeds] 合并: %d 条（%d 源活跃），权重 %.0f~%.0f",
         len(deduped), active,
@@ -598,11 +633,11 @@ def merge_news(
 
 def fetch_all_news() -> Tuple[List[Dict], Dict[str, int]]:
     """
-    串行采集 5 源新闻，返回合并结果 + 各源统计。
+    串行采集 6 源新闻，返回合并结果 + 各源统计。
 
     Returns:
         (merged_news, source_stats)
-        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N}
+        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N, "ths_hot": N}
     """
     sources = {
         "sina": fetch_sina_news,
@@ -610,6 +645,8 @@ def fetch_all_news() -> Tuple[List[Dict], Dict[str, int]]:
         "wallstreetcn": lambda: fetch_wallstreetcn_news(30),
         "eastmoney": lambda: fetch_eastmoney_kuaixun(30),
         "newsnow": fetch_newsnow_hot,
+        "nga_forum": fetch_nga_forum_news,
+        "ths_hot": fetch_ths_hot_topics,
     }
 
     results: Dict[str, List[Dict]] = {}
@@ -632,5 +669,125 @@ def fetch_all_news() -> Tuple[List[Dict], Dict[str, int]]:
         results.get("wallstreetcn", []),
         results.get("eastmoney", []),
         results.get("newsnow", []),
+        results.get("nga_forum", []),
+        results.get("ths_hot", []),
     )
     return merged, stats
+
+
+# =============================================================================
+# S6: NGA 论坛帖子（散户讨论，早期信号源）
+# =============================================================================
+
+def fetch_nga_forum_news() -> List[Dict[str, Any]]:
+    """
+    NGA 大时代论坛帖子标题 → 新闻条目。
+
+    复用 ForumSentimentService 的采集管道，将帖子标题转为统一新闻格式。
+    散户讨论的信息密度低于专业媒体，但能捕捉早期传闻和情绪转向。
+    """
+    try:
+        from src.config import Config
+        from src.services.forum_sentiment import ForumSentimentService
+
+        config = Config.get_instance()
+        if not config.forum_sentiment_enabled:
+            return []
+
+        service = ForumSentimentService(config)
+        if not service.is_available:
+            return []
+
+        result = service.fetch_hot_stocks()
+        items: List[Dict] = []
+
+        # 将热门股的关联帖子转为新闻条目
+        for stock in result.hot_stocks[:30]:
+            for post in stock.top_posts:
+                title = (post.get("title") or "").strip()
+                if not title or len(title) < 6:
+                    continue
+                tid = post.get("tid", 0)
+                items.append({
+                    "title": title,
+                    "snippet": title[:150],
+                    "source": "NGA论坛",
+                    "source_type": "nga_forum",
+                    "url": f"https://bbs.nga.cn/read.php?tid={tid}" if tid else "",
+                    "published_date": "",
+                })
+
+        # 去重（同一帖子可能被多只热门股引用）
+        seen_titles = set()
+        deduped = []
+        for item in items:
+            if item["title"] not in seen_titles:
+                seen_titles.add(item["title"])
+                deduped.append(item)
+
+        logger.info("[news_feeds] S6 NGA 论坛: %d 条（%d 帖子）", len(deduped), result.thread_count)
+        return deduped
+
+    except Exception as exc:
+        logger.warning("[news_feeds] NGA 论坛采集失败: %s", exc)
+        return []
+
+
+# =============================================================================
+# S7: 同花顺热榜话题（投资者关注焦点，直接反映市场热点）
+# =============================================================================
+
+def fetch_ths_hot_topics() -> List[Dict[str, Any]]:
+    """
+    同花顺热榜热门话题 → 新闻条目。
+
+    这是投资者关注焦点的直接反映，例如"美国拟禁止中国光模块进口"类话题。
+    每个话题包含标题、描述、相关股票代码和热度值。
+
+    Returns:
+        新闻条目列表，格式与 S1-S5 一致
+    """
+    try:
+        from src.services.ths_hot_list import fetch_hot_topics
+
+        topics = fetch_hot_topics(page_size=30)
+        if not topics:
+            logger.warning("[news_feeds] S7 同花顺热榜: 0 条")
+            return []
+
+        items = []
+        for topic in topics:
+            title = topic.get("title", "").strip()
+            if not title:
+                continue
+
+            # 构建描述（包含相关股票信息）
+            description = topic.get("description", "")
+            related_stocks = topic.get("related_stocks", [])
+            if related_stocks:
+                stock_names = [s.get("name", "") for s in related_stocks[:3] if s.get("name")]
+                if stock_names:
+                    description = f"{description} 关联股票: {', '.join(stock_names)}"
+
+            # 构建 URL（如果有）
+            jump_url = topic.get("jump_url", "")
+            if jump_url and not jump_url.startswith("http"):
+                jump_url = f"https:{jump_url}" if jump_url.startswith("//") else ""
+
+            items.append({
+                "title": title,
+                "snippet": description[:200] if description else title[:150],
+                "source": "同花顺热榜",
+                "source_type": "ths_hot",
+                "url": jump_url,
+                "published_date": "",  # 热榜无明确时间戳
+                "heat": topic.get("heat", 0),
+                "related_stocks": related_stocks,
+            })
+
+        logger.info("[news_feeds] S7 同花顺热榜: %d 条", len(items))
+        return items
+
+    except Exception as exc:
+        logger.warning("[news_feeds] 同花顺热榜采集失败: %s", exc)
+        return []

@@ -11,6 +11,7 @@ Phase 1: 六节点市场分析
 """
 
 from src.got.schemas import (
+    MainlineGroup,
     MarketContext,
     SectorContext,
     CapitalContext,
@@ -22,6 +23,7 @@ from src.got.orchestrator import GOTOrchestrator
 
 __all__ = [
     "GOTOrchestrator",
+    "MainlineGroup",
     "MarketContext",
     "SectorContext",
     "CapitalContext",

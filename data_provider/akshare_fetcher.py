@@ -2772,6 +2772,72 @@ class AkshareFetcher(BaseFetcher):
             return None
 
 
+    # ==================== 实时资金流（盘中 T+0） ====================
+
+    def get_sector_fund_flow_concept(self) -> Optional[pd.DataFrame]:
+        """
+        获取概念板块实时资金流（盘中 T+0）。
+
+        来源：akshare stock_fund_flow_concept(symbol="即时")
+        返回：~300 个概念板块，含流入资金/流出资金/净额（亿元）
+        """
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_fund_flow_concept(symbol=即时)")
+            df = ak.stock_fund_flow_concept(symbol="即时")
+            if df is not None and not df.empty:
+                return df
+            return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 概念板块资金流获取失败: {e}")
+            return None
+
+    def get_sector_fund_flow_industry(self) -> Optional[pd.DataFrame]:
+        """
+        获取行业板块实时资金流（盘中 T+0）。
+
+        来源：akshare stock_fund_flow_industry(symbol="即时")
+        返回：~41 个行业板块，含流入资金/流出资金/净额（亿元）
+        """
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_fund_flow_industry(symbol=即时)")
+            df = ak.stock_fund_flow_industry(symbol="即时")
+            if df is not None and not df.empty:
+                return df
+            return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 行业板块资金流获取失败: {e}")
+            return None
+
+    def get_individual_fund_flow(
+        self, stock_code: str, market: str = "sh"
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取个股主力资金流（日线含今日，实际 T-1 或当日盘后）。
+
+        来源：akshare stock_individual_fund_flow()
+        返回：日度主力/超大单/大单/中单/小单净流入金额和占比
+        注意：最新行可能是当日（盘中运行）或 T-1（收盘后运行）
+        """
+        import akshare as ak
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(f"[API调用] ak.stock_individual_fund_flow(stock={stock_code}, market={market})")
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+            if df is not None and not df.empty:
+                return df
+            return None
+        except Exception as e:
+            logger.warning(f"[Akshare] 个股资金流 {stock_code} 获取失败: {e}")
+            return None
+
+
 if __name__ == "__main__":
     # 测试代码
     logging.basicConfig(level=logging.DEBUG)

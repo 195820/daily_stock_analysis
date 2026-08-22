@@ -332,7 +332,7 @@ ambush ──[leading 突破+score>60, 驻留≥1天]──► active_mainline
   - 破位 BROKEN = 5日涨幅≤0 或 跌破MA20 或 过热exhausted且20日高位<0.60 或 单日分数崩≥20
   - 主判据 `price_chg_5d` 是真实5日涨幅，**不随当日截面排名变**（黄金 08-13 被医药挤压到 50 分但5日涨仍正 → 走冷却而非消失）
 - **驻留/置信度门槛**：切换需连续驻留（cooling→active 需2天、exhausted→active 需2天、ambush 持续值≥2天动量转负才出局）；**硬触发豁免**：单日崩≥20分立即降级、单日涨>8%+leading 立即进主线
-- **埋伏判据**（`_is_ambush_candidate`，替代旧 `_check_momentum_ambush`）：`ratio<0.55 + 动量≥0.5 且刚转正 + 近3日不跌 + 结构吸筹≥0.5 + 45≤score≤72 + 非防守`。高位残留分(黄金 08-17 ratio 0.922/78分)被直接拒绝
+- **埋伏判据**（`_is_ambush_candidate`，替代旧 `_check_momentum_ambush`）：`ratio<0.55 + 动量≥0.5 且刚转正 + 近3日不跌 + 结构吸筹≥0.5 + score≤72（P2: 45下限砍掉） + 非防守`。高位残留分(黄金 08-17 ratio 0.922/78分)被直接拒绝
 - **状态记忆**：`Node2SectorTrendRecord` 新增 `state`/`dwell_days`/`rrg_ratio_ema`/`rrg_momentum_ema` 4 列，替代 unified_signal 三值回映射（修复"主线记忆易断开"）
 
 **学术依据**：
@@ -892,7 +892,8 @@ risk_budget = clip(risk_budget, 0.2, 0.8)
 composite = tech_score  # Node 2 的 strength_score (0-100)
 composite += 10 if capital_check == "aligned" else -15 if "divergent"
 composite += 8 if news_check == "catalyzed" else -12 if "negative"
-composite += 5 if sentiment_check == "high" else -5 if "low"
+composite += 5 if sentiment_check == "high" else -5 if "low" and role != "ambush"
+# P3: 埋伏板块不惩罚低热度（低关注度是埋伏的利润来源）
 # Lifecycle 修正
 composite += 8 if phase in ("launch", "acceleration")
 composite -= 15 if phase in ("late_stage", "mature_exhausted")
@@ -908,6 +909,138 @@ composite = clip(composite, 0, 100)
 | divergent | score≥50 + capital=divergent 或 news=negative | 同 |
 | speculative | score<40 + news=catalyzed | 同 |
 | avoid | score<40 + 无消息催化; 或晚期+negative信号 | 同 |
+
+#### 2.6.2b Level 1 平行分支: 埋伏通道（P3）
+
+**方法**：`_build_ambush_channel()`
+
+> 在 mini-GOT Level 1 内与主线 composite **平行的独立分支**。
+> 4 维交叉验证照做但重新分工，不再合成 composite。
+
+**输入**：`sector.ambush`（Node 2 技术闸门）+ `capital`（吸筹确认）+ `news.catalyst_calendar`（催化剂）+ `sentiment`（拥挤度）
+
+**3 层流水线**：
+
+| 层 | 方法 | 逻辑 |
+|----|------|------|
+| 闸门层 | `_check_negative_catalyst()` | ★★★ 利空 → 直接否决 |
+| 闸门层 | `_check_accumulation_gate()` | 当日正向净流入 → 通过 |
+| 闸门层 | `_check_anti_top_buy()` | 注意力闸（3+ 只个股上热榜 → 否决）+ 已发酵检查（催化剂 ≥5 天前出现 → 行情可能已走完） |
+| 闸门层 | `_check_crowded_blacklist()` | 板块名精确匹配热榜 → 否决（来晚了） |
+| 排序层 | `_compute_catalyst_score()` | B 公式：主催化分 + 冗余加成 |
+
+**B 公式**：
+```python
+main_score = IMPACT_WEIGHT[level] × proximity × confidence
+# proximity: 3~10 交易日 = 1.0; 1~2 交易日 = 0.6（anticipation 大半走完）
+# IMPACT_WEIGHT: ★★★=1.0, ★★=0.6, ★=0.3
+
+redundancy = min((n-1) × 0.2, 0.4) × main_score  # 第2+个催化剂，封顶+40%
+total = main_score + redundancy
+```
+
+**无催化分支**：闸门全过但窗口内无合格催化剂 → 蓄水池（`AmbushReservoirEntry`）
+
+**输出**：
+- `ambush_pool: list[AmbushCandidate]`（正式池，≤10，宁缺毋滥）
+- `ambush_reservoir: list[AmbushReservoirEntry]`（蓄水池，4 周自动除名）
+- `ambush_veto_log: list[str]`（否决记录）
+
+**文献依据**：
+- Kargarzadeh et al. 2026：事件前和当天价格移动最大，"等确认再进 = 买在顶上"
+- 每类事件有故事寿命（M&A 12.9 天、财报 2.3 天、产品发布 0.9 天）→ 退出按类型分叉
+
+#### 2.6.2c Phase 2 埋伏仓位与退出（P4）
+
+**方法**：`_ambush_exit_signal()` + `_write_ambush_buy_snapshots()` + `_close_ambush_snapshots()`
+
+**类型化仓位系数**（在 `_assess_risk()` 的 `sector_limits` 公式中追加）：
+
+```python
+sector_limit = base × regime_m × role_m × conf_w × catalyst_coeff
+# catalyst_coeff: drift=1.0 / fade=0.7 / binary=0.4
+# 文献依据：Yee 2025（二元事件风险调整收益在事件后上升段达峰，限仓压缩）
+```
+
+| 催化剂类型 | 系数 | 理由 |
+|-----------|------|------|
+| drift（量化基本面） | ×1.0 | 持有吃事件后漂移，给得大 |
+| fade（软叙事） | ×0.7 | 事件日即退，持有期短 |
+| binary（高不确定） | ×0.4 | 二元事件不要赌，赌则限仓 |
+
+**买入催化剂快照**（Phase 2 建仓时写入 `ambush_position_snapshots` 表）：
+- 记录：symbol / sector / category_tag / catalyst_event_id / event_date / impact_level / entry_price
+- 退出后：exit_signal / exit_date / exit_price / is_open=False
+- 与催化归档表共表设计（买入快照 + 兑现结果 = 完整复盘记录）
+
+**埋伏退出分支**（扩展 `_score_holdings()`，`_lifecycle_sell_signal` 之外平行检测）：
+
+| 情形 | 触发条件 | exit_signal |
+|------|---------|-------------|
+| fade 型催化剂 | `today > event_date`（事件日次日开盘卖） | `fade_sell` |
+| drift 漂移衰竭 | 事件后 ≥10 交易日 + 持有涨幅 <2% | `drift_exhausted` |
+| drift 破 MA20 | `current_price < MA20` | `drift_break_ma20` |
+| drift 硬超时 | 持有 >20 交易日 | `drift_timeout` |
+| 事件落空（binary） | 事件日 >2 交易日仍未发生 | `event_cancelled` |
+| 硬止损 | `P&L < -7%`（任意类型） | `stop_loss` |
+| DDE 毕业 | 板块 DDE 爆发（TODO：待板块级检测） | `dde_graduation` |
+
+**配置参数**（集中常量，归档积累后校准）：
+```python
+AMBUSH_DRIFT_STALL_DAYS = 10          # 漂移衰竭观察窗口
+AMBUSH_DRIFT_TIMEOUT_DAYS = 20        # 硬超时（交易日）
+AMBUSH_DRIFT_STALL_THRESHOLD = 0.02   # 漂移衰竭涨幅阈值
+AMBUSH_BINARY_GRACE_DAYS = 2          # 二元事件 grace period
+```
+
+#### 2.6.2d Phase 2 催化剂关联度重排（P5）
+
+**目的**：在选股漏斗中注入前瞻维度——催化剂日历告诉选股流水线"未来 2 周哪只股票有事件驱动"。
+
+**集成点**：`_filter_got_finalists()` 轮次 4（风险排雷）之后、轮次 5（板块分散）之前。
+
+**评分逻辑**（`_score_catalyst_relevance()`）：
+
+| 事件级别 | 匹配方式 | 分数 |
+|---------|---------|------|
+| 个股级（earnings/lockup）| title 正则提取股票代码 → 当事股 | 100（直接置顶）|
+| 板块级（narrative/global/macro）| sector 字段匹配 | confidence × impact × proximity × direction_coeff × 50 |
+| 无匹配 | — | 0 |
+
+**重排规则**：
+- 仅对 ambush 板块候选生效（主线保持技术排序）
+- 最大 confidence < 0.7 → 不重排（保持技术排序）
+- 关联度只做重排不做准入（防"概念正宗但没人买"）
+
+**临近度系数**：`proximity = max(0.3, 1.0 - days_diff / 30.0)`
+
+**方向修正**：positive → ×1.0, negative → ×0.5（利空不置顶）
+
+#### 2.6.2e 催化归档表（P6）
+
+**目的**：每个催化剂事件兑现后记录预期 vs 实际，作为所有可配参数的 A 股本地化校准源。
+
+**四大用途**：
+1. 参数校准源（0.7 阈值/10日衰竭/4周除名等）
+2. 反向查询通道存废依据
+3. 矛盾否决准确率统计
+4. 事件类型故事寿命本地重估
+
+**`CatalystRealizationRecord` 表**：
+
+| 字段组 | 字段 | 用途 |
+|--------|------|------|
+| 事件标识 | event_id(UK), event_type, source, source_type | forward/reverse_discovery/veto/reservoir |
+| 事件信息 | sector, title, event_date, category_tag, impact_level | 与 CatalystEvent 对齐 |
+| 预期 | consensus_expectation, direction, confidence | 买入前的判断 |
+| 兑现结果 | is_realized, realization_date, actual_return, drift_direction_correct | 事后验证 |
+| 故事寿命 | story_start/peak/end_date, story_lifetime_days | 持有窗口分型 |
+
+**`CatalystRealizationTracker` 类**：
+- `register_event(event, source_type)` — 日历构建时注册（`_save_events()` 末尾自动调用）
+- `check_and_record_realization(target_date)` — 每日运行，检测过期事件并计算板块收益（orchestrator `run()` 末尾调用）
+- `get_realization_stats(days)` — 按 event_type/source_type/category_tag 分组统计兑现率
+- `get_story_lifetimes(days)` — 各类事件的故事寿命分布
 
 #### 2.6.3 Level 2: 组合决策
 

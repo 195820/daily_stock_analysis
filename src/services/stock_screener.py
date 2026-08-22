@@ -24,7 +24,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import Config
 from src.storage import DatabaseManager, ScreenerResultRecord
@@ -55,8 +55,13 @@ class ScreenerStock:
     signal_tags: List[str] = field(default_factory=list)  # 信号标签
 
     # 板块信息
-    sector_name: str = ""          # 所属板块
-    sector_score: float = 0.0      # 板块强度分
+    sector_name: str = ""          # 所属板块（最强板块，向后兼容）
+    sector_score: float = 0.0      # 板块强度分（加权平均）
+    all_sectors: List[Dict] = field(default_factory=list)  # 所有板块信息
+    # all_sectors 格式: [
+    #   {"name": "铜概念", "score": 90, "type": "concept", "is_mainline": True, "weight": 1.5},
+    #   ...
+    # ]
 
     # 舆情信息
     sentiment_score: float = 0.0   # 舆情情绪分 -1~1
@@ -76,11 +81,20 @@ class ScreenerStock:
 
     # GOT 模式专用字段
     capital_score: float = 0.0             # 资金面评分 0-100
+    capital_available: bool = False        # 资金面是否有真实数据（缺失时不参与加权）
     news_score: float = 0.0                # 消息面评分 0-100
+    news_available: bool = False           # 消息面是否有真实数据
     tech_wave_score: float = 0.0           # 波段技术评分 0-100
     risk_score_safe: float = 100.0         # 风险评分 0-100（越高越安全，与 risk_score 相反）
     sector_type: str = ""                  # 板块类型: active_mainline / ambush
     backtest_snapshot: Optional[Dict[str, Any]] = None  # 回测快照
+
+    # P5 催化剂关联度字段
+    catalyst_relevance_score: float = 0.0  # 催化剂关联度 0-100
+    catalyst_event_title: str = ""         # 关联的催化剂事件标题
+    catalyst_event_date: str = ""          # 事件日期 YYYY-MM-DD
+    catalyst_event_type: str = ""          # earnings / lockup / narrative / global / macro
+    catalyst_confidence: float = 0.0       # 催化剂置信度 0-1
 
 
 @dataclass
@@ -96,6 +110,53 @@ class ScreenerRunResult:
     error: Optional[str] = None                # 错误信息
     elapsed_seconds: float = 0.0               # 执行耗时
     query: str = ""                            # 问财查询语句
+
+
+# ============================================================
+# 五维评分权重 + 缺失值归一化工具
+# ============================================================
+
+# 基础权重（按数据可靠性分配，参见 NBER Freyberger et al. 2022 缺失值处理原则）
+SCORING_WEIGHTS = {
+    "capital": 0.15,   # 数据不可靠（DDE 常失败），学术 alpha 弱（长江证券正交化后 IC -3.6%）
+    "news": 0.15,      # 依赖外部搜索 API
+    "sector": 0.25,    # mootdx TCP 稳定
+    "tech": 0.25,      # K 线永远可用
+    "risk": 0.20,      # 波动率永远可算
+}
+
+
+def weighted_score_with_redistribution(
+    dimension_scores: Dict[str, float],
+    dimension_available: Dict[str, bool],
+    base_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """加权评分 + 缺失维度权重归一化。
+
+    数据缺失时跳过该维度（而非给 0 分），剩余维度权重按比例放大。
+    参考 NBER Working Paper w30761 (Freyberger et al., 2022)。
+
+    Args:
+        dimension_scores: {维度名: 分数}（缺失维度的值不参与计算）
+        dimension_available: {维度名: 是否可用}
+        base_weights: 基础权重，默认使用 SCORING_WEIGHTS
+
+    Returns:
+        (综合分, 实际使用的归一化权重)
+    """
+    weights = base_weights or SCORING_WEIGHTS
+    active = {k for k, v in dimension_available.items() if v and k in weights}
+
+    if not active:
+        return 50.0, {}
+
+    total_w = sum(weights[k] for k in active)
+    if total_w <= 0:
+        return 50.0, {}
+
+    adjusted = {k: weights[k] / total_w for k in active}
+    score = sum(dimension_scores.get(k, 0) * adjusted[k] for k in active)
+    return round(score, 1), adjusted
 
 
 # ============================================================
@@ -340,6 +401,8 @@ class StockScreenerPipeline:
         # 构建板块名称 → strength_score 映射
         # 使用全部分析过的板块，确保更多个股能匹配到所属板块
         board_score_map: Dict[str, float] = {}
+        mainline_names = set()  # 主线板块名称集合
+
         all_sectors = rotation.all_sectors or (
             rotation.strong_sectors
             + rotation.emerging_sectors
@@ -348,6 +411,9 @@ class StockScreenerPipeline:
         for sector in all_sectors:
             if sector.strength_score > 0:
                 board_score_map[sector.name] = sector.strength_score
+                # 记录主线板块（强势 + 崛起）
+                if sector in rotation.strong_sectors or sector in rotation.emerging_sectors:
+                    mainline_names.add(sector.name)
 
         if not board_score_map:
             logger.info("[选股] 无强势/崛起板块，跳过板块评分")
@@ -363,19 +429,55 @@ class StockScreenerPipeline:
                 if not boards:
                     continue
 
-                best_score = 0.0
-                best_name = ""
+                # 收集所有匹配的板块信息
+                sector_scores = []  # [(score, weight), ...]
+                all_sectors_info = []  # 所有板块详细信息
+
                 for board in boards:
                     board_name = board.get("name", "")
+                    board_type = board.get("type", "concept")
+
                     if board_name in board_score_map:
                         score = board_score_map[board_name]
-                        if score > best_score:
-                            best_score = score
-                            best_name = board_name
+                        # 主线板块权重更高（1.5x），其他板块权重 1.0
+                        is_mainline = board_name in mainline_names
+                        weight = 1.5 if is_mainline else 1.0
 
-                if best_score > 0:
-                    stock.sector_name = best_name
-                    stock.sector_score = best_score
+                        sector_scores.append((score, weight))
+                        all_sectors_info.append({
+                            "name": board_name,
+                            "score": score,
+                            "type": board_type,
+                            "is_mainline": is_mainline,
+                            "weight": weight,
+                        })
+
+                # Top-N 过滤：只取强度最高的 3 个板块，避免稀释效应
+                # 学术参考：COAR-HGNN (KBS, 2024) 使用注意力机制动态加权
+                # 简化方案：Top-3 过滤，聚焦核心驱动概念
+                if sector_scores:
+                    # 按强度排序，只取 Top 3
+                    sorted_indices = sorted(
+                        range(len(sector_scores)),
+                        key=lambda i: sector_scores[i][0],
+                        reverse=True
+                    )
+                    top_indices = sorted_indices[:3]
+
+                    top_sector_scores = [sector_scores[i] for i in top_indices]
+                    top_sectors_info = [all_sectors_info[i] for i in top_indices]
+
+                    # 计算加权平均分数（基于 Top 3）
+                    total_weight = sum(w for _, w in top_sector_scores)
+                    weighted_score = sum(s * w for s, w in top_sector_scores) / total_weight
+
+                    stock.sector_score = weighted_score
+                    stock.all_sectors = all_sectors_info  # 保留所有板块信息用于展示
+
+                    # 选择最强板块作为主板块（向后兼容）
+                    best_sector = max(all_sectors_info, key=lambda x: x["score"])
+                    stock.sector_name = best_sector["name"]
+
                     matched_count += 1
             except Exception as e:
                 logger.debug(f"[选股] 板块匹配失败 {stock.code}: {e}")
@@ -963,7 +1065,9 @@ class StockScreenerPipeline:
 
         # 从达标的主线/埋伏板块获取成分股（用问财快速筛选）
         for sector_info in qualified_mainlines + qualified_ambush:
-            sector_name = sector_info.get("name")
+            # L3 清洗：TDX 板块名可能带 \u0000 填充/首尾空白
+            from src.services.board_name_resolver import clean_board_name
+            sector_name = clean_board_name(sector_info.get("name") or "")
             sector_score = sector_info.get("strength_score", 0)
             sector_type = "active_mainline" if sector_info in qualified_mainlines else "ambush"
 
@@ -1011,7 +1115,13 @@ class StockScreenerPipeline:
         """
         try:
             from src.services.ths_screener import THSScreenerService
+            from src.services.board_name_resolver import clean_board_name, get_board_name_resolver
             ths_service = THSScreenerService(self.config)
+
+            # L3 清洗 + L1/L2 解析：别名表（人工实测）→ 同花顺官方列表模糊匹配
+            sector_name = clean_board_name(sector_name)
+            resolver = get_board_name_resolver()
+            board_name = resolver.resolve(sector_name)
 
             # 根据板块类型使用不同的 DDE 筛选条件
             if sector_type == "active_mainline":
@@ -1022,22 +1132,81 @@ class StockScreenerPipeline:
                 dde_condition = "近5个交易日的dde大单净量合计>0，"
 
             # 概念→行业关键词映射（用于过滤蹭概念的票）
+            # 键名必须与 Phase 1 输出的板块名称完全一致（通常带"概念"后缀）
+            # 2026-08-18 补全：覆盖当前活跃主线板块，防止蹭概念票混入
             concept_industry_map = {
+                # ── 原有 ──
                 "数据要素": ["计算机", "软件", "数据处理", "信息服务", "互联网", "通信"],
                 "AI产业链": ["计算机", "软件", "电子", "通信", "人工智能", "芯片", "半导体"],
                 "AIGC概念": ["计算机", "软件", "传媒", "互联网", "人工智能"],
                 "AI智能体": ["计算机", "软件", "人工智能", "机器人"],
                 "华为鸿蒙": ["计算机", "软件", "电子", "通信", "手机"],
-                "CXO": ["医药", "医疗", "生物", "制药", "CRO", "CDMO"],
-                "黄金": ["贵金属", "有色", "矿业", "黄金"],
+                "CXO概念": ["医药", "医疗", "生物", "制药", "CRO", "CDMO"],
+                "生物制药": ["医药", "医疗", "生物", "制药", "生物医药"],
+                "生物医药": ["医药", "医疗", "生物", "制药"],
+                "黄金概念": ["贵金属", "有色", "矿业", "黄金"],
+                "黄金": ["贵金属", "有色", "矿业", "黄金"],  # 兼容不带"概念"后缀
+                "有色金属": ["有色", "金属", "矿业", "铜", "铝", "锂"],
+                "有色": ["有色", "金属", "矿业", "铜", "铝", "锂"],  # 兼容简称
                 "钢铁": ["钢铁", "金属制品", "特钢"],
                 "化纤": ["化学纤维", "化工", "涤纶", "氨纶"],
                 "汽车整车": ["汽车", "整车", "新能源车"],
                 "虚拟电厂": ["电力", "电气", "电网", "能源"],
+                "合成生物": ["生物", "医药", "化工", "发酵", "酶制剂"],
+                "稀土永磁": ["有色", "稀土", "金属", "磁性材料"],
+                "铜": ["有色", "铜", "金属", "矿业"],
+                "复合铜箔": ["有色", "铜", "金属", "新材料", "锂电"],
+                "5G概念": ["通信", "电子", "芯片", "半导体", "网络"],
+
+                # ── 2026-08-18 补全：光伏/电池技术 ──
+                "TOPCon电": ["光伏", "电池", "太阳能", "新能源", "硅片", "电气设备", "半导体设备", "电力设备"],
+                "BC电池":   ["光伏", "电池", "太阳能", "新能源", "硅片", "电气设备", "电力设备"],
+                "钙钛矿电": ["光伏", "电池", "太阳能", "新能源", "材料", "化工", "电气设备"],
+                "钠电池":   ["电池", "新能源", "储能", "化工", "电气设备", "锂电"],
+                "固态电池": ["电池", "新能源", "储能", "化工", "材料", "电气设备"],
+
+                # ── 2026-08-18 补全：电子/半导体 ──
+                "PCB概念":  ["电子", "电路", "PCB", "印刷电路", "覆铜板", "电子元器件", "半导体"],
+                "CPO概念":  ["光模块", "光通信", "通信设备", "电子", "半导体", "光电子"],
+                "OLED概念": ["显示", "面板", "电子", "半导体", "光电", "电子元器件"],
+                "MiniLED":  ["显示", "面板", "LED", "光电", "电子", "半导体"],
+                "光刻机":   ["半导体设备", "光刻", "精密制造", "光学", "电子", "机械设备"],
+
+                # ── 2026-08-18 补全：消费电子/显示 ──
+                "消费电子": ["电子", "消费电子", "手机", "智能硬件", "声学", "光学"],
+                "折叠屏":   ["显示", "面板", "手机", "消费电子", "柔性", "电子"],
+                "玻璃基板": ["显示", "玻璃", "面板", "电子", "新材料", "化工"],
+
+                # ── 2026-08-18 补全：通信/算力 ──
+                "光通信":   ["光模块", "光纤", "光器件", "通信", "电子", "通信设备"],
+                "液冷服务": ["服务器", "数据中心", "通信设备", "电子", "散热", "机械设备"],
+                "数据中心": ["计算机", "服务器", "数据中心", "通信", "电子", "互联网"],
+
+                # ── 2026-08-18 补全：新能源/汽车 ──
+                "新能源车": ["汽车", "新能源车", "电动车", "电池", "电机", "电控"],
+                "高压快充": ["充电", "电力", "电气", "新能源", "电池", "充电桩"],
+                "光伏":     ["光伏", "太阳能", "新能源", "电池", "电气设备"],
+
+                # ── 2026-08-18 补全：军工/航天 ──
+                "商业航天": ["航天", "军工", "航空", "卫星", "国防", "机械设备"],
+                "国防军工": ["军工", "国防", "航空", "航天", "兵器", "船舶"],
+                "无人机":   ["航空", "无人机", "军工", "飞行器", "机械设备"],
+
+                # ── 2026-08-18 补全：其他科技 ──
+                "人形机器": ["机器人", "机械", "自动化", "伺服", "减速器", "电气设备"],
+                "芯片":     ["半导体", "芯片", "集成电路", "电子", "电子元器件"],
+                "存储芯片": ["半导体", "存储", "芯片", "内存", "闪存", "电子"],
+                "先进封装": ["半导体", "封装", "芯片", "集成电路", "电子"],
+                "第三代半": ["半导体", "碳化硅", "氮化镓", "化合物半导体", "电子", "芯片", "集成电路"],
+                "有机硅概": ["有机硅", "硅材料", "化工", "新材料", "硅胶"],
+                "石墨烯":   ["石墨烯", "碳材料", "新材料", "纳米", "化工"],
+                "铜缆高速": ["通信", "电缆", "连接器", "电子", "数据中心", "铜"],
+                "EDA概念":  ["电子设计自动化", "软件", "半导体", "芯片", "计算机"],
+                "苹果概念": ["消费电子", "手机", "苹果", "电子", "声学", "光学"],
             }
 
             query = (
-                f"{sector_name}概念板块成分股，"
+                f"所属同花顺板块是{board_name}，"
                 f"{dde_condition}"
                 "上市天数>365天，"
                 "非ST，"
@@ -1048,6 +1217,8 @@ class StockScreenerPipeline:
 
             ths_result = ths_service.query(query)
             if ths_result and ths_result.stocks:
+                # 查询命中：若 board_name 来自 L2 模糊匹配，回写别名表（下次直接命中）
+                resolver.confirm(sector_name, board_name)
                 # 行业过滤：检查每只票的行业板块是否与概念主题相关
                 industry_keywords = concept_industry_map.get(sector_name, [])
                 filtered_stocks = []
@@ -1065,7 +1236,7 @@ class StockScreenerPipeline:
                 if len(filtered_stocks) < len(ths_result.stocks):
                     logger.info(f"[行业过滤] {sector_name}: {len(ths_result.stocks)}→{len(filtered_stocks)} 只（过滤{len(ths_result.stocks)-len(filtered_stocks)}只蹭概念票）")
 
-                # 取前 5 只
+                # 取前 10 只候选（后续由横盘过滤 + 漏斗筛选二次过滤）
                 stocks = [
                     {
                         "code": s.code,
@@ -1076,7 +1247,7 @@ class StockScreenerPipeline:
                         "turnover_rate": s.turnover_rate,
                         "volume": s.volume,
                     }
-                    for s in filtered_stocks[:5]
+                    for s in filtered_stocks[:10]
                 ]
                 logger.info(
                     f"[问财初筛-DDE-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选"
@@ -1087,9 +1258,10 @@ class StockScreenerPipeline:
             else:
                 logger.warning(f"[问财初筛-DDE-{sector_type}] {sector_name} 无结果，降级为不带 DDE 筛选")
                 # 降级：不过滤 DDE 阈值，但仍查询 DDE 值（供资金面评分用）
-                query_fallback = f"{sector_name}概念板块成分股，dde大单净量，上市天数>365天，非ST，按涨跌幅降序"
+                query_fallback = f"所属同花顺板块是{board_name}，dde大单净量，上市天数>365天，非ST，按涨跌幅降序"
                 ths_result = ths_service.query(query_fallback)
                 if ths_result and ths_result.stocks:
+                    resolver.confirm(sector_name, board_name)
                     stocks = [
                         {
                             "code": s.code,
@@ -1107,6 +1279,86 @@ class StockScreenerPipeline:
         except Exception as e:
             logger.error(f"[问财初筛-DDE-{sector_type}] {sector_name} 失败: {e}")
             return []
+
+    # ── 横盘 stagnation 过滤（回测实证：多窗口小涨幅区间胜率最低）──
+
+    # 横盘死区定义（回测 44 条实证，2026-06-13 ~ 06-17）
+    # 核心规律：多时间窗口均处于 0~10% 涨幅的票次日胜率仅 30~40%
+    # 而"回调买入"或"中等涨幅确认"的票胜率 60~80%
+    _STAGNATION_ZONES = [
+        (3,  0.00, 0.02),   # 3日 0~2%：刚启动但未确认
+        (5, -0.02, 0.02),   # 5日 -2~2%：横盘震荡
+        (12, 0.00, 0.10),   # 12日 0~10%：中期无趋势
+        (15, 0.00, 0.10),   # 15日 0~10%：中期无趋势
+    ]
+
+    def _filter_stagnation(
+        self, candidates: List[Dict], fetcher_manager
+    ) -> List[Dict]:
+        """横盘过滤：排除多时间窗口均处于"死区"的票。
+
+        回测依据（44 条历史选股，T+1 收益）：
+        - 3日 0~2%: 胜率 33%
+        - 5日 -2~2%: 胜率 33%
+        - 12日 0~10%: 胜率 30%
+        - 15日 0~10%: 胜率 40%
+        反之，回调（<-5%）或中等涨幅（5~20%）胜率 60~80%。
+
+        判定逻辑：如果一个票在 ≥2 个时间窗口都落入死区 → 排除。
+        单窗口落入死区不排除（可能是时间尺度差异）。
+        """
+        if not candidates:
+            return candidates
+
+        kept = []
+        stagnation_count = 0
+
+        for stock in candidates:
+            code = stock["code"]
+            try:
+                r = fetcher_manager.get_daily_data(code, days=30)
+                df = r[0] if isinstance(r, tuple) else r
+                if df is None or len(df) < 16:
+                    kept.append(stock)  # 数据不足，降级保留
+                    continue
+
+                df = df.reset_index(drop=True)
+                close = df["close"].values
+                n = len(close)
+                today_close = close[-1]
+
+                # 检查各时间窗口是否落入死区
+                dead_zones_hit = 0
+                for days, low, high in self._STAGNATION_ZONES:
+                    if n <= days:
+                        continue
+                    past_close = close[-(days + 1)]
+                    if past_close <= 0:
+                        continue
+                    ret = (today_close - past_close) / past_close
+                    if low <= ret < high:
+                        dead_zones_hit += 1
+
+                # ≥2 个窗口落入死区 → 横盘票，排除
+                if dead_zones_hit >= 2:
+                    stagnation_count += 1
+                    logger.debug(
+                        f"[横盘过滤] {code} 排除: {dead_zones_hit} 个窗口落入死区"
+                    )
+                else:
+                    kept.append(stock)
+
+            except Exception as e:
+                logger.debug(f"[横盘过滤] {code} 计算失败({e})，降级保留")
+                kept.append(stock)
+
+        if stagnation_count > 0:
+            logger.info(
+                f"[横盘过滤] {len(candidates)} → {len(kept)} 只"
+                f"（排除 {stagnation_count} 只多窗口横盘票）"
+            )
+
+        return kept
 
     def _filter_got_finalists(
         self,
@@ -1127,16 +1379,35 @@ class StockScreenerPipeline:
 
         candidates = universe.copy()
 
+        # 轮次 0: 剔除涨停股（当日无法买入）
+        def _is_limit_up(c: dict) -> bool:
+            pct = c.get("change_pct", 0)
+            code = c.get("code", "")
+            # 创业板(300xxx)/科创板(688xxx) 涨跌幅限制 20%
+            if code.startswith(("300", "688", "689")):
+                return pct >= 19.5
+            # 主板/中小板 涨跌幅限制 10%
+            return pct >= 9.5
+
+        limit_up_count = sum(1 for c in candidates if _is_limit_up(c))
+        candidates = [c for c in candidates if not _is_limit_up(c)]
+        logger.info(f"轮次 0: {len(candidates)} 只（剔除 {limit_up_count} 只涨停）")
+
         # 轮次 1: 信号过滤（排除衰竭板块）
         exhausted = [s.get("name") for s in got_context.get("sector_context", {}).get("exhausted_mainline", [])]
         candidates = [c for c in candidates if c["sector"] not in exhausted]
         logger.info(f"轮次 1: {len(candidates)} 只（排除衰竭板块）")
 
+        # 轮次 1.5: 横盘过滤（排除多窗口小涨幅的停滞票）
+        candidates = self._filter_stagnation(candidates, fetcher_manager)
+        logger.info(f"轮次 1.5: {len(candidates)} 只（横盘过滤后）")
+
         # 轮次 2: 资金面评分 Top 20
         capital_ctx = got_context.get("capital_context", {})
-        capital_scores = self._score_capital(candidates, capital_ctx, fetcher_manager)
+        capital_scores, capital_avail = self._score_capital(candidates, capital_ctx)
         for c in candidates:
             c["capital_score"] = capital_scores.get(c["code"], 0)
+            c["capital_available"] = capital_avail.get(c["code"], False)
         candidates.sort(key=lambda x: x["capital_score"], reverse=True)
         candidates = candidates[:20]
         logger.info(f"轮次 2: {len(candidates)} 只（资金面 Top 20）")
@@ -1160,9 +1431,38 @@ class StockScreenerPipeline:
 
         # 消息面评分（全量候选，不排序但记录分数）
         news_ctx = got_context.get("news_context", {})
-        news_scores = self._score_news(candidates, news_ctx)
+        sector_ctx = got_context.get("sector_context", {})
+        news_scores, news_avail = self._score_news(candidates, news_ctx, sector_ctx)
         for c in candidates:
             c["news_score"] = news_scores.get(c["code"], 0)
+            c["news_available"] = news_avail.get(c["code"], False)
+
+        # P5: 催化剂关联度重排（仅 ambush 板块，置信度 >= 0.7 时生效）
+        catalyst_scores, catalyst_details = self._score_catalyst_relevance(candidates, got_context)
+        max_catalyst_confidence = max(
+            (d.get("confidence", 0) for d in catalyst_details.values()),
+            default=0.0,
+        )
+        ambush_candidates = [c for c in candidates if c.get("sector_type") == "ambush"]
+        if catalyst_scores and max_catalyst_confidence >= 0.7 and ambush_candidates:
+            # 对 ambush 候选按催化剂关联度重排
+            for c in candidates:
+                c["catalyst_relevance_score"] = catalyst_scores.get(c["code"], 0)
+            # 仅重排 ambush 候选（主线候选保持技术排序）
+            ambush_candidates.sort(
+                key=lambda x: x.get("catalyst_relevance_score", 0), reverse=True
+            )
+            # 重建候选列表：主线保持原序 + ambush 按催化剂重排
+            mainline_reordered = [c for c in candidates if c.get("sector_type") != "ambush"]
+            candidates = mainline_reordered + ambush_candidates
+            logger.info(
+                f"P5催化剂重排: {len(ambush_candidates)} 只 ambush 候选重排 "
+                f"(max_confidence={max_catalyst_confidence:.2f})"
+            )
+        elif catalyst_scores:
+            logger.info(
+                f"P5催化剂重排跳过: max_confidence={max_catalyst_confidence:.2f} < 0.7"
+            )
 
         # 轮次 5: 板块分散 Top N（每个板块最多 1 只）
         sector_count = {}
@@ -1177,12 +1477,20 @@ class StockScreenerPipeline:
                     score=0.0,  # 稍后计算
                     source="got",
                     capital_score=c.get("capital_score", 0),
+                    capital_available=c.get("capital_available", False),
                     news_score=c.get("news_score", 0),
+                    news_available=c.get("news_available", False),
                     tech_wave_score=c["tech_wave_score"],
                     risk_score_safe=c["risk_score_safe"],
                     sector_name=c["sector"],
                     sector_score=c["sector_score"],
                     sector_type=c["sector_type"],
+                    # P5 催化剂关联度
+                    catalyst_relevance_score=c.get("catalyst_relevance_score", 0),
+                    catalyst_event_title=catalyst_details.get(c["code"], {}).get("event_title", ""),
+                    catalyst_event_date=catalyst_details.get(c["code"], {}).get("event_date", ""),
+                    catalyst_event_type=catalyst_details.get(c["code"], {}).get("event_type", ""),
+                    catalyst_confidence=catalyst_details.get(c["code"], {}).get("confidence", 0),
                 )
 
                 # 计算综合评分（5 维）
@@ -1202,235 +1510,477 @@ class StockScreenerPipeline:
 
         return finalists
 
-    def _score_capital(self, candidates: List[Dict], capital_ctx: dict, fetcher_manager) -> Dict[str, float]:
-        """资金面评分（30% 权重）
+    def _score_capital(
+        self, candidates: List[Dict], capital_ctx: dict
+    ) -> Tuple[Dict[str, float], Dict[str, bool]]:
+        """资金面评分（15% 权重）
 
-        评分维度：
-        - 龙虎榜机构买入: +40分（如果在 mainline_stocks_bought 中）
-        - 主力资金净流入: +30分（从 AKShare 获取）
-        - 北向资金净买入: +15分（如果 get_northbound_flow 显示净流入）
-        - 大宗交易溢价: +15分（如果 signal_type == "抢筹"）
+        评分维度（v2 重构，砍掉无法获取的维度）：
+        - DDE 大单净量百分位: 0-50分（问财初筛已包含）
+        - 板块资金流百分位: 0-50分（Node 3 sector_flow 数据）
+        总计: 0-100分
+
+        Returns:
+            (scores, availability): 评分字典 + 可用性字典
+            availability[code]=True 表示该股票有真实资金数据（DDE 或板块资金流命中）
         """
-        # 解析龙虎榜买入列表（格式: "300502.新易盛"）
-        dragon_tiger_bought_raw = capital_ctx.get("evidence", {}).get("dragon_tiger", {}).get("mainline_stocks_bought", [])
-        dragon_tiger_bought_codes = set()
-        for item in dragon_tiger_bought_raw:
-            if "." in item:
-                code = item.split(".")[0]
-                dragon_tiger_bought_codes.add(code)
-
-        # 资金流数据：直接从候选股的 DDE 字段获取（问财初筛已包含）
-        # 不再逐只调用 AKShare/mootdx，节省 90%+ 耗时
-        capital_flow_data = {}
+        # ── 维度1: DDE 大单净量百分位 (0-50分) ──
+        dde_data = {}
         for c in candidates:
             dde = c.get("dde_net_pct", 0)
             if dde != 0:
-                capital_flow_data[c["code"]] = dde
+                dde_data[c["code"]] = dde
 
-        if capital_flow_data:
+        if dde_data:
             logger.info(
-                f"[资金面-THS] 使用问财 DDE 数据: "
-                f"{len(capital_flow_data)} 只, "
-                f"范围 {min(capital_flow_data.values()):.2f}%~{max(capital_flow_data.values()):.2f}%"
+                f"[资金面-DDE] {len(dde_data)} 只, "
+                f"范围 {min(dde_data.values()):.2f}%~{max(dde_data.values()):.2f}%"
             )
         else:
-            logger.warning("[资金面-THS] 候选股无 DDE 数据，资金面维度将为 0")
+            logger.warning("[资金面-DDE] 候选股无 DDE 数据")
 
-        # 一次性获取北向资金数据（避免重复请求）
-        northbound_positive = False
-        try:
-            northbound_df = fetcher_manager.get_northbound_flow()
-            if northbound_df is not None and not northbound_df.empty:
-                latest = northbound_df.iloc[-1]
-                if latest.get("net_amount", 0) > 0:
-                    northbound_positive = True
-                    logger.info("[资金面] 北向资金净流入")
-        except Exception as e:
-            logger.warning(f"获取北向资金失败: {e}")
+        dde_sorted = sorted(dde_data.values(), reverse=True) if dde_data else []
 
-        # 一次性获取大宗交易数据（避免重复请求）
-        block_trade_data = {}
-        try:
-            block_trade_df = fetcher_manager.get_block_trade()
-            if block_trade_df is not None and not block_trade_df.empty:
-                # 大宗交易数据按股票代码分组
-                # 注意：字段名可能是 '代码' 而不是 'code'
-                code_col = '代码' if '代码' in block_trade_df.columns else 'code'
-                signal_col = 'signal_type' if 'signal_type' in block_trade_df.columns else None
+        # ── 维度2: 板块资金流 (0-50分) ──
+        # 从 sector_flow 解析板块名→净流入金额（亿）
+        sector_flow_map = self._parse_sector_flow(capital_ctx)
 
-                if signal_col:
-                    for _, row in block_trade_df.iterrows():
-                        stock_code = str(row.get(code_col, ''))
-                        signal = row.get(signal_col, '')
-                        if stock_code:
-                            # 如果有多条记录，取最新的信号
-                            block_trade_data[stock_code] = signal
-                    logger.info(f"[资金面] 获取到 {len(block_trade_data)} 只股票的大宗交易数据")
-        except Exception as e:
-            logger.warning(f"获取大宗交易失败: {e}")
+        if sector_flow_map:
+            logger.info(
+                f"[资金面-板块] {len(sector_flow_map)} 个板块有资金流数据, "
+                f"范围 {min(sector_flow_map.values()):.1f}~{max(sector_flow_map.values()):.1f}亿"
+            )
+        else:
+            logger.warning("[资金面-板块] 无 sector_flow 数据")
 
-        scores = {}
-
-        # 资金流排名百分位（DDE 大单净量%，用于 0-30 分评分）
-        flow_values = sorted(capital_flow_data.values(), reverse=True) if capital_flow_data else []
-
+        # 为每个候选股匹配其所属板块的资金流（包含负值——净流出也是有效数据）
+        sector_flow_by_stock = {}
         for c in candidates:
-            score = 0
+            sector = c.get("sector", "")
+            if sector in sector_flow_map:
+                sector_flow_by_stock[c["code"]] = sector_flow_map[sector]
 
-            # 龙虎榜机构买入 (+40)
-            if c["code"] in dragon_tiger_bought_codes:
-                score += 40
+        # 板块资金流百分位：基于全量板块排名（而非仅候选股之间）
+        all_flows = sorted(sector_flow_map.values(), reverse=True) if sector_flow_map else []
 
-            # 主力资金净流入 — DDE 大单净量排名百分位 (+0~30)
-            if c["code"] in capital_flow_data and flow_values:
-                dde_val = capital_flow_data[c["code"]]
-                # 排名百分位：DDE 越高排名越靠前，percentile 越高
-                rank_idx = flow_values.index(dde_val)
-                percentile = 1.0 - (rank_idx / max(len(flow_values) - 1, 1))
-                score += int(30 * percentile)
+        # ── 综合评分 ──
+        scores = {}
+        availability = {}
+        for c in candidates:
+            score = 0.0
+            has_data = False
 
-            # 北向资金（所有股票共享同一个结果）(+15)
-            if northbound_positive:
-                score += 15
+            # DDE 百分位 (0-50)
+            if c["code"] in dde_data and dde_sorted:
+                dde_val = dde_data[c["code"]]
+                rank_idx = dde_sorted.index(dde_val)
+                percentile = 1.0 - (rank_idx / max(len(dde_sorted) - 1, 1))
+                score += 50 * percentile
+                has_data = True
 
-            # 大宗交易抢筹 (+15)
-            stock_signal = block_trade_data.get(c["code"], "")
-            if stock_signal == "抢筹":
-                score += 15
+            # 板块资金流百分位 (0-50)：在全量板块中的排名位置
+            if c["code"] in sector_flow_by_stock and all_flows:
+                flow_val = sector_flow_by_stock[c["code"]]
+                # 计算 flow_val 在 all_flows 中的排名（二分查找更高效）
+                rank_idx = 0
+                for i, v in enumerate(all_flows):
+                    if v >= flow_val:
+                        rank_idx = i
+                    else:
+                        break
+                percentile = 1.0 - (rank_idx / max(len(all_flows) - 1, 1))
+                score += 50 * percentile
+                has_data = True
 
-            scores[c["code"]] = score
+            scores[c["code"]] = round(score, 1)
+            availability[c["code"]] = has_data
 
-        return scores
+        return scores, availability
 
-    def _score_news(self, candidates: List[Dict], news_ctx: dict) -> Dict[str, float]:
-        """消息面评分（20% 权重）
+    @staticmethod
+    def _parse_sector_flow(capital_ctx: dict) -> Dict[str, float]:
+        """从 Node 3 的 sector_flow 解析板块名→净流入金额（亿）
 
-        根据新闻事件中 affected_sectors 与候选股所在板块的匹配度评分。
-        - high impact + positive → +40
-        - high impact + negative → -20（减分）
-        - medium impact + positive → +20
-        - medium impact + negative → -10
-        - 多源确认（source_count ≥ 3）额外 ×1.5
+        优先使用全量映射 sector_flow_all（~300 概念 + ~41 行业），
+        回退到 top_concepts/top_industries（仅 top 5+3）。
+        """
+        import re
+        sector_flow = capital_ctx.get("evidence", {}).get("sector_flow")
+        if not sector_flow:
+            return {}
+
+        # 优先全量映射（Node 3 存储的 ~300 概念 + ~41 行业实时数据）
+        all_map = sector_flow.get("sector_flow_all")
+        if all_map and isinstance(all_map, dict) and len(all_map) > 10:
+            return all_map
+
+        # 回退：从 top_concepts/top_industries 字符串解析
+        result = {}
+        pattern = re.compile(r"^(.+?)\(([\d.]+)亿\)$")
+
+        for entry_list in [sector_flow.get("top_concepts", []), sector_flow.get("top_industries", [])]:
+            if not isinstance(entry_list, list):
+                continue
+            for entry in entry_list:
+                m = pattern.match(entry)
+                if m:
+                    board_name = m.group(1).strip()
+                    amount = float(m.group(2))
+                    # 同一板块可能在 concepts 和 industries 都出现，取最大值
+                    result[board_name] = max(result.get(board_name, 0), amount)
+
+        return result
+
+    def _get_all_sector_names(self, sector_context: dict) -> set:
+        """构建完整板块名集合（TDX_BOARD_REGISTRY + sector.json 动态板块）
+
+        确保候选股 sector 值无论来自 registry 还是动态发现都能被匹配到。
+        """
+        from data_provider.tdx_board_mapping import TDX_BOARD_REGISTRY
+
+        # 基础：TDX 注册表（~85 个硬编码板块）
+        names = {info["name"] for info in TDX_BOARD_REGISTRY.values()}
+
+        # 兜底：从当天 sector.json 提取所有板块名（覆盖动态发现的板块）
+        for key in ("active_mainline", "ambush", "top_by_score"):
+            items = sector_context.get(key, [])
+            for item in items:
+                # active_mainline 是 MainlineGroup 格式，需展开 members
+                members = item.get("members", [])
+                if members:
+                    for m in members:
+                        if m.get("name"):
+                            names.add(m["name"])
+                elif item.get("name"):
+                    names.add(item["name"])
+
+        return names
+
+    def _score_news(
+        self, candidates: List[Dict], news_ctx: dict, sector_context: dict = None
+    ) -> Tuple[Dict[str, float], Dict[str, bool]]:
+        """消息面评分（15% 权重）— LLM 语义匹配版
+
+        流程：
+        1. 将 Node 4 事件 + 板块名列表（TDX_REGISTRY + 动态板块）交给 LLM
+        2. LLM 输出：每个受影响板块的 sentiment × relevance
+        3. 候选股 sector 精确匹配 LLM 输出的板块名 → 评分
+        4. LLM 失败时降级到子串匹配
+
+        Returns:
+            (scores, availability): 评分字典 + 可用性字典
         """
         events = news_ctx.get("major_events", [])
         if not events:
-            return {c["code"]: 50.0 for c in candidates}  # 无新闻时中性
+            logger.warning("[消息面] 无新闻事件，所有候选股消息面不可用")
+            return {c["code"]: 40.0 for c in candidates}, {c["code"]: False for c in candidates}
 
+        # 构建完整板块名集合
+        all_sector_names = self._get_all_sector_names(sector_context or {})
+
+        # 尝试 LLM 语义匹配
+        sector_news_map = self._llm_score_sector_news(events, all_sector_names)
+
+        if sector_news_map:
+            logger.info(f"[消息面-LLM] {len(sector_news_map)} 个板块获匹配")
+        else:
+            logger.warning("[消息面-LLM] LLM 匹配失败，降级到子串匹配")
+            sector_news_map = self._fallback_sector_match(events, all_sector_names)
+
+        # 评分：基础分 40 + 板块情感分 × 60
+        # 有事件即视为可用（无匹配给中性基础分 40，参与加权）
+        has_events = bool(events)
         scores = {}
+        availability = {}
         for c in candidates:
             sector = c.get("sector", "")
-            score = 50.0  # 基础分（中性）
+            news_signal = sector_news_map.get(sector, 0.0)
+            score = 40.0 + news_signal * 60.0
+            scores[c["code"]] = max(0.0, min(100.0, score))
+            availability[c["code"]] = has_events
 
-            for event in events:
-                affected = event.get("affected_sectors", [])
-                # 板块名匹配（模糊匹配：板块名包含在 affected 或反之）
-                if not any(self._sector_matches(sector, a) for a in affected):
+        return scores, availability
+
+    def _llm_score_sector_news(self, events: list, all_sector_names: set) -> Dict[str, float]:
+        """调用 LLM 将新闻事件映射到具体板块的情感分
+
+        Args:
+            events: Node 4 新闻事件列表
+            all_sector_names: 合法板块名集合（TDX_REGISTRY + 动态板块）
+
+        Returns:
+            {板块名: 加权情感分}，范围 [-1, +1]
+        """
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        board_list = sorted(all_sector_names)
+
+        if not board_list:
+            logger.warning("[消息面-LLM] 板块名列表为空")
+            return {}
+
+        # 构建事件摘要
+        event_lines = []
+        for i, ev in enumerate(events):
+            title = ev.get("title", "")
+            summary = ev.get("summary", "")[:200]
+            sentiment = ev.get("sentiment", "neutral")
+            impact = ev.get("impact_level", "medium")
+            event_lines.append(f"{i+1}. [{impact}/{sentiment}] {title}\n   {summary}")
+        events_text = "\n".join(event_lines)
+        boards_text = ", ".join(board_list)
+
+        prompt = f"""你是一个A股市场分析专家。给定以下新闻事件和合法板块名列表，判断每个事件影响了哪些板块。
+
+## 新闻事件
+{events_text}
+
+## 合法板块名列表（只能从以下名称中选择）
+{boards_text}
+
+## 输出要求
+输出 JSON 数组，每个元素表示一个受影响的板块：
+[{{"sector": "板块名", "relevance": 0.8, "sentiment": "positive"}}, ...]
+
+规则：
+- sector 必须是上方合法板块名列表中的精确名称
+- relevance: 0-1，事件对该板块的影响程度
+- sentiment: positive / negative / neutral
+- 一个事件可影响多个板块，不同事件可影响同一板块（取最强影响）
+- 只输出 relevance >= 0.3 的板块
+- 只输出 JSON 数组，不要其他文字"""
+
+        try:
+            adapter = LLMToolAdapter(self.config)
+            response = adapter.call_text(
+                [{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=3000,
+                timeout=60,
+            )
+
+            if not response or not response.content:
+                logger.warning("[消息面-LLM] LLM 返回空")
+                return {}
+
+            # 解析 JSON
+            import re
+            match = re.search(r'\[[\s\S]*\]', response.content)
+            if not match:
+                logger.warning("[消息面-LLM] 无法提取 JSON 数组")
+                return {}
+
+            items = json.loads(match.group())
+            if not isinstance(items, list):
+                return {}
+
+            # 聚合：同一板块取最强影响
+            sector_scores: Dict[str, float] = {}
+            sentiment_multiplier = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                sector = str(item.get("sector", "")).strip()
+                relevance = float(item.get("relevance", 0))
+                sentiment = str(item.get("sentiment", "neutral")).strip()
+
+                if sector not in all_sector_names or relevance < 0.3:
                     continue
 
-                impact = event.get("impact_level", "low")
-                sentiment = event.get("sentiment", "neutral")
-                source_count = event.get("source_count", 1)
+                signal = relevance * sentiment_multiplier.get(sentiment, 0)
+                # 同一板块多事件取绝对值最大的
+                if abs(signal) > abs(sector_scores.get(sector, 0)):
+                    sector_scores[sector] = signal
 
-                # 基础分数
-                if impact == "high" and sentiment == "positive":
-                    delta = 40
-                elif impact == "high" and sentiment == "negative":
-                    delta = -20
-                elif impact == "medium" and sentiment == "positive":
-                    delta = 20
-                elif impact == "medium" and sentiment == "negative":
-                    delta = -10
-                else:
-                    delta = 0
+            logger.info(f"[消息面-LLM] 解析成功: {len(sector_scores)} 个板块")
+            return sector_scores
 
-                # 多源确认加成
-                if source_count >= 3:
-                    delta = int(delta * 1.5)
+        except Exception as e:
+            logger.warning(f"[消息面-LLM] LLM 调用失败: {e}")
+            return {}
 
-                score += delta
+    def _fallback_sector_match(self, events: list, all_sector_names: set) -> Dict[str, float]:
+        """降级方案：子串匹配 affected_sectors → 板块名
 
-            scores[c["code"]] = max(0, min(100, score))
+        Args:
+            events: Node 4 新闻事件列表
+            all_sector_names: 合法板块名集合（TDX_REGISTRY + 动态板块）
+        """
+        sector_scores: Dict[str, float] = {}
+        sentiment_multiplier = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
 
-        return scores
+        for ev in events:
+            affected = ev.get("affected_sectors", [])
+            sentiment = ev.get("sentiment", "neutral")
+            impact = ev.get("impact_level", "medium")
 
-    @staticmethod
-    def _sector_matches(stock_sector: str, news_sector: str) -> bool:
-        """板块名模糊匹配（处理新闻板块名与问财板块名不一致的情况）"""
-        if not stock_sector or not news_sector:
-            return False
-        # 精确匹配或包含关系
-        return stock_sector in news_sector or news_sector in stock_sector
+            base = {"high": 1.0, "medium": 0.6, "low": 0.3}.get(impact, 0.3)
+            signal = base * sentiment_multiplier.get(sentiment, 0)
+
+            # 子串匹配：affected_sector 与板块名双向包含即命中
+            matched_boards = set()
+            for a in affected:
+                for board in all_sector_names:
+                    if a in board or board in a:
+                        matched_boards.add(board)
+
+            for board in matched_boards:
+                if abs(signal) > abs(sector_scores.get(board, 0)):
+                    sector_scores[board] = signal
+
+        return sector_scores
 
     def _score_technical_wave(self, candidates: List[Dict], fetcher_manager) -> Dict[str, float]:
-        """波段技术指标评分（15% 权重）
+        """波段技术指标评分（15% 权重）— 连续评分版
 
-        与短线不同，波段操作关注：
-        - MA20 趋势: 20%（价格在 MA20 上方且 MA20 向上）
-        - 布林带位置: 15%（在中轨和上轨之间）
-        - 周线趋势: 15%（周线 MA10 向上）
-        - RSI12: 10%（50-70 区间，未超买）
-        - 20 日突破: 10%（突破 20 日最高价）
-        - 量比: 10%（1.5-3.0 温和放量）
-        - 换手率: 10%（3%-8% 适中）
-        - MACD 金叉: 10%（DIF 上穿 DEA）
+        所有维度改为连续评分（消除二元判定的分辨率损失）：
+        - MA20 趋势: 20分（偏离度 12 + 斜率 8）
+        - 布林带位置: 15分（带状位置连续映射）
+        - RSI12: 10分（50-70 最优，分段连续）
+        - 20日突破: 10分（突破程度连续）
+        - 量比: 10分（1.5-3.0 最优，连续）
+        - 换手率: 10分（3%-8% 最优，连续）
+        - MACD 状态: 10分（金叉/死叉/方向 + DIF 力度）
+        - 均线排列: 15分（MA 间距连续）
         """
         scores = {}
 
         for c in candidates:
-            # 获取 60 天 K 线
             try:
                 df, _ = fetcher_manager.get_daily_data(c["code"], days=60)
                 if df is None or len(df) < 20:
                     scores[c["code"]] = 0
                     continue
 
-                score = 0
+                close = df["close"]
+                score = 0.0
 
-                # MA20 趋势（20%）
-                ma20 = df["close"].rolling(20).mean().iloc[-1]
-                ma20_5d_ago = df["close"].rolling(20).mean().iloc[-5]
-                if df["close"].iloc[-1] > ma20 and ma20 > ma20_5d_ago:
-                    score += 20
+                # ── 1. MA20 趋势（20分：偏离度 12 + 斜率 8）──
+                ma20 = close.rolling(20).mean()
+                ma20_now = ma20.iloc[-1]
+                ma20_5d = ma20.iloc[-5]
+                if ma20_now > 0:
+                    gap = (close.iloc[-1] - ma20_now) / ma20_now
+                    slope = (ma20_now - ma20_5d) / ma20_now
+                    if gap > 0:
+                        score += min(12.0, gap * 300)
+                    if slope > 0:
+                        score += min(8.0, slope * 200)
 
-                # 布林带位置（15%）
-                bb_mid = df["close"].rolling(20).mean().iloc[-1]
-                bb_std = df["close"].rolling(20).std().iloc[-1]
+                # ── 2. 布林带位置（15分）──
+                bb_mid = ma20_now
+                bb_std = close.rolling(20).std().iloc[-1]
                 bb_upper = bb_mid + 2 * bb_std
-                if bb_mid < df["close"].iloc[-1] < bb_upper:
-                    score += 15
+                bb_lower = bb_mid - 2 * bb_std
+                if bb_upper > bb_lower:
+                    boll_pos = (close.iloc[-1] - bb_lower) / (bb_upper - bb_lower)
+                    # 最优区间 0.5~0.85，两端衰减
+                    if boll_pos < 0:
+                        score += 0
+                    elif boll_pos < 0.3:
+                        score += boll_pos / 0.3 * 7
+                    elif boll_pos <= 0.85:
+                        score += 7 + (boll_pos - 0.3) / 0.55 * 8
+                    elif boll_pos <= 1.0:
+                        score += 15 - (boll_pos - 0.85) / 0.15 * 5
+                    else:
+                        score += 10  # 上轨以上，略扣
 
-                # RSI12（10%）
-                rsi12 = self._calc_rsi(df["close"], 12)
-                if 50 <= rsi12 <= 70:
-                    score += 10
+                # ── 3. RSI12（10分：50-70 最优）──
+                rsi12 = self._calc_rsi(close, 12)
+                if rsi12 < 30:
+                    score += rsi12 / 30 * 3
+                elif rsi12 < 50:
+                    score += 3 + (rsi12 - 30) / 20 * 5
+                elif rsi12 <= 70:
+                    score += 8 + (rsi12 - 50) / 20 * 2
+                elif rsi12 <= 85:
+                    score += max(0, 10 - (rsi12 - 70) / 15 * 6)
+                else:
+                    score += 2  # 严重超买
 
-                # 20 日突破（10%）
-                high_20d = df["high"].rolling(20).max().iloc[-2]
-                if df["close"].iloc[-1] > high_20d:
-                    score += 10
+                # ── 4. 20日突破（10分：突破程度连续）──
+                high_20d_prev = df["high"].rolling(20).max().iloc[-2]
+                if high_20d_prev > 0:
+                    breakout_ratio = (close.iloc[-1] - high_20d_prev) / high_20d_prev
+                    if breakout_ratio > 0:
+                        score += min(10.0, 5.0 + breakout_ratio * 200)
+                    else:
+                        # 未突破但接近高点也给分
+                        score += max(0, 5.0 + breakout_ratio * 100)
 
-                # 量比（10%）
-                volume_ratio = df["volume"].iloc[-1] / df["volume"].rolling(5).mean().iloc[-2]
-                if 1.5 <= volume_ratio <= 3.0:
-                    score += 10
+                # ── 5. 量比（10分：1.5-3.0 最优）──
+                vol_ma5 = df["volume"].rolling(5).mean().iloc[-2]
+                if vol_ma5 > 0:
+                    volume_ratio = df["volume"].iloc[-1] / vol_ma5
+                    if volume_ratio < 0.5:
+                        score += 0
+                    elif volume_ratio < 1.0:
+                        score += (volume_ratio - 0.5) / 0.5 * 3
+                    elif volume_ratio <= 3.0:
+                        score += 3 + (volume_ratio - 1.0) / 2.0 * 7
+                    elif volume_ratio <= 5.0:
+                        score += max(0, 10 - (volume_ratio - 3.0) / 2.0 * 5)
+                    else:
+                        score += 2  # 过度放量
 
-                # 换手率（10%）— 直接使用问财返回的数据，避免逐只拉行情
-                turnover_rate = c.get("turnover_rate", 0)
-                if turnover_rate and 0.03 <= turnover_rate <= 0.08:
-                    score += 10
+                # ── 6. 换手率（10分：3%-8% 最优）──
+                turnover_rate = c.get("turnover_rate", 0) or 0
+                if turnover_rate <= 0:
+                    score += 0
+                elif turnover_rate < 0.03:
+                    score += turnover_rate / 0.03 * 4
+                elif turnover_rate <= 0.08:
+                    score += 4 + (turnover_rate - 0.03) / 0.05 * 6
+                elif turnover_rate <= 0.15:
+                    score += max(0, 10 - (turnover_rate - 0.08) / 0.07 * 5)
+                else:
+                    score += 2  # 过度换手
 
-                # MACD 金叉（10%）
-                macd_line, signal_line, _ = self._calc_macd(df["close"])
-                if macd_line.iloc[-1] > signal_line.iloc[-1] and macd_line.iloc[-2] <= signal_line.iloc[-2]:
-                    score += 10
+                # ── 7. MACD 状态（10分）──
+                macd_line, signal_line, hist = self._calc_macd(close)
+                macd_now = macd_line.iloc[-1]
+                signal_now = signal_line.iloc[-1]
+                macd_prev = macd_line.iloc[-2]
+                signal_prev = signal_line.iloc[-2]
+                # 金叉/死叉基础分
+                if macd_now > signal_now:
+                    score += 6  # 多头状态
+                    # 刚金叉加分
+                    if macd_prev <= signal_prev:
+                        score += 4
+                    else:
+                        # DIF 力度（持续放大）
+                        if hist is not None and len(hist) >= 2:
+                            hist_now = hist.iloc[-1]
+                            hist_prev = hist.iloc[-2]
+                            if hist_now > hist_prev > 0:
+                                score += 3
+                            elif hist_now > 0:
+                                score += 1
+                else:
+                    # 空头状态
+                    if macd_prev >= signal_prev:
+                        score += 0  # 刚死叉，最差
+                    else:
+                        score += 2  # 持续空头但未恶化
 
-                # 均线多头排列（15%）
-                ma5 = df["close"].rolling(5).mean().iloc[-1]
-                ma10 = df["close"].rolling(10).mean().iloc[-1]
-                if ma5 > ma10 > ma20:
-                    score += 15
+                # ── 8. 均线多头排列（15分：间距连续）──
+                ma5 = close.rolling(5).mean().iloc[-1]
+                ma10 = close.rolling(10).mean().iloc[-1]
+                ma20_val = ma20_now
+                if ma5 > ma10 > ma20_val and ma20_val > 0:
+                    # 多头排列，按间距给分
+                    gap_5_10 = (ma5 - ma10) / ma20_val
+                    gap_10_20 = (ma10 - ma20_val) / ma20_val
+                    score += min(15.0, 8 + (gap_5_10 + gap_10_20) * 200)
+                elif ma5 > ma10:
+                    score += 4  # 部分多头
+                elif ma5 > ma20_val:
+                    score += 2
 
-                scores[c["code"]] = score
+                scores[c["code"]] = min(100.0, round(score, 1))
             except Exception as e:
                 logger.warning(f"计算技术指标失败 {c['code']}: {e}")
                 scores[c["code"]] = 0
@@ -1482,52 +2032,239 @@ class StockScreenerPipeline:
 
         return scores
 
+    # ============================================================
+    # P5 催化剂关联度重排
+    # ============================================================
+
+    def _score_catalyst_relevance(
+        self, candidates: List[Dict], got_context: dict
+    ) -> Tuple[Dict[str, float], Dict[str, dict]]:
+        """催化剂关联度评分（P5）
+
+        消费 catalyst_calendar，为每只候选股计算催化剂关联度分数。
+
+        评分逻辑：
+        1. 个股级事件（earnings/lockup）→ title 含股票代码 → 当事股直接置顶 (score=100)
+        2. 板块级事件（narrative/global/macro）→ sector 匹配 → score = confidence × impact × proximity × 50
+        3. 无事件匹配 → score=0
+
+        重排规则：
+        - 仅对 ambush 板块候选生效
+        - 最大 confidence < 0.7 → 不重排（保持技术排序）
+
+        Returns:
+            (scores, details): 评分字典 + 催化剂详情字典
+        """
+        import re
+
+        # ── 加载催化剂日历 ──
+        news_ctx = got_context.get("news_context", {})
+        calendar_data = news_ctx.get("catalyst_calendar")
+        if not calendar_data:
+            logger.info("[P5催化剂] 无催化剂日历数据，跳过重排")
+            return {}, {}
+
+        events = calendar_data.get("events", [])
+        if not events:
+            logger.info("[P5催化剂] 催化剂日历无事件，跳过重排")
+            return {}, {}
+
+        logger.info(f"[P5催化剂] 加载 {len(events)} 个催化剂事件")
+
+        # ── 提取个股级事件中的股票代码 → event 映射 ──
+        stock_code_pattern = re.compile(r'(\d{6})')
+        individual_events: Dict[str, List[dict]] = {}  # stock_code → [events]
+        sector_events: Dict[str, List[dict]] = {}      # sector_name → [events]
+
+        from datetime import date as date_cls
+        today = date_cls.today()
+
+        for evt in events:
+            event_type = evt.get("event_type", "")
+            confidence = float(evt.get("confidence", 0))
+            sector = evt.get("sector", "")
+            title = evt.get("title", "")
+
+            # 低置信事件不参与评分（但仍记录）
+            if confidence < 0.7:
+                continue
+
+            # 个股级事件：从 title 提取股票代码
+            if event_type in ("earnings", "lockup"):
+                codes = stock_code_pattern.findall(title)
+                for code in codes:
+                    individual_events.setdefault(code, []).append(evt)
+
+            # 板块级事件：按 sector 分组
+            if sector:
+                sector_events.setdefault(sector, []).append(evt)
+
+        # ── 为每只候选股评分 ──
+        scores: Dict[str, float] = {}
+        details: Dict[str, dict] = {}
+
+        for c in candidates:
+            code = c["code"]
+            sector = c.get("sector", "")
+            sector_type = c.get("sector_type", "")
+
+            best_score = 0.0
+            best_event: dict = {}
+
+            # 1. 个股级事件 → 直接置顶
+            if code in individual_events:
+                for evt in individual_events[code]:
+                    # 个股级事件 score = 100（最高优先级）
+                    if 100 > best_score:
+                        best_score = 100.0
+                        best_event = evt
+                # 如果有个股级事件，跳过板块级事件（个股级优先级最高）
+
+            # 2. 板块级事件 → confidence × impact × proximity × 50
+            if best_score < 100 and sector in sector_events:
+                for evt in sector_events[sector]:
+                    confidence = float(evt.get("confidence", 0))
+                    impact = int(evt.get("impact_level", 1))
+
+                    # 临近度系数：事件日距今越近越重要
+                    try:
+                        evt_date_str = evt.get("event_date", "")
+                        if evt_date_str:
+                            evt_date = date_cls.fromisoformat(str(evt_date_str)[:10])
+                            days_diff = abs((evt_date - today).days)
+                            proximity = max(0.3, 1.0 - days_diff / 30.0)
+                        else:
+                            proximity = 0.5
+                    except (ValueError, TypeError):
+                        proximity = 0.5
+
+                    # 方向修正：negative 事件降权（利空不置顶）
+                    direction = evt.get("direction", "positive")
+                    direction_coeff = 1.0 if direction == "positive" else 0.5
+
+                    evt_score = confidence * impact * proximity * direction_coeff * 50
+                    evt_score = min(99.0, evt_score)  # 不超过个股级
+
+                    if evt_score > best_score:
+                        best_score = evt_score
+                        best_event = evt
+
+            scores[code] = round(best_score, 1)
+            if best_event:
+                details[code] = {
+                    "event_title": best_event.get("title", ""),
+                    "event_date": str(best_event.get("event_date", "")),
+                    "event_type": best_event.get("event_type", ""),
+                    "confidence": float(best_event.get("confidence", 0)),
+                }
+
+        # ── 统计 ──
+        matched = sum(1 for v in scores.values() if v > 0)
+        if matched > 0:
+            logger.info(f"[P5催化剂] {matched}/{len(candidates)} 只匹配到催化剂事件")
+
+        return scores, details
+
     def _compute_got_composite_score(self, stock: ScreenerStock, got_context: dict) -> float:
         """综合评分（满分 100）
 
-        权重分配（5 维度）：
-        - 资金面: 30%（龙虎榜/主力资金/大宗交易）
-        - 消息面: 20%（事件影响 + 多源确认）
-        - 板块强度: 20%（主线/埋伏/启动信号）
-        - 技术面(波段): 15%（MA20/布林带/周线）
-        - 风险因子: 15%（估值/超买/波动率，反向 → risk_score_safe）
+        权重分配（5 维度，按数据可靠性分配）：
+        - 资金面: 15%（数据常缺失，alpha 弱）
+        - 消息面: 15%（依赖外部 API）
+        - 板块强度: 25%（mootdx TCP 稳定）
+        - 技术面(波段): 25%（K 线永远可用）
+        - 风险因子: 20%（波动率永远可算）
+
+        缺失维度跳过 + 权重归一化（NBER Freyberger et al. 2022）。
         """
-        sector_score = stock.sector_score   # 0-100
-        tech_score = stock.tech_wave_score  # 0-100
-        risk_score = stock.risk_score_safe  # 0-100（越高越安全）
-        capital = stock.capital_score       # 0-100
-        news = stock.news_score             # 0-100
+        scores = {
+            "capital": stock.capital_score,
+            "news": stock.news_score,
+            "sector": stock.sector_score,
+            "tech": stock.tech_wave_score,
+            "risk": stock.risk_score_safe,
+        }
+        available = {
+            "capital": stock.capital_available,
+            "news": stock.news_available,
+            "sector": True,   # 板块数据始终可用
+            "tech": True,     # K 线始终可用
+            "risk": True,     # 波动率始终可算
+        }
 
-        composite = (
-            capital * 0.30 +
-            news * 0.20 +
-            sector_score * 0.20 +
-            tech_score * 0.15 +
-            risk_score * 0.15
-        )
-
-        return round(composite, 2)
+        composite, _ = weighted_score_with_redistribution(scores, available)
+        return composite
 
     def _generate_got_reasoning(self, stock: ScreenerStock, got_context: dict) -> str:
         """生成推荐理由（Markdown 格式）"""
+        # 计算实际权重（考虑缺失维度归一化）
+        scores = {
+            "capital": stock.capital_score,
+            "news": stock.news_score,
+            "sector": stock.sector_score,
+            "tech": stock.tech_wave_score,
+            "risk": stock.risk_score_safe,
+        }
+        available = {
+            "capital": stock.capital_available,
+            "news": stock.news_available,
+            "sector": True,
+            "tech": True,
+            "risk": True,
+        }
+        _, actual_weights = weighted_score_with_redistribution(scores, available)
+
+        def _w(dim: str) -> float:
+            return actual_weights.get(dim, 0) * 100
+
         lines = [
             f"**综合评分**: {stock.score:.1f}/100",
+        ]
+
+        # 标注缺失维度
+        missing_dims = [k for k, v in available.items() if not v]
+        if missing_dims:
+            lines.append(f"⚠️ 缺失维度（已跳过归一化）: {', '.join(missing_dims)}")
+
+        lines.extend([
             "",
             "### 核心逻辑",
-            f"1. **资金面** ({stock.capital_score*0.3:.1f}/30): ",
-            f"   - 资金面评分 {stock.capital_score:.0f}/100",
-            f"2. **消息面** ({stock.news_score*0.2:.1f}/20): ",
-            f"   - 消息面评分 {stock.news_score:.0f}/100",
-            f"3. **板块强度** ({stock.sector_score*0.2:.1f}/20): ",
+            f"1. **资金面** ({stock.capital_score * _w('capital') / 100:.1f}/{_w('capital'):.0f}): ",
+            f"   - 资金面评分 {stock.capital_score:.0f}/100"
+            + ("（无真实数据，已跳过）" if not stock.capital_available else ""),
+            f"2. **消息面** ({stock.news_score * _w('news') / 100:.1f}/{_w('news'):.0f}): ",
+            f"   - 消息面评分 {stock.news_score:.0f}/100"
+            + ("（无事件匹配，已跳过）" if not stock.news_available else ""),
+            f"3. **板块强度** ({stock.sector_score * _w('sector') / 100:.1f}/{_w('sector'):.0f}): ",
             f"   - 属于{stock.sector_type}板块「{stock.sector_name}」",
             f"   - 板块强度 {stock.sector_score:.0f} 分",
-            f"4. **技术面** ({stock.tech_wave_score*0.15:.1f}/15): ",
+            f"4. **技术面** ({stock.tech_wave_score * _w('tech') / 100:.1f}/{_w('tech'):.0f}): ",
             f"   - 波段技术指标评分 {stock.tech_wave_score:.0f}/100",
-            f"5. **风险** ({stock.risk_score_safe*0.15:.1f}/15): ",
+            f"5. **风险** ({stock.risk_score_safe * _w('risk') / 100:.1f}/{_w('risk'):.0f}): ",
             f"   - 安全评分 {stock.risk_score_safe:.0f}/100",
+        ])
+
+        # P5 催化剂关联度（仅在有匹配事件时展示）
+        if stock.catalyst_relevance_score > 0:
+            event_type_label = {
+                "earnings": "财报", "lockup": "解禁",
+                "narrative": "叙事催化", "global": "全球映射", "macro": "宏观数据",
+            }.get(stock.catalyst_event_type, stock.catalyst_event_type)
+            lines.extend([
+                "",
+                f"6. **催化剂关联度** ({stock.catalyst_relevance_score:.0f}/100):",
+                f"   - 关联事件: {stock.catalyst_event_title}",
+                f"   - 事件类型: {event_type_label}",
+                f"   - 事件日期: {stock.catalyst_event_date}",
+                f"   - 置信度: {stock.catalyst_confidence:.2f}",
+            ])
+        else:
+            lines.append("")
+
+        lines.extend([
             "",
             "### 交易建议",
-        ]
+        ])
 
         if stock.backtest_snapshot:
             snapshot = stock.backtest_snapshot

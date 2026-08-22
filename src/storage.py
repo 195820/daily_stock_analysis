@@ -1109,6 +1109,142 @@ class SectorFrameRecord(Base):
         self.member_codes = json.dumps(codes, ensure_ascii=False)
 
 
+class CatalystEventRecord(Base):
+    """催化剂日历事件持久化。
+
+    存储板块级前瞻催化剂：财报/解禁/宏观/叙事/全球映射。
+    去重策略：event_id = MD5(source + event_type + sector + date)，UPSERT 语义。
+    """
+
+    __tablename__ = 'catalyst_events'
+
+    event_id = Column(String(64), primary_key=True)
+    event_date = Column(Date, nullable=False, index=True)
+    event_type = Column(String(20), nullable=False)
+    title = Column(Text, nullable=False)
+    sector = Column(String(50), nullable=False, index=True)
+    impact_level = Column(Integer, default=1)
+    direction = Column(String(10), default='positive')
+    confidence = Column(Float, default=1.0)
+    consensus_expectation = Column(Text, default='')
+    source = Column(String(30), nullable=False)
+    category_tag = Column(String(10), default='')
+    is_global = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+    expires_at = Column(Date, index=True)
+
+    __table_args__ = (
+        Index('ix_catalyst_sector_date', 'sector', 'event_date'),
+        Index('ix_catalyst_expires', 'expires_at'),
+    )
+
+
+class CatalystRefreshTracker(Base):
+    """日历刷新节奏追踪（单行记录，UPSERT 语义）。"""
+
+    __tablename__ = 'catalyst_refresh'
+
+    id = Column(Integer, primary_key=True)
+    last_full_refresh = Column(Date, nullable=False)
+    trading_days_since_refresh = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+
+class AmbushPositionSnapshotRecord(Base):
+    """埋伏持仓催化剂快照（P4）。
+
+    Phase 2 建仓时写入：记录买入时的催化剂元数据（类型/日期/影响等级/共识预期）。
+    每日运行退出检测：与催化剂日历/新闻对账，触发 fade/drift/binary 退出逻辑。
+    退出后 is_open=False，保留完整复盘记录（买入快照 + 兑现结果）。
+
+    去重策略：symbol + entry_date 唯一（同一股票同一天不会重复建仓）。
+    """
+
+    __tablename__ = 'ambush_position_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    sector_name = Column(String(64), nullable=False, index=True)
+    # 催化剂元数据（买入时的快照）
+    category_tag = Column(String(10), nullable=False)       # drift / fade / binary
+    catalyst_event_id = Column(String(64), default='')
+    catalyst_event_title = Column(Text, default='')
+    catalyst_event_date = Column(Date)
+    impact_level = Column(Integer, default=1)               # 1=★ 2=★★ 3=★★★
+    consensus_expectation = Column(Text, default='')
+    # 建仓信息
+    entry_date = Column(Date, nullable=False, index=True)
+    entry_price = Column(Float, nullable=False)
+    # 退出追踪
+    exit_signal = Column(String(30))                        # fade_sell / drift_exhausted / event_cancelled / dde_graduation
+    exit_date = Column(Date)
+    exit_price = Column(Float)
+    is_open = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'entry_date', name='uix_ambush_snapshot_symbol_date'),
+        Index('ix_ambush_snapshot_sector', 'sector_name', 'is_open'),
+    )
+
+
+class CatalystRealizationRecord(Base):
+    """催化剂事件兑现归档（P6）。
+
+    每个催化剂事件兑现后记录：预期 vs 实际、板块事件后收益、漂移方向对错、
+    反向发现/否决/蓄水池转化等标记。
+
+    用途：
+    1. 所有可配参数的 A 股本地化校准源
+    2. 反向查询通道的存废依据（兑现率统计）
+    3. 矛盾否决的准确率统计
+    4. 事件类型故事寿命的本地重估
+
+    与 AmbushPositionSnapshotRecord 通过 catalyst_event_id 关联。
+    """
+
+    __tablename__ = 'catalyst_realizations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 事件标识
+    event_id = Column(String(64), nullable=False, index=True, unique=True)
+    event_type = Column(String(20), nullable=False)          # earnings/lockup/narrative/global/macro
+    source = Column(String(30), nullable=False)              # akshare_earnings / llm_narrative / global_map
+    source_type = Column(String(20), nullable=False, default='forward')  # forward / reverse_discovery / veto / reservoir
+    # 事件信息
+    sector = Column(String(64), nullable=False, index=True)
+    title = Column(Text, default='')
+    event_date = Column(Date, nullable=False)
+    category_tag = Column(String(10), default='')            # drift / fade / binary
+    impact_level = Column(Integer, default=1)
+    # 预期
+    consensus_expectation = Column(Text, default='')
+    direction = Column(String(10), default='positive')       # positive / negative / binary
+    confidence = Column(Float, default=1.0)
+    # 兑现结果
+    is_realized = Column(Boolean, default=False, index=True)
+    realization_date = Column(Date)                          # 事件实际发生/确认日期
+    actual_return = Column(Float)                            # 板块事件后收益 (%)
+    drift_direction_correct = Column(Boolean)                # 漂移方向是否预判正确
+    # 故事寿命追踪
+    story_start_date = Column(Date)                          # 事件开始影响日期
+    story_peak_date = Column(Date)                           # 事件影响达峰日期
+    story_end_date = Column(Date)                            # 事件影响消退日期
+    story_lifetime_days = Column(Integer)                    # 故事寿命（日历日）
+    # 备注
+    notes = Column(Text, default='')
+    # 时间戳
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_realization_type_date', 'event_type', 'event_date'),
+        Index('ix_realization_source_type', 'source_type'),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 

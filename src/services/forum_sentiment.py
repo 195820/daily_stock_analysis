@@ -119,32 +119,94 @@ SECTOR_KEYWORDS = [
 # ============================================================
 
 class _NgaClient:
-    """NGA API HTTP 客户端，处理 GBK 编码和 Cookie 认证。"""
+    """NGA API HTTP 客户端，处理 GBK 编码和 Cookie 认证。
+
+    支持自动续期：Cookie 失效时用用户名密码重新登录。
+    """
 
     BASE_URL = "https://bbs.nga.cn"
     _REQUEST_TIMEOUT = 15
+    _RELOGIN_MAX_RETRIES = 2
 
-    def __init__(self, uid: str, cid: str):
-        self._session = requests.Session()
-        # 重试策略
+    def __init__(
+        self,
+        uid: str,
+        cid: str,
+        *,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
+        self._username = username
+        self._password = password
+        self._uid = uid
+        self._cid = cid
+        self._session = self._build_session(uid, cid)
+
+    def _build_session(self, uid: str, cid: str) -> requests.Session:
+        """构建带 Cookie 和重试策略的 Session。"""
+        session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry)
-        self._session.mount("https://", adapter)
-        self._session.headers.update({
+        session.mount("https://", adapter)
+        session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
-            "Referer": f"{self.BASE_URL}/thread.php?fid=706",
+            "Referer": f"{self.BASE_URL}/",
         })
-        self._session.cookies.set("ngaPassportUid", uid, domain=".nga.cn")
-        self._session.cookies.set("ngaPassportCid", cid, domain=".nga.cn")
+        session.cookies.set("ngaPassportUid", uid, domain=".nga.cn")
+        session.cookies.set("ngaPassportCid", cid, domain=".nga.cn")
+        return session
 
-    def fetch_thread_list(self, fid: int, page: int = 1) -> Dict[str, Any]:
-        """获取版面帖子列表。返回解析后的 JSON dict。"""
+    @property
+    def can_relogin(self) -> bool:
+        return bool(self._username and self._password)
+
+    def relogin(self) -> bool:
+        """用用户名密码重新登录，刷新 Cookie。返回是否成功。"""
+        if not self.can_relogin:
+            logger.warning("[NGA] 无法续期：未配置用户名/密码")
+            return False
+
+        for attempt in range(1, self._RELOGIN_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{self.BASE_URL}/accounts/login",
+                    data={
+                        "name": self._username,
+                        "password": self._password,
+                        "cid": "nginx",
+                    },
+                    headers={"User-Agent": self._session.headers["User-Agent"]},
+                    timeout=self._REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    # NGA 登录成功后 Set-Cookie 里带 ngaPassportUid/Cid
+                    for cookie in resp.cookies:
+                        if cookie.name in ("ngaPassportUid", "ngaPassportCid"):
+                            self._session.cookies.set(
+                                cookie.name, cookie.value, domain=".nga.cn",
+                            )
+                    # 验证新 Cookie 有效
+                    new_uid = self._session.cookies.get("ngaPassportUid", domain=".nga.cn")
+                    if new_uid:
+                        self._uid = new_uid
+                        logger.info("[NGA] 自动续期成功 (attempt %d)", attempt)
+                        return True
+                logger.warning("[NGA] 登录返回 status=%d (attempt %d)", resp.status_code, attempt)
+            except Exception as exc:
+                logger.warning("[NGA] 登录异常: %s (attempt %d)", exc, attempt)
+            time.sleep(1)
+
+        logger.error("[NGA] 自动续期失败，需手动更新 Cookie")
+        return False
+
+    def fetch_thread_list(self, stid: int, page: int = 1) -> Dict[str, Any]:
+        """获取帖子合集的帖子列表。返回解析后的 JSON dict。"""
         url = f"{self.BASE_URL}/thread.php"
-        params = {"fid": fid, "page": page, "__output": 8}
+        params = {"stid": stid, "page": page, "__output": 8}
         return self._get_json(url, params)
 
     def fetch_thread_content(self, tid: int, page: int = 1) -> Dict[str, Any]:
@@ -154,9 +216,16 @@ class _NgaClient:
         return self._get_json(url, params)
 
     def _get_json(self, url: str, params: Dict) -> Dict[str, Any]:
-        """GET 请求 → GBK 解码 → JSON 解析。"""
+        """GET 请求 → GBK 解码 → JSON 解析。认证失败时自动续期重试。"""
         resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT)
         resp.encoding = "gbk"
+
+        # 检测认证失败 → 自动续期
+        if resp.status_code in (401, 403) or self._is_auth_error(resp):
+            if self.can_relogin and self.relogin():
+                resp = self._session.get(url, params=params, timeout=self._REQUEST_TIMEOUT)
+                resp.encoding = "gbk"
+
         if resp.status_code != 200:
             raise RuntimeError(f"NGA HTTP {resp.status_code}: {url}")
         # strict=False 容忍帖子内容中的控制字符
@@ -166,6 +235,15 @@ class _NgaClient:
             err_msg = err.get("1", str(err)) if isinstance(err, dict) else str(err)
             raise RuntimeError(f"NGA API error: {err_msg[:200]}")
         return data
+
+    @staticmethod
+    def _is_auth_error(resp: requests.Response) -> bool:
+        """检测 NGA 返回的 JSON 中是否包含认证错误。"""
+        try:
+            text = resp.text[:500]
+            return "登录" in text or "cookie" in text.lower() or "-1001" in text
+        except Exception:
+            return False
 
 
 # ============================================================
@@ -287,6 +365,8 @@ class ForumSentimentService:
             self._client = _NgaClient(
                 uid=config.forum_sentiment_nga_uid,
                 cid=config.forum_sentiment_nga_cid,
+                username=config.forum_sentiment_nga_username,
+                password=config.forum_sentiment_nga_password,
             )
 
     @property
@@ -363,7 +443,7 @@ class ForumSentimentService:
     def _do_fetch(self, top_n: int) -> ForumSentimentResult:
         """执行实际的采集和分析流程。"""
         cfg = self._config
-        fid = cfg.forum_sentiment_nga_fid
+        stid = cfg.forum_sentiment_nga_stid
         pages = cfg.forum_sentiment_pages
         high_rise_threshold = cfg.forum_sentiment_high_rise_threshold
         high_rise_extra = cfg.forum_sentiment_high_rise_extra_pages
@@ -372,7 +452,7 @@ class ForumSentimentService:
         all_threads: List[Dict] = []
         for page in range(1, pages + 1):
             try:
-                data = self._client.fetch_thread_list(fid, page)
+                data = self._client.fetch_thread_list(stid, page)
                 thread_dict = data.get("data", {}).get("__T", {})
                 for _idx, t in thread_dict.items():
                     if isinstance(t, dict) and t.get("tid"):

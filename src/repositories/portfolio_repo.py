@@ -905,6 +905,7 @@ class PortfolioRepository:
                         market_value_base=float(item["market_value_base"]),
                         unrealized_pnl_base=float(item["unrealized_pnl_base"]),
                         valuation_currency=valuation_currency,
+                        name=item.get("name", ""),
                     )
                 )
 
@@ -1090,6 +1091,7 @@ class PortfolioRepository:
                         market_value_base=float(item["market_value_base"]),
                         unrealized_pnl_base=float(item["unrealized_pnl_base"]),
                         valuation_currency=valuation_currency,
+                        name=item.get("name", ""),
                     )
                 )
 

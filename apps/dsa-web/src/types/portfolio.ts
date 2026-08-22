@@ -29,6 +29,7 @@ export interface PortfolioAccountCreateRequest {
 
 export interface PortfolioPositionItem {
   symbol: string;
+  name?: string;  // 股票中文名
   market: string;
   currency: string;
   quantity: number;

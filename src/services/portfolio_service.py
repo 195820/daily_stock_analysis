@@ -961,6 +961,9 @@ class PortfolioService:
         total_cost_base = 0.0
         fx_stale = False
 
+        # 缓存股票名称查询结果，避免重复查询
+        name_cache: Dict[str, str] = {}
+
         keys: Iterable[Tuple[str, str, str]]
         if cost_method == "fifo":
             keys = list(fifo_lots.keys())
@@ -969,6 +972,11 @@ class PortfolioService:
 
         for key in sorted(keys):
             symbol, market, currency = key
+
+            # 获取股票中文名（带缓存）
+            if symbol not in name_cache:
+                name_cache[symbol] = self._get_stock_name(symbol)
+            stock_name = name_cache[symbol]
 
             if cost_method == "fifo":
                 active_lots = [lot for lot in fifo_lots[key] if lot["remaining_quantity"] > EPS]
@@ -1028,6 +1036,7 @@ class PortfolioService:
             position_rows.append(
                 {
                     "symbol": symbol,
+                    "name": stock_name,
                     "market": market,
                     "currency": currency,
                     "quantity": round(qty, 8),
@@ -1050,6 +1059,37 @@ class PortfolioService:
             total_cost_base += cost_base
 
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
+
+    def _get_stock_name(self, symbol: str) -> str:
+        """获取股票中文名。
+
+        优先从数据库已存储的名称读取，其次实时行情，最后回退到代码本身。
+        """
+        # 1. 优先从数据库读取已存储的名称
+        try:
+            from src.storage import PortfolioPosition
+            with self.repo.db.get_session() as session:
+                pos = session.query(PortfolioPosition).filter(
+                    PortfolioPosition.symbol == symbol
+                ).first()
+                if pos and pos.name:
+                    return pos.name
+        except Exception:
+            pass
+
+        # 2. 从实时行情获取
+        try:
+            from data_provider.base import DataFetcherManager
+
+            manager = DataFetcherManager()
+            quote = manager.get_realtime_quote(symbol)
+            if quote and quote.get("name"):
+                return str(quote["name"])
+        except Exception:
+            pass
+
+        # 3. 回退：返回代码本身
+        return symbol
 
     def _resolve_position_price(self, *, symbol: str, as_of_date: date) -> _ResolvedPositionPrice:
         today = date.today()
@@ -1583,9 +1623,16 @@ class PortfolioService:
     @staticmethod
     def _normalize_market(value: str) -> str:
         market = (value or "").strip().lower()
-        if market not in VALID_MARKETS:
-            raise ValueError("market must be one of: cn, hk, us")
-        return market
+        # 交易所代码 → 国家代码（兼容 OCR 导入 / 外部数据源的交易所标识）
+        exchange_to_country = {
+            "sh": "cn", "sz": "cn", "bj": "cn",
+            "hk": "hk", "hkex": "hk",
+            "nyse": "us", "nasdaq": "us", "amex": "us",
+        }
+        resolved = exchange_to_country.get(market, market)
+        if resolved not in VALID_MARKETS:
+            raise ValueError(f"market must be one of: cn, hk, us (got '{value}')")
+        return resolved
 
     @staticmethod
     def _normalize_currency(value: str) -> str:

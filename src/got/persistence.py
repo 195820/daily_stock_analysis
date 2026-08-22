@@ -121,7 +121,7 @@ def load_ema_baseline() -> Optional[dict[str, Any]]:
     """加载 EMA 基线（指数移动平均 + 滚动标准差）
 
     Returns:
-        {"weighted_score": float, "score_std": float,
+        {"regime_score": float, "score_std": float,
          "last_updated": str, "sample_count": int}
         不存在时返回 None
     """
@@ -133,7 +133,7 @@ def load_ema_baseline() -> Optional[dict[str, Any]]:
         with open(_EMA_BASELINE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         logger.info(
-            f"[persistence] 已加载 EMA 基线: score={data.get('weighted_score', 0):.3f}, "
+            f"[persistence] 已加载 EMA 基线: score={data.get('regime_score', data.get('weighted_score', 0)):.3f}, "
             f"std={data.get('score_std', 0):.3f}, samples={data.get('sample_count', 0)}"
         )
         return data
@@ -146,7 +146,7 @@ def save_ema_baseline(baseline: dict[str, Any]) -> Path:
     """保存 EMA 基线
 
     Args:
-        baseline: {"weighted_score": float, "score_std": float,
+        baseline: {"regime_score": float, "score_std": float,
                    "last_updated": str, "sample_count": int}
 
     Returns:
@@ -156,5 +156,5 @@ def save_ema_baseline(baseline: dict[str, Any]) -> Path:
 
     _atomic_write_json(_EMA_BASELINE_FILE, baseline)
 
-    logger.info(f"[persistence] 已保存 EMA 基线: score={baseline.get('weighted_score', 0):.3f}")
+    logger.info(f"[persistence] 已保存 EMA 基线: score={baseline.get('regime_score', baseline.get('weighted_score', 0)):.3f}")
     return _EMA_BASELINE_FILE

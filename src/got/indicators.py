@@ -478,6 +478,141 @@ def calculate_bollinger_score(df: pd.DataFrame, period: int = 20, num_std: float
 
 
 # =============================================================================
+# Chaikin A/D Line（积累/分配线）
+# =============================================================================
+
+def calculate_ad_line(df: pd.DataFrame) -> pd.Series:
+    """Chaikin Accumulation/Distribution Line。
+
+    CLV = ((close - low) - (high - close)) / (high - low)
+    A/D Line = cumsum(CLV × volume)
+
+    A/D Line 上升 = 资金流入（accumulation）
+    A/D Line 下降 = 资金流出（distribution）
+    与价格背离时有强预测力（65-72% 准确率，TradeAlgo 2026）。
+    """
+    high_low_range = (df["high"] - df["low"]).replace(0, 1)
+    clv = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / high_low_range
+    money_flow = clv * df["volume"]
+    return money_flow.cumsum()
+
+
+def ad_line_confirmation(df: pd.DataFrame, lookback: int = 20) -> float:
+    """A/D Line 方向确认评分（0~1）。
+
+    量价同向上升 → 高分（突破有资金支撑）
+    A/D Line 上升 + 价格横盘 → 中高分（暗中吸筹）
+    A/D Line 下降 + 价格上涨 → 低分（分配信号）
+
+    论文依据：A/D Line divergence 预测反转准确率 65-72%
+    """
+    if len(df) < lookback:
+        return 0.5
+    ad = calculate_ad_line(df)
+    close = df["close"]
+
+    ad_change = ad.iloc[-1] - ad.iloc[-lookback]
+    price_change = close.iloc[-1] - close.iloc[-lookback]
+
+    if ad_change > 0 and price_change > 0:
+        return 0.9   # 量价齐升
+    elif ad_change > 0 and price_change <= 0:
+        return 0.7   # 暗中吸筹（bullish divergence）
+    elif ad_change <= 0 and price_change > 0:
+        return 0.2   # 分配信号（bearish divergence）
+    else:
+        return 0.3   # 量价齐跌
+
+
+def ad_distribution_signal(df: pd.DataFrame) -> bool:
+    """A/D Line 分配信号检测。
+
+    条件：价格 20d 上涨 > 3% 但 A/D Line 近 10d 下降
+    → 机构在价格上升中暗中出货
+
+    论文依据：出现在 72% 的重大下跌（>10%）前，平均提前 18 个交易日
+    """
+    if len(df) < 20:
+        return False
+    ad = calculate_ad_line(df)
+    close = df["close"]
+    price_up_20d = close.iloc[-1] / close.iloc[-20] - 1
+    ad_down_10d = ad.iloc[-1] - ad.iloc[-10]
+    return bool(price_up_20d > 0.03 and ad_down_10d < 0)
+
+
+def accumulation_score(df: pd.DataFrame) -> float:
+    """机构积累检测 — A/D Line 上升 + 价格横盘。
+
+    返回 0~1 的积累信号强度。
+    论文依据：A/D Line 积累信号出现在 68% 的拉升前（TradeAlgo 2026）
+    """
+    if len(df) < 20:
+        return 0.0
+    ad = calculate_ad_line(df)
+    close = df["close"]
+
+    ad_slope = (
+        (ad.iloc[-1] - ad.iloc[-20]) / abs(ad.iloc[-20])
+        if abs(ad.iloc[-20]) > 1e-10 else 0.0
+    )
+    price_vol = close.pct_change().tail(20).std() * np.sqrt(252)
+    price_change = abs(close.iloc[-1] / close.iloc[-20] - 1)
+
+    # 积累 = A/D Line 持续上升 + 价格横盘（低波动 + 低变化）
+    if ad_slope > 0.05 and price_change < 0.05 and price_vol < 0.30:
+        return clip(ad_slope * 5, 0, 1)
+    return 0.0
+
+
+# =============================================================================
+# 成交量变异系数（Volume Coefficient of Variation）
+# =============================================================================
+
+def volume_vcv(df: pd.DataFrame, lookback: int = 20) -> float:
+    """成交量变异系数 — 知情交易代理指标。
+
+    VCV = std(volume) / mean(volume)
+    VCV 上升 = 成交量分布不均匀 = 知情资金选择性介入
+
+    论文依据：Boone & White 2015, Kyle 1985 模型扩展
+    """
+    if len(df) < lookback:
+        return 0.5
+    vol = df["volume"].tail(lookback)
+    mean_vol = vol.mean()
+    if mean_vol <= 0:
+        return 0.5
+    vcv = vol.std() / mean_vol
+    # VCV 0.3~1.0 为正常范围，>0.6 暗示知情交易
+    return clip((vcv - 0.3) / 0.7, 0, 1)
+
+
+# =============================================================================
+# 布林带宽百分位排名
+# =============================================================================
+
+def bb_width_percentile(df: pd.DataFrame, period: int = 20, lookback: int = 252) -> float:
+    """布林带宽在当前历史窗口中的百分位排名（0~1）。
+
+    越低 = 越压缩（squeeze）。bottom 10-20th percentile = 真正 squeeze。
+    论文依据：Bollinger 1992, squeeze 后突破爆发力最强
+    """
+    if len(df) < period + 10:
+        return 0.5
+    close = df["close"]
+    ma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    bw = (2 * std / ma).dropna()
+    if len(bw) < 10:
+        return 0.5
+    historical = bw.tail(min(lookback, len(bw)))
+    current = bw.iloc[-1]
+    pct = (historical < current).mean()
+    return float(clip(pct, 0, 1))
+
+
+# =============================================================================
 # 综合指标计算
 # =============================================================================
 

@@ -62,19 +62,19 @@ daily_stock_analysis/
 │   │
 │   ├── got/                     # GOT 架构（市场分析）
 │   │   ├── nodes/               # 7 个 GOT 节点（Phase 1: 6 个 + Phase 2: 1 个）
-│   │   │   ├── market_analysis.py    # Node 1: 大盘（ADX调权/多时间框架 mini GOT）
-│   │   │   ├── sector_analysis.py    # Node 2: 板块（启动信号/生命周期/主线分级）
-│   │   │   ├── capital_analysis.py   # Node 3: 资金面（5维机构评分/降级机制）
-│   │   │   ├── news_analysis.py      # Node 4: 消息面（3并发LLM/多源确认）
-│   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（反身性5阶段）
-│   │   │   ├── aggregator.py         # Node 6: 聚合（10对矛盾/时间一致性）
-│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，FINCON 风格 Manager）
+│   │   │   ├── market_analysis.py    # Node 1: 大盘（4维技术评分/多时间框架/连续仓位）
+│   │   │   ├── sector_analysis.py    # Node 2: 板块（4维百分位/启动检测/主线家族/主线框）
+│   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向/降级机制）
+│   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化）
+│   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（3层分级GOT/L0全局/L1板块/L2组合）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线）
 │   │   ├── schemas.py           # 节点输入输出 Pydantic Schema
 │   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度）
 │   │   ├── indicators.py        # 纯规则指标函数
 │   │   ├── persistence.py       # 上下文持久化（data/aggregator_contexts/，Node 6 时间一致性用）
 │   │   ├── archive.py           # 每日历史档（data/got_daily/YYYYMMDD/，全量 ctx + reasoning）
-│   │   └── news_feeds.py        # Node 4 新闻采集 v2（新浪/CLS/华尔街见闻/东财/NewsNow 8平台热榜，5 源推送型）
+│   │   └── news_feeds.py        # Node 4 新闻采集（7源推送型：新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）
 │   │
 │   ├── services/                # 核心服务
 │   │   ├── technical_indicator.py    # 短线技术指标（需扩展 ADX/MACD）
@@ -125,66 +125,67 @@ daily_stock_analysis/
 │   └── custom/
 │       └── screener_design.md        # 选股系统设计文档
 │
-└── agent_cot_design.md          # GOT 架构设计文档（v0.3）
+└── agent_cot_design.md          # GOT 架构设计文档（v1.0，2026-08-11）
 ```
 
 ---
 
 ## GOT 架构概览
 
-> 设计文档：`agent_cot_design.md`（v0.3）
+> **详细设计文档**：[`agent_cot_design.md`](agent_cot_design.md)（v1.0，2026-08-11）  
+> 本文档仅保留高层架构速览，节点级详细设计（评分维度、阈值、LLM 调用、Schema）见设计文档。
 
-**核心理念**：前半段 GOT（并行+聚合），后半段 CoT（线性流水线）
+### 核心理念
 
-### Phase 1: GOT 市场分析
+前半段 GOT（并行+聚合），后半段 CoT（线性流水线）
 
 ```
 独立数据路（并行）          技术分析路（串行）
 ┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐ ┌──────────┐
 │ 消息面   │ │ 情绪面   │   │ 大盘     │→│ 板块     │→│ 资金面   │
 │ Node 4   │ │ Node 5   │   │ Node 1   │ │ Node 2   │ │ Node 3   │
-│ 3次LLM   │ │ 反身性   │   │ ADX调权  │ │ 启动分级 │ │ 北向资金 │
-│ 多源确认 │ │ 雪球+搜索 │   │ 多时间框 │ │ 生命周期 │ │ 5维评分  │
+│ 7源采集  │ │ 6维评分  │   │ 4维技术  │ │ 4维百分位│ │ 3维资金  │
+│ 4次LLM   │ │ 反身性   │   │ 多时间框 │ │ 启动检测 │ │ 降级机制 │
 └──────────┘ └──────────┘   └──────────┘ └──────────┘ └──────────┘
       ↓              ↓              ↓            ↓            ↓
    news_ctx    sentiment_ctx   market_ctx   sector_ctx   capital_ctx
                                                         ↓
                                               ┌──────────────────┐
-                                              │   聚合节点 Node 6  │
-                                              │  10对矛盾检测     │
-                                              │  LLM 批处理       │
-                                              │  消息面覆盖       │
-                                              │  时间一致性校验   │
+                                              │  Node 6: 聚合     │
+                                              │  3层分级 GOT 架构  │
+                                              │  L0: 全局环境     │
+                                              │  L1: 板块mini-GOT │
+                                              │  L2: 组合决策     │
                                               └──────────────────┘
                                                         ↓
                                                 unified_context
+                                                        ↓
+                                              ┌──────────────────┐
+                                              │  Phase 2: 统一决策 │
+                                              │  5步流水线        │
+                                              │  Step 1: 风险评估  │
+                                              │  Step 2: 统一打分  │
+                                              │  Step 3: 组合优化  │
+                                              │  Step 4: 轮动检测  │
+                                              │  Step 5: LLM精炼  │
+                                              └──────────────────┘
+                                                        ↓
+                                                PortfolioDecision
 ```
 
-### Phase 2: 统一决策节点（FINCON 风格）
+### 关键设计决策速览
 
-> 架构评审（2026-08-03）：原串行设计（持仓判断 → 选股 → 建议）存在循环依赖，改为统一决策节点
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 数据源优先级 | mootdx TCP P0 → efinance HTTP P0 → akshare P1 | TCP 不受 HTTP 反爬影响 |
+| 评分归一化 | 截面百分位排名（Node 2） | 自适应牛熊市，避免 clip 硬阈值 |
+| 矛盾检测 | 规则决策树（Node 6） | 比 LLM 推断更稳定、可解释 |
+| 仓位计算 | 连续函数（波动率×状态缩放） | 比离散映射更平滑 |
+| 选股消息面 | 1次LLM评100板块 + 字典查找 | 比40次LLM评40只股快10倍 |
+| 框系统 | SQLite 持久化（主线框个体级进出）| 比硬编码更灵活、可回溯；埋伏板块不持久化，每日实时判定 |
 
-```
-Phase 1 输出 (UnifiedContext) + 当前持仓
-         ↓
-┌─────────────────────────────────────────────┐
-│  统一决策节点（3 Step，1 个 LLM 调用）        │
-│                                             │
-│  Step 1: 风险评估（约束设定）                 │
-│  → 仓位上限/止损线/板块限制/风险预算          │
-│                                             │
-│  Step 2: 统一打分（持仓 + 候选股）            │
-│  → 所有标的统一排序（继续持有 vs 卖出 vs 买入）│
-│  → 候选股筛选：问财 DDE 策略（大单净量≥0.8%） │
-│                                             │
-│  Step 3: 组合优化（规则 + LLM 混合）          │
-│  → 在约束下生成最优配置                       │
-└─────────────────────────────────────────────┘
-         ↓
-    PortfolioDecision（交易建议 + reasoning）
-```
+### 候选股筛选优化
 
-**候选股筛选优化**（2026-08-03）：
 - ✅ 问财初筛改为 DDE 策略（`dde大单净量>=0.8%`，替代宽松的`主力资金净流入>0`）
 - ✅ 移除无意义的"最低价"条件（限制波动在 0-2%，过滤掉活跃股）
 - ✅ 每板块从 10 只降到 5 只，总候选从 80-100 降到 30-40
@@ -239,7 +240,7 @@ Phase 1 输出 (UnifiedContext) + 当前持仓
 
 ## 实施计划
 
-> 详见 `agent_cot_design.md` Section 7
+> 详见 [`agent_cot_design.md`](agent_cot_design.md) §2-§3（各节点设计）+ §6（编排流程）+ §7（历史档系统）
 
 | 阶段 | 目标 | 工作量 | 状态 |
 |------|------|--------|------|
@@ -513,6 +514,118 @@ Phase 1 输出 (UnifiedContext) + 当前持仓
 - `src/got/__init__.py`（小改）：更新文档注释
 - `agent_cot_design.md`（更新）：Node 6 设计文档同步
 
+**Node 6 埋伏通道 P3（2026-08-19）：**
+
+> 基于 plan.md 的 GOT 埋伏分支拆分设计。P1（催化剂日历）+ P2（Node 2 闸门重构）已完成。
+
+**核心变更**：
+- ✅ Level 1 平行分支：`_build_ambush_channel()` 与主线 mini-GOT 独立
+- ✅ 3 层流水线：闸门层（★★★利空否决 + 吸筹确认 + 防买顶双闸 + 拥挤黑名单）→ 排序层（B 公式）
+- ✅ B 公式催化剂排序：主催化分 = 影响权重 × 临近系数 × 置信度 + 冗余加成（封顶 +40%）
+- ✅ 拆除 ±5 主线尺子偏见：埋伏板块 `sentiment_check=="low"` 不再扣 5 分
+- ✅ 蓄水池机制：闸门通过但无合格催化剂 → `AmbushReservoirEntry`（4 周自动除名）
+- ✅ 矛盾否决日志：`ambush_veto_log` 记录所有否决理由
+- ✅ Schema 扩展：`AmbushCandidate` + `AmbushReservoirEntry` + `SectorIntel` 4 个埋伏字段 + `UnifiedContext` 3 个输出字段
+- ✅ Archive 集成：`reasoning.md` 新增埋伏通道摘要（正式池 + 蓄水池 + 否决记录）
+
+**验证结果（20260814 归档数据，10 个埋伏板块）**：
+- 9 个入蓄水池（无催化剂事件 → no_catalyst）
+- 1 个被吸筹闸拦截（OLED概念，当日净流出 -1.71 亿）
+- ±5 拆除验证通过：主线 composite=55 vs 埋伏 composite=60，差值 +5.0
+
+**P3 文件改动清单**：
+- `src/got/schemas.py`（+55 行）：`AmbushCandidate` + `AmbushReservoirEntry` + `SectorIntel` 4 字段 + `UnifiedContext` 3 字段
+- `src/got/nodes/aggregator.py`（+230 行）：7 个新方法 + ±5 拆除 + run() 集成
+- `src/got/archive.py`（+25 行）：reasoning.md 埋伏通道摘要
+- `agent_cot_design.md`（+30 行）：§2.6.2b 埋伏通道设计文档
+
+**Phase 2 埋伏仓位与退出 P4（2026-08-19）：**
+
+> 基于 P3 正式池输出，消费 `category_tag`（drift/fade/binary）实现类型化仓位和催化剂驱动退出分支。
+
+**核心变更**：
+- ✅ 类型化仓位系数：`_assess_risk()` 中 `sector_limits` 公式追加 `catalyst_coeff`（drift×1.0 / fade×0.7 / binary×0.4）
+- ✅ 埋伏退出分支：`_ambush_exit_signal()` 实现 6 种退出触发（fade_sell / drift_exhausted / drift_break_ma20 / drift_timeout / event_cancelled / stop_loss）
+- ✅ 买入催化剂快照：`_write_ambush_buy_snapshots()` 在 Phase 2 建仓时写入 `ambush_position_snapshots` 表
+- ✅ 退出关闭快照：`_close_ambush_snapshots()` 触发退出时更新 is_open=False + exit 字段
+- ✅ `_score_holdings()` 集成：加载快照 → 退出检测 → 覆盖 action → 填充 `ambush_exit_signal` 字段
+- ✅ `PortfolioDecision.ambush_exit_signals` 新增字段，归档集成到 `trading_recommendations.md` + `reasoning.md`
+- ✅ Schema 扩展：`AmbushPositionSnapshot`（Pydantic）+ `UnifiedScoringResult` 3 埋伏字段 + `TradeAllocation` 4 催化剂字段 + `PortfolioDecision.ambush_exit_signals`
+- ✅ Storage 新增：`AmbushPositionSnapshotRecord` 表（买入快照 + 退出追踪 + 复盘记录）
+
+**退出触发清单**：
+| 类型 | 触发条件 | exit_signal |
+|------|---------|-------------|
+| fade | 事件日次日 | fade_sell |
+| drift | 事件后 ≥10 日 + 涨幅 <2% | drift_exhausted |
+| drift | 破 MA20 | drift_break_ma20 |
+| drift | 持有 >20 交易日 | drift_timeout |
+| binary | 事件日 >2 日未发生 | event_cancelled |
+| 通用 | P&L < -7% | stop_loss |
+
+**验证结果（单元测试）**：
+- ✅ `_ambush_exit_signal` 8 个场景全部通过（fade 退出/等待、binary 落空/等待、drift 衰竭/超时/持有、硬止损）
+- ✅ `_assess_risk` 类型化系数：drift/binary 仓位比 = 2.85（预期 ~2.5）
+- ✅ `AmbushPositionSnapshotRecord` 表读写 + 关闭流程正常
+
+**P4 文件改动清单**：
+- `src/got/schemas.py`（+65 行）：`AmbushPositionSnapshot` + `UnifiedScoringResult` 3 字段 + `TradeAllocation` 4 字段 + `PortfolioDecision.ambush_exit_signals`
+- `src/storage.py`（+40 行）：`AmbushPositionSnapshotRecord` 表
+- `src/got/nodes/portfolio_decision.py`（+200 行）：`_ambush_exit_signal()` + `_load_ambush_snapshots()` + `_write_ambush_buy_snapshots()` + `_close_ambush_snapshots()` + `_assess_risk` 类型化系数 + `_score_holdings()` 集成
+- `src/got/archive.py`（+30 行）：`trading_recommendations.md` + `reasoning.md` 埋伏退出摘要
+- `agent_cot_design.md`（+45 行）：§2.6.2c Phase 2 埋伏仓位与退出设计文档
+- `scripts/test_p4_ambush.py`（新建 ~300 行）：P4 单元测试脚本
+
+**Phase 2 催化剂关联度重排 P5（2026-08-19）：**
+
+> 消费催化剂日历，在选股漏斗轮次 4（风险排雷）之后、轮次 5（板块分散）之前，按催化剂关联度对 ambush 候选重排。
+
+**核心变更**：
+- ✅ 新增 `_score_catalyst_relevance()` 方法：从 `news_context.catalyst_calendar` 加载事件，为每只候选股计算关联度分数
+- ✅ 个股级事件（earnings/lockup）→ title 含股票代码 → 当事股直接置顶（score=100）
+- ✅ 板块级事件（narrative/global/macro）→ sector 匹配 → score = confidence × impact × proximity × direction_coeff × 50
+- ✅ 置信度 < 0.7 事件不参与评分（保持技术排序）
+- ✅ 仅对 ambush 板块候选生效，主线保持原序
+- ✅ ScreenerStock 新增 5 个催化剂字段（relevance_score/event_title/event_date/event_type/confidence）
+- ✅ `_generate_got_reasoning()` 新增催化剂关联度展示（事件标题/类型/日期/置信度）
+
+**验证结果**：
+- ✅ 个股级事件置顶：600519 score=100（earnings 匹配）
+- ✅ 板块级事件评分：000858 score=85.5（narrative，confidence=0.75）
+- ✅ 低置信过滤：601318 score=0（confidence=0.5 < 0.7）
+
+**P5 文件改动清单**：
+- `src/services/stock_screener.py`（+120 行）：ScreenerStock 5 字段 + `_score_catalyst_relevance()` + 漏斗集成 + reasoning 展示
+
+**催化归档表 P6（2026-08-19）：**
+
+> 每个催化剂事件兑现后记录预期 vs 实际，用途：参数校准源、反向查询存废、否决准确率、故事寿命本地重估。
+
+**核心变更**：
+- ✅ `CatalystRealizationRecord` 表：event_id(唯一) + event_type/source/source_type + 预期字段 + 兑现结果(is_realized/actual_return/drift_direction_correct) + 故事寿命(story_start/peak/end/lifetime_days)
+- ✅ `CatalystRealizationTracker` 类：`register_event()`（日历构建时注册）+ `check_and_record_realization()`（每日运行，检测过期事件并计算板块收益）+ `get_realization_stats()`（兑现率统计）+ `get_story_lifetimes()`（故事寿命统计）
+- ✅ 催化剂日历集成：`_save_events()` 末尾自动注册到归档表
+- ✅ 编排器集成：`run()` 末尾调用 `check_and_record_realization()`
+- ✅ 与 AmbushPositionSnapshotRecord 通过 event_id 关联
+
+**四大统计用途**：
+1. 按 event_type/source_type/category_tag 分组兑现率
+2. 漂移方向预判准确率
+3. 各类事件的故事寿命分布（avg/median/min/max）
+4. 反向查询/否决/蓄水池通道的独立准确率
+
+**验证结果**：
+- ✅ CatalystRealizationRecord 表读写 + 兑现更新正常
+- ✅ 统计方法：total=3, realized=2, rate=0.67, direction_accuracy=0.50
+- ✅ 故事寿命：earnings avg=10.0天
+
+**P6 文件改动清单**：
+- `src/storage.py`（+50 行）：`CatalystRealizationRecord` 表
+- `src/got/catalyst_realization.py`（新建 ~280 行）：`CatalystRealizationTracker` 类
+- `src/got/catalyst_calendar.py`（+10 行）：`_save_events()` 注册到归档表
+- `src/got/orchestrator.py`（+10 行）：`run()` 末尾兑现检测
+- `scripts/test_p5_p6.py`（新建 ~220 行）：P5/P6 验证脚本
+
 **Node 1 重设计（2026-07-30）：**
 
 > 基于 Node 6 v2 重跑 Phase 1 暴露的问题
@@ -591,6 +704,36 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `src/got/archive.py`（+10 行）：reasoning.md 加降级摘要
 - `agent_cot_design.md`（更新）：§3.2 设计文档同步
 
+**Node 2 白名单补全（2026-08-07）：**
+
+> 基于用户反馈：元件、电子化学品、半导体等板块未出现在主线中。经系统审查，白名单（CONCEPT_UNIVERSE + TDX_BOARD_REGISTRY）覆盖不全，大量东财活跃概念板块未被追踪。
+
+**问题诊断**：
+- ❌ 元件、电子化学品：完全不在白名单中
+- ❌ 半导体：虽在注册表但被归入过大（19 个成员）的家族，共振率仅 0.11
+- ❌ ~30 个当前热点板块缺失（IGBT、碳化硅、BC电池、PEEK材料等）
+- ❌ ~15 个冗余/过时条目（CPO/共封装光学重复、电力物联网过时、MR/AR/VR冗余）
+- ❌ ~10 个命名错位（EDA vs EDA概念、6G vs 6G概念、鸿蒙 vs 鸿蒙概念）
+
+**核心变更**：
+- ✅ 新增 ~30 个板块（半导体上游/电池技术/新材料/数字经济/新内容/消费等）
+- ✅ 剔除 ~15 个冗余/过时条目
+- ✅ 修正 ~10 个命名对齐（匹配东财实际板块名）
+- ✅ 新增 8 个 category 子分类（electronic_components/power_semiconductor/battery_tech/new_materials/digital_economy/new_content/frontier/consumer）
+- ✅ FAMILY_KEYWORDS 同步更新，新增华为生态 + 前沿科技家族
+- ✅ _FRAME_GROUP + _FRAME_GROUP_KEYWORDS 同步更新
+- ✅ TDX_BOARD_REGISTRY 添加 TODO 注释（~25 个板块代码待查找）
+
+**待完成**：
+- [ ] 运行 `scripts/find_missing_board_codes.py` 查找缺失板块的 TDX 代码
+- [ ] 填入 TDX_BOARD_REGISTRY 中对应的 TODO 条目
+- [ ] 重新运行 Node 2 验证输出
+
+**文件改动清单**：
+- `src/got/nodes/sector_analysis.py`：CONCEPT_UNIVERSE + FAMILY_KEYWORDS + _CATEGORY_GROUP + _FRAME_GROUP + _FRAME_GROUP_KEYWORDS
+- `data_provider/tdx_board_mapping.py`：TDX_BOARD_REGISTRY（添加 TODO 注释）
+- `scripts/find_missing_board_codes.py`（新建）：查找缺失板块 TDX 代码的工具脚本
+
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块
 - ✅ `main.py`（修改）：新增 `--got` 入口（`python main.py --got`）
@@ -620,7 +763,12 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `_extract_got_universe(got_context)` — 提取主线/埋伏板块成分股
 - `_get_sector_constituents(sector_name)` — 成分股获取（三级降级：问财→东财→空）
 - `_filter_got_finalists(universe, got_context, top_n)` — 5 轮漏斗筛选
-- `_score_capital/technical_wave/risk()` — 三维度评分
+- `_score_capital()` — 资金面评分（DDE百分位 + 板块资金流百分位）
+- `_score_news()` — 消息面评分（LLM 语义匹配 + CONCEPT_UNIVERSE 展开降级）
+- `_llm_score_sector_news()` — LLM 调用：事件→板块情感映射
+- `_fallback_sector_match()` — 降级方案：CONCEPT_UNIVERSE 展开 + 子串匹配
+- `_parse_sector_flow()` — 解析 Node 3 sector_flow 字符串列表
+- `_score_technical_wave/risk()` — 技术面/风险评分
 - `_compute_got_composite_score()` — 综合评分
 - `_generate_got_reasoning()` — 推荐理由生成
 
@@ -643,9 +791,30 @@ python scripts/backtest_got_screener.py --date 2026-07-29
 - `scripts/test_got_data_loading.py`（新建 ~80 行）：数据加载测试
 
 **已知限制**：
-- 消息面评分（`news_score`）暂未实现，当前设为 0（权重 20% 空缺）
 - 成分股获取依赖问财/东财，反爬环境下可能失败
 - 回测脚本假设次日可获取行情数据，非交易日无法回测
+
+**选股评分重构（2026-08-10）：**
+
+> 修复资金面和消息面评分区分度为零的问题
+
+**资金面 `_score_capital()` 重构**：
+- ✅ 砍掉死代码：龙虎榜(+40) — `CapitalEvidence` schema 无此字段
+- ✅ 砍掉失效维度：北向资金(2024-08停披)、大宗交易(信号极少)
+- ✅ 砍掉废弃参数：`fetcher_manager` 不再传入
+- ✅ 新公式：DDE百分位(0-50) + 板块资金流百分位(0-50) = 0-100
+- ✅ 新增 `_parse_sector_flow()` 方法：解析 Node 3 的 `sector_flow.top_concepts/industries` 字符串列表（格式 `"板块名(金额亿)"`）
+- 效果：分数分布从 0-30 拓宽到 5-47.5
+
+**消息面 `_score_news()` 重构**：
+- ✅ LLM 语义匹配：将 Node 4 事件 + `CONCEPT_UNIVERSE`（~100个合法板块名）交给 LLM
+- ✅ LLM 输出 `{sector: relevance × sentiment}` 映射，候选股 sector 精确匹配
+- ✅ 新增 `_llm_score_sector_news()` 方法：LLM 调用 + JSON 解析
+- ✅ 新增 `_fallback_sector_match()` 降级：CONCEPT_UNIVERSE 展开 + 子串匹配
+- ✅ 砍掉 `_search_individual_stock_news()` + 关键词列表（依赖 SearchService API Key，匹配粗糙）
+- ✅ 砍掉 `_sector_matches()` 静态方法（无调用方）
+- ✅ 基础分从 50 降到 40（更保守先验）
+- 效果：从全部 50/100 (10/20) → 40-100/100 (8-20/20)，AIGC概念等可命中满分
 
 **Phase 2 架构评审与优化（2026-08-03）：**
 
@@ -739,12 +908,12 @@ push2.eastmoney.com HTTP 接口被东财反爬封锁（RemoteDisconnected），�
 
 ## 环境
 
-- **Conda**: `dsa`（Python 3.12.13）
+- **Conda**: `daily_stock_analysis`（Python 3.12.13）
 - **数据库**: SQLite `data/stock_analysis.db`（自动建表）
 - **配置**: `.env`（LLM API Key、NGA Cookie、东财反爬等）
 
 ```powershell
-conda activate dsa
+conda activate daily_stock_analysis
 python main.py                     # 常规分析
 python main.py --screener          # 选股
 python main.py --schedule          # 定时模式

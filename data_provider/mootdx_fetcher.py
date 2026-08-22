@@ -427,6 +427,10 @@ class MootdxFetcher(BaseFetcher):
                 # 筛选 880xxx 概念板块
                 mask = df["code"].astype(str).str.startswith("880")
                 concepts = df[mask][["code", "name"]].to_dict("records")
+                # 清洗 TDX GBK 定长字段的 \u0000 填充/截断空白（如 "白酒\u0000..."）
+                for board in concepts:
+                    board["name"] = str(board.get("name") or "").replace("\u0000", "").strip()
+                concepts = [b for b in concepts if b["name"]]
                 logger.info(f"[Mootdx] 概念板块总数: {len(concepts)}")
                 return concepts
         except Exception as e:
@@ -449,6 +453,10 @@ class MootdxFetcher(BaseFetcher):
                 # 筛选 881xxx 行业板块
                 mask = df["code"].astype(str).str.startswith("881")
                 industries = df[mask][["code", "name"]].to_dict("records")
+                # 清洗 TDX GBK 定长字段的 \u0000 填充/截断空白
+                for board in industries:
+                    board["name"] = str(board.get("name") or "").replace("\u0000", "").strip()
+                industries = [b for b in industries if b["name"]]
                 logger.info(f"[Mootdx] 行业板块总数: {len(industries)}")
                 return industries
         except Exception as e:
@@ -459,39 +467,67 @@ class MootdxFetcher(BaseFetcher):
         self,
         codes: list[str],
         concurrency: int = 20,
-    ) -> dict[str, float]:
-        """批量获取板块当日涨跌幅（每板块仅取 2 天 K 线，快筛用）。
+    ) -> dict[str, dict]:
+        """批量获取板块快筛数据（每板块取 11 天 K 线，支持 B-lite 累计动量通道）。
 
         Args:
             codes: 板块代码列表
             concurrency: 并发数
 
         Returns:
-            {code: change_pct}，获取失败的板块不在结果中
+            {code: {
+                'change_1d': float,  # 当日涨跌幅
+                'change_3d': float,  # 3日累计涨幅
+                'change_5d': float,  # 5日累计涨幅
+                'has_crash': bool,   # 近5日是否有单日跌幅>5%
+            }}
+            获取失败的板块不在结果中
         """
         import concurrent.futures
 
-        results: dict[str, float] = {}
+        results: dict[str, dict] = {}
 
-        def fetch_one(code: str) -> tuple[str, Optional[float]]:
+        def fetch_one(code: str) -> tuple[str, Optional[dict]]:
             try:
                 with self._mootdx_session() as client:
+                    # B-lite: 扩展到 11 根 K 线（offset=10）
                     df = client.index_bars(
-                        symbol=code, frequency=9, start=0, offset=5,
+                        symbol=code, frequency=9, start=0, offset=10,
                     )
-                    if df is None or len(df) < 2:
+                    if df is None or len(df) < 6:
                         return code, None
                     # 过滤 vol=0 的 bar
                     if "vol" in df.columns:
                         df = df[df["vol"] > 0]
-                    if len(df) < 2:
+                    if len(df) < 6:
                         return code, None
-                    prev = float(df.iloc[-2]["close"])
-                    last = float(df.iloc[-1]["close"])
-                    if prev <= 0:
-                        return code, None
-                    chg = (last - prev) / prev * 100
-                    return code, round(chg, 2)
+
+                    # 计算各时间框架累计涨幅
+                    closes = df["close"].astype(float).values
+                    n = len(closes)
+
+                    # 1日涨幅
+                    change_1d = (closes[-1] - closes[-2]) / closes[-2] * 100 if n >= 2 else 0
+
+                    # 3日累计涨幅
+                    change_3d = (closes[-1] - closes[-4]) / closes[-4] * 100 if n >= 4 else 0
+
+                    # 5日累计涨幅
+                    change_5d = (closes[-1] - closes[-6]) / closes[-6] * 100 if n >= 6 else 0
+
+                    # 近5日是否有单日跌幅>5%
+                    daily_returns = [
+                        (closes[i] - closes[i-1]) / closes[i-1] * 100
+                        for i in range(max(1, n-5), n)
+                    ]
+                    has_crash = any(r < -5.0 for r in daily_returns)
+
+                    return code, {
+                        'change_1d': round(change_1d, 2),
+                        'change_3d': round(change_3d, 2),
+                        'change_5d': round(change_5d, 2),
+                        'has_crash': has_crash,
+                    }
             except Exception:
                 return code, None
 
@@ -503,9 +539,9 @@ class MootdxFetcher(BaseFetcher):
                     executor.submit(fetch_one, code): code for code in codes
                 }
                 for future in concurrent.futures.as_completed(futures):
-                    code, chg = future.result()
-                    if chg is not None:
-                        results[code] = chg
+                    code, data = future.result()
+                    if data is not None:
+                        results[code] = data
         except Exception as e:
             logger.warning(f"[Mootdx] 批量快筛失败: {e}")
 

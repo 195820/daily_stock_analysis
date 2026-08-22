@@ -274,6 +274,103 @@ def _write_reasoning_md(
             )
             lines.append("")
 
+    # ── 催化剂日历摘要（P1） ──
+    news_ctx = contexts.get("news")
+    cal = getattr(news_ctx, "catalyst_calendar", None) if news_ctx else None
+    if cal and cal.events:
+        from datetime import date as _date_cls
+        today = _date_cls.today()
+        high_conf = [e for e in cal.events if e.confidence >= 0.7]
+        three_star = [e for e in cal.events if e.impact_level == 3]
+
+        lines.append(f"## 📅 催化剂日历（{len(cal.events)} 事件，{len(three_star)} 个 ★★★）— {cal.refresh_mode}")
+        lines.append("")
+
+        # ── 今日关键事件 ──
+        today_events = [e for e in high_conf if e.event_date == today]
+        if today_events:
+            lines.append(f"**今日（{today}）{len(today_events)} 个事件:**")
+            for e in sorted(today_events, key=lambda x: -x.impact_level)[:6]:
+                stars = "★" * e.impact_level
+                arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️"}.get(e.direction, "•")
+                tag = f" `{e.category_tag}`" if e.category_tag else ""
+                lines.append(f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%})")
+            lines.append("")
+
+        # ── 未来 2 周按日期展示（每日 Top 事件）──
+        future_events = [e for e in high_conf if e.event_date > today]
+        if future_events:
+            # 按日期分组，每日取 impact_level 最高的 2 个
+            from collections import defaultdict
+            by_date = defaultdict(list)
+            for e in future_events:
+                by_date[e.event_date].append(e)
+
+            lines.append(f"**未来 {len(future_events)} 个事件（按日期）:**")
+            for d in sorted(by_date.keys())[:7]:  # 最多展示 7 天
+                day_events = sorted(by_date[d], key=lambda x: (-x.impact_level, -x.confidence))
+                top = day_events[0]
+                stars = "★" * top.impact_level
+                arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️"}.get(top.direction, "•")
+                extra = f" +{len(day_events)-1}个" if len(day_events) > 1 else ""
+                lines.append(f"- {d} {arrow} {stars} **{top.sector}**: {top.title}{extra}")
+            lines.append("")
+
+        # ── 按板块聚合：哪些板块有 upcoming catalyst ──
+        if future_events:
+            sector_events = defaultdict(list)
+            for e in future_events:
+                sector_events[e.sector].append(e)
+            # 按事件数排序，展示有最多催化剂的板块
+            top_sectors = sorted(sector_events.items(), key=lambda x: -len(x[1]))[:8]
+            if top_sectors:
+                lines.append("**板块催化密度（未来 2 周）:**")
+                for sector, evts in top_sectors:
+                    dates = sorted(set(e.event_date for e in evts))
+                    max_impact = max(e.impact_level for e in evts)
+                    stars = "★" * max_impact
+                    tag = f" `{evts[0].category_tag}`" if evts[0].category_tag else ""
+                    lines.append(
+                        f"- {stars} **{sector}**{tag}: {len(evts)} 个事件"
+                        f" ({dates[0]}~{dates[-1]})"
+                    )
+                lines.append("")
+
+    # ── 埋伏通道摘要（P3） ──
+    unified_ctx = contexts.get("unified")
+    ambush_pool = getattr(unified_ctx, "ambush_pool", []) if unified_ctx else []
+    ambush_reservoir = getattr(unified_ctx, "ambush_reservoir", []) if unified_ctx else []
+    ambush_veto = getattr(unified_ctx, "ambush_veto_log", []) if unified_ctx else []
+    if ambush_pool or ambush_reservoir or ambush_veto:
+        lines.append(f"## 🔍 埋伏通道（正式池 {len(ambush_pool)} / 蓄水池 {len(ambush_reservoir)} / 否决 {len(ambush_veto)}）")
+        lines.append("")
+        if ambush_pool:
+            lines.append("**正式池（催化剂排序）：**")
+            for c in ambush_pool:
+                stars = "★" * c.top_event_level
+                date_str = str(c.top_event_date) if c.top_event_date else "—"
+                tag_emoji = {"drift": "📈", "fade": "🔔", "binary": "⚖️"}.get(c.category_tag, "•")
+                lines.append(
+                    f"- {tag_emoji} **{c.sector_name}** ({stars}, "
+                    f"score={c.catalyst_score:.2f}, {c.category_tag})"
+                    f" — 最近事件 {date_str}: {', '.join(c.events[:2])}"
+                )
+            lines.append("")
+        if ambush_reservoir:
+            lines.append("**蓄水池（观察中）：**")
+            for r in ambush_reservoir:
+                reason_label = r.reason
+                if reason_label.startswith("near_miss:"):
+                    failed = reason_label.split(":", 1)[1]
+                    reason_label = f"近失({failed})"
+                lines.append(f"- {r.sector_name} — {reason_label}")
+            lines.append("")
+        if ambush_veto:
+            lines.append("**否决记录：**")
+            for v in ambush_veto[:8]:
+                lines.append(f"- ❌ {v}")
+            lines.append("")
+
     for key in NODE_ORDER:
         ctx = contexts[key]
         title = REASONING_NODE_TITLES[key]
@@ -449,6 +546,22 @@ def archive_phase2(
                 f.write(f"- {warning}\n")
             f.write("\n")
 
+        # P4：埋伏持仓退出信号
+        ambush_exits = getattr(decision, "ambush_exit_signals", [])
+        if ambush_exits:
+            f.write(f"## 🔍 埋伏退出信号（{len(ambush_exits)} 条）\n\n")
+            tag_emoji = {"drift": "📈", "fade": "🔔", "binary": "⚖️"}
+            for exit_info in ambush_exits:
+                tag = exit_info.get("category_tag", "?")
+                emoji = tag_emoji.get(tag, "•")
+                f.write(
+                    f"- {emoji} **{exit_info.get('symbol', '')}** "
+                    f"({exit_info.get('sector', '')}/{tag}): "
+                    f"`{exit_info.get('exit_signal', '')}` — "
+                    f"{exit_info.get('reason', '')}\n"
+                )
+            f.write("\n")
+
         f.write(f"## 推理总结\n\n")
         f.write(f"{decision.reasoning}\n")
 
@@ -476,6 +589,17 @@ def archive_phase2(
             f.write(f"**风险提示:**\n\n")
             for w in decision.warnings:
                 f.write(f"- {w}\n")
+            f.write("\n")
+        # P4：埋伏退出信号
+        ambush_exits = getattr(decision, "ambush_exit_signals", [])
+        if ambush_exits:
+            f.write(f"**🔍 埋伏退出信号（{len(ambush_exits)} 条）:**\n\n")
+            for exit_info in ambush_exits:
+                f.write(
+                    f"- {exit_info.get('symbol', '')} "
+                    f"({exit_info.get('sector', '')}/{exit_info.get('category_tag', '?')}): "
+                    f"`{exit_info.get('exit_signal', '')}`\n"
+                )
             f.write("\n")
     logger.info(f"[Archive] Phase 2 reasoning 已追加到: {reasoning_path}")
 

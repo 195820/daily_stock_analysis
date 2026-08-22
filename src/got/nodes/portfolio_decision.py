@@ -102,7 +102,7 @@ class PortfolioDecisionNode:
 
         # Step 3: 组合优化（规则 + LLM 混合）
         logger.info("[Phase 2] Step 3: 组合优化")
-        allocation = self._allocate(unified_scoring, risk_assessment, portfolio)
+        allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio)
 
         # Step 4: 轮动时机检测 + 家族拥挤检查（吃鱼身+高切低策略）
         logger.info("[Phase 2] Step 4: 轮动检测 + 拥挤检查")
@@ -111,13 +111,34 @@ class PortfolioDecisionNode:
         )
         crowding_warnings = self._check_family_crowding(holdings_scores)
 
+        # P4：收集埋伏退出信号（_score_holdings 中填充）
+        ambush_exit_signals = getattr(self, '_ambush_exits', [])
+        if ambush_exit_signals:
+            logger.info(f"[Phase 2] P4 埋伏退出信号: {len(ambush_exit_signals)} 条")
+            for exit_info in ambush_exit_signals:
+                logger.info(
+                    f"  [P4 退出] {exit_info['symbol']} "
+                    f"({exit_info['sector']}/{exit_info['category_tag']}): "
+                    f"{exit_info['exit_signal']} — {exit_info['reason']}"
+                )
+            # 关闭已退出的快照（is_open=False）
+            self._close_ambush_snapshots(ambush_exit_signals, portfolio)
+
+        # P4：埋伏仓买入快照写入（买入催化剂快照）
+        ambush_buys = self._write_ambush_buy_snapshots(
+            allocation, unified_scoring, unified_context,
+        )
+        if ambush_buys:
+            logger.info(f"[Phase 2] P4 埋伏买入快照: {len(ambush_buys)} 条")
+
         # LLM 精炼（生成可追溯的推理总结）
         reasoning = await self._llm_refinement(
-            risk_assessment, unified_scoring, allocation, unified_context, portfolio
+            risk_assessment, unified_scoring, allocation, unified_context, portfolio,
+            vetoed_candidates=vetoed_candidates,
         )
 
         # 生成操作总结
-        summary = self._generate_summary(allocation, risk_assessment)
+        summary = self._generate_summary(allocation, risk_assessment, vetoed_candidates)
 
         # 生成风险提示
         warnings = self._generate_warnings(allocation, risk_assessment, unified_context)
@@ -132,6 +153,7 @@ class PortfolioDecisionNode:
             reasoning=reasoning,
             rotation_signals=rotation_signals,
             crowding_warnings=crowding_warnings,
+            ambush_exit_signals=ambush_exit_signals,
         )
 
         logger.info(
@@ -173,8 +195,8 @@ class PortfolioDecisionNode:
             stop_loss = -0.07
 
         # 板块暴露限制：动态计算（参考 Conviction-Tier + 序贯投资理论）
-        # 上限 = base × regime乘数 × role乘数 × confidence
-        # 效果：bull+主线+高确信 ≈ 36%，bear+埋伏 ≈ 5%
+        # 上限 = base × regime乘数 × role乘数 × confidence × 催化剂类型系数（P4）
+        # 效果：bull+主线+高确信 ≈ 36%，bear+埋伏+binary ≈ 2%
         #
         # 新版分类（TOP-N + conviction sizing）：
         # - actionable: 排名靠前，可选股（主线 100% 仓位，埋伏 50% 仓位）
@@ -183,6 +205,16 @@ class PortfolioDecisionNode:
         REGIME_MULTIPLIER = {"bull": 1.0, "transition": 0.65, "bear": 0.35}
         # cooling（高位降温）最低档：防新买入（2026-08-17 状态机校准新增）
         ROLE_MULTIPLIER = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3}
+        # P4 催化剂类型系数（文献：Yee 2025, 二元事件限仓）
+        # drift: 持有吃事件后漂移，给得大
+        # fade: 事件日即退，持有期短
+        # binary: 高不确定，文献"不要赌，赌则限仓"
+        CATALYST_TYPE_COEFF = {"drift": 1.0, "fade": 0.7, "binary": 0.4}
+
+        # 构建埋伏板块 → 催化剂类型映射（P4：消费 ambush_pool 的 category_tag）
+        ambush_type_map: Dict[str, str] = {}
+        for candidate in unified.ambush_pool:
+            ambush_type_map[candidate.sector_name] = candidate.category_tag
 
         sector_limits = {}
         if unified.confirmed_sectors:
@@ -204,7 +236,16 @@ class PortfolioDecisionNode:
                 else:  # fallback
                     base = 0.10
 
-                sector_limits[sector_name] = round(base * regime_m * role_m * conf_w, 3)
+                # P4 催化剂类型系数：仅对埋伏板块生效
+                catalyst_coeff = 1.0
+                if role == "ambush" and sector_name in ambush_type_map:
+                    catalyst_coeff = CATALYST_TYPE_COEFF.get(
+                        ambush_type_map[sector_name], 0.7
+                    )
+
+                sector_limits[sector_name] = round(
+                    base * regime_m * role_m * conf_w * catalyst_coeff, 3
+                )
 
         # 风险预算：基于 market_regime 的 risk_budget
         # risk_budget 范围 [0.2, 0.8]，映射到实际风险预算 [0.03, 0.08]
@@ -330,6 +371,8 @@ class PortfolioDecisionNode:
     ) -> List[UnifiedScoringResult]:
         """对每只持仓评估"继续持有"的吸引力（接入 GOT 上下文 + Node 6 v3 板块情报）"""
         results = []
+        # P4：重置埋伏退出记录（每次 _score_holdings 调用重新收集）
+        self._ambush_exits = []
 
         accounts = portfolio.get("accounts", [])
         if not accounts:
@@ -351,6 +394,9 @@ class PortfolioDecisionNode:
 
         # 批量获取持仓股的真实技术指标评分（替代 P&L 代理）
         tech_scores_real = self._batch_fetch_tech_scores(positions)
+
+        # ── P4：加载埋伏持仓快照（用于退出信号检测）──
+        ambush_snapshot_map = self._load_ambush_snaphots(positions)
 
         # 批量计算资金面/消息面评分（复用 screener 的方法，避免重复实现）
         holding_candidates = []
@@ -449,18 +495,23 @@ class PortfolioDecisionNode:
             sector_strength = stock_sector_info.get("strength", 50.0)
             sector_role = stock_sector_info.get("sector_role", "")
 
-            # 分层决策（方案 C：组合方案）
+            # 分层决策（方案 C：组合方案 + Invesco 2024 非对称门槛）
             if not sector_name:
                 # 完全不在追踪范围
                 action = "sell"
             elif lifecycle_phase is None:
                 # 板块不在 confirmed_sectors 中（可能被踢出）
-                # 利用 lifecycle_phase 为 null 作为"板块已踢出"的信号
-                if sector_strength < 60:
-                    # 板块被踢出 + 强度低 → 卖出
+                # Invesco 2024 非对称门槛：持仓者降温期保护
+                # 进入主线门槛高（60），踢出门槛低（40）→ 防止"卖在降温，买回在上攻"whipsaw
+                if sector_strength < 40:
+                    # 深度破位 → 卖出（真正弱势，不是降温）
                     action = "sell"
+                elif sector_strength < 60:
+                    # 轻度降温（40-60）→ 减仓但不强制卖出
+                    # （给再启动快速通道留空间：FAST 信号触发后直接回主线）
+                    action = "reduce"
                 else:
-                    # 板块被踢出但强度尚可（>=60）→ 持有观察
+                    # 强度尚可（>=60）→ 持有观察
                     action = "hold"
             elif sector_strength < 50:
                 action = "sell"
@@ -470,6 +521,27 @@ class PortfolioDecisionNode:
                 action = "hold"
             elif sector_role not in ("mainline", "ambush"):
                 action = "sell"
+            elif sector_role == "ambush" and symbol in ambush_snapshot_map:
+                # P4 埋伏退出分支：催化剂驱动，替代生命周期逻辑
+                snapshot = ambush_snapshot_map[symbol]
+                last_price = position.get("last_price", 0.0)
+                exit_signal, exit_reason = self._ambush_exit_signal(
+                    snapshot, date.today(), last_price,
+                )
+                if exit_signal:
+                    action = "sell"
+                    ambush_exit_info = {
+                        "symbol": symbol,
+                        "sector": sector_name,
+                        "category_tag": snapshot.category_tag,
+                        "exit_signal": exit_signal,
+                        "reason": exit_reason,
+                    }
+                    if not hasattr(self, '_ambush_exits'):
+                        self._ambush_exits = []
+                    self._ambush_exits.append(ambush_exit_info)
+                else:
+                    action = "hold"
             else:
                 # 使用生命周期驱动逻辑（吃鱼身+高切低策略）
                 action, _ = self._lifecycle_sell_signal(
@@ -542,6 +614,23 @@ class PortfolioDecisionNode:
                 f"动作: {action}"
             )
 
+            # ── P4 埋伏退出字段（仅埋伏持仓有效）──
+            ambush_position_type = None
+            ambush_exit_signal = None
+            ambush_exit_reason = None
+            if symbol in ambush_snapshot_map:
+                snap = ambush_snapshot_map[symbol]
+                ambush_position_type = snap.category_tag
+                # 查找是否在 _ambush_exits 中
+                for exit_info in self._ambush_exits:
+                    if exit_info["symbol"] == symbol:
+                        ambush_exit_signal = exit_info["exit_signal"]
+                        ambush_exit_reason = exit_info["reason"]
+                        reasoning += f", [埋伏退出:{exit_info['exit_signal']}]"
+                        break
+                else:
+                    reasoning += f", [埋伏持有:{snap.category_tag}]"
+
             results.append(
                 UnifiedScoringResult(
                     symbol=symbol,
@@ -562,6 +651,9 @@ class PortfolioDecisionNode:
                     lifecycle_day=lifecycle_day,
                     overheat_severity=overheat_severity,
                     family_name=family_name,
+                    ambush_position_type=ambush_position_type,
+                    ambush_exit_signal=ambush_exit_signal,
+                    ambush_exit_reason=ambush_exit_reason,
                 )
             )
 
@@ -704,6 +796,97 @@ class PortfolioDecisionNode:
         # impact_score 范围 [-1, 1]，映射到 [0, 100]
         score = news_context.impact_score or 0.0
         return 50.0 + score * 50.0
+
+    async def _verify_candidate_sectors(
+        self,
+        finalists: list,
+        sector_intel_map: Dict[str, Dict],
+    ) -> list:
+        """候选股板块交叉验证（2026-08-18 新增）
+
+        用 efinance.get_belong_board() 验证问财返回的板块标签是否真实。
+        防止蹭概念票（如利君股份被问财错误归类为 TOPCon电）。
+
+        验证逻辑：
+        1. 对每只候选股，调用 efinance 获取其实际所属板块列表
+        2. 检查 screener 标签的板块是否在 efinance 返回列表中
+        3. 如果不在，清空板块标签（打分时板块维度给中性分 50）
+
+        注意：只在候选股数量较少时（≤15）执行，避免过多 API 调用。
+        """
+        if not finalists or len(finalists) > 15:
+            return finalists
+
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+        verified = []
+
+        for stock in finalists:
+            tagged_sector = getattr(stock, 'sector', '') or getattr(stock, 'sector_name', '') or ''
+
+            # 无板块标签或不在 sector_intel_map 中，跳过验证
+            if not tagged_sector or tagged_sector not in sector_intel_map:
+                verified.append(stock)
+                continue
+
+            try:
+                # 调用 efinance 获取实际所属板块
+                clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
+                boards = manager.get_belong_boards(clean_code)
+
+                if not boards:
+                    # 获取失败，保留原标签（降级为信任问财）
+                    logger.warning(
+                        f"[板块验证] {stock.code} {stock.name}: "
+                        f"efinance 获取失败，保留问财标签'{tagged_sector}'"
+                    )
+                    verified.append(stock)
+                    continue
+
+                # 提取板块名称集合
+                actual_board_names = {
+                    b.get("name", "") or b.get("board_name", "")
+                    for b in boards
+                }
+
+                # 检查标签板块是否在实际板块中
+                if tagged_sector in actual_board_names:
+                    # 验证通过
+                    logger.debug(
+                        f"[板块验证] {stock.code} {stock.name}: "
+                        f"✓ '{tagged_sector}' 在 efinance 板块列表中"
+                    )
+                    verified.append(stock)
+                else:
+                    # 验证失败：问财标签不在 efinance 返回列表中
+                    logger.warning(
+                        f"[板块验证] {stock.code} {stock.name}: "
+                        f"✗ 问财标签'{tagged_sector}'不在 efinance 板块{list(actual_board_names)[:5]}...中，"
+                        f"清空板块标签"
+                    )
+                    # 清空板块标签，打分时板块维度会给中性分
+                    if hasattr(stock, 'sector'):
+                        stock.sector = ""
+                    if hasattr(stock, 'sector_name'):
+                        stock.sector_name = ""
+                    # 保留 sector_score 但降低权重（打分时会处理）
+                    verified.append(stock)
+
+            except Exception as e:
+                # 验证过程出错，保留原标签（降级为信任问财）
+                logger.warning(
+                    f"[板块验证] {stock.code} {stock.name}: "
+                    f"验证出错({e})，保留问财标签'{tagged_sector}'"
+                )
+                verified.append(stock)
+
+        logger.info(
+            f"[板块验证] 完成: {len(finalists)} 只候选股，"
+            f"{len([s for s in verified if not (getattr(s, 'sector', '') or getattr(s, 'sector_name', ''))])} 只被清空标签"
+        )
+
+        return verified
 
     def _get_sector_capital_score(
         self, sector_name: str, sector_intel_map: Dict[str, Dict], global_capital: float
@@ -892,10 +1075,12 @@ class PortfolioDecisionNode:
         """
         try:
             from src.services.ths_screener import THSScreenerService
+            from src.services.board_name_resolver import get_board_name_resolver
             from src.config import get_config
 
             config = get_config()
             ths_service = THSScreenerService(config)
+            resolver = get_board_name_resolver()
 
             # 遍历主线板块
             for group in sector_context.active_mainline:
@@ -905,11 +1090,13 @@ class PortfolioDecisionNode:
 
                     # 查询成分股（简化版，不带 DDE 过滤）
                     try:
-                        query = f"{sector_name}概念板块成分股，上市天数>365天，非ST"
+                        board_name = resolver.resolve(sector_name)
+                        query = f"{board_name}概念板块成分股，上市天数>365天，非ST"
                         logger.debug(f"[板块映射] 查询 {sector_name} 成分股...")
                         ths_result = ths_service.query(query)
 
                         if ths_result and ths_result.stocks:
+                            resolver.confirm(sector_name, board_name)
                             for stock in ths_result.stocks:
                                 clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
                                 # 初始化该股票的板块列表
@@ -932,10 +1119,12 @@ class PortfolioDecisionNode:
                 sector_strength = ambush_sector.strength_score
 
                 try:
-                    query = f"{sector_name}概念板块成分股，上市天数>365天，非ST"
+                    board_name = resolver.resolve(sector_name)
+                    query = f"{board_name}概念板块成分股，上市天数>365天，非ST"
                     ths_result = ths_service.query(query)
 
                     if ths_result and ths_result.stocks:
+                        resolver.confirm(sector_name, board_name)
                         for stock in ths_result.stocks:
                             clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
                             if clean_code not in self._stock_sector_map:
@@ -996,8 +1185,8 @@ class PortfolioDecisionNode:
             board_name = board.get("name", "") or board.get("board_name", "")
             if board_name in confirmed_map:
                 intel = confirmed_map[board_name]
-                # 用 tech_score 作为强度（Node 2 的百分位评分）
-                strength = intel.tech_score
+                # 板块强度统一用综合口径（composite），不再用纯技术分（2026-08-18）
+                strength = intel.composite_score
                 # 主线板块权重更高
                 weight = 1.5 if intel.sector_role == "mainline" else 1.0
                 matched.append({
@@ -1193,6 +1382,292 @@ class PortfolioDecisionNode:
         final_score = 0.6 * priority + 0.4 * composite_score
         return final_score
 
+    # ── P4 埋伏退出分支（催化剂驱动） ──
+
+    # 退出参数（集中配置，归档积累后校准）
+    AMBUSH_DRIFT_STALL_DAYS = 10          # 漂移型：事件后 N 个交易日无涨 → 衰竭
+    AMBUSH_DRIFT_TIMEOUT_DAYS = 20        # 漂移型：硬超时（交易日）
+    AMBUSH_DRIFT_STALL_THRESHOLD = 0.02   # 漂移型：涨幅 < 2% 视为走平
+    AMBUSH_BINARY_GRACE_DAYS = 2          # 二元型：事件日后 N 个交易日仍未发生 → 落空
+
+    def _ambush_exit_signal(
+        self,
+        snapshot,
+        today: date,
+        current_price: float,
+        kline_closes: Optional[List[float]] = None,
+    ) -> tuple[Optional[str], str]:
+        """埋伏持仓退出信号检测（P4，催化剂驱动）
+
+        退出触发清单（plan.md §三 Node 7）：
+        | fade 型      | 事件日次日开盘卖（buy the rumor, sell the news）|
+        | drift 型     | 持有吃漂移；满足任一退出：衰竭/破MA20/硬超时    |
+        | 事件落空     | 到期未发生/宣布推迟 → 立即退出                 |
+        | DDE 毕业     | 转主线逻辑接管（由调用方在板块级检测）          |
+
+        Args:
+            snapshot: AmbushPositionSnapshotRecord（is_open=True）
+            today: 当前日期
+            current_price: 持仓股当前价格
+            kline_closes: 最近 N 日收盘价序列（drift 型 MA20 判断用）
+
+        Returns:
+            (exit_signal, exit_reason):
+                exit_signal=None → 继续持有
+                exit_signal="fade_sell" / "drift_exhausted" / "drift_break_ma20" /
+                             "drift_timeout" / "event_cancelled"
+        """
+        from src.got.catalyst_calendar import _count_trade_days
+
+        entry_date = snapshot.entry_date
+        event_date = snapshot.catalyst_event_date
+        category_tag = snapshot.category_tag
+
+        # 通用：硬止损（无论哪种类型）
+        entry_price = snapshot.entry_price
+        if entry_price > 0:
+            pnl_pct = (current_price - entry_price) / entry_price
+            if pnl_pct < -0.07:  # 埋伏仓统一 -7% 止损
+                return (
+                    "stop_loss",
+                    f"埋伏仓止损: P&L {pnl_pct:.1%}, 入场价 {entry_price:.2f} → 现价 {current_price:.2f}",
+                )
+
+        # ── fade 型：事件日次日卖 ──
+        if category_tag == "fade":
+            if event_date and today > event_date:
+                return (
+                    "fade_sell",
+                    f"fade 型催化剂已兑现（事件日 {event_date}），buy the rumor sell the news",
+                )
+            return None, "fade 型：等待事件日"
+
+        # ── binary 型：事件落空即走 ──
+        if category_tag == "binary":
+            if event_date:
+                trading_days_since_event = _count_trade_days(event_date, today)
+                if trading_days_since_event > self.AMBUSH_BINARY_GRACE_DAYS:
+                    return (
+                        "event_cancelled",
+                        f"binary 型催化剂落空：事件日 {event_date} 已过 {trading_days_since_event} 个交易日仍未发生",
+                    )
+            return None, "binary 型：等待事件确认"
+
+        # ── drift 型：持有吃漂移，三种退出 ──
+        if category_tag == "drift":
+            if not event_date:
+                # 无事件日期，退化为超时检查
+                trading_days_held = _count_trade_days(entry_date, today)
+                if trading_days_held > self.AMBUSH_DRIFT_TIMEOUT_DAYS:
+                    return (
+                        "drift_timeout",
+                        f"drift 型硬超时：已持有 {trading_days_held} 个交易日（上限 {self.AMBUSH_DRIFT_TIMEOUT_DAYS}）",
+                    )
+                return None, "drift 型：无事件日期，等待漂移或超时"
+
+            trading_days_since_event = _count_trade_days(event_date, today)
+
+            # 条件 c：硬超时 20 个交易日
+            trading_days_held = _count_trade_days(entry_date, today)
+            if trading_days_held > self.AMBUSH_DRIFT_TIMEOUT_DAYS:
+                return (
+                    "drift_timeout",
+                    f"drift 型硬超时：已持有 {trading_days_held} 个交易日（上限 {self.AMBUSH_DRIFT_TIMEOUT_DAYS}）",
+                )
+
+            # 条件 a：事件后 10 个交易日漂移衰竭
+            if trading_days_since_event >= self.AMBUSH_DRIFT_STALL_DAYS:
+                # 衰竭判定：当前价格 vs 事件后首日价格（近似用 entry_price × (1 + 预期漂移)）
+                # 简化：若持有期涨幅 < AMBUSH_DRIFT_STALL_THRESHOLD → 衰竭
+                if entry_price > 0:
+                    held_return = (current_price - entry_price) / entry_price
+                    if held_return < self.AMBUSH_DRIFT_STALL_THRESHOLD:
+                        return (
+                            "drift_exhausted",
+                            f"drift 型漂移衰竭：事件后 {trading_days_since_event} 日，"
+                            f"持有期涨幅仅 {held_return:.1%}（阈值 {self.AMBUSH_DRIFT_STALL_THRESHOLD:.0%}）",
+                        )
+
+            # 条件 b：破 MA20
+            if kline_closes and len(kline_closes) >= 20:
+                ma20 = sum(kline_closes[-20:]) / 20
+                if current_price < ma20:
+                    return (
+                        "drift_break_ma20",
+                        f"drift 型破 MA20: 现价 {current_price:.2f} < MA20 {ma20:.2f}",
+                    )
+
+            return None, (
+                f"drift 型持有中：事件后 {trading_days_since_event} 日，"
+                f"持有 {trading_days_held} 日，继续吃漂移"
+            )
+
+        # 未知类型：默认持有
+        return None, f"未知催化剂类型 '{category_tag}'，默认持有"
+
+    def _load_ambush_snaphots(
+        self, positions: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """加载埋伏持仓快照（P4）
+
+        从 ambush_position_snapshots 表查询 is_open=True 的记录，
+        与当前持仓列表匹配，返回 symbol → snapshot_record 映射。
+
+        降级：表不存在或查询失败 → 返回空映射（跳过退出检测）。
+        """
+        symbol_set = {
+            p.get("symbol", "").replace("SH", "").replace("SZ", "").replace("BJ", "")
+            for p in positions
+            if p.get("symbol")
+        }
+        if not symbol_set:
+            return {}
+
+        try:
+            from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                records = (
+                    session.query(AmbushPositionSnapshotRecord)
+                    .filter(
+                        AmbushPositionSnapshotRecord.is_open == True,  # noqa: E712
+                        AmbushPositionSnapshotRecord.symbol.in_(symbol_set),
+                    )
+                    .all()
+                )
+                return {r.symbol: r for r in records}
+        except Exception as e:
+            logger.debug(f"[P4] 加载埋伏快照失败（降级跳过退出检测）: {e}")
+            return {}
+
+    def _write_ambush_buy_snapshots(
+        self,
+        allocation: List[TradeAllocation],
+        unified_scoring: List[UnifiedScoringResult],
+        unified_context: UnifiedContext,
+    ) -> List[Dict[str, Any]]:
+        """P4 埋伏仓买入快照写入
+
+        对每个 buy 类型的 allocation：
+        1. 从 unified_scoring 找到该 symbol 的板块
+        2. 若板块在 ambush_pool 中 → 写入催化剂快照到 SQLite
+        3. 返回成功写入的快照列表（用于日志）
+
+        降级：表不存在/写入失败 → 记录日志但不阻塞主流程。
+        """
+        buy_allocations = [a for a in allocation if a.action == "buy" and a.quantity_delta > 0]
+        if not buy_allocations:
+            return []
+
+        # 构建 symbol → scoring 映射（获取板块名）
+        symbol_to_scoring = {s.symbol: s for s in unified_scoring}
+
+        # 构建板块名 → AmbushCandidate 映射
+        ambush_pool_map = {
+            c.sector_name: c for c in unified_context.ambush_pool
+        }
+
+        written = []
+        try:
+            from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                for alloc in buy_allocations:
+                    scoring = symbol_to_scoring.get(alloc.symbol)
+                    if not scoring:
+                        continue
+
+                    # 从 reasoning 中解析板块名（格式: "板块[XXX]强度XX..."）
+                    sector_name = self._extract_sector_from_reasoning(alloc.reasoning)
+                    if not sector_name or sector_name not in ambush_pool_map:
+                        continue
+
+                    candidate = ambush_pool_map[sector_name]
+                    today = date.today()
+                    entry_price = alloc.price_range[0] if alloc.price_range else 0.0
+
+                    record = AmbushPositionSnapshotRecord(
+                        symbol=alloc.symbol,
+                        sector_name=sector_name,
+                        category_tag=candidate.category_tag,
+                        catalyst_event_id=candidate.events[0] if candidate.events else "",
+                        catalyst_event_title=candidate.events[0] if candidate.events else "",
+                        catalyst_event_date=candidate.top_event_date,
+                        impact_level=candidate.top_event_level,
+                        consensus_expectation="",
+                        entry_date=today,
+                        entry_price=entry_price,
+                        is_open=True,
+                    )
+                    session.merge(record)
+                    written.append({
+                        "symbol": alloc.symbol,
+                        "sector": sector_name,
+                        "category_tag": candidate.category_tag,
+                        "entry_price": entry_price,
+                    })
+
+                session.commit()
+
+        except Exception as e:
+            logger.warning(f"[P4] 埋伏买入快照写入失败（降级跳过）: {e}")
+
+        return written
+
+    @staticmethod
+    def _extract_sector_from_reasoning(reasoning: str) -> str:
+        """从 reasoning 字符串中提取板块名（格式: 板块[XXX]强度...）"""
+        import re
+        match = re.search(r'板块\[([^\]]+)\]', reasoning)
+        return match.group(1) if match else ""
+
+    def _close_ambush_snapshots(
+        self,
+        exit_signals: List[Dict[str, Any]],
+        portfolio: Dict[str, Any],
+    ) -> None:
+        """P4：关闭已退出的埋伏快照（is_open=False + exit 字段）
+
+        Args:
+            exit_signals: _ambush_exits 列表
+            portfolio: 持仓快照（用于获取退出价格）
+        """
+        if not exit_signals:
+            return
+
+        # 构建 symbol → last_price 映射
+        accounts = portfolio.get("accounts", [])
+        price_map: Dict[str, float] = {}
+        if accounts:
+            for pos in accounts[0].get("positions", []):
+                price_map[pos.get("symbol", "")] = pos.get("last_price", 0.0)
+
+        try:
+            from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
+            db = DatabaseManager()
+            today = date.today()
+            with db.get_session() as session:
+                for exit_info in exit_signals:
+                    symbol = exit_info["symbol"]
+                    exit_price = price_map.get(symbol, 0.0)
+                    (
+                        session.query(AmbushPositionSnapshotRecord)
+                        .filter(
+                            AmbushPositionSnapshotRecord.symbol == symbol,
+                            AmbushPositionSnapshotRecord.is_open == True,  # noqa: E712
+                        )
+                        .update({
+                            "exit_signal": exit_info["exit_signal"],
+                            "exit_date": today,
+                            "exit_price": exit_price,
+                            "is_open": False,
+                        })
+                    )
+                session.commit()
+            logger.info(f"[P4] 关闭 {len(exit_signals)} 条埋伏快照")
+        except Exception as e:
+            logger.warning(f"[P4] 关闭埋伏快照失败: {e}")
+
     def _detect_rotation_opportunity(
         self,
         holdings: List[UnifiedScoringResult],
@@ -1367,6 +1842,11 @@ class PortfolioDecisionNode:
             screener._filter_got_finalists, universe, got_context, 10
         )
 
+        # ── 2026-08-18 新增：候选股板块交叉验证 ──
+        # 用 efinance.get_belong_board() 验证问财返回的板块标签是否真实
+        # 防止蹭概念票（如利君股份被问财错误归类为 TOPCon电）
+        finalists = await self._verify_candidate_sectors(finalists, sector_intel_map)
+
         # 转换为 UnifiedScoringResult，并利用板块情报调整评分
         # 缺失维度权重归一化（NBER: 缺失≠零分）
         from src.services.stock_screener import (
@@ -1379,8 +1859,9 @@ class PortfolioDecisionNode:
 
         results = []
         for stock in finalists:
-            # 查找股票所属板块（从 stock 的 sector 字段）
-            stock_sector = getattr(stock, 'sector', '') or ''
+            # 查找股票所属板块（从 stock 的 sector_name 字段）
+            # 2026-08-18 修复：ScreenerStock 的属性是 sector_name，不是 sector
+            stock_sector = getattr(stock, 'sector_name', '') or getattr(stock, 'sector', '') or ''
 
             # 直接复用 screener 的个股级评分（已包含 DDE + sector_flow + LLM 消息面匹配）
             capital_score = stock.capital_score
@@ -1483,8 +1964,14 @@ class PortfolioDecisionNode:
         unified_scoring: List[UnifiedScoringResult],
         risk: PortfolioRiskAssessment,
         portfolio: Dict[str, Any],
-    ) -> List[TradeAllocation]:
-        """规则驱动的仓位分配（支持高切低轮动策略）"""
+    ) -> tuple[list[TradeAllocation], list[UnifiedScoringResult]]:
+        """规则驱动的仓位分配（支持高切低轮动策略）。
+
+        Returns:
+            (allocations, 被预算约束否决的 BUY 候选列表)
+            当买入预算为 0 时，vetoed 含全部通过评分的 buy 候选，
+            供输出层显式说明"信号被仓位/资金上限否决"，避免静默归零。
+        """
         allocations = []
 
         # 当前持仓映射
@@ -1593,14 +2080,16 @@ class PortfolioDecisionNode:
                 )
 
         # ── Step 3: 生成买入建议 ──
+        # 预收集 BUY 候选（无论预算是否充足），预算不足时显式透出被否决信号
+        buy_candidates = [
+            s
+            for s in unified_scoring
+            if not s.is_holding and s.action_recommendation.startswith("buy")
+        ]
+        buy_candidates.sort(key=lambda x: x.composite_score, reverse=True)
+
         if buy_budget > 0:
-            # 按评分排序，分配资金
-            candidates = [
-                s
-                for s in unified_scoring
-                if not s.is_holding and s.action_recommendation.startswith("buy")
-            ]
-            candidates.sort(key=lambda x: x.composite_score, reverse=True)
+            candidates = buy_candidates
 
             # 差异化仓位分配（参考 Garrone 2026 Structural Optionality Budget）
             # 通过 sector_exposure_limits 推断角色：上限高=主线，上限低=埋伏
@@ -1652,7 +2141,10 @@ class PortfolioDecisionNode:
                         )
                     )
 
-        return allocations
+        # 预算不足时，全部 BUY 候选被约束否决 → 显式透出（消除"高分候选 vs 0 交易"静默矛盾）
+        vetoed_candidates = buy_candidates if buy_budget <= 0 else []
+
+        return allocations, vetoed_candidates
 
     # ── LLM 精炼 ──
 
@@ -1663,6 +2155,7 @@ class PortfolioDecisionNode:
         allocation: List[TradeAllocation],
         unified: UnifiedContext,
         portfolio: Dict[str, Any],
+        vetoed_candidates: Optional[List[UnifiedScoringResult]] = None,
     ) -> str:
         """生成可追溯的推理总结"""
         # 持仓盈亏汇总
@@ -1703,6 +2196,19 @@ class PortfolioDecisionNode:
             ]
         )
 
+        # 被预算约束否决的 BUY 候选（显式披露，消除"高分候选 vs 0 交易"的静默矛盾）
+        vetoed_text = ""
+        if vetoed_candidates:
+            vetoed_text = "\n".join(
+                f"  - {s.name} ({s.symbol}): {s.composite_score:.1f} 分, 建议动作 {s.action_recommendation}"
+                for s in vetoed_candidates[:5]
+            )
+            vetoed_text = (
+                "\n以下 BUY 候选已通过评分，但受预算/仓位上限约束未获资金分配"
+                f"（当前仓位 {risk.current_position_ratio:.0%} ≥ 上限 {risk.position_limit:.0%}，卖出释放资金为 0）：\n"
+                f"{vetoed_text}\n"
+            )
+
         prompt = f"""
 当前风险评估:
 - 仓位上限: {risk.position_limit:.0%}
@@ -1720,6 +2226,7 @@ class PortfolioDecisionNode:
 
 初步分配建议:
 {allocation_text if allocation_text else "  无（当前无需操作）"}
+{vetoed_text}
 
 请生成一段简洁的推理总结（300 字以内），包含以下两部分:
 
@@ -1797,9 +2304,16 @@ class PortfolioDecisionNode:
         self,
         allocation: List[TradeAllocation],
         risk: PortfolioRiskAssessment,
+        vetoed_candidates: Optional[List[UnifiedScoringResult]] = None,
     ) -> str:
         """生成操作总结"""
         if not allocation:
+            if vetoed_candidates:
+                top_vetoed = "、".join(s.name for s in vetoed_candidates[:3])
+                return (
+                    f"当前不产生新买入（{len(vetoed_candidates)} 只 BUY 候选"
+                    f"如{top_vetoed}…受仓位上限 {risk.position_limit:.0%} 约束被否决），维持现有仓位"
+                )
             return "当前无需操作，维持现有仓位"
 
         buy_count = sum(1 for a in allocation if a.action == "buy")

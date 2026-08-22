@@ -486,8 +486,9 @@ class SentimentAnalysisNode:
         """获取 NGA 论坛舆情数据（ ForumSentimentService ）。"""
         from src.config import Config
         from src.services.forum_sentiment import ForumSentimentService
+        from src.config import get_config
 
-        config = Config()
+        config = get_config()
         if not config.forum_sentiment_enabled:
             return {}
 

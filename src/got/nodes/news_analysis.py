@@ -75,13 +75,15 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
    - impact_level: "high"（重大影响）/ "medium"（中等影响）/ "low"（轻微影响）
    - sentiment: "positive"（利好）/ "negative"（利空）/ "neutral"（中性）
    - affected_sectors: 受影响板块列表（尽量映射到概念列表中的概念）
+   - affected_stocks: 事件中明确提到的具体个股名称或代码列表（如"中际旭创"、"300750"）。没有提到具体个股则留空[]
+   - source_type: 事件的主要信息来源类型——"professional"（专业媒体/通讯社）或 "retail_forum"（散户论坛/社区讨论）。如果事件主要由[NGA论坛]等论坛标签的新闻首先提及或讨论，标记为"retail_forum"
 2. 不要遗漏重要事件，也不要重复
 3. 同一事件被多家媒体报道时，合并为一个事件
 4. 如果当前新闻中的事件与历史事件相关（同一主题或因果关系），请在 summary 中标注"延续自：[历史事件标题]"
 5. 严格按 importance 排序，high 在前
 
 输出 JSON 格式（不要 markdown 代码块）：
-{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."]}}]}}"""
+{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"}}]}}"""
 
 CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
 
@@ -200,6 +202,19 @@ class NewsAnalysisNode:
             data_quality=data_quality,
         )
 
+        # ── 催化剂日历（P1） ──
+        try:
+            from src.got.catalyst_calendar import CatalystCalendarBuilder
+            builder = CatalystCalendarBuilder()
+            calendar = await builder.build_calendar()
+            result.catalyst_calendar = calendar
+            logger.info(
+                "[Node 4] 催化剂日历: %d 事件, mode=%s",
+                len(calendar.events), calendar.refresh_mode,
+            )
+        except Exception as exc:
+            logger.warning("[Node 4] 催化剂日历构建失败（已降级）: %s", exc)
+
         logger.info(
             "[Node 4] 完成 — status=%s, impact=%s(%.2f), events=%d",
             status, overall_impact, impact_score, len(events),
@@ -224,6 +239,7 @@ class NewsAnalysisNode:
             "wallstreetcn": "wallstreetcn",
             "eastmoney": "eastmoney_kuaixun",
             "newsnow": "newsnow_hot",
+            "nga_forum": "nga_forum",
         }
         available = [source_map.get(s, s) for s in available]
         missing = [source_map.get(s, s) for s in missing]
@@ -301,11 +317,31 @@ class NewsAnalysisNode:
 
         return events, concepts, risks
 
+    # NGA 保底：确保至少 5 条论坛帖子进入 LLM 输入（散户视角不应被专业媒体完全淹没）
+    _NGA_MIN_FOR_LLM = 5
+
     @staticmethod
     def _format_news_for_prompt(news_items: List[Dict], max_items: int = 50) -> str:
-        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注）。"""
+        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA 保底）。"""
+        top_items = list(news_items[:max_items])
+
+        # NGA 保底：如果 top N 里没有论坛帖子，从后续条目中补入
+        nga_in_top = sum(1 for item in top_items if item.get("source_type") == "nga_forum")
+        if nga_in_top < NewsAnalysisNode._NGA_MIN_FOR_LLM:
+            nga_remaining = [
+                item for item in news_items[max_items:]
+                if item.get("source_type") == "nga_forum"
+            ]
+            needed = NewsAnalysisNode._NGA_MIN_FOR_LLM - nga_in_top
+            for nga_item in nga_remaining[:needed]:
+                # 替换 top_items 末尾最低权重的非 NGA 条目
+                for j in range(len(top_items) - 1, -1, -1):
+                    if top_items[j].get("source_type") != "nga_forum":
+                        top_items[j] = nga_item
+                        break
+
         lines = []
-        for i, item in enumerate(news_items[:max_items], 1):
+        for i, item in enumerate(top_items, 1):
             source = item.get("source", "未知")
             source_type = item.get("source_type", "")
             title = item.get("title", "")
@@ -442,6 +478,8 @@ class NewsAnalysisNode:
                     impact_level=item.get("impact_level", "medium"),
                     sentiment=item.get("sentiment", "neutral"),
                     affected_sectors=item.get("affected_sectors", []),
+                    affected_stocks=item.get("affected_stocks", []),
+                    source_type=item.get("source_type", "professional"),
                     source_count=1,
                 ))
             except Exception as exc:
@@ -535,8 +573,8 @@ class NewsAnalysisNode:
         for i, event in enumerate(events):
             sources = event_source_map[i]
             event.source_count = max(len(sources), 1)
-            # source_type 取匹配到该事件的所有原始新闻中出现最多的 source_type
-            if sources:
+            # source_type：保留 LLM 的 retail_forum 标注，仅对 professional 做字符串归因
+            if sources and event.source_type == "professional":
                 event.source_type = max(sources, key=lambda s: sum(
                     1 for item in raw_news if item.get("source_type") == s
                 ))

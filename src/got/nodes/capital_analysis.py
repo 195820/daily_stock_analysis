@@ -179,8 +179,8 @@ class CapitalAnalysisNode:
         def _fetch():
             try:
                 from src.services.dde_fetcher import DdeFetcher
-                from src.config import Config
-                config = Config()
+                from src.config import get_config
+                config = get_config()
                 dde = DdeFetcher(config)
                 result = dde.fetch_market_dde()
                 if not result or result.error or not result.snapshots:
@@ -428,10 +428,29 @@ class CapitalAnalysisNode:
 
         final_score = clip(final_score + mainline_bonus, -1.0, 1.0)
 
+        # 构建全量板块名→净流入(亿)映射（~300 概念 + ~41 行业），供下游评分使用
+        sector_flow_all = {}
+        for _df in [concept_df, industry_df]:
+            if _df is None or _df.empty:
+                continue
+            _net_col = _find_column(_df, ["净额", "净流"])
+            _name_col = _find_column(_df, ["行业", "板块名称", "名称"])
+            if not _net_col or not _name_col:
+                continue
+            for _, _row in _df.iterrows():
+                _name = str(_row[_name_col]).strip()
+                _amount = pd.to_numeric(_row[_net_col], errors="coerce")
+                if pd.isna(_amount):
+                    continue
+                # 同一板块在概念/行业中重复时取较大值
+                prev = sector_flow_all.get(_name, float("-inf"))
+                sector_flow_all[_name] = round(float(_amount), 2) if _amount > prev else prev
+
         return final_score, {
             "score": round(final_score, 4),
             "top_concepts": top_concepts,
             "top_industries": top_industries,
+            "sector_flow_all": sector_flow_all,
             "mainline_bonus": mainline_bonus > 0,
             "timestamp": data.get("timestamp"),
         }
@@ -564,9 +583,22 @@ class CapitalAnalysisNode:
             action_hint = "当日资金整体态度"
             timing_note = "请基于当日全天数据分析，不要使用午后等盘中时态。"
 
+        # 有效维度说明（盘中单维模式 / 数据降级时注入，限制 LLM 过度自信）
+        dim_note = ""
+        if ctx.missing_dimensions:
+            dim_note = (
+                f"有效维度缺失：{'、'.join(ctx.missing_dimensions)}，"
+                f"置信度 {ctx.confidence_multiplier:.0%}。"
+                "若置信度≤50%，请在结论中明确提示“结论基于单一资金维度、证据强度有限”，"
+                "严禁使用“强烈看多”“坚决做多”等强绝对化措辞，改用“资金维度强流入”等限定表述。"
+            )
+        else:
+            dim_note = "三维资金数据完整（板块资金流/大单/北向），证据充分。"
+
         prompt = (
             f"你是一个专业的资金流分析师。根据以下{time_context}资金数据，撰写简洁分析报告。\n\n"
             f"机构态度评分：{ctx.institutional_score}（{ctx.institutional_attitude}）\n\n"
+            f"有效维度：{dim_note}\n\n"
             f"支撑证据：\n{evidence_text}\n\n"
             f"大盘背景：科技成长趋势={trend}\n"
             f"板块背景：活跃主线={mainline_names}（{mainline_count}个）\n\n"

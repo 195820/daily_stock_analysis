@@ -18,10 +18,12 @@ import logging
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from src.got.schemas import (
     MarketContext,
+    MarketStateSignal,
     TechGrowthSignal,
     StyleSignal,
     TimeframeSignals,
@@ -127,23 +129,28 @@ class MarketAnalysisNode:
             tech_growth.get("regime_metadata", {}),
         )
 
-        # Step 5: 仓位上限计算
-        position_limit = self._calculate_position_limit(
-            timeframe_got,
-            mid_small_cap.get("trend", "neutral"),
-            large_cap.get("trend", "neutral"),
-        )
-
-        # Step 6: 支撑/阻力位
+        # Step 5: 支撑/阻力位
         key_levels = self._calculate_key_levels(index_data.get("399006.SZ"))
 
-        # Step 7: T-0 实时涨跌幅（腾讯接口，同步 HTTP → 放到线程池避免阻塞事件循环）
+        # Step 6: T-0 实时涨跌幅（腾讯接口，同步 HTTP → 放到线程池避免阻塞事件循环）
         today_change = await asyncio.to_thread(self._fetch_realtime_index)
 
-        # Step 8: 跨指数一致性 + confidence（三因素加权）
+        # Step 7: 跨指数一致性 + confidence（三因素加权）
         cross_consistency, cross_pattern = self._compute_cross_index_consistency(indicator_results)
         regime_metadata = tech_growth.get("regime_metadata", {})
         confidence = self._calculate_confidence(cross_consistency, timeframe_got, regime_metadata)
+
+        # Step 8: 仓位上限计算（依赖 cross_consistency）
+        # 使用创业板指的收盘价作为价格历史（代表成长股波动率）
+        price_history = index_data.get("399006.SZ", pd.Series()).get("close")
+        position_details = self._calculate_position_limit_v2(
+            timeframe_got,
+            mid_small_cap.get("trend", "neutral"),
+            large_trend=large_cap.get("trend", "neutral"),
+            price_history=price_history,
+            cross_index_consistency=cross_consistency,
+        )
+        position_limit = position_details["position_limit"]
 
         # Step 9: T-0 实时修正 confidence
         confidence = self._apply_realtime_adjustment(
@@ -162,9 +169,19 @@ class MarketAnalysisNode:
             tech_growth, timeframe_got, cross_pattern, today_change, breadth_data
         )
 
+        # Step 12: 合成市场状态条件变量（下游 Node2/Node6 主消费入口，2026-08-19 新增）
+        market_state = self._build_market_state(
+            tech_growth=tech_growth,
+            timeframe_got=timeframe_got,
+            today_change=today_change,
+            position_limit=position_limit,
+            position_details=position_details,
+        )
+
         # 构建输出
         return MarketContext(
             tech_growth=tech_growth,
+            market_state=market_state,
             mid_small_cap=mid_small_cap,
             large_cap=large_cap,
             position_limit=position_limit,
@@ -181,6 +198,85 @@ class MarketAnalysisNode:
             ),
             today_change=today_change,
             market_breadth=breadth_data,
+            realized_volatility=position_details.get("realized_volatility"),
+            vol_adjusted_position=position_details.get("vol_adjusted_position"),
+            regime_scale=position_details.get("regime_scale"),
+        )
+
+    def _build_market_state(
+        self,
+        tech_growth: dict,
+        timeframe_got: TimeframeGOTResult,
+        today_change: dict,
+        position_limit: float,
+        position_details: dict,
+    ) -> MarketStateSignal:
+        """合成市场状态条件变量（2026-08-19 新增）。
+
+        把 Node 1 已算的散字段聚合成可传导的 attack_power（进攻强度 0~1），
+        供 Node 2（板块选股强度）和 Node 6（聚合权重）直接消费。
+
+        依据（2026-08-18 东吴金工报告 + RegimeFolio）：
+        - 市场状态应作为跨股票共享的条件变量，重塑下游表示与合成
+        - 预测与配置必须共享同一 regime 信号，避免处方脱节（prescription misalignment）
+
+        attack_power 合成：
+        - 动量分: tech_score (-1~1) → (score+1)/2
+        - mini-GOT 分: unified_score (-1~1) → (unified_score+1)/2
+        - 风险分: position_limit (0.2~1.5) → 归一化
+        - 暴跌 override: 最弱指数 < -3% 时强制压低到 0.15（防守优先）
+        """
+        # 1. 基础攻击力：技术面 + mini-GOT 加权
+        tech_score = float(tech_growth.get("score", 0) or 0)
+        mini_score = getattr(timeframe_got, "unified_score", 0) or 0
+        momentum_power = (min(max(tech_score, -1), 1) + 1) / 2
+        mini_power = (min(max(mini_score, -1), 1) + 1) / 2
+        base_power = 0.5 * momentum_power + 0.5 * mini_power
+
+        # 2. 风险状态：position_limit 反映风险预算（越低压仓越保守）
+        # position_limit 范围约 [0.2, 1.5]，映射到 0~1
+        pos_limit = float(position_limit or 0.5)
+        risk_power = min(max((pos_limit - 0.2) / 1.3, 0.0), 1.0)
+
+        # 3. 合成攻击力（动量 50% + 风险预算 50%）
+        attack_power = 0.5 * base_power + 0.5 * risk_power
+
+        # 4. 暴跌 override：最弱指数单日 < -3% → 强制防守
+        crash_override = False
+        if today_change:
+            worst = min(today_change.values())
+            if worst < -3.0:
+                crash_override = True
+                attack_power = min(attack_power, 0.15)
+
+        # 5. 风险状态分类
+        vol = position_details.get("realized_volatility")
+        risk_state = "normal"
+        if vol is not None:
+            if vol > 0.45:
+                risk_state = "extreme_high"
+            elif vol > 0.30:
+                risk_state = "high"
+
+        # 6. regime 分类
+        trend = tech_growth.get("trend", "neutral")
+        regime = "transition"
+        if trend == "bullish" and attack_power > 0.6:
+            regime = "bull"
+        elif trend == "bearish" or (crash_override and attack_power < 0.3):
+            regime = "bear"
+
+        return MarketStateSignal(
+            attack_power=round(float(min(max(attack_power, 0.0), 1.0)), 4),
+            regime=regime,
+            mini_got_trend=getattr(timeframe_got, "unified_trend", "neutral"),
+            mini_got_score=float(getattr(timeframe_got, "unified_score", 0) or 0),
+            mini_got_confidence=float(getattr(timeframe_got, "timeframe_confidence", 1.0) or 1.0),
+            timeframe_consistency=(tech_growth.get("consistency") or "aligned"),
+            contradiction_type=getattr(timeframe_got, "contradiction_type", None),
+            risk_state=risk_state,
+            realized_volatility=vol,
+            crash_override=crash_override,
         )
 
     def _get_index_kline(self, fetcher, code: str, days: int = 250) -> Optional[pd.DataFrame]:
@@ -420,27 +516,151 @@ class MarketAnalysisNode:
         else:
             return "neutral"
 
-    def _calculate_position_limit(self, timeframe_got: TimeframeGOTResult, mid_trend: str, large_trend: str) -> float:
-        """基于时间框架 mini GOT 的统一信号计算仓位上限"""
-        unified_trend = timeframe_got.unified_trend
-        tf_confidence = timeframe_got.timeframe_confidence
+    def _estimate_realized_volatility(self, price_series: pd.Series, lookback_days: int = 20) -> float:
+        """
+        估计实现波动率（年化）
 
-        # 基础仓位
-        if unified_trend == "bullish":
-            base_limit = 1.0
-        elif unified_trend == "neutral":
-            base_limit = 0.5
-        else:
-            base_limit = 0.0
+        参考：Moreira & Muir (2017), "The Impact of Volatility Targeting"
 
-        # 矛盾折扣
-        base_limit *= tf_confidence
+        Args:
+            price_series: 价格序列（收盘价）
+            lookback_days: 回溯窗口（默认 20 日）
 
-        # 极端风险折扣
-        if mid_trend == "bearish" and large_trend == "bearish":
-            base_limit *= 0.5
+        Returns:
+            realized_vol: 年化波动率（0.0 ~ 1.0+）
+        """
+        if price_series is None or len(price_series) < lookback_days:
+            return 0.15  # 默认 15% 波动率
 
-        return clip(base_limit, 0.0, 1.0)
+        # 计算对数收益率
+        log_returns = np.log(price_series / price_series.shift(1)).dropna()
+
+        if len(log_returns) < lookback_days:
+            return 0.15
+
+        # 最近 N 日的标准差 × √252 = 年化波动率
+        recent_vol = log_returns.iloc[-lookback_days:].std()
+        annualized_vol = recent_vol * np.sqrt(252)
+
+        return max(0.05, annualized_vol)  # 最低 5%
+
+    def _calculate_volatility_adjusted_position(
+        self,
+        realized_vol: float,
+        target_vol: float = 0.15,
+    ) -> float:
+        """
+        波动率目标制：仓位 = target_vol / realized_vol
+
+        核心思想：波动率高时降低仓位，波动率低时提高仓位，保持组合风险恒定
+
+        参考：Moreira & Muir (2017)
+
+        Args:
+            realized_vol: 实现波动率（年化）
+            target_vol: 目标波动率（默认 15%）
+
+        Returns:
+            position_scale: 0.5 ~ 1.5
+        """
+        if realized_vol <= 0:
+            return 1.0
+
+        scale = target_vol / realized_vol
+
+        # 限制范围：0.5x ~ 1.5x（提高最低限制，避免高波动时仓位过低）
+        return clip(scale, 0.5, 1.5)
+
+    def _calculate_regime_scaling(
+        self,
+        timeframe_got: TimeframeGOTResult,
+        cross_index_consistency: float,
+    ) -> float:
+        """
+        状态感知缩放：连续函数替代二元判定
+
+        参考：
+        - AlgoKing "Dynamic Position Sizing with Kelly + Regime"
+        - MSCI "Adaptive Multi-Factor Allocation"
+
+        核心思想：根据多个因子的置信度加权平均，输出 0.2 ~ 1.0 的连续缩放因子
+
+        Args:
+            timeframe_got: 时间框架 GOT 结果
+            cross_index_consistency: 跨指数一致性（0 ~ 1）
+
+        Returns:
+            regime_scale: 0.2 ~ 1.0（永远不会归零）
+        """
+        # 因子 1: 时间框架一致性（0 ~ 1）
+        tf_factor = timeframe_got.timeframe_confidence
+
+        # 因子 2: 跨指数一致性（0 ~ 1）
+        cross_factor = cross_index_consistency
+
+        # 因子 3: 方向强度（unified_score 映射到 0.3 ~ 1.0）
+        score = timeframe_got.unified_score
+        direction_factor = clip((score + 1.0) / 2.0, 0.3, 1.0)
+
+        # 加权平均（置信度加权）
+        regime_scale = (
+            tf_factor * 0.40 +
+            cross_factor * 0.30 +
+            direction_factor * 0.30
+        )
+
+        return clip(regime_scale, 0.2, 1.0)
+
+    def _calculate_position_limit_v2(
+        self,
+        timeframe_got: TimeframeGOTResult,
+        mid_trend: str,
+        large_trend: str,
+        price_history: Optional[pd.Series] = None,
+        cross_index_consistency: float = 0.5,
+    ) -> dict:
+        """
+        新版仓位上限：两层决策系统
+
+        Layer 1: 波动率调整 → 保持风险恒定
+        Layer 2: 状态感知缩放 → 适应市场环境
+
+        参考：
+        - Moreira & Muir (2017), "The Impact of Volatility Targeting"
+        - AlgoKing "Dynamic Position Sizing with Kelly + Regime"
+
+        Args:
+            timeframe_got: 时间框架 GOT 结果
+            mid_trend: 中期趋势（未使用，保留兼容性）
+            large_trend: 长期趋势（未使用，保留兼容性）
+            price_history: 价格历史（用于波动率估计）
+            cross_index_consistency: 跨指数一致性
+
+        Returns:
+            dict: {position_limit, realized_volatility, vol_adjusted_position, regime_scale}
+        """
+        # Layer 1: 波动率调整
+        realized_vol = self._estimate_realized_volatility(price_history)
+        vol_adjusted = self._calculate_volatility_adjusted_position(realized_vol)
+
+        # Layer 2: 状态感知缩放
+        regime_scale = self._calculate_regime_scaling(
+            timeframe_got,
+            cross_index_consistency,
+        )
+
+        # 基础仓位 = 波动率调整 × 状态缩放
+        position_limit = vol_adjusted * regime_scale
+
+        # 限制范围：0.2 ~ 1.5
+        position_limit = clip(position_limit, 0.2, 1.5)
+
+        return {
+            "position_limit": position_limit,
+            "realized_volatility": realized_vol,
+            "vol_adjusted_position": vol_adjusted,
+            "regime_scale": regime_scale,
+        }
 
     def _calculate_key_levels(self, df: Optional[pd.DataFrame]) -> KeyLevels:
         """计算支撑/阻力位"""
@@ -797,6 +1017,14 @@ class MarketAnalysisNode:
 
         return MarketContext(
             tech_growth=tech_growth,
+            market_state=MarketStateSignal(
+                attack_power=0.45,
+                regime="transition",
+                mini_got_trend="neutral",
+                mini_got_score=0.10,
+                mini_got_confidence=0.8,
+                crash_override=False,
+            ),
             mid_small_cap=mid_small_cap,
             large_cap=large_cap,
             position_limit=round(position_limit, 2),

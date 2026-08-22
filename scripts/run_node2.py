@@ -4,6 +4,12 @@ import asyncio
 import json
 import sys
 
+# 配置 UTF-8 输出
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 sys.path.insert(0, ".")
 
 # 反爬补丁必须在任何东财 API 调用之前应用
@@ -150,11 +156,18 @@ async def main():
                   f"阶段={s.lifecycle.phase if s.lifecycle else '-'}")
             if s.launch_signal:
                 print(f"      启动信号: {s.launch_signal.level} (score={s.launch_signal.score})")
+                dims = s.launch_signal.dimensions
+                if dims:
+                    print(f"        维度: 整理={dims.get('consolidation',0):.2f}  量能={dims.get('volume_expansion',0):.2f}  "
+                          f"价格={dims.get('price_strength',0):.2f}  趋势={dims.get('trend_alignment',0):.2f}  "
+                          f"宽度={dims.get('breadth',0):.2f}  AD确认={dims.get('ad_confirmation',0):.2f}")
 
     print(f"\n衰竭主线 ({len(ctx.exhausted_mainline)}):")
     for s in ctx.exhausted_mainline:
+        severity_str = f"过热={s.overheat_severity:.2f}({s.overheat_severity and 'exhausted' if s.overheat_severity and s.overheat_severity > 0.5 else 'warning'})" if s.overheat_severity else "过热=-"
         print(f"  {s.name} ({s.code})  强度={s.strength_score:.1f}  "
-              f"分级={s.tier}  阶段={s.lifecycle.phase if s.lifecycle else '-'}")
+              f"分级={s.tier}  阶段={s.lifecycle.phase if s.lifecycle else '-'}  "
+              f"{severity_str}")
 
     print(f"\n埋伏期 ({len(ctx.ambush)}):")
     for s in ctx.ambush:

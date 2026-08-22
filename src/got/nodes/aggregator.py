@@ -33,7 +33,19 @@ from src.got.schemas import (
     MarketRegime,
     SectorIntel,
     SectorDetail,
+    AmbushCandidate,
+    AmbushReservoirEntry,
+    CatalystEvent,
 )
+from src.got.catalyst_config import (
+    IMPACT_WEIGHT,
+    ANTICIPATION_DECAY_NEAR,
+    ANTICIPATION_DECAY_NORMAL,
+    ANTICIPATION_THRESHOLD_DAYS,
+    CATALYST_MAX_POOL_SIZE,
+    CATALYST_CONFIDENCE_GATE,
+)
+from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
     load_previous_context,
     save_current_context,
@@ -72,6 +84,13 @@ GENERIC_SUFFIXES = ("概念",)
 class AggregatorNode:
     """Node 6: 分层 GOT 聚合（全局环境 → 板块 mini GOT → 组合决策）"""
 
+    # 资金流中的通道/杠杆聚合项（非真实板块），板块级错位比对一律排除，
+    # 防止"融资融券/深股通"这类通道资金被误当成板块资金参与家族错位归并。
+    _CAPITAL_CHANNEL_TERMS = frozenset({
+        "融资融券", "深股通", "沪股通", "北向资金",
+        "陆股通", "融资余额", "融券余额", "两融",
+    })
+
     def __init__(self, use_mock: bool = True):
         self.use_mock = use_mock
 
@@ -99,13 +118,26 @@ class AggregatorNode:
             f"fear_greed={regime.fear_greed:.2f}"
         )
 
-        # ── Level 1: 板块 mini GOT ──
-        sector_intels = self._build_sector_intel(sector, capital, news, sentiment)
+        # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
+        ambush_pool, ambush_reservoir, ambush_veto_log = self._build_ambush_channel(
+            sector, capital, news, sentiment,
+        )
+
+        # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
+        sector_intels = self._build_sector_intel(
+            sector, capital, news, sentiment,
+            ambush_pool=ambush_pool, ambush_reservoir=ambush_reservoir,
+        )
+        # 将埋伏通道结果回写到 SectorIntel（供 reasoning.md 和 Phase 2 消费）
+        self._enrich_ambush_sector_intel(sector_intels, ambush_pool, ambush_reservoir)
+
         logger.info(
             f"[Node 6] Level 1 — {len(sector_intels)} 个板块情报, "
             f"actionable={sum(1 for s in sector_intels if s.classification == 'actionable')}, "
             f"caution={sum(1 for s in sector_intels if s.classification == 'caution')}, "
             f"exclude={sum(1 for s in sector_intels if s.classification == 'exclude')}"
+            f" | 埋伏通道: 正式池={len(ambush_pool)}, 蓄水池={len(ambush_reservoir)}, "
+            f"否决={len(ambush_veto_log)}"
         )
 
         # LLM 精炼板块情报
@@ -147,6 +179,9 @@ class AggregatorNode:
             llm_refinement_used=True,
             ema_baseline=None,
             confirmed_sectors=sector_intels,
+            ambush_pool=ambush_pool,
+            ambush_reservoir=ambush_reservoir,
+            ambush_veto_log=ambush_veto_log,
         )
 
         # 持久化
@@ -222,7 +257,9 @@ class AggregatorNode:
         regime_score += institutional_score * 0.2
 
         # Node 4: 消息面
-        regime_score += news_impact_score * 0.1
+        # 权重 0.1 → 0.2：国内科技股与海外科技消息联动性极高，
+        # 消息面不应是 regime 中最弱的一维（与 Node 3 资金面持平）
+        regime_score += news_impact_score * 0.2
 
         # Node 5: 情绪面
         # fear_greed: 0=恐惧, 1=贪婪
@@ -265,9 +302,13 @@ class AggregatorNode:
         risk_budget = clip(risk_budget, 0.2, 0.8)
 
         # 宏观判断文本
+        # 机构态度维度口径标注（盘中单维模式：数值口径不变，仅文本显式标注证据维度）
+        cal_note = ""
+        if capital.confidence_multiplier <= 0.5:
+            cal_note = "（单维资金口径）"
         macro_overlay = (
             f"regime_score={regime_score:.2f}, ADX={adx_value:.0f}, "
-            f"板块{market_direction}, 机构态度{institutional_score:+.2f}, "
+            f"板块{market_direction}, 机构态度{institutional_score:+.2f}{cal_note}, "
             f"恐贪={fear_greed:.2f}({sentiment_stage})"
         )
 
@@ -296,8 +337,15 @@ class AggregatorNode:
         capital: CapitalContext,
         news: NewsContext,
         sentiment: SentimentContext,
+        ambush_pool: Optional[list[AmbushCandidate]] = None,
+        ambush_reservoir: Optional[list[AmbushReservoirEntry]] = None,
     ) -> list[SectorIntel]:
-        """对每个候选板块做 4 维 mini GOT，标记主线/埋伏来源"""
+        """对每个候选板块做 4 维 mini GOT，标记主线/埋伏来源
+
+        分类拆分消费：主线/降温板块走 composite TOP-N（Node 2 尺子），
+        埋伏板块的 classification 由埋伏通道准入结果直接映射
+        （入正式池 → actionable，否则 caution），不再与主线争抢 TOP-N 名额。
+        """
 
         # 收集候选板块：(name, detail, role_info)
         candidates = []
@@ -358,12 +406,22 @@ class AggregatorNode:
             )
             raw_data.append((name, composite, capital_check, news_check, detail, sector_role, role_info, other))
 
-        # ── Pass 2: 批量分类（TOP-N → actionable）──
+        # ── Pass 2: 批量分类（主线/降温走 TOP-N，埋伏按通道结果拆分）──
+        # 埋伏板块不走 composite TOP-N：其准入由埋伏通道的闸门+B公式排序决定，
+        # composite（Node 2 尺子）对低位埋伏板块天然偏见，不能当埋伏的尺子
         classify_input = [
             (name, composite, capital_check, news_check, detail, sector_role)
             for name, composite, capital_check, news_check, detail, sector_role, _, _ in raw_data
+            if sector_role != "ambush"
         ]
         classification_map = self._classify_all_sectors(classify_input, top_n=12)
+
+        ambush_pool_names = {c.sector_name for c in (ambush_pool or [])}
+        for name, composite, capital_check, news_check, detail, sector_role, _, _ in raw_data:
+            if sector_role == "ambush":
+                classification_map[name] = (
+                    "actionable" if name in ambush_pool_names else "caution"
+                )
 
         # ── Pass 3: 创建 SectorIntel（使用批量分类结果）──
         results = []
@@ -385,7 +443,7 @@ class AggregatorNode:
         name: str,
         detail: Optional[SectorDetail],
         capital_flows: list[tuple[str, float]],
-        news_keywords: list[tuple[str, str, str]],
+        news_keywords: list[tuple[str, dict]],
         hot_sectors: list[str],
         role_info: Optional[dict] = None,
     ) -> tuple[float, str, str, dict]:
@@ -433,8 +491,8 @@ class AggregatorNode:
         # ── 维度 2: 资金面 ──
         capital_check, capital_detail = self._cross_check_capital(name, capital_flows)
 
-        # ── 维度 3: 消息面 ──
-        news_check, news_detail = self._cross_check_news(name, news_keywords)
+        # ── 维度 3: 消息面（分级修正：影响等级 × 多源确认 × 海外联动）──
+        news_check, news_detail, news_adjust = self._cross_check_news(name, news_keywords)
 
         # ── 维度 4: 情绪面 ──
         sentiment_check, sentiment_detail = self._cross_check_sentiment(name, hot_sectors)
@@ -449,16 +507,13 @@ class AggregatorNode:
         elif capital_check == "divergent":
             composite -= 15
 
-        # 消息面修正
-        if news_check == "catalyzed":
-            composite += 8
-        elif news_check == "negative":
-            composite -= 12
+        # 消息面修正（分级：高影响事件修正幅度最高可达 ±20/−24，不再是扁平 ±8/−12）
+        composite += news_adjust
 
-        # 情绪面修正
+        # 情绪面修正（P3: 埋伏板块不惩罚低热度——低关注度是埋伏的利润来源）
         if sentiment_check == "high":
             composite += 5
-        elif sentiment_check == "low":
+        elif sentiment_check == "low" and sector_role != "ambush":
             composite -= 5
 
         # Lifecycle 修正
@@ -565,46 +620,98 @@ class AggregatorNode:
 
         return "neutral", f"{name}不在资金流入 top"
 
+    # 消息面分级修正参数（v2：消息面权重加大）
+    # 基础修正按影响等级分档，多源确认与海外联动再放大，正负各自封顶
+    _NEWS_POS_ADJUST = {"high": 12.0, "medium": 8.0, "low": 4.0}
+    _NEWS_NEG_ADJUST = {"high": -18.0, "medium": -12.0, "low": -6.0}
+    _NEWS_SOURCE_MULTIPLIER = 1.3   # source_count >= 3：多源确认放大
+    _NEWS_GLOBAL_MULTIPLIER = 1.3   # event_type == "global"：海外科技消息→A股联动放大
+    _NEWS_FADING_MULTIPLIER = 0.5   # fading/archived：行情已 price-in，减半
+    _NEWS_POS_CAP = 20.0            # 正面修正封顶
+    _NEWS_NEG_CAP = -24.0           # 负面修正封顶
+
     def _cross_check_news(
         self,
         name: str,
-        keywords: list[tuple[str, str, str]],
-    ) -> tuple[str, str]:
-        """消息面交叉验证: (check, detail)"""
+        keywords: list[tuple[str, dict]],
+    ) -> tuple[str, str, float]:
+        """消息面交叉验证（分级修正版）: (check, detail, adjustment)
+
+        修正幅度 = Σ(影响等级基础分 × 多源系数 × 海外联动系数 × 生命周期衰减)，
+        正面封顶 +20、负面封顶 −24。
+        设计依据：国内科技股高度跟随海外科技消息，global 事件额外放大 1.3×。
+        """
         if not keywords:
-            return "neutral", "无消息催化"
+            return "neutral", "无消息催化", 0.0
 
         name_parts = self._split_sector_name(name)
-        matched_events = []
+        matched: list[dict] = []
 
-        for kw, title, sentiment in keywords:
+        for kw, meta in keywords:
             for part in name_parts:
-                if len(part) >= 2 and (part in kw or kw in part or part in title):
-                    matched_events.append((title, sentiment))
+                if len(part) >= 2 and (part in kw or kw in part or part in meta["title"]):
+                    matched.append(meta)
                     break
 
-        if not matched_events:
-            return "neutral", f"{name}无直接消息催化"
+        if not matched:
+            return "neutral", f"{name}无直接消息催化", 0.0
 
-        # 去重
+        # 去重（按标题）
         seen = set()
         unique = []
-        for title, sentiment in matched_events:
-            if title not in seen:
-                seen.add(title)
-                unique.append((title, sentiment))
+        for meta in matched:
+            if meta["title"] not in seen:
+                seen.add(meta["title"])
+                unique.append(meta)
 
-        pos = sum(1 for _, s in unique if s == "positive")
-        neg = sum(1 for _, s in unique if s == "negative")
+        pos_adjust = 0.0
+        neg_adjust = 0.0
+        pos_count = 0
+        neg_count = 0
+        global_hit = False
 
-        if pos > neg and pos >= 2:
-            return "catalyzed", f"{pos}条正面催化: {unique[0][0][:30]}"
-        elif pos > neg:
-            return "catalyzed", f"1条正面催化: {unique[0][0][:30]}"
-        elif neg > pos:
-            return "negative", f"{neg}条负面消息: {unique[0][0][:30]}"
+        for meta in unique:
+            sentiment = meta.get("sentiment", "neutral")
+            if sentiment not in ("positive", "negative"):
+                continue
+            base = (
+                self._NEWS_POS_ADJUST.get(meta.get("impact_level", "low"), 4.0)
+                if sentiment == "positive"
+                else self._NEWS_NEG_ADJUST.get(meta.get("impact_level", "low"), -6.0)
+            )
+            magnitude = abs(base)
+            if meta.get("source_count", 1) >= 3:
+                magnitude *= self._NEWS_SOURCE_MULTIPLIER
+            if meta.get("event_type") == "global":
+                magnitude *= self._NEWS_GLOBAL_MULTIPLIER
+                global_hit = True
+            if meta.get("lifecycle_state") in ("fading", "archived"):
+                magnitude *= self._NEWS_FADING_MULTIPLIER
+            if sentiment == "positive":
+                pos_adjust += magnitude
+                pos_count += 1
+            else:
+                neg_adjust -= magnitude
+                neg_count += 1
+
+        pos_adjust = min(pos_adjust, self._NEWS_POS_CAP)
+        neg_adjust = max(neg_adjust, self._NEWS_NEG_CAP)
+        adjustment = pos_adjust + neg_adjust
+
+        top_title = unique[0]["title"][:30]
+        if pos_count > neg_count and adjustment >= 6:
+            global_note = "（含海外联动）" if global_hit else ""
+            check = "catalyzed"
+            detail = f"{pos_count}条正面催化{global_note} +{adjustment:.0f}: {top_title}"
+        elif neg_count > pos_count and adjustment <= -6:
+            global_note = "（含海外联动）" if global_hit else ""
+            check = "negative"
+            detail = f"{neg_count}条负面消息{global_note} {adjustment:.0f}: {top_title}"
         else:
-            return "neutral", f"消息中性: {unique[0][0][:30]}"
+            check = "neutral"
+            detail = f"消息中性: {top_title}"
+
+        return check, detail, round(adjustment, 1)
 
     def _cross_check_sentiment(
         self,
@@ -783,6 +890,323 @@ class AggregatorNode:
             return sectors
 
     # =========================================================================
+    # Level 1 平行分支: 埋伏通道（P3）
+    # =========================================================================
+
+    def _build_ambush_channel(
+        self,
+        sector: SectorContext,
+        capital: CapitalContext,
+        news: NewsContext,
+        sentiment: SentimentContext,
+    ) -> tuple[list[AmbushCandidate], list[AmbushReservoirEntry], list[str]]:
+        """埋伏通道（P3）：独立于主线 composite 的平行分支
+
+        3 层流水线：
+        1. 闸门：Node 2 技术闸门 pass + 资金吸筹确认 + ★★★利空否决
+        2. 防买顶双闸：注意力闸（热榜）+ 已发酵检查
+        3. 排序：B 公式催化剂排序分
+
+        Returns:
+            (ambush_pool, ambush_reservoir, veto_log)
+        """
+        # 预提取数据（即使 ambush 为空也处理 near_miss）
+        hot_sectors = self._extract_hot_sectors(sentiment)
+        calendar = getattr(news, "catalyst_calendar", None)
+        all_events = calendar.events if calendar else []
+        events_by_sector = self._group_events_by_sector(all_events)
+        today = date.today()
+
+        pool: list[AmbushCandidate] = []
+        reservoir: list[AmbushReservoirEntry] = []
+        veto_log: list[str] = []
+
+        # ── 近失板块直接入蓄水池（差 1 条闸门，观察 1 周）──
+        near_miss_list = getattr(sector, "near_miss_ambush", []) or []
+        for detail in near_miss_list:
+            fail_list = detail.near_miss_conditions or ["unknown"]
+            reservoir.append(AmbushReservoirEntry(
+                sector_name=detail.name,
+                sector_code=detail.code,
+                reason=f"near_miss:{','.join(fail_list)}",
+                entered_date=today,
+                weeks_without_catalyst=0,
+            ))
+        if near_miss_list:
+            logger.info(
+                f"[Node 6] 近失入蓄水池: {len(near_miss_list)} 个 "
+                f"({', '.join(d.name for d in near_miss_list[:5])})"
+            )
+
+        if not sector.ambush:
+            return pool, reservoir, veto_log
+
+        for detail in sector.ambush:
+            name = detail.name
+            sector_events = events_by_sector.get(name, [])
+
+            # ── 闸门层 1: ★★★ 利空否决 ──
+            negative_block = self._check_negative_catalyst(sector_events)
+            if negative_block:
+                veto_log.append(f"{name}: ★★★利空否决 — {negative_block}")
+                continue
+
+            # ── 闸门层 2: 吸筹确认 ──
+            accumulation_ok, accum_detail = self._check_accumulation_gate(
+                name, capital,
+            )
+            if not accumulation_ok:
+                # 吸筹未确认 → 不入池也不入蓄水池（技术闸门已过但资金未确认 = 观望）
+                continue
+
+            # ── 闸门层 3: 防买顶双闸 ──
+            anti_top_ok, anti_top_reason = self._check_anti_top_buy(
+                name, hot_sectors, sector_events, today,
+            )
+            if not anti_top_ok:
+                veto_log.append(f"{name}: 防买顶否决 — {anti_top_reason}")
+                continue
+
+            # ── 闸门层 4: 拥挤度黑名单 ──
+            if self._check_crowded_blacklist(name, hot_sectors):
+                veto_log.append(f"{name}: 拥挤度黑名单（多只个股上热榜，来晚了）")
+                continue
+
+            # ── 排序层: B 公式催化剂排序 ──
+            qualified_events = [
+                e for e in sector_events
+                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                and e.direction != "negative"
+            ]
+
+            if not qualified_events:
+                # 无催化分支 → 蓄水池
+                reservoir.append(AmbushReservoirEntry(
+                    sector_name=name,
+                    sector_code=detail.code,
+                    reason="no_catalyst",
+                    entered_date=today,
+                    weeks_without_catalyst=0,
+                ))
+                continue
+
+            score, top_event, category_tag, event_titles = self._compute_catalyst_score(
+                qualified_events, today,
+            )
+
+            pool.append(AmbushCandidate(
+                sector_name=name,
+                sector_code=detail.code,
+                catalyst_score=round(score, 3),
+                category_tag=category_tag,
+                events=event_titles[:3],
+                top_event_date=top_event.event_date if top_event else None,
+                top_event_level=top_event.impact_level if top_event else 1,
+                accumulation_detail=accum_detail,
+                gate_notes="闸门全通过",
+            ))
+
+        # 按催化剂排序分降序
+        pool.sort(key=lambda x: x.catalyst_score, reverse=True)
+        pool = pool[:CATALYST_MAX_POOL_SIZE]
+
+        logger.info(
+            f"[Node 6] 埋伏通道: {len(sector.ambush)} 候选 → "
+            f"正式池={len(pool)}, 蓄水池={len(reservoir)}, 否决={len(veto_log)}"
+        )
+        return pool, reservoir, veto_log
+
+    @staticmethod
+    def _group_events_by_sector(
+        events: list[CatalystEvent],
+    ) -> dict[str, list[CatalystEvent]]:
+        """将催化剂事件按板块名分组"""
+        grouped: dict[str, list[CatalystEvent]] = {}
+        for event in events:
+            grouped.setdefault(event.sector, []).append(event)
+        return grouped
+
+    @staticmethod
+    def _check_negative_catalyst(events: list[CatalystEvent]) -> Optional[str]:
+        """检查是否有 ★★★ 利空事件（直接否决）"""
+        for event in events:
+            if event.impact_level >= 3 and event.direction == "negative":
+                return f"{event.title}({event.event_date})"
+        return None
+
+    @staticmethod
+    def _check_accumulation_gate(
+        sector_name: str,
+        capital: CapitalContext,
+    ) -> tuple[bool, str]:
+        """吸筹确认闸门：连续 3 日小幅净流入
+
+        判定依据：capital.evidence.sector_flow 中的板块资金流方向。
+        注意：当前 CapitalContext 仅提供当日截面资金流（top_concepts/top_industries），
+        无逐日序列。降级为"当日正向流入即通过"，待 P6 接入逐日数据后升级。
+        """
+        # 从 sector_flow_all 中查找板块净流入
+        sector_flow = capital.evidence.sector_flow if capital and capital.evidence else None
+        if not sector_flow:
+            return False, "资金面数据缺失"
+
+        sector_flow_all = sector_flow.get("sector_flow_all") or {}
+        for name, amount in sector_flow_all.items():
+            if not isinstance(name, str) or not name:
+                continue
+            clean = AggregatorNode._strip_generic_suffix(name)
+            if AggregatorNode._fuzzy_match(sector_name, clean):
+                try:
+                    flow_val = float(amount)
+                except (TypeError, ValueError):
+                    continue
+                if flow_val > 0:
+                    return True, f"当日净流入{flow_val:.1f}亿"
+                else:
+                    return False, f"当日净流出{abs(flow_val):.1f}亿"
+
+        # top_concepts / top_industries 模糊匹配
+        for key in ("top_concepts", "top_industries"):
+            items = sector_flow.get(key, [])
+            for item in items:
+                match = re.match(r'(.+?)\(([+-]?[\d.]+)亿\)', item)
+                if match and AggregatorNode._fuzzy_match(sector_name, match.group(1)):
+                    flow_val = float(match.group(2))
+                    if flow_val > 0:
+                        return True, f"当日净流入{flow_val:.1f}亿（{key}）"
+                    return False, f"当日净流出{abs(flow_val):.1f}亿（{key}）"
+
+        return False, "未找到板块资金流数据"
+
+    def _check_anti_top_buy(
+        self,
+        sector_name: str,
+        hot_sectors: list[str],
+        events: list[CatalystEvent],
+        today: date,
+    ) -> tuple[bool, str]:
+        """防买顶双闸：注意力闸 + 已发酵检查
+
+        注意力闸：板块多只个股上热榜 → 已在传闻期发酵，买在顶上的风险极高
+        已发酵检查：同类催化剂已在过去 7 天内出现过 → 行情可能已提前走完
+
+        文献：Kargarzadeh et al. 2026 — "等确认再进 = 买在顶上"
+        """
+        # 注意力闸：3+ 只关联个股上热榜 → 太热了
+        match_count = sum(
+            1 for hot in hot_sectors
+            if self._fuzzy_match(sector_name, hot)
+        )
+        if match_count >= 3:
+            return False, f"{match_count}只个股上热榜（注意力已过高）"
+
+        # 已发酵检查：如果窗口内已有 ≥2 个同类合格事件且最早的在 5 天前
+        # → 行情可能已提前消化（传闻期发酵）
+        qualified = [
+            e for e in events
+            if e.confidence >= CATALYST_CONFIDENCE_GATE
+            and e.direction != "negative"
+        ]
+        if len(qualified) >= 2:
+            earliest = min(e.event_date for e in qualified)
+            days_since = (today - earliest).days
+            if days_since >= 5:
+                return False, f"催化剂已在 {days_since} 天前出现（行情可能已提前走完）"
+
+        return True, ""
+
+    @staticmethod
+    def _check_crowded_blacklist(
+        sector_name: str,
+        hot_sectors: list[str],
+    ) -> bool:
+        """拥挤度黑名单：板块名或子词直接出现在热榜关联板块中
+
+        与防买顶的注意力闸互补：
+        - 注意力闸：模糊匹配 3+ 只 → 否决（渐进式）
+        - 拥挤黑名单：精确匹配板块名 → 否决（硬闸）
+
+        逻辑：低关注度才是埋伏的利润来源，已被全网关注 = 来晚了
+        """
+        clean_name = AggregatorNode._strip_generic_suffix(sector_name)
+        for hot in hot_sectors:
+            clean_hot = AggregatorNode._strip_generic_suffix(hot)
+            if clean_name == clean_hot:
+                return True
+        return False
+
+    @staticmethod
+    def _compute_catalyst_score(
+        events: list[CatalystEvent],
+        today: date,
+    ) -> tuple[float, Optional[CatalystEvent], str, list[str]]:
+        """B 公式催化剂排序分
+
+        主催化分 = 影响权重 × 临近系数 × 置信度
+        冗余加成 = 第 2 个及以上合格催化剂，每个 +20% 主催化分，封顶 +40%
+
+        Returns:
+            (score, top_event, category_tag, event_titles)
+        """
+        if not events:
+            return 0.0, None, "", []
+
+        # 按影响等级降序排列，找最高等级事件
+        sorted_events = sorted(events, key=lambda e: (-e.impact_level, e.event_date))
+        top_event = sorted_events[0]
+
+        # 计算主催化分（取最高等级事件）
+        impact_weight = IMPACT_WEIGHT.get(top_event.impact_level, 0.3)
+
+        # 临近系数：事件距今天的交易日数
+        trade_days = _count_trade_days(today, top_event.event_date) if top_event.event_date >= today else 0
+        if trade_days <= ANTICIPATION_THRESHOLD_DAYS:
+            proximity = ANTICIPATION_DECAY_NEAR  # 0.6（anticipation 大半走完）
+        else:
+            proximity = ANTICIPATION_DECAY_NORMAL  # 1.0
+
+        main_score = impact_weight * proximity * top_event.confidence
+
+        # 冗余加成：第 2 个及以上合格催化剂
+        redundancy_count = len(sorted_events) - 1
+        if redundancy_count > 0:
+            redundancy_bonus = min(redundancy_count * 0.2, 0.4) * main_score
+        else:
+            redundancy_bonus = 0.0
+
+        total_score = main_score + redundancy_bonus
+
+        # 类型标签：取最高等级事件的 category_tag
+        category_tag = top_event.category_tag or "drift"
+
+        # 事件标题列表
+        event_titles = [e.title for e in sorted_events[:3]]
+
+        return total_score, top_event, category_tag, event_titles
+
+    @staticmethod
+    def _enrich_ambush_sector_intel(
+        sector_intels: list[SectorIntel],
+        ambush_pool: list[AmbushCandidate],
+        ambush_reservoir: list[AmbushReservoirEntry],
+    ) -> None:
+        """将埋伏通道结果回写到 SectorIntel 的埋伏字段"""
+        pool_map = {c.sector_name: c for c in ambush_pool}
+        reservoir_map = {r.sector_name: r for r in ambush_reservoir}
+
+        for intel in sector_intels:
+            if intel.sector_role != "ambush":
+                continue
+            name = intel.sector_name
+            if name in pool_map:
+                candidate = pool_map[name]
+                intel.ambush_catalyst_score = candidate.catalyst_score
+                intel.ambush_category_tag = candidate.category_tag
+                intel.ambush_events = candidate.events
+            elif name in reservoir_map:
+                intel.ambush_gate_fail = "no_catalyst"
+
+    # =========================================================================
     # Level 2: 组合决策
     # =========================================================================
 
@@ -792,11 +1216,19 @@ class AggregatorNode:
         confirmed: list[SectorIntel],
         base_position: float,
     ) -> float:
-        """基于 regime + actionable_sectors 计算仓位"""
+        """基于 regime + actionable_sectors 计算仓位
 
-        actionable_count = len([s for s in confirmed if s.classification == "actionable"])
+        口径隔离：只统计主线/降温侧的 actionable，埋伏板块的仓位由
+        Node 7 的 ROLE_MULTIPLIER 单独控制，不顶高全局仓位上限。
+        """
+
+        actionable = [
+            s for s in confirmed
+            if s.classification == "actionable" and s.sector_role != "ambush"
+        ]
+        actionable_count = len(actionable)
         avg_confidence = (
-            sum(s.confidence for s in confirmed if s.classification == "actionable") / actionable_count
+            sum(s.confidence for s in actionable) / actionable_count
             if actionable_count > 0 else 0.0
         )
 
@@ -820,10 +1252,16 @@ class AggregatorNode:
         regime: MarketRegime,
         sectors: list[SectorIntel],
     ) -> str:
-        """基于 regime + sectors 判定统一信号"""
+        """基于 regime + sectors 判定统一信号（主线侧口径，埋伏不参与）"""
 
-        actionable_count = len([s for s in sectors if s.classification == "actionable"])
-        exclude_count = len([s for s in sectors if s.classification == "exclude"])
+        actionable_count = len([
+            s for s in sectors
+            if s.classification == "actionable" and s.sector_role != "ambush"
+        ])
+        exclude_count = len([
+            s for s in sectors
+            if s.classification == "exclude" and s.sector_role != "ambush"
+        ])
 
         if regime.regime == "bull" and actionable_count >= 3:
             return "bullish"
@@ -839,9 +1277,12 @@ class AggregatorNode:
         regime: MarketRegime,
         sectors: list[SectorIntel],
     ) -> float:
-        """计算整体置信度"""
+        """计算整体置信度（主线侧口径，埋伏不参与）"""
 
-        actionable = [s for s in sectors if s.classification == "actionable"]
+        actionable = [
+            s for s in sectors
+            if s.classification == "actionable" and s.sector_role != "ambush"
+        ]
         if not actionable:
             return 0.3
 
@@ -878,18 +1319,61 @@ class AggregatorNode:
         return flows
 
     @staticmethod
-    def _extract_news_keywords(news: NewsContext) -> list[tuple[str, str, str]]:
-        """提取消息面关键词: [(关键词, 事件标题, sentiment), ...]"""
+    def _parse_sector_level_flows(capital: CapitalContext) -> dict[str, float]:
+        """解析板块级资金流（capital.sector_flow_all），排除通道/杠杆聚合项。
+
+        Returns:
+            {板块名: 净流入(亿)} — 仅用于板块级错位比对，不做家族级归并。
+        """
+        flows: dict[str, float] = {}
+        sector_flow = capital.evidence.sector_flow if capital and capital.evidence else None
+        if not sector_flow:
+            return flows
+        sector_flow_all = sector_flow.get("sector_flow_all") or {}
+        for name, amount in sector_flow_all.items():
+            if not isinstance(name, str) or not name:
+                continue
+            clean = AggregatorNode._strip_generic_suffix(name)
+            if clean in AggregatorNode._CAPITAL_CHANNEL_TERMS:
+                continue
+            try:
+                flows[name] = float(amount)
+            except (TypeError, ValueError):
+                continue
+        return flows
+
+    @staticmethod
+    def _extract_news_keywords(news: NewsContext) -> list[tuple[str, dict]]:
+        """提取消息面关键词: [(关键词, 事件元数据), ...]
+
+        元数据保留影响等级/多源数/事件类型/生命周期，供分级修正使用
+        （旧版只保留 sentiment，导致高影响事件与低影响事件修正幅度相同）。
+        """
         keywords = []
         for event in news.major_events:
+            meta = {
+                "title": event.title,
+                "sentiment": event.sentiment,
+                "impact_level": event.impact_level,
+                "source_count": event.source_count,
+                "event_type": event.event_type,
+                "lifecycle_state": event.lifecycle_state,
+            }
             for sector_name in event.affected_sectors:
-                keywords.append((sector_name, event.title, event.sentiment))
-            keywords.append((event.title, event.title, event.sentiment))
+                keywords.append((sector_name, meta))
+            keywords.append((event.title, meta))
 
         for concept in news.concept_suggestions:
             name = concept.get("concept_name", "")
             if name:
-                keywords.append((name, name, "positive"))
+                keywords.append((name, {
+                    "title": name,
+                    "sentiment": "positive",
+                    "impact_level": "low",
+                    "source_count": 1,
+                    "event_type": "industry",
+                    "lifecycle_state": None,
+                }))
 
         return keywords
 
@@ -1096,7 +1580,9 @@ class AggregatorNode:
         """检测矛盾
 
         1. regime vs 板块分歧（bear + 多 confirmed）
-        2. 主线家族 vs 资金流向错位（Node 2 top-1 家族无资金支撑 vs 低排名家族吸金）
+        2. 主线家族 vs 资金流向错位（板块级比对，2026-08-18）
+        3. 技术分排名 vs 综合分排名落差（口径分裂的可读化信号，2026-08-18）
+        4. 资金强流入 vs 情绪中性/恐惧（跨维背离，2026-08-18）
         """
         contradictions = []
 
@@ -1118,6 +1604,52 @@ class AggregatorNode:
                 AggregatorNode._detect_family_capital_mismatch(sector, capital)
             )
 
+        # ── 矛盾 3: 技术分排名 vs 综合分排名落差（口径分裂的可读化信号）──
+        if len(sectors) >= 3:
+            comp_rank = {
+                s.sector_name: i
+                for i, s in enumerate(sorted(sectors, key=lambda x: x.composite_score, reverse=True))
+            }
+            tech_rank = {
+                s.sector_name: i
+                for i, s in enumerate(sorted(sectors, key=lambda x: x.tech_score, reverse=True))
+            }
+            for s in sorted(sectors, key=lambda x: x.composite_score, reverse=True):
+                tr = tech_rank.get(s.sector_name, 99)
+                cr = comp_rank.get(s.sector_name, 99)
+                if abs(tr - cr) < 3:
+                    continue
+                contradictions.append(Contradiction(
+                    pair="tech_composite_rank_divergence",
+                    timeframe="cross_dimension",
+                    description=(
+                        f"「{s.sector_name}」技术分第 {tr + 1} / 综合分第 {cr + 1}，"
+                        f"技术分与综合分排名落差 {abs(tr - cr)} 位"
+                    ),
+                    severity="medium",
+                    conflict_type="opinion",
+                    resolution="综合分（技术+资金+消息+情绪）与纯技术分排名背离，决策以综合口径为准",
+                ))
+                break
+
+        # ── 矛盾 4: 资金强流入 vs 情绪中性/恐惧（跨维背离）──
+        if (
+            capital
+            and regime.institutional_score >= 0.6
+            and 0.3 <= regime.fear_greed <= 0.6
+        ):
+            contradictions.append(Contradiction(
+                pair="capital_vs_sentiment",
+                timeframe="cross_dimension",
+                description=(
+                    f"机构态度 {regime.institutional_score:+.2f}（强流入）"
+                    f"vs 恐贪指数 {regime.fear_greed:.2f}（中性区间），资金与散户情绪未共振"
+                ),
+                severity="medium",
+                conflict_type="opinion",
+                resolution="资金强流入但情绪平淡，警惕资金单兵抢跑后回落，谨慎追涨",
+            ))
+
         return contradictions
 
     @staticmethod
@@ -1125,94 +1657,95 @@ class AggregatorNode:
         sector: SectorContext,
         capital: CapitalContext,
     ) -> list[Contradiction]:
-        """检测 Node 2 主线家族 vs Node 3 资金流向的错位矛盾
+        """检测 Node 2 主线家族 vs Node 3 资金流向的错位矛盾（板块级，2026-08-18 重构）
 
-        高阈值模式：仅在以下条件同时满足时触发——
-        ① Node 2 top-1 家族的 member_boards 在资金 top-5 中完全无匹配
-        ② 资金 top-1 对应的家族在 Node 2 家族排名中不在 top-2
+        旧实现把资金 top-5 通过 fuzzy 匹配逐条归并到家族再与家族排名比对，
+        导致"芯片概念+存储芯片"等板块级资金被误并进代表板块命名的大家族
+        （如"PCB概念等19板块"），制造出"908亿"家族级幻数，且掩盖了
+        真正的主线缺资金信号。
 
-        错位 → high severity；排名差 ≥3 → medium severity。
+        新实现板块级精确比对（strip 泛化后缀后按名精配，不做子串模糊）：
+          方向 1（单兵抢跑）：
+            资金板块级 top 板块所属家族在 Node 2 综合排名 ≥ 2（未进 top-2）→ high
+          方向 2（主线缺资金）：
+            Node 2 top-1 家族全部成员板块在板块级资金中无正流入 → medium
         """
         families = sorted(sector.theme_families, key=lambda f: f.family_score, reverse=True)
         if len(families) < 2:
             return []
 
-        # 解析资金流 top-5
-        flows = AggregatorNode._parse_capital_flows(capital)
-        top5_flows = flows[:5]
-        if not top5_flows:
+        # 板块级资金流（精确、排除通道项）
+        sector_level = AggregatorNode._parse_sector_level_flows(capital)
+        top_flows = sorted(sector_level.items(), key=lambda x: x[1], reverse=True)
+        if not top_flows:
             return []
+        # strip 后缀后的板块资金表，便于与家族成员精确映射
+        sector_level_stripped = {
+            AggregatorNode._strip_generic_suffix(name): amount
+            for name, amount in sector_level.items()
+        }
 
-        # 为每个资金流条目找到其对应的家族
-        def _find_family_for_flow(flow_name: str) -> Optional[str]:
-            """找到资金流条目所属的家族"""
-            for family in families:
-                for board in family.member_boards:
-                    if AggregatorNode._fuzzy_match(board, flow_name):
-                        return family.family_name
-            return None
+        # 板块(strip 后缀) → 家族 精确映射
+        board_to_family: dict[str, str] = {}
+        for fam in families:
+            for board in fam.member_boards:
+                key = AggregatorNode._strip_generic_suffix(board)
+                board_to_family.setdefault(key, fam.family_name)
 
-        # 计算每个家族的资金流入总额
-        family_capital: dict[str, float] = {}
-        family_capital_top_flow: dict[str, str] = {}
-        for flow_name, amount in top5_flows:
-            matched_family = _find_family_for_flow(flow_name)
-            if matched_family:
-                family_capital[matched_family] = family_capital.get(matched_family, 0) + amount
-                if matched_family not in family_capital_top_flow:
-                    family_capital_top_flow[matched_family] = f"{flow_name}({amount:.0f}亿)"
-
-        # 家族排名（按 score 降序）
         family_rank = {f.family_name: i for i, f in enumerate(families)}
-        # 资金排名（按流入额降序）
-        capital_ranked = sorted(family_capital.items(), key=lambda x: x[1], reverse=True)
-        capital_rank = {name: i for i, (name, _) in enumerate(capital_ranked)}
 
-        contradictions = []
-        top1_family = families[0].family_name
+        contradictions: list[Contradiction] = []
 
-        # 条件 ①: top-1 家族在资金 top-5 中完全无匹配
-        top1_has_capital = top1_family in family_capital
-        # 条件 ②: 资金 top-1 家族在 Node 2 排名中不在 top-2
-        if capital_ranked:
-            capital_top1_family = capital_ranked[0][0]
-            capital_top1_not_in_sector_top2 = family_rank.get(capital_top1_family, 99) >= 2
-        else:
-            capital_top1_family = None
-            capital_top1_not_in_sector_top2 = False
-
-        # 错位矛盾（high severity）
-        if not top1_has_capital and capital_top1_not_in_sector_top2 and capital_top1_family:
-            top1_members = ", ".join(families[0].member_boards[:3])
-            capital_top1_amount = capital_ranked[0][1]
+        # ── 方向 1：资金板块级 top 板块所属家族排名错位（单兵抢跑）──
+        for flow_name, amount in top_flows[:5]:
+            fam = board_to_family.get(AggregatorNode._strip_generic_suffix(flow_name))
+            if not fam:
+                continue  # 非主线家族成员，不参与错位判定
+            rank = family_rank.get(fam, 99)
+            if rank < 2:
+                continue  # 资金与综合口径一致（家族在 top-2），无错位
             contradictions.append(Contradiction(
                 pair="sector_capital_mainline_mismatch",
                 timeframe="cross_dimension",
                 description=(
-                    f"主线错位：Node 2 核心主线「{top1_family}」（{top1_members}）"
-                    f"在资金 top-5 中无匹配，而「{capital_top1_family}」"
-                    f"独占资金 top-1（{capital_top1_amount:.0f}亿）但 Node 2 排名仅第 {family_rank.get(capital_top1_family, '?') + 1}"
+                    f"资金流领先板块「{flow_name}」（净流入 {amount:.0f}亿，板块级）"
+                    f"所属家族「{fam}」在 Node 2 综合排名仅第 {rank + 1}，"
+                    f"资金与家族综合评分未共振"
                 ),
                 severity="high",
-                conflict_type="factual",
-                resolution=f"建议降低「{top1_family}」置信度，关注「{capital_top1_family}」是否被技术面低估",
+                conflict_type="opinion",
+                resolution=(
+                    f"「{flow_name}」单板块资金领先但与整个家族的综合口径"
+                    f"（技术+资金+消息+情绪）排名错位，"
+                    f"可能为个别板块单兵抢跑或口径未确认，"
+                    f"建议以综合分复核其主线地位，勿仅因资金流入追涨"
+                ),
             ))
+            break
 
-        # 方向矛盾（medium severity）：家族 score 排名与资金排名差 ≥3
-        elif capital_top1_family and capital_top1_not_in_sector_top2:
-            score_rank = family_rank.get(capital_top1_family, 99)
-            cap_rank = capital_rank.get(capital_top1_family, 99)
-            rank_gap = abs(score_rank - cap_rank)
-            if rank_gap >= 3:
+        # ── 方向 2：Node 2 top-1 家族无板块级资金支撑（主线缺资金）──
+        if not contradictions:
+            top_family = families[0]
+            funded = any(
+                sector_level_stripped.get(board_key, 0.0) > 0
+                for board in top_family.member_boards
+                for board_key in [AggregatorNode._strip_generic_suffix(board)]
+            )
+            if not funded:
                 contradictions.append(Contradiction(
-                    pair="sector_capital_rank_divergence",
+                    pair="sector_capital_no_support",
                     timeframe="cross_dimension",
                     description=(
-                        f"「{capital_top1_family}」技术面排名第 {score_rank + 1} vs 资金面排名第 {cap_rank + 1}，"
-                        f"差距 {rank_gap} 位"
+                        f"Node 2 核心主线家族「{top_family.family_name}」"
+                        f"（综合第 1，共振{top_family.family_resonance:.0%}）"
+                        f"在板块级资金流中无任何正向流入，技术强势缺乏资金确认"
                     ),
                     severity="medium",
                     conflict_type="opinion",
+                    resolution=(
+                        "技术领先但资金未确认的主线应降低置信度，"
+                        "等待资金面后续跟进，避免追高站岗"
+                    ),
                 ))
 
         return contradictions

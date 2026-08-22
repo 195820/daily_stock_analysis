@@ -23,10 +23,22 @@ A股自选股智能分析系统 - 主调度程序
 """
 from __future__ import annotations
 
+import io
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# Windows 控制台 UTF-8 输出（防止 GBK 编码崩溃）
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# 抑制 mootdx 库 ResourceWarning（mootdx/config.py:33 裸 open() 未关闭，上游 bug）
+# 使用 simplefilter 确保优先级最高；覆盖整个解释器生命周期（含 shutdown GC 阶段）
+import warnings
+warnings.simplefilter("ignore", ResourceWarning)
 
 from dotenv import dotenv_values
 from src.config import setup_env
@@ -1297,23 +1309,90 @@ def main() -> int:
 
         # 模式1.6: GOT Phase 1 市场分析
         if args.got:
-            logger.info("模式: GOT Phase 1 市场分析（6 节点全链路）")
+            logger.info("模式: GOT Phase 1 + Phase 2 全链路分析")
             try:
                 # 加载东财反爬补丁（NID 令牌 + 随机 UA + 请求休眠）
                 from src.patches.eastmoney_patch import eastmoney_patch
                 eastmoney_patch()
 
                 import asyncio
+                from datetime import date
                 from src.got.orchestrator import GOTOrchestrator
 
                 orchestrator = GOTOrchestrator(use_mock=False)
                 unified = asyncio.run(orchestrator.run())
 
                 logger.info(
-                    f"[GOT] 完成 — 信号: {unified.unified_signal}, "
+                    f"[GOT] Phase 1 完成 — 信号: {unified.unified_signal}, "
                     f"置信度: {unified.overall_confidence:.2f}, "
                     f"仓位上限: {unified.final_position_limit:.2f}"
                 )
+
+                # 读取 Phase 2 决策（如果存在）
+                from src.got.archive import load_phase2_decision
+                decision = load_phase2_decision(date.today())
+
+                if decision:
+                    print("\n" + "=" * 60)
+                    print("Phase 2: 交易建议")
+                    print("=" * 60)
+                    print(f"操作总结: {decision.summary}")
+                    print(f"\n风险评估:")
+                    print(f"  仓位上限: {decision.risk_assessment.position_limit:.0%}")
+                    print(f"  当前仓位: {decision.risk_assessment.current_position_ratio:.0%}")
+                    print(f"  止损线: {decision.risk_assessment.stop_loss_threshold:.0%}")
+
+                    print(f"\n统一打分 Top 5:")
+                    for i, score in enumerate(decision.unified_scoring[:5], 1):
+                        held_tag = "【持仓】" if score.is_holding else ""
+                        lifecycle_tag = f"[{score.lifecycle_phase}]" if score.lifecycle_phase else ""
+                        print(
+                            f"  {i}. {score.name} ({score.symbol}) {held_tag}{lifecycle_tag}: "
+                            f"{score.composite_score:.1f} 分"
+                        )
+
+                    print(f"\n交易建议 ({len(decision.allocation)} 条):")
+                    for alloc in decision.allocation:
+                        action_tag = {
+                            "buy": "[BUY]",
+                            "sell": "[SELL]",
+                            "hold": "[HOLD]",
+                        }.get(alloc.action, "[?]")
+                        print(
+                            f"  {action_tag} {alloc.name} ({alloc.symbol})"
+                        )
+                        print(
+                            f"     数量: {alloc.quantity_delta:+d} 股, "
+                            f"金额: ¥{alloc.target_value:,.0f}"
+                        )
+                        print(f"     理由: {alloc.reasoning}")
+
+                    # 显示轮动信号（吃鱼身+高切低策略）
+                    if decision.rotation_signals:
+                        print(f"\n轮动信号 ({len(decision.rotation_signals)}):")
+                        for signal in decision.rotation_signals:
+                            print(f"  [{signal['type']}] {signal['reason']}")
+                            if 'aging' in signal:
+                                print(f"    老化持仓: {', '.join(signal['aging'])}")
+                            if 'targets' in signal:
+                                print(f"    轮动目标: {', '.join(signal['targets'])}")
+
+                    # 显示家族拥挤警告
+                    if decision.crowding_warnings:
+                        print(f"\n家族拥挤警告 ({len(decision.crowding_warnings)}):")
+                        for warning in decision.crowding_warnings:
+                            severity = "⚠️ 高" if warning['severity'] == 'high' else "⚡ 中"
+                            print(f"  {severity} {warning['suggestion']}")
+
+                    if decision.warnings:
+                        print(f"\n风险提示:")
+                        for warning in decision.warnings:
+                            print(f"  [!] {warning}")
+
+                    print(f"\n推理总结:\n{decision.reasoning}")
+                else:
+                    logger.info("[GOT] Phase 2 决策不存在（可能 Phase 2 未启用或失败）")
+
                 return 0
 
             except Exception as e:

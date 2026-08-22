@@ -123,6 +123,49 @@ class GOTOrchestrator:
                 # 存档失败不应阻断 GOT 主流程
                 logger.warning("[GOT] 历史档存档失败（已忽略）: %s", exc)
 
+            # ── Phase 2: 统一决策节点 ──
+            try:
+                logger.info("[GOT] Phase 2: 开始统一决策")
+                from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+                decision_node = PortfolioDecisionNode(use_mock=False)
+                decision = await decision_node.run(
+                    unified_context=unified,
+                    market_context=market_ctx,
+                    sector_context=sector_ctx,
+                    capital_context=capital_ctx,
+                    news_context=news_ctx,
+                    sentiment_context=sentiment_ctx,
+                )
+
+                logger.info(
+                    f"[GOT] Phase 2 完成 — 交易建议: {len(decision.allocation)} 条"
+                )
+
+                # 存档 Phase 2 决策
+                try:
+                    from src.got.archive import archive_phase2
+
+                    archive_phase2(decision, run_date=target_date)
+                except Exception as archive_exc:
+                    logger.warning(
+                        "[GOT] Phase 2 决策存档失败（已忽略）: %s", archive_exc
+                    )
+
+            except Exception as exc:
+                # Phase 2 失败不应阻断 Phase 1
+                logger.warning("[GOT] Phase 2 失败（已忽略）: %s", exc)
+
+            # P6: 催化剂兑现检测（每日运行，记录过期事件的兑现结果）
+            try:
+                from src.got.catalyst_realization import CatalystRealizationTracker
+                tracker = CatalystRealizationTracker()
+                realized = tracker.check_and_record_realization(target_date=target_date)
+                if realized > 0:
+                    logger.info(f"[GOT] P6 兑现检测: 新兑现 {realized} 个事件")
+            except Exception as exc:
+                logger.warning("[GOT] P6 兑现检测失败（已忽略）: %s", exc)
+
         return unified
 
     async def _run_tech_path(self) -> tuple:

@@ -50,14 +50,12 @@ async def main():
         print(f"  confidence: {result.confidence_multiplier}")
         print(f"  missing: {result.missing_dimensions}")
         print(f"  evidence:")
-        if result.evidence.northbound:
-            print(f"    northbound: {result.evidence.northbound}")
-        if result.evidence.dragon_tiger:
-            print(f"    dragon_tiger: {result.evidence.dragon_tiger}")
-        if result.evidence.margin_trading:
-            print(f"    margin_trading: {result.evidence.margin_trading}")
-        if result.evidence.block_trade:
-            print(f"    block_trade: {result.evidence.block_trade}")
+        if result.evidence.sector_flow:
+            print(f"    sector_flow: {result.evidence.sector_flow}")
+        if result.evidence.dde:
+            print(f"    dde: {result.evidence.dde}")
+        if result.evidence.northbound_realtime:
+            print(f"    northbound_realtime: {result.evidence.northbound_realtime}")
         print(f"  reasoning: {(result.reasoning or '')[:200]}")
         print(f"  data_quality.available: {result.data_quality.available_fields}")
         print(f"  data_quality.failed: {result.data_quality.fetch_failed_fields}")
