@@ -1832,6 +1832,13 @@ class SectorAnalysisNode:
 
         # ── 埋伏：低位+动量转正蓄势，只能经 leading 突破上位 ──
         if prev_state == "ambush":
+            # E12b 飞刀驱逐（硬退出，不依赖 is_ambush）
+            # 修复前：E14 要求 not is_ambush，但"越低越好"维度让崩塌板块
+            # is_ambush 恒 True → 锁死在 ambush。半导体 08-24~25 因此无法退出。
+            # 触发条件：动量严重恶化（<0.2）+ 强度极低（<25）= 明确崩塌，非蓄势。
+            if rs_momentum < 0.2 and strength_score < 25:
+                return "neutral"
+
             if not is_ambush and q == "leading" and strength_score > 60:
                 if prev_dwell >= 1:
                     return "active_mainline"      # E13 突破上位
@@ -1960,16 +1967,38 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _score_turnaround(momentum_trajectory: list[float]) -> float:
-        """动量刚转正窗口评分：近 3 日有低于 0.5 的天 → 视为"刚转正"，高分。
+        """动量刚转正窗口评分：检测从 <0.5 上穿到 ≥0.5 的翻转点。
 
-        连续多天 > 0.5 → 持续改善非埋伏起点 → 低分。
+        设计意图：捕捉"蓄势待涨"的起点——动量刚从弱势区（<0.5）翻入强势区（≥0.5）。
+        区分三种场景：
+          ① 刚上穿（1-3 天内）→ 高分（0.4~1.0），最佳埋伏起点
+          ② 从未上穿（全程 <0.5）→ 0 分（"从未转正"≠"刚转正"，是飞刀不是蓄势）
+          ③ 早已上穿（>3 天）或持续 >0.5 → 低分（已不是起点了）
+
+        修复前（v3.3.1）：below_count/len(recent)，全程<0.5拿满分，半导体08-25
+        因此误入ambush（momentum从0.726崩到0.106，turnaround反给1.0满分）。
         """
-        recent = [m for m in (momentum_trajectory or [])[-3:] if m is not None]
-        if not recent:
-            return 0.5  # 无历史数据给中间分（不惩罚）
-        below_count = sum(1 for m in recent if m < 0.5)
-        # 全低于 0.5 → 1.0（刚转正最佳候选）；全高于 → 0.0
-        return below_count / len(recent)
+        traj = [m for m in (momentum_trajectory or []) if m is not None]
+        if len(traj) < 2:
+            return 0.0  # 数据不足，无法判定上穿，不给分（冷启动惩罚由外层处理）
+
+        # 从末尾往前找最近一次上穿点（<0.5 → ≥0.5）
+        # days_ago = 1 表示昨天发生上穿
+        crossover_days_ago = None
+        for i in range(len(traj) - 1, 0, -1):
+            days_ago = len(traj) - 1 - i
+            if days_ago > 5:
+                break  # 只看最近 5 天
+            if traj[i] >= 0.5 and traj[i - 1] < 0.5:
+                crossover_days_ago = days_ago
+                break
+
+        if crossover_days_ago is None:
+            return 0.0  # 无上穿 → 零分（飞刀场景）
+
+        # 按距今天数衰减：1天前=1.0, 2天前=0.7, 3天前=0.4, 4+天前=0.1
+        decay_map = {1: 1.0, 2: 0.7, 3: 0.4}
+        return decay_map.get(crossover_days_ago, 0.1)
 
     @staticmethod
     def _score_volume_position(df: pd.DataFrame) -> float:
@@ -2083,6 +2112,22 @@ class SectorAnalysisNode:
                     # 每 1% 跌幅 → 0.9 折：-5% → 0.9^5 ≈ 0.59
                     direction_factor = 0.9 ** abs(return_3d * 100)
                     total *= max(0.3, direction_factor)  # 下限 0.3 防止单次暴跌归零
+
+        # ── 病因D：trajectory 斜率约束（2026-08-25 新增）──
+        # strength_trajectory 连续 N 天单调递减 → "飞刀"信号，乘性惩罚
+        # 与方向惩罚互补：方向惩罚看价格，这里看强度分的趋势性恶化
+        # 半导体 08-25 trajectory=[49.7,51.5,29.6,16.2,27.3,18.9,11.2] 末段连续递减
+        if len(trajectory) >= 3:
+            declining_streak = 0
+            for i in range(len(trajectory) - 1, 0, -1):
+                if trajectory[i] < trajectory[i - 1]:
+                    declining_streak += 1
+                else:
+                    break
+            # 连续3天递减=0.8, 4天=0.6, 5+天=0.4
+            if declining_streak >= 3:
+                slope_factor = max(0.4, 1.0 - (declining_streak - 2) * 0.2)
+                total *= slope_factor
 
         return round(total, 4)
 

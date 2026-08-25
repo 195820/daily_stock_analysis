@@ -2050,7 +2050,7 @@ class PortfolioDecisionNode:
                                 last_price,
                             ),
                             expected_return=pnl_pct_decimal,
-                            stop_loss=last_price * 0.93,  # 保留部分仓位，止损放宽
+                            stop_loss=round(last_price * 0.93, 2),  # 保留部分仓位，止损放宽
                             risk_reward_ratio=0.0,
                             confidence=0.8,
                             reasoning=score.reasoning,
@@ -2134,8 +2134,8 @@ class PortfolioDecisionNode:
                                 estimated_price * 1.02,
                             ),
                             expected_return=0.10,  # 目标 +10%
-                            stop_loss=estimated_price * (1 - stop_loss_pct),
-                            risk_reward_ratio=0.10 / stop_loss_pct,
+                            stop_loss=round(estimated_price * (1 - stop_loss_pct), 2),
+                            risk_reward_ratio=round(0.10 / stop_loss_pct, 2),
                             confidence=score.confidence,
                             reasoning=score.reasoning,
                         )
@@ -2241,6 +2241,7 @@ class PortfolioDecisionNode:
 重要：你的总结必须与上述"初步分配建议"一致。如果有 BUY 操作，就解释为什么买入；如果没有操作，就解释为什么维持现状。不要自行判断是否需要买入——分配建议已经由规则引擎确定。
 
 注意：用通俗易懂的语言，避免使用技术术语。
+引用评分时必须使用上方给出的精确数值（如"69.5 分"），不得四舍五入或自行重算。
 """
 
         try:

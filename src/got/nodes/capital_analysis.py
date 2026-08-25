@@ -42,11 +42,16 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # 3 维度权重（总分母 = 1.0）
+# 注意：northbound_realtime 自 2024-08 起官方停披，已永久豁免
+# 缺失时不拖低 confidence_multiplier，权重自动归一化到 sector_flow + dde
 DIMENSION_WEIGHTS: dict[str, float] = {
     "sector_flow": 0.50,
     "dde": 0.35,
     "northbound_realtime": 0.15,
 }
+
+# 永久豁免维度（官方停披/结构性不可用，不参与置信度分母计算）
+EXEMPT_DIMENSIONS: set[str] = {"northbound_realtime"}
 
 # 维度中文名称
 DIMENSION_LABELS: dict[str, str] = {
@@ -278,7 +283,7 @@ class CapitalAnalysisNode:
             missing_dimensions.append(DIMENSION_LABELS["dde"])
             quality.fetch_failed_fields.append("dde")
 
-        # --- 维度 3：北向资金实时（权重 0.15，通常降级）---
+        # --- 维度 3：北向资金实时（永久豁免 — 2024-08 起官方停披，不计入缺失）---
         nb_score = self._score_northbound_realtime(raw_data.get("northbound_realtime"))
         if nb_score is not None:
             score, ev_dict = nb_score
@@ -286,9 +291,8 @@ class CapitalAnalysisNode:
             available_scores.append(score)
             available_weights.append(DIMENSION_WEIGHTS["northbound_realtime"])
             quality.available_fields.append("northbound_realtime")
-        else:
-            missing_dimensions.append(DIMENSION_LABELS["northbound_realtime"])
-            quality.fetch_failed_fields.append("northbound_realtime")
+        # 北向资金 2024-08 起官方停披，缺失时不标记 fetch_failed / missing
+        # 避免每天恒定 degraded 拖累置信度
 
         # === 降级处理 ===
         if not available_scores:
@@ -310,8 +314,9 @@ class CapitalAnalysisNode:
         )
         institutional_score = clip(institutional_score, -1.0, 1.0)
 
-        # 置信度 = 可用维度数 / 总维度数
-        confidence_multiplier = len(available_scores) / len(DIMENSION_WEIGHTS)
+        # 置信度 = 可用维度数 / 有效维度总数（排除永久豁免维度）
+        effective_total = len(DIMENSION_WEIGHTS) - len(EXEMPT_DIMENSIONS & set(DIMENSION_WEIGHTS.keys()))
+        confidence_multiplier = len(available_scores) / max(1, effective_total)
 
         # 态度判定
         if institutional_score > _BULLISH_THRESHOLD:
@@ -652,10 +657,10 @@ class CapitalAnalysisNode:
     def _mock_output(self) -> CapitalContext:
         """Mock 输出"""
         return CapitalContext(
-            status="degraded",
+            status="normal",  # 北向豁免后，仅 sector_flow + dde 两维即为正常
             institutional_attitude="neutral",
             institutional_score=0.05,
-            confidence_multiplier=0.67,
+            confidence_multiplier=1.0,  # 2/2 有效维度（北向已豁免）
             evidence=CapitalEvidence(
                 sector_flow={
                     "score": 0.15,

@@ -724,7 +724,7 @@ run()
 
 **核心变更**：
 - ✅ 新增 `_score_catalyst_relevance()` 方法：从 `news_context.catalyst_calendar` 加载事件，为每只候选股计算关联度分数
-- ✅ 个股级事件（earnings/lockup）→ title 含股票代码 → 当事股直接置顶（score=100）
+- ✅ 个股级事件（earnings）→ title 含股票代码 → 当事股直接置顶（score=100，direction=="negative" 跳过）
 - ✅ 板块级事件（narrative/global/macro）→ sector 匹配 → score = confidence × impact × proximity × direction_coeff × 50
 - ✅ 置信度 < 0.7 事件不参与评分（保持技术排序）
 - ✅ 仅对 ambush 板块候选生效，主线保持原序
@@ -767,6 +767,20 @@ run()
 - `src/got/catalyst_calendar.py`（+10 行）：`_save_events()` 注册到归档表
 - `src/got/orchestrator.py`（+10 行）：`run()` 末尾兑现检测
 - `scripts/test_p5_p6.py`（新建 ~220 行）：P5/P6 验证脚本
+
+**催化剂日历瘦身：限售解禁移除（2026-08-25）：**
+
+> 限售解禁是利空风险事件，不应作为催化剂正面信号参与埋伏评分。0824 数据显示 121/242 条事件（50%）为 lockup，30 只股票扇出到 52 个板块，严重稀释 narrative/macro 事件信息密度。且 P5 存在 direction bug（negative 个股事件 score=100 置顶），利空被当成催化剂推荐。
+
+**核心变更**：
+- ✅ `_full_build()` 跳过 lockup：`all_stocks = earnings_raw`（消除无效板块映射 IO）+ 删除 lockup 事件生成循环
+- ✅ `_build_structured_events()` 防御性早返回：`event_type == "lockup"` → 空列表
+- ✅ P5 `_score_catalyst_relevance()` 两个 `if` 改 `elif` 互斥（防重复计分）
+- ✅ P5 个股级事件增加 `direction == "negative"` 跳过（利空不置顶）
+- ✅ `_fetch_lockup_calendar()` 保留（未来风险通道复用），但不再进入日历
+- ✅ 行为变化：个股事件（如财报）不再外溢到同板块其他候选股的关联度分（收紧合理）
+- 预期效果：日历事件从 242 降至 121，信息密度提升一倍
+- 现有 lockup 记录由 `expires_at` 自然过期（最长 14 天）
 
 **Node 1 重设计（2026-07-30）：**
 
@@ -936,6 +950,41 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `src/got/catalyst_config.py`：TODO 标记 + `RESERVOIR_EXPIRY_DAYS`/`RESERVOIR_PROMOTION_MIN_DAYS`
 - `src/got/nodes/portfolio_decision.py`：TODO 标记（4 个退出参数）
 - `scripts/test_ambush_fix.py`（新建）：5 项验证测试
+
+**埋伏评分修复 + 蓄水池收紧 + 北向豁免（2026-08-25）：**
+
+> 基于 0824/0825 运行回归。半导体强度分从 49.7 崩到 11.2（momentum 从 0.726 崩到 0.106），却被 `_score_turnaround` 反给满分误入 ambush 且锁死出不来（ambush_days 累积到 4）。同时蓄水池无上限膨胀（14→22 条），capital 每天恒定 degraded。
+
+**问题诊断**：
+- ❌ turnaround 逻辑反转：`below_count/len(recent)` 把"从未转正"当"刚转正"给满分
+- ❌ 状态机 E14 锁死：退出要求 `not is_ambush`，但"越低越好"三维（rs_ratio/turnaround/strength_cap）让崩塌板块 is_ambush 恒 True
+- ❌ 蓄水池无上限 + 结转无再评估：14→22 条，低质量条目挂 20 天才走
+- ❌ 北向资金 2024-08 起官方停披，每天恒定 degraded 拖累置信度
+
+**核心变更**：
+- ✅ P0-1 turnaround 上穿检测：`_score_turnaround` 改检测 `<0.5→≥0.5` 翻转点 + 距今天数衰减（1天=1.0/2天=0.7/3天=0.4），无上穿→0 分
+- ✅ P0-2 飞刀驱逐 E12b：ambush 分支新增硬退出 `rs_momentum<0.2 且 strength<25 → neutral`，不依赖 is_ambush 翻假
+- ✅ 病因D trajectory 斜率约束：强度轨迹连续 3+ 天单调递减 → 乘性惩罚（0.8/0.6/0.4）
+- ✅ P1 蓄水池收紧：`_merge_reservoir` 增加再评估（今日不在近失名单+驻留≥3天→除名）+ 容量上限 `RESERVOIR_MAX_SIZE=15` + 过期 20→10 交易日
+- ✅ P2 浮点格式化：`stop_loss`/`risk_reward_ratio` 计算后 `round(,2)`，消除 reasoning 中的 `6.602999999999999` 泄漏
+- ✅ P2 日历板块名对齐：`_normalize_sector_name` 双向别名映射（"半导体概念"↔"半导体"等 10 组）+ `_flatten_concept_universe` 双向展开
+- ✅ P3 北向永久豁免：`EXEMPT_DIMENSIONS` 集合 + `confidence_multiplier` 分母排除豁免维度（3→2 有效维度）
+
+**验证结果（0825 全量运行）**：
+- 半导体：ambush→neutral（ambush_days 归零），落入蓄水池 near_miss(score 0.29<0.3)
+- 蓄水池：22→10 条（低于上限 15）
+- Capital：北向缺失不再计入，missing_dimensions 从"北向"变为"DDE"（真正缺失项）
+- Phase 2：从"误买大为股份 ¥49k"转为"维持空仓"（评分更保守）
+
+**文件改动清单**：
+- `src/got/nodes/sector_analysis.py`：turnaround 上穿检测 + E12b 飞刀驱逐 + trajectory 斜率约束
+- `src/got/nodes/aggregator.py`：蓄水池再评估 + 容量上限 + 调用方传入 near_miss_names
+- `src/got/catalyst_config.py`：`RESERVOIR_EXPIRY_DAYS` 20→10 + `RESERVOIR_MAX_SIZE=15`
+- `src/got/nodes/portfolio_decision.py`：stop_loss/risk_reward_ratio round(,2)
+- `src/got/catalyst_calendar.py`：板块名双向别名 + `_normalize_sector_name`
+- `src/got/nodes/capital_analysis.py`：`EXEMPT_DIMENSIONS` + confidence 分母修正
+- `src/got/archive.py`：trading_recommendations.md 止损/风险收益比 `.2f` 格式化
+- `src/services/stock_screener.py`：P5 催化事件 individual vs sector 互斥 + 利空不置顶
 
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块

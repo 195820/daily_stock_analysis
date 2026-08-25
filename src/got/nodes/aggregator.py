@@ -978,13 +978,19 @@ class AggregatorNode:
         today_reservoir: list[AmbushReservoirEntry],
         prev_reservoir_map: dict[str, dict],
         today: date,
+        today_near_miss_names: Optional[set[str]] = None,
     ) -> list[AmbushReservoirEntry]:
         """蓄水池跨日合并：今日新入 + 前日留存 → 合并列表。
 
         - 今日在 + 前日在：天数 = 前日天数 + 1，保留入池日
         - 今日在 + 前日不在：天数 = 0（新入池）
-        - 今日不在 + 前日在：天数 +1，若 < RESERVOIR_EXPIRY_DAYS → 保留
+        - 今日不在 + 前日在：
+          - 若板块已不在今日近失名单且驻留 ≥3 天 → 除名（"不再是近失"=最强退出信号）
+          - 否则天数 +1，若 ≥ RESERVOIR_EXPIRY_DAYS → 除名
+        - 末尾容量上限：超出 RESERVOIR_MAX_SIZE 时按 days_in_reservoir 降序驱逐
         """
+        from src.got.catalyst_config import RESERVOIR_MAX_SIZE
+
         merged: dict[str, AmbushReservoirEntry] = {}
 
         # 今日新入 + 前日续存
@@ -1000,11 +1006,18 @@ class AggregatorNode:
                     entry.entered_strength = prev["entered_strength"]
             merged[name] = entry
 
-        # 前日有但今日无：保留条件（未过期）
+        # 前日有但今日无：再评估
         for name, prev in prev_reservoir_map.items():
             if name in merged:
                 continue
             days = prev.get("days_in_reservoir", 0) + 1
+
+            # 再评估：今日不在近失名单 + 驻留≥3天 → 除名
+            # "不再是近失"本身是最强的退出信号，不需要等到过期
+            if today_near_miss_names is not None and name not in today_near_miss_names and days >= 3:
+                logger.info(f"[Node 6] 蓄水池再评估除名: {name} (驻留{days}天, 已不在近失名单)")
+                continue
+
             if days >= RESERVOIR_EXPIRY_DAYS:
                 logger.info(f"[Node 6] 蓄水池除名: {name} (驻留{days}天 ≥ {RESERVOIR_EXPIRY_DAYS})")
                 continue
@@ -1015,6 +1028,21 @@ class AggregatorNode:
                 entered_date=date.fromisoformat(prev["entered_date"]) if isinstance(prev.get("entered_date"), str) else prev.get("entered_date", today),
                 days_in_reservoir=days,
                 entered_strength=prev.get("entered_strength", 0.0),
+            )
+
+        # 容量上限：超出时按 days_in_reservoir 降序驱逐最老条目
+        if len(merged) > RESERVOIR_MAX_SIZE:
+            sorted_entries = sorted(
+                merged.values(),
+                key=lambda e: e.days_in_reservoir,
+                reverse=True,
+            )
+            evicted = sorted_entries[:len(merged) - RESERVOIR_MAX_SIZE]
+            evicted_names = {e.sector_name for e in evicted}
+            merged = {k: v for k, v in merged.items() if k not in evicted_names}
+            logger.info(
+                f"[Node 6] 蓄水池容量驱逐: {len(evicted)} 条 "
+                f"(上限 {RESERVOIR_MAX_SIZE}, 被驱逐: {', '.join(evicted_names)})"
             )
 
         return list(merged.values())
@@ -1099,8 +1127,7 @@ class AggregatorNode:
                     f"强度{entry.entered_strength:.0f}→{current_strength:.0f})"
                 )
             else:
-                # 闸门未通过 → 回蓄水池（天数已+1，保留）
-                entry.days_in_reservoir += 1
+                # 闸门未通过 → 回蓄水池（天数已在 _merge_reservoir 中 +1，不再重复计数）
                 remaining.append(entry)
                 if fail_reason:
                     logger.info(f"[Node 6] 升格未通过闸门: {name}, {fail_reason}")
@@ -1209,8 +1236,9 @@ class AggregatorNode:
 
         # ── P1-2: 蓄水池跨日合并 ──
         prev_reservoir_map = self._load_previous_reservoir()
+        today_near_miss_names = {d.name for d in near_miss_list} if near_miss_list else None
         if prev_reservoir_map:
-            reservoir = self._merge_reservoir(reservoir, prev_reservoir_map, today)
+            reservoir = self._merge_reservoir(reservoir, prev_reservoir_map, today, today_near_miss_names)
             logger.info(
                 f"[Node 6] 蓄水池跨日合并: 今日新入 + 前日留存 → {len(reservoir)} 条"
             )
@@ -1222,6 +1250,21 @@ class AggregatorNode:
             )
             pool.extend(promoted_pool)
             reservoir = remaining_reservoir
+
+        # 去重：同一板块可能同时走"闸门全通过"和"蓄水池升格"两条路径入池
+        # 保留"闸门全通过"（权威性更高），去除升格副本
+        seen_sectors: set[str] = set()
+        deduped_pool: list[AmbushCandidate] = []
+        for candidate in pool:
+            if candidate.sector_name not in seen_sectors:
+                seen_sectors.add(candidate.sector_name)
+                deduped_pool.append(candidate)
+            else:
+                logger.debug(
+                    f"[Node 6] 埋伏池去重: {candidate.sector_name} "
+                    f"(gate_notes={candidate.gate_notes})"
+                )
+        pool = deduped_pool
 
         # 按催化剂排序分降序
         pool.sort(key=lambda x: x.catalyst_score, reverse=True)

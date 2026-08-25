@@ -582,8 +582,8 @@ def archive_phase2(
                     f"¥{alloc.target_value:,.0f}\n"
                 )
                 f.write(f"  - 理由: {alloc.reasoning}\n"
-                        f"  - 止损: {alloc.stop_loss}, "
-                        f"风险收益比: {alloc.risk_reward_ratio}\n")
+                        f"  - 止损: ¥{alloc.stop_loss:.2f}, "
+                        f"风险收益比: {alloc.risk_reward_ratio:.2f}\n")
             f.write("\n")
         if decision.warnings:
             f.write(f"**风险提示:**\n\n")

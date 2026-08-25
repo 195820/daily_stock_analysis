@@ -38,7 +38,39 @@ def _flatten_concept_universe() -> Set[str]:
     for subcats in CONCEPT_UNIVERSE.values():
         for board_list in subcats.values():
             names.update(board_list)
+    # 增加 Node 2 板块名别名（东财板块名 vs CONCEPT_UNIVERSE 命名差异）
+    # Node 2 使用东财原始板块名（如"半导体"），CONCEPT_UNIVERSE 中可能是"半导体概念"
+    # 双向映射：两个名字都加入集合，确保任一方都能匹配
+    aliases = {
+        "半导体概念": "半导体", "芯片概念": "芯片",
+        "PCB概念": "PCB", "CPO概念": "CPO",
+        "EDA概念": "EDA", "OLED概念": "OLED",
+        "算力概念": "算力", "液冷概念": "液冷",
+        "数据中心概念": "数据中心",
+    }
+    # 双向：原集合有"半导体概念"→加"半导体"；若有"半导体"→加"半导体概念"
+    all_names = set(names)
+    for formal, alias in aliases.items():
+        if formal in all_names:
+            names.add(alias)
+        if alias in all_names:
+            names.add(formal)
     return names
+
+
+# 板块名规范化映射：将 CONCEPT_UNIVERSE 命名（如"半导体概念"）→ Node 2 东财板块名（如"半导体"）
+_SECTOR_NAME_CANONICAL = {
+    "半导体概念": "半导体", "芯片概念": "芯片",
+    "PCB概念": "PCB", "CPO概念": "CPO",
+    "EDA概念": "EDA", "OLED概念": "OLED",
+    "算力概念": "算力", "液冷概念": "液冷",
+    "数据中心概念": "数据中心",
+}
+
+
+def _normalize_sector_name(name: str) -> str:
+    """将板块名规范化为 Node 2 使用的东财板块名。"""
+    return _SECTOR_NAME_CANONICAL.get(name, name)
 
 
 def _make_event_id(source: str, event_type: str, sector: str, event_date: date) -> str:
@@ -197,7 +229,7 @@ class CatalystCalendarBuilder:
     # =================================================================
 
     async def _full_build(self, start: date, end: date) -> List[CatalystEvent]:
-        """全量构建：结构化(财报+解禁+宏观) + 全球映射 + LLM 叙事"""
+        """全量构建：结构化(财报+宏观) + 全球映射 + LLM 叙事（限售解禁不纳入）"""
         all_events: List[CatalystEvent] = []
 
         # ── 结构化数据（并发获取） ──
@@ -219,16 +251,16 @@ class CatalystCalendarBuilder:
         macro_raw = self._generate_macro_calendar(start, end)
 
         # ── 批量映射：stock → sectors（并发，一次完成） ──
-        all_stocks = earnings_raw + lockup_raw
+        # lockup 不入催化剂日历（利空风险事件），仅映射 earnings 股票
+        all_stocks = earnings_raw
         stock_sector_map = await self._batch_map_stocks(all_stocks, max_concurrent=8)
 
         for raw in earnings_raw:
             mapped = self._map_structured_event_fast(raw, "earnings", stock_sector_map)
             all_events.extend(mapped)
 
-        for raw in lockup_raw:
-            mapped = self._map_structured_event_fast(raw, "lockup", stock_sector_map)
-            all_events.extend(mapped)
+        # 限售解禁不纳入催化剂日历（利空风险事件，非正面催化信号）
+        # 未来由独立 risk_events 通道消费
 
         # 聚合同板块同日期的多只股票事件（合并标题）
         all_events = self._aggregate_structured_events(all_events)
@@ -549,6 +581,10 @@ class CatalystCalendarBuilder:
         self, raw: Dict, event_type: str, sectors: List[str]
     ) -> List[CatalystEvent]:
         """根据已映射的板块列表生成 CatalystEvent"""
+        # 限售解禁不纳入催化剂日历（利空风险，非催化正面信号）
+        if event_type == "lockup":
+            return []
+
         if not sectors:
             return []
 
@@ -566,11 +602,11 @@ class CatalystCalendarBuilder:
 
         return [
             CatalystEvent(
-                event_id=_make_event_id(source, event_type, sector, event_date),
+                event_id=_make_event_id(source, event_type, _normalize_sector_name(sector), event_date),
                 event_date=event_date,
                 event_type=event_type,
                 title=title,
-                sector=sector,
+                sector=_normalize_sector_name(sector),
                 impact_level=impact,
                 direction=direction,
                 confidence=0.95,  # 结构化数据高置信
@@ -580,7 +616,6 @@ class CatalystCalendarBuilder:
             )
             for sector in sectors
         ]
-
     async def _map_stock_to_sectors(self, stock_code: str) -> List[str]:
         """stock_code → 所属概念板块列表（只返回 CONCEPT_UNIVERSE 内的）
 
@@ -824,8 +859,10 @@ class CatalystCalendarBuilder:
             try:
                 event_date = date.fromisoformat(str(item["date"])[:10])
                 sector = item.get("sector", "")
+                # 规范化板块名（"半导体概念"→"半导体"等，与 Node 2 对齐）
+                canonical_sector = _normalize_sector_name(sector)
 
-                if sector not in self.concept_set:
+                if sector not in self.concept_set and canonical_sector not in self.concept_set:
                     continue
                 if not (start <= event_date <= end):
                     continue
@@ -835,11 +872,11 @@ class CatalystCalendarBuilder:
                 impact = max(1, min(3, impact))
 
                 results.append(CatalystEvent(
-                    event_id=_make_event_id("llm_narrative", "narrative", sector, event_date),
+                    event_id=_make_event_id("llm_narrative", "narrative", canonical_sector, event_date),
                     event_date=event_date,
                     event_type="narrative",
                     title=item.get("title", "叙事型催化"),
-                    sector=sector,
+                    sector=canonical_sector,
                     impact_level=impact,
                     direction=item.get("direction", "positive"),
                     confidence=confidence,

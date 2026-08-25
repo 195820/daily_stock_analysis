@@ -2095,8 +2095,8 @@ class StockScreenerPipeline:
                 for code in codes:
                     individual_events.setdefault(code, []).append(evt)
 
-            # 板块级事件：按 sector 分组
-            if sector:
+            # 板块级事件：按 sector 分组（与个股级互斥，防止同一事件重复计分）
+            elif sector:
                 sector_events.setdefault(sector, []).append(evt)
 
         # ── 为每只候选股评分 ──
@@ -2111,9 +2111,12 @@ class StockScreenerPipeline:
             best_score = 0.0
             best_event: dict = {}
 
-            # 1. 个股级事件 → 直接置顶
+            # 1. 个股级事件 → 直接置顶（跳过利空事件）
             if code in individual_events:
                 for evt in individual_events[code]:
+                    direction = evt.get("direction", "positive")
+                    if direction == "negative":
+                        continue  # 利空个股事件（如限售解禁）不置顶
                     # 个股级事件 score = 100（最高优先级）
                     if 100 > best_score:
                         best_score = 100.0
