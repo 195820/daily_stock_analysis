@@ -424,6 +424,7 @@ class CatalystEvent(BaseModel):
     source: str = Field(..., description="akshare_earnings / akshare_lockup / macro_rule / llm_narrative / global_map")
     category_tag: str = Field(default="", description="drift / fade / binary（退出策略分型依据）")
     is_global: bool = Field(default=False, description="是否来自全球事件映射")
+    source_news: Optional[str] = Field(default=None, description="来源新闻标题（LLM 叙事事件用于回声检测）")
     created_at: Optional[date] = None
 
 

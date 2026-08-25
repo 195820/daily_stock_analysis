@@ -782,6 +782,27 @@ run()
 - 预期效果：日历事件从 242 降至 121，信息密度提升一倍
 - 现有 lockup 记录由 `expires_at` 自然过期（最长 14 天）
 
+**催化剂日历 LLM 叙事回声过滤（2026-08-25）：**
+
+> 0825 数据显示 LLM 叙事事件出现"已发生事件回声"问题：新闻"美股存储光通信板块重挫"（8-25 已发生）被 LLM 映射到 8-29（周六），出现在"未来事件"列表。本质是时态问题（事后描述冒充前瞻性事件），非极性问题。
+
+**核心变更**：
+- ✅ A 增强版 prompt：注入今日日期 + 时态判断表格（区分"已发生事件"vs"已发生事件的后续影响"）+ 正反 few-shot 示例
+- ✅ D1 回声检测：`_is_echo_event()` — title 与 source_news 互相包含或字符级 Jaccard ≥ 0.6 + direction="negative" → 丢弃
+- ✅ D2 周末守卫：`event_date.weekday() >= 5` 直接丢弃（A 股周末不开盘）
+- ✅ Schema 扩展：`CatalystEvent` 新增 `source_news` 字段（保留 LLM 输出的来源新闻标题）
+- ✅ Storage 扩展：`CatalystEventRecord` 新增 `source_news` 列（DB 迁移需手动 ALTER TABLE）
+
+**验证结果**：
+- 单元测试 3/3 通过（周末守卫 + 回声检测 + 相似度阈值）
+- 全量重建后 8-29 存储芯片事件不再出现，无周末事件
+
+**文件改动清单**：
+- `src/got/schemas.py`：`CatalystEvent` 加 `source_news` 字段
+- `src/storage.py`：`CatalystEventRecord` 加 `source_news` 列
+- `src/got/catalyst_calendar.py`：Prompt 增强 + `_parse_llm_narrative` 加 D1/D2 过滤 + `_save_events`/`_load_active_events` 同步 source_news
+- `scripts/test_catalyst_fix.py`（新建）：3 项单元测试 + 全量重建验证
+
 **Node 1 重设计（2026-07-30）：**
 
 > 基于 Node 6 v2 重跑 Phase 1 暴露的问题

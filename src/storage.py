@@ -1130,6 +1130,7 @@ class CatalystEventRecord(Base):
     source = Column(String(30), nullable=False)
     category_tag = Column(String(10), default='')
     is_global = Column(Boolean, default=False)
+    source_news = Column(String(200), nullable=True)  # 来源新闻标题（LLM 叙事回声检测）
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
     expires_at = Column(Date, index=True)

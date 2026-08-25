@@ -781,7 +781,10 @@ class CatalystCalendarBuilder:
             for e in candidates[:30]  # 限制输入量
         )
 
-        prompt = f"""你是一个 A 股市场催化剂分析师。基于以下近期新闻事件，识别未来 {CATALYST_WINDOW_DAYS} 天内可能发生的催化剂事件。
+        today = start  # start 即 target_date（今日）
+        prompt = f"""你是一个 A 股市场催化剂分析师。你的任务是识别未来 {CATALYST_WINDOW_DAYS} 天内**尚未发生**的催化剂事件。
+
+**今天是 {today}**。你需要输出 {start} ~ {end} 之间**真正前瞻性的事件**。
 
 ## 候选新闻事件
 {events_summary}
@@ -807,14 +810,61 @@ class CatalystCalendarBuilder:
 ]
 ```
 
+## 时态判断（核心）
+
+**禁止输出已发生事件的回声**。区分两种情况：
+
+| 情况 | 示例 | 是否允许输出 |
+|------|------|--------------|
+| **事件本身已发生**（禁止） | "美股存储板块重挫"、"某公司暴跌"、"政策已落地" | ❌ 禁止 |
+| **已发生事件的后续影响**（允许，需指出具体未来节点） | "制裁生效后 9-15 落地第二批清单"、"财报发布后 9-10 分析师下调评级" | ✅ 允许，date 必须是具体未来节点 |
+
+**判断标准**：
+- 如果候选新闻描述的是**已经发生的事后状态**（"重挫/暴跌/崩盘/已落地/已公布"），且你无法指出一个**具体的未来触发节点**，则不要输出。
+- 如果候选新闻描述的是**未来将发生的事**（"即将发布/下周落地/预计公布"），则可以输出。
+
+## Few-shot 示例
+
+**✅ 正确示例（前瞻性事件）**：
+```json
+{{
+  "date": "2026-09-05",
+  "title": "英伟达 Q2 财报发布（盘后）",
+  "sector": "半导体",
+  "impact_level": 3,
+  "direction": "binary",
+  "confidence": 0.9,
+  "consensus_expectation": "市场预期 HBM 收入环比 +50%，若 miss 则 A 股算力板块承压",
+  "category_tag": "binary",
+  "source_news": "英伟达将于 9-5 盘后发布 Q2 财报"
+}}
+```
+
+**❌ 错误示例（已发生事件回声，禁止输出）**：
+```json
+{{
+  "date": "2026-08-29",
+  "title": "美股存储光通信板块重挫，A 股相关板块承压",
+  "sector": "存储芯片",
+  "impact_level": 2,
+  "direction": "negative",
+  "confidence": 0.7,
+  "consensus_expectation": "美股重挫传导",
+  "category_tag": "drift",
+  "source_news": "美股存储光通信板块重挫，A 股相关板块或承压"
+}}
+```
+**错误原因**：source_news 和 title 几乎逐字重复，描述的是**已经发生的重挫**，不是未来事件。8-29 是周六，更加不可能发生美股事件。
+
 ## 严格约束
-1. date 必须是 {start} ~ {end} 之间的具体日期
+1. date 必须是 {start} ~ {end} 之间的具体日期，且**不能是周末**（周六/周日 A 股不开盘）
 2. confidence 必须给出（0-1），不确定则给低分（<0.7 的不入评分但会标"参考"）
 3. consensus_expectation 必填——"市场预期什么？"，说不出则 confidence 给 0.5
 4. category_tag 必须标注：drift（量化基本面，事件后继续漂移）/ fade（软叙事，事件日即退）/ binary（高不确定二元事件）
 5. sector 必须来自合法列表，不编造板块名
-6. 宁缺毋滥：没有高置信催化剂就输出空数组
-7. 只输出 JSON，不要其他文字"""
+6. **宁缺毋滥**：没有高置信前瞻性催化剂就输出空数组
+7. **不要输出已发生事件的回声**（参见时态判断表格）
+8. 只输出 JSON，不要其他文字"""
 
         try:
             response = await asyncio.to_thread(
@@ -838,7 +888,14 @@ class CatalystCalendarBuilder:
             return []
 
     def _parse_llm_narrative(self, text: str, start: date, end: date) -> List[CatalystEvent]:
-        """解析 LLM 输出的 JSON，过滤非法条目"""
+        """解析 LLM 输出的 JSON，过滤非法条目
+
+        过滤规则：
+        1. 板块合法性检查
+        2. 日期范围检查
+        3. D2 周末守卫：event_date 落在周末直接丢弃
+        4. D1 回声检测：title 与 source_news 高度相似且 direction="negative" → 已发生事件回声，丢弃
+        """
         # 兼容 markdown code block
         cleaned = text.strip()
         if cleaned.startswith("```"):
@@ -867,28 +924,79 @@ class CatalystCalendarBuilder:
                 if not (start <= event_date <= end):
                     continue
 
+                # D2 周末守卫：日期落在周末直接丢弃
+                if event_date.weekday() >= 5:
+                    logger.debug(
+                        "[CatalystCalendar] 周末守卫丢弃: %s (date=%s, weekday=%d)",
+                        item.get("title", "")[:30], event_date, event_date.weekday()
+                    )
+                    continue
+
                 confidence = float(item.get("confidence", 0.5))
                 impact = int(item.get("impact_level", 1))
                 impact = max(1, min(3, impact))
+
+                title = item.get("title", "叙事型催化")
+                direction = item.get("direction", "positive")
+                source_news = item.get("source_news")
+
+                # D1 回声检测：title 与 source_news 高度相似且 direction="negative"
+                if self._is_echo_event(title, source_news, direction):
+                    logger.debug(
+                        "[CatalystCalendar] 回声检测丢弃: title=%s, source_news=%s",
+                        title[:30], (source_news or "")[:30]
+                    )
+                    continue
 
                 results.append(CatalystEvent(
                     event_id=_make_event_id("llm_narrative", "narrative", canonical_sector, event_date),
                     event_date=event_date,
                     event_type="narrative",
-                    title=item.get("title", "叙事型催化"),
+                    title=title,
                     sector=canonical_sector,
                     impact_level=impact,
-                    direction=item.get("direction", "positive"),
+                    direction=direction,
                     confidence=confidence,
                     consensus_expectation=item.get("consensus_expectation", ""),
                     source="llm_narrative",
                     category_tag=item.get("category_tag", ""),
+                    source_news=source_news,
                 ))
             except (ValueError, KeyError, TypeError) as exc:
                 logger.debug("[CatalystCalendar] 跳过非法 LLM 条目: %s", exc)
                 continue
 
         return results
+
+    @staticmethod
+    def _is_echo_event(title: str, source_news: Optional[str], direction: str) -> bool:
+        """判断是否为已发生事件的回声
+
+        条件：
+        1. direction == "negative"
+        2. source_news 存在
+        3. title 与 source_news 高度相似（字符级 Jaccard >= 0.6 或互相包含）
+        """
+        if direction != "negative":
+            return False
+        if not source_news:
+            return False
+
+        # 互相包含：一个完全包含另一个
+        if source_news in title or title in source_news:
+            return True
+
+        # 字符级 Jaccard 相似度
+        title_chars = set(title)
+        source_chars = set(source_news)
+        if not title_chars or not source_chars:
+            return False
+
+        intersection = title_chars & source_chars
+        union = title_chars | source_chars
+        jaccard = len(intersection) / len(union) if union else 0
+
+        return jaccard >= 0.6
 
     # =================================================================
     # 持久化
@@ -913,6 +1021,7 @@ class CatalystCalendarBuilder:
                     existing.impact_level = event.impact_level
                     existing.confidence = event.confidence
                     existing.consensus_expectation = event.consensus_expectation
+                    existing.source_news = event.source_news
                     existing.expires_at = expires
                 else:
                     record = CatalystEventRecord(
@@ -928,6 +1037,7 @@ class CatalystCalendarBuilder:
                         source=event.source,
                         category_tag=event.category_tag,
                         is_global=event.is_global,
+                        source_news=event.source_news,
                         expires_at=expires,
                     )
                     session.add(record)
@@ -971,6 +1081,7 @@ class CatalystCalendarBuilder:
                 source=r.source,
                 category_tag=r.category_tag or "",
                 is_global=r.is_global or False,
+                source_news=r.source_news,
             )
             for r in records
         ]
