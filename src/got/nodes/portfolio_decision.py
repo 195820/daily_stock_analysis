@@ -1385,10 +1385,10 @@ class PortfolioDecisionNode:
     # ── P4 埋伏退出分支（催化剂驱动） ──
 
     # 退出参数（集中配置，归档积累后校准）
-    AMBUSH_DRIFT_STALL_DAYS = 10          # 漂移型：事件后 N 个交易日无涨 → 衰竭
-    AMBUSH_DRIFT_TIMEOUT_DAYS = 20        # 漂移型：硬超时（交易日）
-    AMBUSH_DRIFT_STALL_THRESHOLD = 0.02   # 漂移型：涨幅 < 2% 视为走平
-    AMBUSH_BINARY_GRACE_DAYS = 2          # 二元型：事件日后 N 个交易日仍未发生 → 落空
+    AMBUSH_DRIFT_STALL_DAYS = 10          # TODO: 待校准 (当前样本量: 0) — 漂移型：事件后 N 个交易日无涨 → 衰竭
+    AMBUSH_DRIFT_TIMEOUT_DAYS = 20        # TODO: 待校准 (当前样本量: 0) — 漂移型：硬超时（交易日）
+    AMBUSH_DRIFT_STALL_THRESHOLD = 0.02   # TODO: 待校准 (当前样本量: 0) — 漂移型：涨幅 < 2% 视为走平
+    AMBUSH_BINARY_GRACE_DAYS = 2          # TODO: 待校准 (当前样本量: 0) — 二元型：事件日后 N 个交易日仍未发生 → 落空
 
     def _ambush_exit_signal(
         self,

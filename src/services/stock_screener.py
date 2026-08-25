@@ -1125,8 +1125,8 @@ class StockScreenerPipeline:
 
             # 根据板块类型使用不同的 DDE 筛选条件
             if sector_type == "active_mainline":
-                # 主线：当天 DDE 强势
-                dde_condition = "1个交易日前的dde大单净量>=0.8%，近2个交易日的区间dde大单净量>=0.8%，"
+                # 主线：当天 DDE 强势（单条件，降低阈值避免交集归零）
+                dde_condition = "1个交易日前的dde大单净量>=0.5%，"
             else:
                 # 埋伏：近5日DDE累计为正（吸筹信号，不要求连续，刚启动的板块也能入选）
                 dde_condition = "近5个交易日的dde大单净量合计>0，"
@@ -1211,7 +1211,7 @@ class StockScreenerPipeline:
                 "上市天数>365天，"
                 "非ST，"
                 "所属同花顺行业，"
-                "按涨跌幅降序"
+                "按dde大单净量降序"  # 排序键：资金主导（非涨跌幅）
             )
             logger.info(f"[问财初筛-DDE-{sector_type}] {sector_name}: {query[:60]}...")
 
@@ -1236,7 +1236,7 @@ class StockScreenerPipeline:
                 if len(filtered_stocks) < len(ths_result.stocks):
                     logger.info(f"[行业过滤] {sector_name}: {len(ths_result.stocks)}→{len(filtered_stocks)} 只（过滤{len(ths_result.stocks)-len(filtered_stocks)}只蹭概念票）")
 
-                # 取前 10 只候选（后续由横盘过滤 + 漏斗筛选二次过滤）
+                # 取前 15 只候选（宽进严出：给下游漏斗更多输入）
                 stocks = [
                     {
                         "code": s.code,
@@ -1247,7 +1247,7 @@ class StockScreenerPipeline:
                         "turnover_rate": s.turnover_rate,
                         "volume": s.volume,
                     }
-                    for s in filtered_stocks[:10]
+                    for s in filtered_stocks[:15]
                 ]
                 logger.info(
                     f"[问财初筛-DDE-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选"
@@ -1258,7 +1258,7 @@ class StockScreenerPipeline:
             else:
                 logger.warning(f"[问财初筛-DDE-{sector_type}] {sector_name} 无结果，降级为不带 DDE 筛选")
                 # 降级：不过滤 DDE 阈值，但仍查询 DDE 值（供资金面评分用）
-                query_fallback = f"所属同花顺板块是{board_name}，dde大单净量，上市天数>365天，非ST，按涨跌幅降序"
+                query_fallback = f"所属同花顺板块是{board_name}，dde大单净量，上市天数>365天，非ST，所属同花顺行业，按dde大单净量降序"
                 ths_result = ths_service.query(query_fallback)
                 if ths_result and ths_result.stocks:
                     resolver.confirm(sector_name, board_name)

@@ -44,6 +44,8 @@ from src.got.catalyst_config import (
     ANTICIPATION_THRESHOLD_DAYS,
     CATALYST_MAX_POOL_SIZE,
     CATALYST_CONFIDENCE_GATE,
+    RESERVOIR_EXPIRY_DAYS,
+    RESERVOIR_PROMOTION_MIN_DAYS,
 )
 from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
@@ -893,6 +895,218 @@ class AggregatorNode:
     # Level 1 平行分支: 埋伏通道（P3）
     # =========================================================================
 
+    # ── P1-2: 闸门抽取（供正式池 + 升格分支复用）──
+
+    def _run_ambush_gates(
+        self,
+        name: str,
+        sector_events: list,
+        capital: "CapitalContext",
+        hot_sectors: list[str],
+        today: date,
+    ) -> tuple[bool, str, str]:
+        """4 层闸门流水线（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）。
+
+        Returns:
+            (passed, fail_reason, accum_detail)
+            - passed=True: 闸门全通过，accum_detail 为吸筹确认细节
+            - passed=False: fail_reason 为否决原因（空串=静默否决，不入 veto_log）
+        """
+        # 闸门 1: ★★★ 利空否决
+        negative_block = self._check_negative_catalyst(sector_events)
+        if negative_block:
+            return False, f"★★★利空否决 — {negative_block}", ""
+
+        # 闸门 2: 吸筹确认
+        accumulation_ok, accum_detail = self._check_accumulation_gate(name, capital)
+        if not accumulation_ok:
+            return False, "", ""  # 静默否决（观望，不入 veto_log）
+
+        # 闸门 3: 防买顶双闸
+        anti_top_ok, anti_top_reason = self._check_anti_top_buy(
+            name, hot_sectors, sector_events, today,
+        )
+        if not anti_top_ok:
+            return False, f"防买顶否决 — {anti_top_reason}", ""
+
+        # 闸门 4: 拥挤度黑名单
+        if self._check_crowded_blacklist(name, hot_sectors):
+            return False, "拥挤度黑名单（多只个股上热榜，来晚了）", ""
+
+        return True, "", accum_detail
+
+    # ── P1-2: 蓄水池跨日合并 + 升格 + 除名 ──
+
+    @staticmethod
+    def _load_previous_reservoir() -> dict[str, dict]:
+        """加载前日蓄水池（从 data/got_daily/ 最近归档的 unified.json）。
+
+        Returns:
+            {sector_name: entry_dict}，失败返回空 dict。
+        """
+        import json
+        from pathlib import Path
+
+        archive_dir = Path("data/got_daily")
+        if not archive_dir.exists():
+            return {}
+
+        # 找最近一个有 unified.json 的日期目录
+        date_dirs = sorted(
+            [d for d in archive_dir.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+        for d in date_dirs:
+            unified_path = d / "unified.json"
+            if unified_path.exists():
+                try:
+                    with open(unified_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    prev_reservoir = data.get("ambush_reservoir", [])
+                    return {
+                        e["sector_name"]: e
+                        for e in prev_reservoir
+                        if e.get("sector_name")
+                    }
+                except Exception as e:
+                    logger.warning(f"[Node 6] 加载前日蓄水池失败: {e}")
+                    return {}
+        return {}
+
+    @staticmethod
+    def _merge_reservoir(
+        today_reservoir: list[AmbushReservoirEntry],
+        prev_reservoir_map: dict[str, dict],
+        today: date,
+    ) -> list[AmbushReservoirEntry]:
+        """蓄水池跨日合并：今日新入 + 前日留存 → 合并列表。
+
+        - 今日在 + 前日在：天数 = 前日天数 + 1，保留入池日
+        - 今日在 + 前日不在：天数 = 0（新入池）
+        - 今日不在 + 前日在：天数 +1，若 < RESERVOIR_EXPIRY_DAYS → 保留
+        """
+        merged: dict[str, AmbushReservoirEntry] = {}
+
+        # 今日新入 + 前日续存
+        for entry in today_reservoir:
+            name = entry.sector_name
+            if name in prev_reservoir_map:
+                prev = prev_reservoir_map[name]
+                entry.days_in_reservoir = prev.get("days_in_reservoir", 0) + 1
+                # 保留首次入池日期和入池强度
+                if prev.get("entered_date"):
+                    entry.entered_date = date.fromisoformat(prev["entered_date"]) if isinstance(prev["entered_date"], str) else prev["entered_date"]
+                if prev.get("entered_strength"):
+                    entry.entered_strength = prev["entered_strength"]
+            merged[name] = entry
+
+        # 前日有但今日无：保留条件（未过期）
+        for name, prev in prev_reservoir_map.items():
+            if name in merged:
+                continue
+            days = prev.get("days_in_reservoir", 0) + 1
+            if days >= RESERVOIR_EXPIRY_DAYS:
+                logger.info(f"[Node 6] 蓄水池除名: {name} (驻留{days}天 ≥ {RESERVOIR_EXPIRY_DAYS})")
+                continue
+            merged[name] = AmbushReservoirEntry(
+                sector_name=name,
+                sector_code=prev.get("sector_code", ""),
+                reason=prev.get("reason", "carried_over"),
+                entered_date=date.fromisoformat(prev["entered_date"]) if isinstance(prev.get("entered_date"), str) else prev.get("entered_date", today),
+                days_in_reservoir=days,
+                entered_strength=prev.get("entered_strength", 0.0),
+            )
+
+        return list(merged.values())
+
+    def _check_reservoir_promotion(
+        self,
+        reservoir_entries: list[AmbushReservoirEntry],
+        sector_ctx: "SectorContext",
+        news_ctx: "NewsContext",
+        capital_ctx: "CapitalContext",
+        sentiment_ctx: "SentimentContext",
+        today: date,
+    ) -> tuple[list[AmbushCandidate], list[AmbushReservoirEntry]]:
+        """蓄水池升格检测（P1-2）。
+
+        升格 = 获得重新走闸门流水线的资格，非直接入池。
+        条件：驻留 ≥ RESERVOIR_PROMOTION_MIN_DAYS + 有合格催化剂 + 强度相对回升。
+
+        Returns:
+            (promoted_to_pool, remaining_in_reservoir)
+        """
+        strength_lookup = getattr(sector_ctx, "strength_lookup", {})
+        calendar = getattr(news_ctx, "catalyst_calendar", None)
+        all_events = calendar.events if calendar else []
+        events_by_sector = self._group_events_by_sector(all_events)
+        hot_sectors = self._extract_hot_sectors(sentiment_ctx)
+
+        promoted_pool: list[AmbushCandidate] = []
+        remaining: list[AmbushReservoirEntry] = []
+
+        for entry in reservoir_entries:
+            name = entry.sector_name
+
+            # 条件 1: 驻留天数
+            if entry.days_in_reservoir < RESERVOIR_PROMOTION_MIN_DAYS:
+                remaining.append(entry)
+                continue
+
+            # 条件 2: 有合格催化剂
+            sector_events = events_by_sector.get(name, [])
+            qualified_events = [
+                e for e in sector_events
+                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                and e.direction != "negative"
+            ]
+            if not qualified_events:
+                remaining.append(entry)
+                continue
+
+            # 条件 3: 强度相对回升
+            current_strength = strength_lookup.get(name)
+            if current_strength is None:
+                remaining.append(entry)
+                continue
+            if current_strength <= entry.entered_strength:
+                remaining.append(entry)
+                continue
+
+            # 升格 → 重新走闸门
+            gate_passed, fail_reason, accum_detail = self._run_ambush_gates(
+                name, sector_events, capital_ctx, hot_sectors, today,
+            )
+
+            if gate_passed:
+                score, top_event, category_tag, event_titles = self._compute_catalyst_score(
+                    qualified_events, today,
+                )
+                promoted_pool.append(AmbushCandidate(
+                    sector_name=name,
+                    sector_code=entry.sector_code,
+                    catalyst_score=round(score, 3),
+                    category_tag=category_tag,
+                    events=event_titles[:3],
+                    top_event_date=top_event.event_date if top_event else None,
+                    top_event_level=top_event.impact_level if top_event else 1,
+                    accumulation_detail=accum_detail,
+                    gate_notes="蓄水池升格",
+                ))
+                logger.info(
+                    f"[Node 6] 蓄水池升格: {name} "
+                    f"(驻留{entry.days_in_reservoir}天, "
+                    f"强度{entry.entered_strength:.0f}→{current_strength:.0f})"
+                )
+            else:
+                # 闸门未通过 → 回蓄水池（天数已+1，保留）
+                entry.days_in_reservoir += 1
+                remaining.append(entry)
+                if fail_reason:
+                    logger.info(f"[Node 6] 升格未通过闸门: {name}, {fail_reason}")
+
+        return promoted_pool, remaining
+
     def _build_ambush_channel(
         self,
         sector: SectorContext,
@@ -900,12 +1114,12 @@ class AggregatorNode:
         news: NewsContext,
         sentiment: SentimentContext,
     ) -> tuple[list[AmbushCandidate], list[AmbushReservoirEntry], list[str]]:
-        """埋伏通道（P3）：独立于主线 composite 的平行分支
+        """埋伏通道（P3+P1-2）：独立于主线 composite 的平行分支
 
-        3 层流水线：
-        1. 闸门：Node 2 技术闸门 pass + 资金吸筹确认 + ★★★利空否决
-        2. 防买顶双闸：注意力闸（热榜）+ 已发酵检查
-        3. 排序：B 公式催化剂排序分
+        流水线：
+        1. 今日候选 → 闸门（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）→ 正式池/蓄水池
+        2. 跨日合并：今日蓄水池 + 前日留存 → 合并列表（天数递增，过期除名）
+        3. 升格检测：蓄水池中满足条件的板块 → 重新走闸门 → 正式池
 
         Returns:
             (ambush_pool, ambush_reservoir, veto_log)
@@ -921,8 +1135,9 @@ class AggregatorNode:
         reservoir: list[AmbushReservoirEntry] = []
         veto_log: list[str] = []
 
-        # ── 近失板块直接入蓄水池（差 1 条闸门，观察 1 周）──
+        # ── 近失板块直接入蓄水池（差 1 条闸门，观察）──
         near_miss_list = getattr(sector, "near_miss_ambush", []) or []
+        strength_lookup = getattr(sector, "strength_lookup", {})
         for detail in near_miss_list:
             fail_list = detail.near_miss_conditions or ["unknown"]
             reservoir.append(AmbushReservoirEntry(
@@ -931,6 +1146,8 @@ class AggregatorNode:
                 reason=f"near_miss:{','.join(fail_list)}",
                 entered_date=today,
                 weeks_without_catalyst=0,
+                days_in_reservoir=0,
+                entered_strength=strength_lookup.get(detail.name, detail.strength_score),
             ))
         if near_miss_list:
             logger.info(
@@ -938,73 +1155,73 @@ class AggregatorNode:
                 f"({', '.join(d.name for d in near_miss_list[:5])})"
             )
 
-        if not sector.ambush:
-            return pool, reservoir, veto_log
+        # ── 今日 ambush 候选 → 闸门 → 正式池/蓄水池 ──
+        if sector.ambush:
+            for detail in sector.ambush:
+                name = detail.name
+                sector_events = events_by_sector.get(name, [])
 
-        for detail in sector.ambush:
-            name = detail.name
-            sector_events = events_by_sector.get(name, [])
+                # 闸门流水线（抽取为独立方法，供升格复用）
+                gate_passed, fail_reason, accum_detail = self._run_ambush_gates(
+                    name, sector_events, capital, hot_sectors, today,
+                )
 
-            # ── 闸门层 1: ★★★ 利空否决 ──
-            negative_block = self._check_negative_catalyst(sector_events)
-            if negative_block:
-                veto_log.append(f"{name}: ★★★利空否决 — {negative_block}")
-                continue
+                if not gate_passed:
+                    if fail_reason:
+                        veto_log.append(f"{name}: {fail_reason}")
+                    continue
 
-            # ── 闸门层 2: 吸筹确认 ──
-            accumulation_ok, accum_detail = self._check_accumulation_gate(
-                name, capital,
-            )
-            if not accumulation_ok:
-                # 吸筹未确认 → 不入池也不入蓄水池（技术闸门已过但资金未确认 = 观望）
-                continue
+                # 闸门通过 → 催化剂排序
+                qualified_events = [
+                    e for e in sector_events
+                    if e.confidence >= CATALYST_CONFIDENCE_GATE
+                    and e.direction != "negative"
+                ]
 
-            # ── 闸门层 3: 防买顶双闸 ──
-            anti_top_ok, anti_top_reason = self._check_anti_top_buy(
-                name, hot_sectors, sector_events, today,
-            )
-            if not anti_top_ok:
-                veto_log.append(f"{name}: 防买顶否决 — {anti_top_reason}")
-                continue
+                if not qualified_events:
+                    # 无催化分支 → 蓄水池
+                    reservoir.append(AmbushReservoirEntry(
+                        sector_name=name,
+                        sector_code=detail.code,
+                        reason="no_catalyst",
+                        entered_date=today,
+                        weeks_without_catalyst=0,
+                        days_in_reservoir=0,
+                        entered_strength=strength_lookup.get(name, detail.strength_score),
+                    ))
+                    continue
 
-            # ── 闸门层 4: 拥挤度黑名单 ──
-            if self._check_crowded_blacklist(name, hot_sectors):
-                veto_log.append(f"{name}: 拥挤度黑名单（多只个股上热榜，来晚了）")
-                continue
+                score, top_event, category_tag, event_titles = self._compute_catalyst_score(
+                    qualified_events, today,
+                )
 
-            # ── 排序层: B 公式催化剂排序 ──
-            qualified_events = [
-                e for e in sector_events
-                if e.confidence >= CATALYST_CONFIDENCE_GATE
-                and e.direction != "negative"
-            ]
-
-            if not qualified_events:
-                # 无催化分支 → 蓄水池
-                reservoir.append(AmbushReservoirEntry(
+                pool.append(AmbushCandidate(
                     sector_name=name,
                     sector_code=detail.code,
-                    reason="no_catalyst",
-                    entered_date=today,
-                    weeks_without_catalyst=0,
+                    catalyst_score=round(score, 3),
+                    category_tag=category_tag,
+                    events=event_titles[:3],
+                    top_event_date=top_event.event_date if top_event else None,
+                    top_event_level=top_event.impact_level if top_event else 1,
+                    accumulation_detail=accum_detail,
+                    gate_notes="闸门全通过",
                 ))
-                continue
 
-            score, top_event, category_tag, event_titles = self._compute_catalyst_score(
-                qualified_events, today,
+        # ── P1-2: 蓄水池跨日合并 ──
+        prev_reservoir_map = self._load_previous_reservoir()
+        if prev_reservoir_map:
+            reservoir = self._merge_reservoir(reservoir, prev_reservoir_map, today)
+            logger.info(
+                f"[Node 6] 蓄水池跨日合并: 今日新入 + 前日留存 → {len(reservoir)} 条"
             )
 
-            pool.append(AmbushCandidate(
-                sector_name=name,
-                sector_code=detail.code,
-                catalyst_score=round(score, 3),
-                category_tag=category_tag,
-                events=event_titles[:3],
-                top_event_date=top_event.event_date if top_event else None,
-                top_event_level=top_event.impact_level if top_event else 1,
-                accumulation_detail=accum_detail,
-                gate_notes="闸门全通过",
-            ))
+        # ── P1-2: 蓄水池升格检测 ──
+        if reservoir:
+            promoted_pool, remaining_reservoir = self._check_reservoir_promotion(
+                reservoir, sector, news, capital, sentiment, today,
+            )
+            pool.extend(promoted_pool)
+            reservoir = remaining_reservoir
 
         # 按催化剂排序分降序
         pool.sort(key=lambda x: x.catalyst_score, reverse=True)

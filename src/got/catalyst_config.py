@@ -144,10 +144,12 @@ GLOBAL_TO_A_SHARE_MAP = [
 # =============================================================================
 
 CATALYST_WINDOW_DAYS = 14           # 前瞻窗口（日历日，约 10 交易日）
-CATALYST_CONFIDENCE_GATE = 0.7      # 低于此值不入评分（只进日历展示标"参考"）
+CATALYST_CONFIDENCE_GATE = 0.7      # TODO: 待校准 (当前样本量: 0) — 低于此值不入评分（只进日历展示标"参考"）
 CATALYST_FULL_REFRESH_INTERVAL = 5  # 全量刷新间隔（交易日）
 CATALYST_MAX_POOL_SIZE = 10         # 正式池上限（宁缺毋滥）
-CATALYST_RESERVOIR_WEEKS = 4        # 蓄水池板块连续 N 周无催化 → 自动除名
+CATALYST_RESERVOIR_WEEKS = 4        # [遗留] 已被 RESERVOIR_EXPIRY_DAYS=20 替代，不再使用
+RESERVOIR_EXPIRY_DAYS = 20           # TODO: 待校准 (当前样本量: 0) — 蓄水池驻留 ≥N 交易日 → 自动除名
+RESERVOIR_PROMOTION_MIN_DAYS = 2     # TODO: 待校准 — 升格最低驻留天数（太短无意义）
 
 # 影响等级→权重映射
 IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}

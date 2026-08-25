@@ -876,6 +876,67 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `data_provider/tdx_board_mapping.py`：TDX_BOARD_REGISTRY（添加 TODO 注释）
 - `scripts/find_missing_board_codes.py`（新建）：查找缺失板块 TDX 代码的工具脚本
 
+**Node 2 状态机 HI3 移除（2026-08-24）：**
+
+> HI3（大盘暴跌全局拦截）与输出层主线裁剪职责重复，且破坏状态机马尔可夫性——未破位板块（如白银 96.4 分、leading）也被强制踢成 exhausted，回主线需重走 2 天确认。暴跌日的风险控制已统一到 attack_power → 主线裁剪层。
+
+**问题诊断**：
+- ❌ HI3 在状态机最前面拦截（`market_crash=True → exhausted_mainline`），让主线裁剪层在暴跌日整体失效
+- ❌ 与 8/20 的 floor=1 + 独立行情豁免修复矛盾——同一堵墙上开了个绕过的后门
+- ❌ 候选池归零陷阱的第三次变体（Node 2 埋伏闸门归零 → 主线 DDE 全灭 → HI3 全杀）
+
+**核心变更**：
+- ✅ 删除 `_apply_state_machine` 的 `market_crash` 参数和分支
+- ✅ 删除 `_determine_state_v3` 的 `market_crash` 变量计算
+- ✅ 保留主线裁剪层（`attack_power < 0.25 → max_mainline=1`）作为暴跌日唯一防守
+- ✅ 保留独立行情豁免（组分数≥90 + S/A≥3 → 豁免裁剪，最多 2 个家族）
+- ✅ 暴跌日未破位强者走正常破位判据（broken = 5日涨幅≤0 / 跌破MA20 / ...），未被破位的被裁剪层限制到最多 1 条
+
+**文件改动清单**：
+- `src/got/nodes/sector_analysis.py`：`_apply_state_machine` 删 `market_crash` 参数+分支 + `_determine_state_v3` 删 `market_crash` 计算
+
+**v3.3.1 硬闸门消除 + 埋伏评分质量修复（2026-08-25）：**
+
+> 基于 plan_v3_hard_gate_elimination.md 的 5 个任务 + 08-24 回归暴露的双轨合并伪并集 + 评分区分度倒挂问题。
+
+**v3.3.1 计划实施（5 个任务）**：
+- ✅ P0-1: 埋伏 6 AND 硬闸门 → 6 维加权评分（rs_ratio/rs_momentum/turnaround/accumulation/volume_position/strength_cap）+ 排名截断（Top-K + floor）
+- ✅ P0-2: 问财 DDE 双 AND → 单条件 0.8%→0.5%，排序改 DDE，Top 10→15
+- ✅ P1-1: Node 4 原始新闻持久化（`node4_raw_news` 表 + title 归一化 + Jaccard 相似度去重 + 跨日发酵检测）
+- ✅ P1-2: 蓄水池跨日合并（`_merge_reservoir()` + `days_in_reservoir` 递增 + ≥20 交易日自动除名 + 升格重走闸门）
+- ✅ TODO 标记：催化剂置信度/蓄水池过期/升格天数/埋伏退出 4 组参数标记待校准
+
+**08-24 回归修复（双轨合并 + 评分质量）**：
+
+问题诊断：
+- ❌ 伪并集：Track1(状态机) 15 个候选被合并后全局排序截断到 Top 8，7+ 个被 Track2 竞选淘汰
+- ❌ 评分倒挂：风格板块(昨成交20/基金减仓/高市净率)霸占"越低越好"维度，冷启动 RRG 默认值(rs_ratio=0.00/rs_momentum=0.50)同时拿两维高分
+- ❌ 方向约束丢失：旧 AND 闸门"近 3 日不跌"在评分化时未迁移，暴跌板块照样排前列
+
+核心变更：
+- ✅ 真并集合并：Track1 无条件保留（上限 AMBUSH_TRACK1_MAX=16），Track2 只补位剩余名额 `max(0, TOP_K - len(T1))`
+- ✅ Track1 成员不受 floor 过滤（状态机权威 > 单一截面分）
+- ✅ 冷启动惩罚：`strength_trajectory` 不足 5 天 → 线性渐入系数 `len(trajectory)/5.0`，0 天轨迹 → 分数归零
+- ✅ 方向惩罚：近 3 日累计跌幅每 1% → 总分打 0.9 折（乘性，下限 0.3），找回"近 3 日不跌"方向约束
+- ✅ 噪声过滤增强：新增"昨成交/今日成交/涨幅排名/跌幅排名/换手率排名"关键词
+- ✅ Schema 更新：`AmbushReservoirEntry` 新增 `days_in_reservoir` + `entered_strength`；`SectorContext` 新增 `strength_lookup`
+
+验证结果（单元测试 5/5 通过）：
+- 冷启动(0天轨迹) → score=0.0000（完全归零）
+- 近 3 日暴跌 -5% → score 打 0.61 折（0.9^5≈0.59，符合设计）
+- 完美 RRG + 0 天轨迹 → 0.0000（即使 RRG 满分，无轨迹=零分）
+
+文件改动清单：
+- `src/got/nodes/sector_analysis.py`：6 维评分常量 + 冷启动惩罚 + 方向惩罚 + 真并集合并 + 噪声过滤增强
+- `src/got/nodes/aggregator.py`：蓄水池跨日合并 + 升格重走闸门 + `_run_ambush_gates` 提取
+- `src/got/nodes/news_analysis.py`：原始新闻持久化 + 跨日发酵检测
+- `src/got/schemas.py`：`AmbushReservoirEntry` 2 字段 + `SectorContext.strength_lookup`
+- `src/services/stock_screener.py`：DDE 放松 + 排序改 DDE + Top 15
+- `src/storage.py`：`Node4RawNewsRecord` 表
+- `src/got/catalyst_config.py`：TODO 标记 + `RESERVOIR_EXPIRY_DAYS`/`RESERVOIR_PROMOTION_MIN_DAYS`
+- `src/got/nodes/portfolio_decision.py`：TODO 标记（4 个退出参数）
+- `scripts/test_ambush_fix.py`（新建）：5 项验证测试
+
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块
 - ✅ `main.py`（修改）：新增 `--got` 入口（`python main.py --got`）

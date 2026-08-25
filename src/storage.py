@@ -1245,6 +1245,43 @@ class CatalystRealizationRecord(Base):
     )
 
 
+class Node4RawNewsRecord(Base):
+    """Node 4 原始新闻持久化（P1-1）。
+
+    解决问题：5 源全是滚动窗口（新浪 21h / CLS 1h / ...），
+    中热度消息在窗口内只出现几小时，滚出后永久丢失。
+
+    每次 _fetch_news() 后将全量原始数据写入此表：
+    - 精确匹配去重（title_normalized + source）
+    - 相似度兜底（同源近 3 日，title similarity >= 0.45）
+    - 发酵检测：appearance_count >= 3 AND julianday(last_seen - first_seen) >= 2
+
+    与 Node4EventRecord 的区别：
+    - Node4RawNewsRecord: LLM 提取前的原始新闻（细粒度，跨日出现检测）
+    - Node4EventRecord: LLM 提取后的事件（粗粒度，生命周期追踪）
+    """
+
+    __tablename__ = 'node4_raw_news'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title_normalized = Column(String(200), nullable=False, index=True)  # 清洗后标题（去标点/统一大小写）
+    title_original = Column(Text, nullable=False)  # 原始标题
+    source = Column(String(50), nullable=False, index=True)  # sina/cls/wallstcn/eastmoney/newsnow
+    fetched_date = Column(Date, nullable=False, index=True)  # 采集日期
+    first_seen_date = Column(Date, nullable=False)  # 首次出现日期
+    last_seen_date = Column(Date, nullable=False)  # 最近出现日期
+    appearance_count = Column(Integer, default=1)  # 跨日出现次数
+    lifecycle_state = Column(String(20), default='active')  # active/fermenting/archived
+    # 时间戳
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_raw_news_source_date', 'source', 'fetched_date'),
+        Index('ix_raw_news_lifecycle', 'lifecycle_state', 'last_seen_date'),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 

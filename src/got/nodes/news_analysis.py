@@ -27,7 +27,7 @@ from src.got.schemas import (
     DataQuality,
 )
 from src.got.news_feeds import fetch_all_news
-from src.storage import DatabaseManager, Node4EventRecord
+from src.storage import DatabaseManager, Node4EventRecord, Node4RawNewsRecord
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,9 @@ class NewsAnalysisNode:
 
         # Step 1: 并发采集新闻
         raw_news, data_quality = await self._fetch_news()
+
+        # Step 1.5: 原始新闻持久化（P1-1: 跨日发酵检测基础）
+        self._persist_raw_news(raw_news)
 
         if not raw_news:
             logger.warning("[Node 4] 未获取到任何新闻数据")
@@ -654,6 +657,117 @@ class NewsAnalysisNode:
 
         except Exception as e:
             logger.error("[Node 4] 事件持久化失败: %s", e, exc_info=True)
+
+    # ── P1-1: 原始新闻持久化（跨日发酵检测）──
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """标题归一化：去标点/统一小写/压缩空白，用于精确匹配去重。"""
+        import re
+        t = title.strip().lower()
+        t = re.sub(r'[^\w一-鿿]', '', t)  # 保留中文+字母数字
+        t = re.sub(r'\s+', '', t)
+        return t[:200]  # 截断到 200 字符
+
+    @staticmethod
+    def _title_similarity(a: str, b: str) -> float:
+        """标题相似度（Jaccard on character bigrams）。0~1。"""
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        bigrams_a = {a[i:i+2] for i in range(len(a)-1)}
+        bigrams_b = {b[i:i+2] for i in range(len(b)-1)}
+        if not bigrams_a or not bigrams_b:
+            return 0.0
+        intersection = bigrams_a & bigrams_b
+        union = bigrams_a | bigrams_b
+        return len(intersection) / len(union)
+
+    def _persist_raw_news(self, raw_news: List[Dict]) -> None:
+        """原始新闻持久化（P1-1）：精确匹配 + 相似度兜底去重。
+
+        每次 _fetch_news() 后调用，将全量原始数据写入 node4_raw_news 表。
+        同一新闻跨日重复出现时：appearance_count += 1, last_seen_date 更新。
+        """
+        if not raw_news:
+            return
+
+        today = date.today()
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                persisted = 0
+                updated = 0
+                for item in raw_news:
+                    title = item.get("title", "").strip()
+                    source = item.get("source", "unknown")
+                    if not title:
+                        continue
+
+                    title_norm = self._normalize_title(title)
+
+                    # Step 1: 精确匹配（同标题 + 同来源）
+                    existing = session.query(Node4RawNewsRecord).filter(
+                        Node4RawNewsRecord.title_normalized == title_norm,
+                        Node4RawNewsRecord.source == source,
+                    ).first()
+
+                    # Step 2: 精确未命中 → 同源近 3 日记录做相似度兜底
+                    if not existing:
+                        recent = session.query(Node4RawNewsRecord).filter(
+                            Node4RawNewsRecord.source == source,
+                            Node4RawNewsRecord.fetched_date >= today - timedelta(days=3),
+                            Node4RawNewsRecord.lifecycle_state == 'active',
+                        ).all()
+                        for rec in recent:
+                            if self._title_similarity(title_norm, rec.title_normalized) >= 0.45:
+                                existing = rec
+                                break
+
+                    if existing:
+                        existing.appearance_count += 1
+                        existing.last_seen_date = today
+                        updated += 1
+                    else:
+                        session.add(Node4RawNewsRecord(
+                            title_normalized=title_norm,
+                            title_original=title,
+                            source=source,
+                            fetched_date=today,
+                            first_seen_date=today,
+                            last_seen_date=today,
+                            appearance_count=1,
+                            lifecycle_state='active',
+                        ))
+                        persisted += 1
+
+                session.commit()
+                if persisted or updated:
+                    logger.info(
+                        f"[Node 4] 原始新闻持久化: 新增={persisted}, 更新={updated}"
+                    )
+        except Exception as e:
+            logger.warning(f"[Node 4] 原始新闻持久化失败: {e}")
+
+    def _detect_fermenting_events(self) -> List[Node4RawNewsRecord]:
+        """检测发酵中的原始新闻：跨日出现 ≥3 次 AND 跨度 ≥2 天。
+
+        参考国金证券舆情研究：中热度事件持续出现 → 正在发酵 → 注入 LLM prompt。
+        """
+        from sqlalchemy import func
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                return session.query(Node4RawNewsRecord).filter(
+                    Node4RawNewsRecord.appearance_count >= 3,
+                    Node4RawNewsRecord.lifecycle_state == 'active',
+                    func.julianday(Node4RawNewsRecord.last_seen_date)
+                    - func.julianday(Node4RawNewsRecord.first_seen_date) >= 2,
+                ).all()
+        except Exception as e:
+            logger.warning(f"[Node 4] 发酵检测失败: {e}")
+            return []
 
     def _load_historical_events_from_db(self, session, days: int = 7) -> List[Node4EventRecord]:
         """从 SQLite 加载最近 N 天的事件（用于去重和 LLM prompt 注入）。"""

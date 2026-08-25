@@ -357,6 +357,12 @@ class SectorContext(BaseModel):
         description="评分可信度：high / medium / low（>30% 板块获取失败时降级为 low）",
     )
 
+    # ── P0-1: 全量板块→强度映射（供 Node 6 升格消费）──
+    strength_lookup: dict[str, float] = Field(
+        default_factory=dict,
+        description="板块名→当日强度评分（覆盖全量 analyzed 板块，Node 6 升格时查表）",
+    )
+
 
 # =============================================================================
 # Node 3: 资金面分析
@@ -622,14 +628,17 @@ class AmbushReservoirEntry(BaseModel):
     """埋伏蓄水池条目（P3）
 
     闸门通过但窗口内无合格催化剂 → 进入蓄水池。
-    连续 4 周无催化 → 自动除名。
+    驻留 ≥20 交易日 → 自动除名（RESERVOIR_EXPIRY_DAYS, P1-2）。
     """
     sector_name: str
     sector_code: str = ""
     reason: str = Field(description="入池原因: no_catalyst / near_miss:{条件} / reverse_query_pending / reverse_query_weak")
     entered_date: date = Field(description="入池日期")
-    weeks_without_catalyst: int = Field(default=0, description="连续无催化周数")
+    weeks_without_catalyst: int = Field(default=0, description="[遗留] 已被 days_in_reservoir 替代")
     reverse_query_result: Optional[str] = Field(default=None, description="反向查询结果摘要")
+    # P1-2 新增字段
+    days_in_reservoir: int = Field(default=0, description="蓄水池驻留天数（交易日）")
+    entered_strength: float = Field(default=0.0, description="入池日强度（升格比较基准）")
 
 
 class AmbushPositionSnapshot(BaseModel):
@@ -709,7 +718,7 @@ class UnifiedContext(BaseModel):
     )
     ambush_reservoir: list[AmbushReservoirEntry] = Field(
         default_factory=list,
-        description="埋伏蓄水池（闸门通过但无合格催化剂，4 周自动除名）",
+        description="埋伏蓄水池（闸门通过但无合格催化剂，≥20 交易日自动除名）",
     )
     ambush_veto_log: list[str] = Field(
         default_factory=list,

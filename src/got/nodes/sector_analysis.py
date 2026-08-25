@@ -459,7 +459,14 @@ _QUICK_TOP_N = 30
 _NOISE_BOARD_KEYWORDS = [
     "停板", "涨跌家数", "微盘", "送转", "超跌", "平均股价",
     "全Ａ", "总值", "中位", "停板家数",
-    "昨日", "今日", "连续涨停",  # 技术形态板（每日滚动成分，无产业语义）
+    # ── 统计排名/风格因子/资金标签/信息板（非可交易产业概念）──
+    "均价",  # 统计指数（北证均价/主板均价/创业板均价）
+    "昨成交", "今日成交",  # 成交额排名板（昨成交20 等）
+    "涨幅排名", "跌幅排名", "换手率排名",  # 排名类统计板
+    "市净率", "市盈率", "股息率",  # 估值风格因子（高/低市净率等）
+    "基金减仓", "基金加仓", "基金重仓",  # 资金流向标签
+    "TDX",  # 通达信信息类板块
+    "主力净流入", "主力净流出",  # 资金流向统计板
 ]
 
 
@@ -636,6 +643,11 @@ class SectorAnalysisNode:
                 result.confidence_level = "high"
 
             result.data_quality = quality
+
+            # Step 3.5b: 全量板块→强度映射（P0-1: 供 Node 6 蓄水池升格消费）
+            result.strength_lookup = {
+                s.name: s.strength_score for s in analyzed if s.name
+            }
 
             # Step 3.6: 板块趋势持久化（跨日记忆）
             self._save_sector_trends(analyzed)
@@ -1713,7 +1725,6 @@ class SectorAnalysisNode:
         score_drop: float,
         is_ambush: bool,
         is_defensive: bool,
-        market_crash: bool = False,
         fast_3d_change: Optional[float] = None,
         fast_volume_ratio: float = 1.0,
     ) -> str:
@@ -1725,10 +1736,9 @@ class SectorAnalysisNode:
           主线只能经 高位降温/衰竭 退出，**不存在 主线→埋伏 的边**
         - 切换需驻留/置信度门槛（HMM 后验>0.8, Procida 2026），除硬触发外
         - 硬触发 HI1：单日 score 崩≥20 → 立即降级；HI2：单日暴涨>8%+leading → 立即进主线
-        - 硬触发 HI3（2026-08-19 新增，大盘暴跌防守开关）：普跌+最弱指数< -3% 时，
-          即使板块未破位，也强制退出 active（抗跌板块转防守，不再驻留进攻主线）。
-          依据：大盘系统性下跌时，个股/板块强度失效（Beta 主导 > Alpha），
-          存活主线逆势上涨概率骤降，追高接盘风险极高。
+        - 2026-08-24 移除 HI3（大盘暴跌全局拦截）：职责与输出层主线裁剪重复，
+          且破坏状态机马尔可夫性（未破位板块也被强制踢出，回主线需重走 2 天确认）。
+          暴跌日的风险控制已统一到 attack_power → 主线裁剪层（attack_power < 0.25 → max_mainline=1）。
 
         破位/未破位判据（区分 高位降温(回调未坏) vs 衰竭(破位)）：
           BROKEN = OR(5日涨幅≤0, 跌破MA20, 过热exhausted且20日高位<0.60, 单日崩≥20)
@@ -1736,11 +1746,6 @@ class SectorAnalysisNode:
         # HI2 硬触发：单日暴涨>8% + leading + score>70 → 当日进 active（豁免驻留）
         if today_change is not None and today_change > 8.0 and q == "leading" and strength_score > 70:
             return "active_mainline"
-
-        # 大盘暴跌防守开关（进主线前先扣）：普跌+暴跌日强制退出进攻形态
-        if market_crash:
-            # 抗跌板块（防守标签）直接转防守轮动；其余强制转衰竭（不再驻留 active）
-            return "defensive_rotation" if is_defensive else "exhausted_mainline"
 
         # 破位判据（含 HI1 单日崩≥20 自然落位）
         broken = bool(
@@ -1897,13 +1902,6 @@ class SectorAnalysisNode:
             df, indicators, rrg, strength_score, prev_trend, is_defensive,
         )
 
-        # 大盘暴跌防守开关：普跌 + 最弱指数单日跌幅 < -3%（系统性下跌，Beta 主导）
-        market_crash = (
-            market_direction == "普跌"
-            and market_context.today_change
-            and min(market_context.today_change.values()) < -3.0
-        )
-
         return self._apply_state_machine(
             prev_state=prev_state,
             prev_dwell=prev_dwell,
@@ -1918,10 +1916,175 @@ class SectorAnalysisNode:
             score_drop=score_drop,
             is_ambush=is_ambush,
             is_defensive=is_defensive,
-            market_crash=market_crash,
             fast_3d_change=fast_3d_change,
             fast_volume_ratio=fast_volume_ratio,
         )
+
+    # =================================================================
+    # 埋伏评分化（P0-1: 6 维加权 + 排名截断，替代 6 AND 硬闸门）
+    # =================================================================
+
+    # 评分常量（TODO: 待校准，当前样本量: 0）
+    AMBUSH_TOP_K = 8                       # Track 2 补位名额上限
+    AMBUSH_TRACK1_MAX = 16                 # Track 1 单独上限（2×TOP_K），防状态机膨胀
+    AMBUSH_SCORE_FLOOR = 0.30              # 最低分下限（仅约束 Track 2 补位）
+    AMBUSH_NEAR_MISS_RATIO = 0.7           # 近失下限 = floor × ratio
+
+    # 6 维权重（和 = 1.0）
+    _AMBUSH_W_RS_RATIO = 0.20              # 截面相对强度低位
+    _AMBUSH_W_RS_MOMENTUM = 0.15           # 动量转正
+    _AMBUSH_W_TURNAROUND = 0.15            # 动量刚转正窗口
+    _AMBUSH_W_ACCUMULATION = 0.25          # 结构吸筹（最高权重）
+    _AMBUSH_W_VOLUME_POSITION = 0.15       # 量价位置（低位放量=吸筹）
+    _AMBUSH_W_STRENGTH_CAP = 0.10          # 强度上限（越低=空间越大）
+
+    @staticmethod
+    def _score_rs_ratio(rs_ratio: float) -> float:
+        """RS-Ratio 低位评分：越低位 → 分数越高（埋伏起点在 improving 前夜）。
+
+        rs_ratio ∈ [0, 1]，0.55 以下给分，0 给满分，0.7 以上零分。
+        """
+        if rs_ratio >= 0.70:
+            return 0.0
+        return max(0.0, 1.0 - rs_ratio / 0.70)
+
+    @staticmethod
+    def _score_rs_momentum(rs_momentum: float) -> float:
+        """RS-Momentum 评分：动量已转正 → 给分。
+
+        rs_momentum ∈ [0, 1]，0.3 以下零分（趋势仍在恶化），0.65 给半分，1.0 满分。
+        """
+        if rs_momentum <= 0.30:
+            return 0.0
+        return min(1.0, (rs_momentum - 0.30) / 0.70)
+
+    @staticmethod
+    def _score_turnaround(momentum_trajectory: list[float]) -> float:
+        """动量刚转正窗口评分：近 3 日有低于 0.5 的天 → 视为"刚转正"，高分。
+
+        连续多天 > 0.5 → 持续改善非埋伏起点 → 低分。
+        """
+        recent = [m for m in (momentum_trajectory or [])[-3:] if m is not None]
+        if not recent:
+            return 0.5  # 无历史数据给中间分（不惩罚）
+        below_count = sum(1 for m in recent if m < 0.5)
+        # 全低于 0.5 → 1.0（刚转正最佳候选）；全高于 → 0.0
+        return below_count / len(recent)
+
+    @staticmethod
+    def _score_volume_position(df: pd.DataFrame) -> float:
+        """量价位置评分（国联民生命量张力因子思路）。
+
+        低位放量 = 吸筹（高分），高位放量 = 出货（低分）。
+        价格位置：当前价在 60 日高低区间的位置（0=最低, 1=最高）。
+        量能变化：近 5 日均量 / 20 日均量（>1 = 放量）。
+        """
+        if len(df) < 20:
+            return 0.5  # 数据不足给中间分
+
+        close = df["close"]
+        volume = df["volume"]
+
+        # 价格位置（60 日高低区间百分位）
+        lookback = min(60, len(close))
+        recent_close = close.iloc[-lookback:]
+        price_low = recent_close.min()
+        price_high = recent_close.max()
+        price_range = price_high - price_low
+        if price_range <= 0:
+            return 0.5
+        price_position = (close.iloc[-1] - price_low) / price_range  # 0~1
+
+        # 量能变化
+        vol_5 = volume.iloc[-5:].mean() if len(volume) >= 5 else volume.mean()
+        vol_20 = volume.iloc[-20:].mean() if len(volume) >= 20 else volume.mean()
+        vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1.0
+
+        # 低位放量 = 吸筹（高分），高位放量 = 出货（低分）
+        # score = (1 - price_position) * volume_expansion
+        vol_expansion = min(2.0, vol_ratio) / 2.0  # 归一化到 0~1
+        score = (1.0 - price_position) * vol_expansion
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _score_strength_cap(strength_score: float) -> float:
+        """强度上限评分：强度越低 → 上涨空间越大 → 埋伏分越高。
+
+        strength_score ∈ [0, 100]，0 给满分，80 以上零分。
+        """
+        if strength_score >= 80.0:
+            return 0.0
+        return max(0.0, 1.0 - strength_score / 80.0)
+
+    # 冷启动渐入天数（轨迹不足此值 → 评分打折，防止 RRG 默认值拿高分）
+    _AMBUSH_COLDSTART_WARMUP_DAYS = 5
+
+    @classmethod
+    def _compute_ambush_score_v2(
+        cls,
+        df: pd.DataFrame,
+        indicators: dict[str, float],
+        rrg: "RRGQuadrant",
+        strength_score: float,
+        prev_trend: Optional[dict],
+    ) -> float:
+        """6 维加权埋伏评分（0~1）。替代 _is_ambush_candidate 的 6 AND 硬闸门。
+
+        论文依据：
+        - 截面百分位排名自适应牛熊市（Western Securities RRG）
+        - 低位放量 = 知情资金吸筹（国联民生, Sharpe=3.32）
+        - 波动率压缩 + 量能异常 → 启动概率最高（spike_scanner）
+
+        2026-08-25 修正（08-24 回归暴露两个致命缺陷）：
+        - 病因B 冷启动惩罚：RRG 轨迹不足 _WARMUP_DAYS 天 → 线性渐入系数
+          （防止 rs_ratio=0.00/rs_momentum=0.50 的默认值在 rrg_position 和
+          momentum_turnaround 两维同时拿高分）
+        - 病因C 方向惩罚：近 3 日累计跌幅每 1% 打 0.9 折
+          （找回旧 AND 闸门中"近 3 日不跌"方向约束，保持软评分哲学）
+        """
+        if rrg is None:
+            return 0.0
+
+        momentum_traj = (prev_trend or {}).get("momentum_trajectory") or []
+
+        # 6 维评分
+        s1 = cls._score_rs_ratio(rrg.rs_ratio)
+        s2 = cls._score_rs_momentum(rrg.rs_momentum)
+        s3 = cls._score_turnaround(momentum_traj)
+        s4 = cls._compute_ambush_score(df, indicators)  # 复用已有结构吸筹分
+        s5 = cls._score_volume_position(df)
+        s6 = cls._score_strength_cap(strength_score)
+
+        total = (
+            s1 * cls._AMBUSH_W_RS_RATIO
+            + s2 * cls._AMBUSH_W_RS_MOMENTUM
+            + s3 * cls._AMBUSH_W_TURNAROUND
+            + s4 * cls._AMBUSH_W_ACCUMULATION
+            + s5 * cls._AMBUSH_W_VOLUME_POSITION
+            + s6 * cls._AMBUSH_W_STRENGTH_CAP
+        )
+
+        # ── 病因B：冷启动惩罚 ──
+        # strength_trajectory 记录跨日强度分历史，长度 = 被追踪天数
+        # 轨迹不足 _WARMUP_DAYS 天 → RRG EMA 尚未充分建立，评分打折
+        trajectory = (prev_trend or {}).get("strength_trajectory") or []
+        warmup = cls._AMBUSH_COLDSTART_WARMUP_DAYS
+        cold_start_factor = min(1.0, len(trajectory) / warmup) if warmup > 0 else 1.0
+        total *= cold_start_factor
+
+        # ── 病因C：方向惩罚（找回"近 3 日不跌"约束）──
+        # 近 3 日累计跌幅每 1% → 总分打 0.9 折（乘性，不退回 AND 硬闸门）
+        if len(df) >= 4:
+            close_3d_ago = df["close"].iloc[-4]
+            close_now = df["close"].iloc[-1]
+            if close_3d_ago > 0:
+                return_3d = close_now / close_3d_ago - 1.0
+                if return_3d < 0:
+                    # 每 1% 跌幅 → 0.9 折：-5% → 0.9^5 ≈ 0.59
+                    direction_factor = 0.9 ** abs(return_3d * 100)
+                    total *= max(0.3, direction_factor)  # 下限 0.3 防止单次暴跌归零
+
+        return round(total, 4)
 
     @staticmethod
     def _compute_ambush_score(df: pd.DataFrame, indicators: dict[str, float]) -> float:
@@ -2019,8 +2182,9 @@ class SectorAnalysisNode:
 
         return SectorAnalysisNode._compute_ambush_score(df, indicators) >= 0.5
 
-    @staticmethod
+    @classmethod
     def _is_ambush_candidate(
+        cls,
         df: pd.DataFrame,
         indicators: dict[str, float],
         rrg: RRGQuadrant,
@@ -2028,42 +2192,21 @@ class SectorAnalysisNode:
         prev_trend: Optional[dict],
         is_defensive: bool,
     ) -> bool:
-        """埋伏新判据（2026-08-17 状态机校准，替代 _check_momentum_ambush）。
+        """埋伏评分化判据（P0-1: 6 维加权 + 排名截断，替代 6 AND 硬闸门）。
 
-        文献依据：埋伏的本质 = RRG improving 象限起点（RS-Momentum 刚上穿、RS-Ratio 仍在低位）
-        而非"高分数残留"（旧实现方向反了）。Optuma 2万次旋转统计：
-        埋伏是"蓄势"，只能从低位起，正在走弱/高位回落的板块不是埋伏。
-
-        IS_AMBUSH = AND(
-          rrg.rs_ratio_ema < 0.55,                 # 截面中低位（对应 improving 前夜）
-          rrg.rs_momentum_ema >= 0.5,              # 动量已转正
-          前1~3日内任一天动量<0.5（3日窗口"刚转正"）,
-          _check_ambush(df, indicators),            # 结构吸筹：近3日不跌+量能≥MA20或3日抬升+加权≥0.5
-          strength_score <= 72,                     # 上限保留，排除高残余（P2: 45下限砍掉）
-          not is_defensive,                         # 防守轮动正交
-        )
+        计算 6 维加权分数 → 存入 indicators["ambush_score_v2"] → 供 _integrate_frames 排名。
+        状态机兼容层：score >= AMBUSH_SCORE_FLOOR → is_ambush=True（保留时间维记忆）。
+        防守轮动与埋伏正交，直接排除。
         """
-        if rrg is None:
-            return False
-        if rrg.rs_ratio >= 0.55:
-            return False  # 截面高位残留不是埋伏（黄金 08-17 ratio 0.922 被拒）
-        if rrg.rs_momentum < 0.5:
-            return False  # 动量未转正（趋势仍在恶化）
-        # 动量"刚"转正（3 日窗口）：RRG 本身经 EMA 平滑，单日精确上穿是伪精度。
-        # 前 1~3 日内任一天 < 0.5 → 视为"刚转正"，允许入埋伏。
-        momentum_traj = (prev_trend or {}).get("momentum_trajectory") or []
-        recent_moms = momentum_traj[-3:] if momentum_traj else []
-        # 过滤 None（老库缺列）
-        recent_valid = [m for m in recent_moms if m is not None]
-        if len(recent_valid) >= 2 and all(m >= 0.5 for m in recent_valid):
-            return False  # 连续 2+ 天都在 0.5 以上 → 持续改善，非埋伏起点
-        if not SectorAnalysisNode._check_ambush(df, indicators):
-            return False
-        if strength_score > 72:
-            return False
         if is_defensive:
+            indicators["ambush_score_v2"] = 0.0
             return False
-        return True
+
+        score = cls._compute_ambush_score_v2(
+            df, indicators, rrg, strength_score, prev_trend,
+        )
+        indicators["ambush_score_v2"] = score
+        return score >= cls.AMBUSH_SCORE_FLOOR
 
     @staticmethod
     def _check_ambush_near_miss(
@@ -2717,29 +2860,80 @@ class SectorAnalysisNode:
             key=lambda g: g.group_score, reverse=True,
         )
 
-        # 埋伏输出：直接从当日 state 取，按分数排序截断 Top 10
-        ambush_list = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
-        ambush_list.sort(key=lambda s: s.strength_score, reverse=True)
-        if len(ambush_list) > 10:
-            logger.info(f"[Node 2] 埋伏截断: {len(ambush_list)}→10 个")
-        ambush_list = ambush_list[:10]
-        for s in ambush_list:
-            used_codes.add(s.code)
+        # ── 埋伏输出：真并集双轨合并（2026-08-25 修正）──
+        # 设计原则：Track 1（状态机）是时间维记忆的权威，不受当日截面分竞选淘汰；
+        # Track 2（评分排名）是发现工具，只补位 Track 1 未占的名额。
+        # 参考：v3.3 计划约定 "final_ambush = state_machine_ambush | score_ambush"
 
-        # 近失埋伏：差 1 条闸门未通过（供 Node 6 蓄水池观察）
-        # 过滤非交易类聚合板块（均价/昨*/地区/指数型不在白名单中）
-        valid_names = set(_ALL_KEYWORDS)
-        near_miss_list = [
+        excluded_states = {"active_mainline", "exhausted_mainline", "high_position_cooling", "defensive_rotation"}
+
+        # Track 1: 状态机判定（state == "ambush"，跨日时间维记忆）
+        track1_ambush = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
+        # Track 1 内部按分数排序（保证稳定输出），截断到单独上限
+        track1_ambush.sort(
+            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
+        )
+        track1_ambush = track1_ambush[:self.AMBUSH_TRACK1_MAX]
+
+        # Track 2: 截面排名补位（仅填充 Track 1 剩余名额）
+        track1_codes = {s.code for s in track1_ambush}
+        remaining_slots = max(0, self.AMBUSH_TOP_K - len(track1_ambush))
+        track2_candidates = [
             s for s in analyzed
-            if s.near_miss_conditions
+            if s.state not in excluded_states
             and s.code not in used_codes
-            and s.name in valid_names
+            and s.code not in track1_codes
+            and s.indicators.get("ambush_score_v2", 0) > 0
         ]
-        near_miss_list.sort(key=lambda s: s.strength_score, reverse=True)
+        track2_candidates.sort(
+            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
+        )
+        track2_topk = track2_candidates[:remaining_slots] if remaining_slots > 0 else []
+
+        # 合并：Track 1 无条件保留 + Track 2 补位（须达 floor）
+        ambush_list = list(track1_ambush)
+        for s in track2_topk:
+            if s.indicators.get("ambush_score_v2", 0) >= self.AMBUSH_SCORE_FLOOR:
+                ambush_list.append(s)
+
+        ambush_codes = {s.code for s in ambush_list}
+        used_codes.update(ambush_codes)
+
+        if track1_ambush or track2_topk:
+            logger.info(
+                f"[Node 2] 埋伏双轨: Track1(状态机)={len(track1_ambush)}, "
+                f"Track2(补位{remaining_slots})={len(track2_topk)}, "
+                f"合并后={len(ambush_list)}"
+            )
+
+        # ── 近失埋伏重定义（P0-1）──
+        # near_miss = (不在正式池 OR 低于 floor) AND 分数 >= floor × 0.7
+        near_miss_floor = self.AMBUSH_SCORE_FLOOR * self.AMBUSH_NEAR_MISS_RATIO
+        near_miss_list = []
+        for s in analyzed:
+            if s.code in used_codes:
+                continue
+            if s.state in excluded_states:
+                continue
+            score = s.indicators.get("ambush_score_v2", 0)
+            if score < near_miss_floor:
+                continue
+            # 在正式池或高于 floor → 不是近失
+            in_pool = s.code in ambush_codes
+            above_floor = score >= self.AMBUSH_SCORE_FLOOR
+            if in_pool or above_floor:
+                continue
+            # 近失：分数在 [near_miss_floor, floor) 区间
+            s.near_miss_conditions = [f"score_below_floor({score:.2f}<{self.AMBUSH_SCORE_FLOOR})"]
+            near_miss_list.append(s)
+
+        near_miss_list.sort(
+            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
+        )
         if near_miss_list:
             logger.info(
                 f"[Node 2] 近失埋伏: {len(near_miss_list)} 个 "
-                f"({', '.join(s.name + '(' + ','.join(s.near_miss_conditions or []) + ')' for s in near_miss_list[:5])})"
+                f"(分数区间 [{near_miss_floor:.2f}, {self.AMBUSH_SCORE_FLOOR}))"
             )
         near_miss_list = near_miss_list[:10]  # 截断 Top 10
         for s in near_miss_list:
