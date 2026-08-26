@@ -1074,6 +1074,9 @@ class StockScreenerPipeline:
             # 用问财快速筛选板块成分股
             constituents = self._get_sector_constituents_filtered(sector_name, sector_type)
 
+            if not constituents:
+                logger.warning(f"[选股池] {sector_name}({sector_type}) 问财返回 0 只，该板块无候选股")
+
             for stock_info in constituents:
                 universe.append({
                     "code": stock_info["code"],
@@ -1097,10 +1100,14 @@ class StockScreenerPipeline:
                 seen.add(stock["code"])
                 deduped.append(stock)
 
-        logger.info(
+        msg = (
             f"选股池: {len(qualified_mainlines)} 个主线 + "
             f"{len(qualified_ambush)} 个埋伏 → {len(deduped)} 只股票（问财初筛后）"
         )
+        if not deduped:
+            logger.error(f"{msg} ⚠️ 全部板块问财返回 0 只，Phase 2 将无候选股！")
+        else:
+            logger.info(msg)
 
         return deduped
 
@@ -1118,12 +1125,12 @@ class StockScreenerPipeline:
             from src.services.board_name_resolver import clean_board_name, get_board_name_resolver
             ths_service = THSScreenerService(self.config)
 
-            # L3 清洗 + L1/L2 解析：别名表（人工实测）→ 同花顺官方列表模糊匹配
+            # L3 清洗 + L1/L2 解析（含 kind 信息）
             sector_name = clean_board_name(sector_name)
             resolver = get_board_name_resolver()
-            board_name = resolver.resolve(sector_name)
+            board_name, kind = resolver.resolve_with_kind(sector_name)
 
-            # 根据板块类型使用不同的 DDE 筛选条件
+            # DDE 筛选条件
             if sector_type == "active_mainline":
                 # 主线：当天 DDE 强势（单条件，降低阈值避免交集归零）
                 dde_condition = "1个交易日前的dde大单净量>=0.5%，"
@@ -1135,6 +1142,8 @@ class StockScreenerPipeline:
             # 键名必须与 Phase 1 输出的板块名称完全一致（通常带"概念"后缀）
             # 2026-08-18 补全：覆盖当前活跃主线板块，防止蹭概念票混入
             concept_industry_map = {
+                # ── 跨类别映射（TDX概念→THS行业） ──
+                "水产品": ["水产", "渔业", "养殖"],
                 # ── 原有 ──
                 "数据要素": ["计算机", "软件", "数据处理", "信息服务", "互联网", "通信"],
                 "AI产业链": ["计算机", "软件", "电子", "通信", "人工智能", "芯片", "半导体"],
@@ -1151,6 +1160,7 @@ class StockScreenerPipeline:
                 "钢铁": ["钢铁", "金属制品", "特钢"],
                 "化纤": ["化学纤维", "化工", "涤纶", "氨纶"],
                 "汽车整车": ["汽车", "整车", "新能源车"],
+                "汽车芯片": ["汽车", "半导体", "芯片", "集成电路", "电子"],
                 "虚拟电厂": ["电力", "电气", "电网", "能源"],
                 "合成生物": ["生物", "医药", "化工", "发酵", "酶制剂"],
                 "稀土永磁": ["有色", "稀土", "金属", "磁性材料"],
@@ -1205,63 +1215,42 @@ class StockScreenerPipeline:
                 "苹果概念": ["消费电子", "手机", "苹果", "电子", "声学", "光学"],
             }
 
-            query = (
-                f"所属同花顺板块是{board_name}，"
-                f"{dde_condition}"
-                "上市天数>365天，"
-                "非ST，"
-                "所属同花顺行业，"
-                "按dde大单净量降序"  # 排序键：资金主导（非涨跌幅）
-            )
-            logger.info(f"[问财初筛-DDE-{sector_type}] {sector_name}: {query[:60]}...")
-
-            ths_result = ths_service.query(query)
-            if ths_result and ths_result.stocks:
-                # 查询命中：若 board_name 来自 L2 模糊匹配，回写别名表（下次直接命中）
-                resolver.confirm(sector_name, board_name)
-                # 行业过滤：检查每只票的行业板块是否与概念主题相关
-                industry_keywords = concept_industry_map.get(sector_name, [])
-                filtered_stocks = []
-                for s in ths_result.stocks:
-                    if industry_keywords and s.industry:
-                        # 检查 industry 字段是否包含相关关键词
-                        if any(kw in s.industry for kw in industry_keywords):
-                            filtered_stocks.append(s)
-                        else:
-                            logger.debug(f"[行业过滤] {s.code} {s.name} 行业'{s.industry}'与{sector_name}不匹配，跳过")
-                    else:
-                        # 无映射或无行业信息，保留
-                        filtered_stocks.append(s)
-
-                if len(filtered_stocks) < len(ths_result.stocks):
-                    logger.info(f"[行业过滤] {sector_name}: {len(ths_result.stocks)}→{len(filtered_stocks)} 只（过滤{len(ths_result.stocks)-len(filtered_stocks)}只蹭概念票）")
-
-                # 取前 15 只候选（宽进严出：给下游漏斗更多输入）
-                stocks = [
-                    {
-                        "code": s.code,
-                        "name": s.name,
-                        "price": s.price,
-                        "dde_net_pct": s.dde_net_pct,
-                        "change_pct": s.change_pct,
-                        "turnover_rate": s.turnover_rate,
-                        "volume": s.volume,
-                    }
-                    for s in filtered_stocks[:15]
-                ]
-                logger.info(
-                    f"[问财初筛-DDE-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选"
-                    f"（DDE: {stocks[0]['dde_net_pct']:.2f}%~{stocks[-1]['dde_net_pct']:.2f}%）"
-                    if stocks else ""
-                )
-                return stocks
+            # 按 kind 决定语法尝试顺序
+            concept_clause = f"所属同花顺概念板块是{board_name}，"
+            industry_clause = f"所属同花顺板块是{board_name}，"
+            if kind == "industry":
+                board_clauses = [industry_clause, concept_clause]
             else:
-                logger.warning(f"[问财初筛-DDE-{sector_type}] {sector_name} 无结果，降级为不带 DDE 筛选")
-                # 降级：不过滤 DDE 阈值，但仍查询 DDE 值（供资金面评分用）
-                query_fallback = f"所属同花顺板块是{board_name}，dde大单净量，上市天数>365天，非ST，所属同花顺行业，按dde大单净量降序"
-                ths_result = ths_service.query(query_fallback)
-                if ths_result and ths_result.stocks:
-                    resolver.confirm(sector_name, board_name)
+                board_clauses = [concept_clause, industry_clause]
+
+            common_suffix = "上市天数>365天，非ST，所属同花顺行业，"
+
+            def _try_query(query_template: str, max_results: int) -> Optional[List[Dict]]:
+                """按 board_clauses 顺序尝试查询，命中返回 stocks 列表"""
+                for clause in board_clauses:
+                    query = query_template.replace("{board_clause}", clause)
+                    logger.info(f"[问财初筛-{sector_type}] {sector_name} (kind={kind}): {query[:80]}...")
+                    ths_result = ths_service.query(query)
+                    if not ths_result or not ths_result.stocks:
+                        continue
+                    # 命中：回写别名表
+                    resolver.confirm(sector_name, board_name, kind=kind)
+                    # 行业过滤
+                    industry_keywords = concept_industry_map.get(sector_name, [])
+                    filtered_stocks = []
+                    for s in ths_result.stocks:
+                        if industry_keywords and s.industry:
+                            if any(kw in s.industry for kw in industry_keywords):
+                                filtered_stocks.append(s)
+                            else:
+                                logger.debug(f"[行业过滤] {s.code} {s.name} 行业'{s.industry}'与{sector_name}不匹配")
+                        else:
+                            filtered_stocks.append(s)
+                    if len(filtered_stocks) < len(ths_result.stocks):
+                        logger.info(
+                            f"[行业过滤] {sector_name}: {len(ths_result.stocks)}→"
+                            f"{len(filtered_stocks)} 只（过滤{len(ths_result.stocks)-len(filtered_stocks)}只）"
+                        )
                     stocks = [
                         {
                             "code": s.code,
@@ -1269,18 +1258,82 @@ class StockScreenerPipeline:
                             "price": s.price,
                             "dde_net_pct": s.dde_net_pct,
                             "change_pct": s.change_pct,
+                            "turnover_rate": s.turnover_rate,
+                            "volume": s.volume,
                         }
-                        for s in ths_result.stocks[:5]
+                        for s in filtered_stocks[:max_results]
                     ]
-                    logger.info(f"[问财初筛-降级-{sector_type}] {sector_name} 获取到 {len(stocks)} 只候选")
+                    if stocks:
+                        dde_range = ""
+                        if stocks[0].get("dde_net_pct") is not None:
+                            dde_range = (
+                                f"（DDE: {stocks[0]['dde_net_pct']:.2f}%~"
+                                f"{stocks[-1]['dde_net_pct']:.2f}%）"
+                            )
+                        logger.info(
+                            f"[问财初筛-{sector_type}] {sector_name} 获取到 "
+                            f"{len(stocks)} 只候选 {dde_range}"
+                        )
                     return stocks
-                return []
+                return None
+
+            # ── 第 1 轮：带 DDE 条件 ──
+            result = _try_query(
+                "{board_clause}" + f"{dde_condition}{common_suffix}按dde大单净量降序",
+                max_results=15,
+            )
+            if result is not None:
+                # ── 第 1.5 轮（v2.1）：返回量不足时放松 DDE 阈值 ──
+                # 与第 2 轮互补：第 2 轮处理 _try_query 返回 None（查询本身空），
+                # 第 1.5 轮处理 len(result) <= 2（含行业过滤清零的 []）
+                if len(result) <= 2 and sector_type == "active_mainline":
+                    relaxed_condition = "1个交易日前的dde大单净量>=0.3%，"
+                    relaxed_result = _try_query(
+                        "{board_clause}" + f"{relaxed_condition}{common_suffix}按dde大单净量降序",
+                        max_results=15,
+                    )
+                    if relaxed_result and len(relaxed_result) > len(result):
+                        before_count = len(result)
+                        seen_codes = {s["code"] for s in result}
+                        for s in relaxed_result:
+                            if s["code"] not in seen_codes:
+                                result.append(s)
+                                seen_codes.add(s["code"])
+                        logger.info(
+                            f"[问财初筛-{sector_type}] {sector_name} "
+                            f"DDE≥0.5% 仅 {before_count} 只，"
+                            f"放松至 0.3% 补充至 {len(result)} 只"
+                        )
+                return result
+
+            # ── 第 2 轮：不带 DDE 降级 ──
+            logger.warning(f"[问财初筛-{sector_type}] {sector_name} DDE 轮全空，降级为不带 DDE")
+            result = _try_query(
+                "{board_clause}dde大单净量，" + f"{common_suffix}按dde大单净量降序",
+                max_results=5,
+            )
+            if result is not None:
+                return result
+
+            # 双语法 × 两轮全空 → 醒目告警
+            logger.error(
+                f"[问财初筛-{sector_type}] {sector_name} 双语法全空！"
+                f"resolved={board_name}, kind={kind}。"
+                f"尝试过的语法: {board_clauses}"
+            )
+            return []
 
         except Exception as e:
-            logger.error(f"[问财初筛-DDE-{sector_type}] {sector_name} 失败: {e}")
+            logger.error(f"[问财初筛-{sector_type}] {sector_name} 失败: {e}")
             return []
 
     # ── 横盘 stagnation 过滤（回测实证：多窗口小涨幅区间胜率最低）──
+
+    # TODO(校准): 以下阈值基于 2026-06-13~06-17 回测（44条实证），距今已 70 天。
+    # 市场风格可能已变，建议每 3 个月用最新 60 天数据重新回测校准。
+    # 参考 RegimeFolio (Zhang 2025) 的滚动百分位方法替代固定阈值。
+    _STAGNATION_CALIBRATION_DATE = "2026-06-17"
+    _STAGNATION_SAMPLE_COUNT = 44
 
     # 横盘死区定义（回测 44 条实证，2026-06-13 ~ 06-17）
     # 核心规律：多时间窗口均处于 0~10% 涨幅的票次日胜率仅 30~40%
@@ -1420,13 +1473,11 @@ class StockScreenerPipeline:
         candidates = candidates[:15]
         logger.info(f"轮次 3: {len(candidates)} 只（波段技术 Top 15）")
 
-        # 轮次 4: 风险排雷 Top 8
+        # ── 轮次 4: 风险排雷（主通道 Top 6 + 软保底至多 2）──
         risk_scores = self._score_risk(candidates, fetcher_manager)
         for c in candidates:
             c["risk_score_safe"] = risk_scores.get(c["code"], 0)
-        candidates = [c for c in candidates if c["risk_score_safe"] > 50]  # 风险阈值
-        candidates.sort(key=lambda x: x["risk_score_safe"], reverse=True)
-        candidates = candidates[:8]
+        candidates = self._apply_r4_filter(candidates, got_context)
         logger.info(f"轮次 4: {len(candidates)} 只（风险排雷后）")
 
         # 消息面评分（全量候选，不排序但记录分数）
@@ -1546,10 +1597,18 @@ class StockScreenerPipeline:
         sector_flow_map = self._parse_sector_flow(capital_ctx)
 
         if sector_flow_map:
+            n_flows = len(sector_flow_map)
+            # 数据源标记：sector_flow_all（~300板块）vs top_concepts（~8板块）
+            source_label = "sector_flow_all" if n_flows > 10 else "top_concepts"
             logger.info(
-                f"[资金面-板块] {len(sector_flow_map)} 个板块有资金流数据, "
+                f"[资金面-板块] 数据源={source_label}, {n_flows} 个板块, "
                 f"范围 {min(sector_flow_map.values()):.1f}~{max(sector_flow_map.values()):.1f}亿"
             )
+            if n_flows <= 10:
+                logger.warning(
+                    f"[资金面-板块] sector_flow_all 不可用，仅 {n_flows} 个板块参与排名，"
+                    f"百分位区分度不足（参考 Briere & Szafarz 2021: 窄截面排名退化）"
+                )
         else:
             logger.warning("[资金面-板块] 无 sector_flow 数据")
 
@@ -1877,7 +1936,7 @@ class StockScreenerPipeline:
                     boll_pos = (close.iloc[-1] - bb_lower) / (bb_upper - bb_lower)
                     # 最优区间 0.5~0.85，两端衰减
                     if boll_pos < 0:
-                        score += 0
+                        score += 3  # 超卖反弹潜力（Ni et al. 2020: 触下轨逆向策略正超额收益）
                     elif boll_pos < 0.3:
                         score += boll_pos / 0.3 * 7
                     elif boll_pos <= 0.85:
@@ -1987,13 +2046,80 @@ class StockScreenerPipeline:
 
         return scores
 
+    @staticmethod
+    def _apply_r4_filter(
+        candidates: List[Dict], got_context: dict
+    ) -> List[Dict]:
+        """R4 风险排雷：主通道 Top 6 + 软保底至多 2（v2.1）
+
+        主通道门槛 >50，保底门槛 >40，仅对 actionable 板块提供保底。
+        actionable_sectors 从 got_context 内部派生（双格式兼容 + 板块名清洗）。
+        """
+        from src.services.board_name_resolver import clean_board_name
+
+        R4_MAIN_TOP_K = 6
+        R4_MAIN_FLOOR = 50
+        R4_GUARANTEE_MAX = 2
+        R4_GUARANTEE_FLOOR = 35  # v2.1 修订：40→35，为层3新维度叠加留余量
+
+        # 主通道：>50 + Top 6
+        main_candidates = [c for c in candidates if c["risk_score_safe"] > R4_MAIN_FLOOR]
+        main_candidates.sort(key=lambda x: x["risk_score_safe"], reverse=True)
+        selected = main_candidates[:R4_MAIN_TOP_K]
+        selected_sectors = {c["sector"] for c in selected}
+
+        # 保底通道：派生 actionable_sectors（双格式兼容 + 清洗）
+        sector_ctx = got_context.get("sector_context", {})
+        actionable_sectors = set()
+        for g in sector_ctx.get("active_mainline", []):
+            if "members" in g:
+                for m in g.get("members", []):
+                    actionable_sectors.add(clean_board_name(m.get("name", "")))
+            else:
+                actionable_sectors.add(clean_board_name(g.get("name", "")))
+        for a in sector_ctx.get("ambush", []):
+            actionable_sectors.add(clean_board_name(a.get("name", "")))
+
+        # 保底池：主通道落选(>50) + 40~50 区间，板块未代表
+        guarantee_pool = [
+            c for c in main_candidates[R4_MAIN_TOP_K:]
+            if c["sector"] not in selected_sectors
+        ] + [
+            c for c in candidates
+            if R4_GUARANTEE_FLOOR < c["risk_score_safe"] <= R4_MAIN_FLOOR
+            and c["sector"] not in selected_sectors
+        ]
+        guarantee_pool.sort(key=lambda x: x["risk_score_safe"], reverse=True)
+
+        guarantee_filled = 0
+        for c in guarantee_pool:
+            if guarantee_filled >= R4_GUARANTEE_MAX:
+                break
+            if c["sector"] in actionable_sectors:
+                selected.append(c)
+                selected_sectors.add(c["sector"])
+                guarantee_filled += 1
+                logger.info(
+                    f"R4 软保底: {c['code']} {c.get('name', '')} ({c['sector']}) "
+                    f"risk={c['risk_score_safe']:.1f}"
+                )
+
+        logger.info(
+            f"轮次 4 明细: 主通道 {min(len(main_candidates), R4_MAIN_TOP_K)}"
+            f" + 保底 {guarantee_filled} = {len(selected)} 只"
+        )
+        return selected
+
     def _score_risk(self, candidates: List[Dict], fetcher_manager) -> Dict[str, float]:
         """风险评分（15% 权重，越高越安全）
 
-        扣分项：
-        - RSI > 80（超买）: -30分
-        - 近 5 日涨幅 > 20%: -25分
-        - 波动率 > 0.05: -15分
+        扣分项（v2.1 梯度化）：
+        - RSI6: >85 -30 / >80 -20 / >75 -10
+        - 近 5 日涨幅: >25% -25 / >20% -18 / >15% -10 / >10% -5
+        - 波动率(百分点): >8 -15 / >5 -8（已合入）
+        - 换手率衰减(新增): 近3日/前7日 <0.5 → -10（缩量上涨动能衰竭）
+        - MA20 偏离度(新增): |偏离| >15% -15 / >10% -8 / >7% -3
+          （abs 设计：超涨回归和接飞刀都是买方风险）
 
         注：PE 估值检查已移除（需逐只拉行情，push2 被封时耗时 5s/只）。
         """
@@ -2008,22 +2134,56 @@ class StockScreenerPipeline:
                     scores[c["code"]] = 50  # 数据不足给中间分
                     continue
 
-                # RSI 超买
+                # 1. RSI 超买（梯度化）
                 if len(df) >= 12:
                     rsi6 = self._calc_rsi(df["close"], 6)
-                    if rsi6 > 80:
-                        score -= 30
+                    if rsi6 > 85:
+                        score -= 30   # 极端超买
+                    elif rsi6 > 80:
+                        score -= 20   # 超买
+                    elif rsi6 > 75:
+                        score -= 10   # 轻度超买
 
-                # 近 5 日涨幅
+                # 2. 近 5 日涨幅（梯度化）
                 pct_5d = (df["close"].iloc[-1] / df["close"].iloc[-5] - 1) * 100
-                if pct_5d > 20:
-                    score -= 25
+                if pct_5d > 25:
+                    score -= 25       # 暴涨
+                elif pct_5d > 20:
+                    score -= 18
+                elif pct_5d > 15:
+                    score -= 10
+                elif pct_5d > 10:
+                    score -= 5
 
-                # 波动率
+                # 3. 波动率（已合入，不动）
                 if len(df) >= 20 and "pct_chg" in df.columns:
                     volatility = df["pct_chg"].rolling(20).std().iloc[-1]
-                    if volatility > 0.05:
-                        score -= 15
+                    if volatility > 8:
+                        score -= 15   # 极端波动
+                    elif volatility > 5:
+                        score -= 8    # 高波动
+
+                # 4. 换手率衰减（新增）
+                if len(df) >= 10 and "volume" in df.columns:
+                    vol_recent = df["volume"].iloc[-3:].mean()
+                    vol_past = df["volume"].iloc[-10:-3].mean()
+                    if vol_past > 0:
+                        vol_ratio = vol_recent / vol_past
+                        if vol_ratio < 0.5:
+                            score -= 10  # 缩量上涨，动能衰竭
+
+                # 5. MA20 偏离度（新增）
+                # abs() 设计：超涨回归（正偏离）和接飞刀（负偏离）都是买方风险
+                if len(df) >= 20:
+                    ma20 = df["close"].rolling(20).mean().iloc[-1]
+                    if ma20 > 0:
+                        deviation = (df["close"].iloc[-1] / ma20 - 1) * 100
+                        if abs(deviation) > 15:
+                            score -= 15
+                        elif abs(deviation) > 10:
+                            score -= 8
+                        elif abs(deviation) > 7:
+                            score -= 3
 
                 scores[c["code"]] = max(0, score)
             except Exception as e:
@@ -2122,6 +2282,8 @@ class StockScreenerPipeline:
                         best_score = 100.0
                         best_event = evt
                 # 如果有个股级事件，跳过板块级事件（个股级优先级最高）
+                # 注：多个板块共享同一事件（如 SK 海力士→存储芯片/先进封装/PCB）时，
+                # 每只候选股只匹配自己所属 sector 的事件，取 max 去重，不会重复计分。
 
             # 2. 板块级事件 → confidence × impact × proximity × 50
             if best_score < 100 and sector in sector_events:
@@ -2146,7 +2308,9 @@ class StockScreenerPipeline:
                     direction_coeff = 1.0 if direction == "positive" else 0.5
 
                     evt_score = confidence * impact * proximity * direction_coeff * 50
-                    evt_score = min(99.0, evt_score)  # 不超过个股级
+                    # 板块级封顶 99：严格低于个股级 100，配合 L2287 `if best_score < 100`
+                    # 保证优先级不变量：个股级事件（earnings）永远优先于板块级事件（narrative）
+                    evt_score = min(99.0, evt_score)
 
                     if evt_score > best_score:
                         best_score = evt_score

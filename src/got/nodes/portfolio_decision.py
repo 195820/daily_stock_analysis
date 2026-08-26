@@ -1088,15 +1088,23 @@ class PortfolioDecisionNode:
                     sector_name = member.name
                     sector_strength = member.strength_score
 
-                    # 查询成分股（简化版，不带 DDE 过滤）
+                    # 查询成分股（简化版，不带 DDE 过滤；双语法多轮）
                     try:
-                        board_name = resolver.resolve(sector_name)
-                        query = f"{board_name}概念板块成分股，上市天数>365天，非ST"
-                        logger.debug(f"[板块映射] 查询 {sector_name} 成分股...")
-                        ths_result = ths_service.query(query)
+                        board_name, kind = resolver.resolve_with_kind(sector_name)
+                        # 按 kind 决定语法顺序
+                        concept_q = f"所属同花顺概念板块是{board_name}，上市天数>365天，非ST"
+                        industry_q = f"所属同花顺板块是{board_name}，上市天数>365天，非ST"
+                        queries = [industry_q, concept_q] if kind == "industry" else [concept_q, industry_q]
+
+                        ths_result = None
+                        for q in queries:
+                            logger.debug(f"[板块映射] 查询 {sector_name} (kind={kind}): {q[:60]}...")
+                            ths_result = ths_service.query(q)
+                            if ths_result and ths_result.stocks:
+                                resolver.confirm(sector_name, board_name, kind=kind)
+                                break
 
                         if ths_result and ths_result.stocks:
-                            resolver.confirm(sector_name, board_name)
                             for stock in ths_result.stocks:
                                 clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
                                 # 初始化该股票的板块列表
@@ -1119,12 +1127,20 @@ class PortfolioDecisionNode:
                 sector_strength = ambush_sector.strength_score
 
                 try:
-                    board_name = resolver.resolve(sector_name)
-                    query = f"{board_name}概念板块成分股，上市天数>365天，非ST"
-                    ths_result = ths_service.query(query)
+                    board_name, kind = resolver.resolve_with_kind(sector_name)
+                    # 双语法多轮查询
+                    concept_q = f"所属同花顺概念板块是{board_name}，上市天数>365天，非ST"
+                    industry_q = f"所属同花顺板块是{board_name}，上市天数>365天，非ST"
+                    queries = [industry_q, concept_q] if kind == "industry" else [concept_q, industry_q]
+
+                    ths_result = None
+                    for q in queries:
+                        ths_result = ths_service.query(q)
+                        if ths_result and ths_result.stocks:
+                            resolver.confirm(sector_name, board_name, kind=kind)
+                            break
 
                     if ths_result and ths_result.stocks:
-                        resolver.confirm(sector_name, board_name)
                         for stock in ths_result.stocks:
                             clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
                             if clean_code not in self._stock_sector_map:
@@ -1835,7 +1851,7 @@ class PortfolioDecisionNode:
         # 问财 THS 使用同步 Playwright，需在独立线程中运行
         universe = await asyncio.to_thread(screener._extract_got_universe, got_context)
         if not universe:
-            logger.warning("[Phase 2] 候选池为空")
+            logger.error("[Phase 2] 候选池为空！所有 actionable 板块的问财查询均返回 0 只，请检查板块名映射或网络连通性")
             return []
 
         finalists = await asyncio.to_thread(

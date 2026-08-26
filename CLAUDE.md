@@ -1022,6 +1022,51 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 **文件改动清单**：
 - `src/got/nodes/sector_analysis.py`：`_is_noise_board` 升级 v2（三层判定）+ `_NOISE_BOARD_EXACT` + `_is_noise_pattern`
 
+**Phase 2 问财板块查询修复（2026-08-25）：**
+
+> 0825 全流程 `unified_scoring: []`，Phase 2 选股池 0 只股票。主线A有水产品（98分）、埋伏有汽车芯片（55分），actionable 板块 2 个，但问财初筛全空。
+
+**根因（三层叠加）**：
+- ❌ **问词语法错误**：`所属同花顺板块是X` 只匹配行业板块，Node 2 输出的概念板块全部查空。`所属同花顺概念板块是X` 才能匹配概念板块
+- ❌ **L2 缓存被股票代码污染**：`akshare.stock_board_concept_name_ths()` 返回列 `['name','code']`，代码 `df.columns[1]` 取到 code 列，缓存的 375 个"板块名"全是股票代码，L2 从未工作
+- ❌ **TDX→THS 映射缺口**：水产品在 THS 概念列表中不存在，需跨类别映射到行业板块"养殖业"
+
+**核心变更**：
+- ✅ `board_name_resolver.py` 重写：取列修复（按优先级 `name/名称/概念名称/板块名称`）、同时拉取行业板块列表、缓存格式升级（`concept_names` + `industry_names` 分离）、脏缓存检测（>50% 6位纯数字→重建）、新增 `resolve_with_kind()` 返回 `(name, kind)`、`confirm()` 支持 kind 持久化
+- ✅ `stock_screener.py` 双语法多轮：按 kind 排序 board_clauses（concept 优先 or industry 优先），第 1 轮带 DDE + 第 2 轮降级无 DDE，每轮按序尝试各 clause 命中即返回。新增 水产品/汽车芯片 行业关键词
+- ✅ `portfolio_decision.py` 两处成分股查询同步双语法化
+- ✅ `wencai_board_aliases.json` 新增 水产品→养殖业（kind=industry）
+
+**验证结果（0825 数据重放）**：
+- 水产品（kind=industry）→ 行业语法命中"养殖业" → 1只（DDE 4.00%）
+- 汽车芯片（kind=concept）→ 概念语法命中 → 28只 → 行业过滤 22只 → Top 15
+- 宇宙从 0 → 16 只，Phase 2 管道恢复
+
+**文件改动清单**：
+- `src/services/board_name_resolver.py`（重写）：取列修复 + 行业列表 + resolve_with_kind + confirm(kind) + 脏缓存检测
+- `src/services/stock_screener.py`（核心改动）：双语法多轮查询 + 水产品/汽车芯片行业关键词
+- `src/got/nodes/portfolio_decision.py`（两处改动）：成分股查询双语法化
+- `data/wencai_board_aliases.json`（+1 条）：水产品→养殖业(kind=industry)
+- `data/ths_concept_boards.json`（删除）：旧脏缓存重建
+- `tests/test_board_name_resolver.py`（重写 23 用例）：kind 相关 + 列名适配 + 脏缓存检测
+
+**选股漏斗 v2.1 改进（2026-08-25）：**
+
+> 与问财修复同步提交的多项漏斗层改进。
+
+**核心变更**：
+- ✅ R4 软保底机制：主通道 Top 6（risk>50）+ 保底至多 2 只（risk>35），仅对 actionable 板块提供保底，防止强势板块垄断全部名额
+- ✅ 风险评分梯度化：RSI 从硬阈值(-30)→3 级梯度(>85/-30, >80/-20, >75/-10)；5 日涨幅从 2 级→4 级；波动率从 1 级→2 级
+- ✅ 新增风险维度：换手率衰减（近3日/前7日<0.5 → -10）、MA20 偏离度（abs >15%/-15, >10%/-8, >7%/-3）
+- ✅ 布林带超卖修正：`boll_pos < 0` 从 +0 → +3（触下轨逆向策略正超额收益，Ni et al. 2020）
+- ✅ 横盘过滤校准标记：`_STAGNATION_CALIBRATION_DATE` + `_STAGNATION_SAMPLE_COUNT` 标记回测时效，建议每 3 个月重新校准
+- ✅ 资金面数据源标记：`sector_flow_all`(~300 板块) vs `top_concepts`(~8 板块) 区分日志，窄截面时输出警告
+- ✅ 问财 DDE 放松轮（v1.5）：主线板块 DDE≥0.5% 仅返回 ≤2 只时，自动放松至 ≥0.3% 补充
+
+**文件改动清单**：
+- `src/services/stock_screener.py`：`_apply_r4_filter` + `_score_risk` 梯度化 + 布林带修正 + stagnation 标记 + DDE 放松轮
+- `tests/services/test_stock_screener.py`（+323 行）：R4 软保底 5 个场景测试
+
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块
 - ✅ `main.py`（修改）：新增 `--got` 入口（`python main.py --got`）
