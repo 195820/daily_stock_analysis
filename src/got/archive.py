@@ -183,6 +183,16 @@ def _write_reasoning_md(
             lines.append("## 🌍 全局环境（Level 0）")
             lines.append("")
             lines.append(f"- **Regime:** {regime.regime}")
+            # v2.1: Regime 状态机信息
+            dwell_days = getattr(regime, "dwell_days", 1)
+            transition_count = getattr(regime, "transition_count", 0)
+            transition_pending = getattr(regime, "transition_pending", None)
+            lines.append(f"- **持续天数:** {dwell_days}")
+            lines.append(f"- **近20日切换次数:** {transition_count}")
+            if transition_pending:
+                lines.append(f"- **待确认信号:** {transition_pending}（首次出现，待次日确认）")
+            if dwell_days < 2:
+                lines.append(f"- ⚠️ **低置信度:** regime 刚切换（dwell={dwell_days}），矛盾检测标记低置信")
             lines.append(f"- **风险预算:** {regime.risk_budget:.0%}")
             lines.append(f"- **恐贪指数:** {regime.fear_greed:.2f}（{regime.sentiment_stage}）")
             lines.append(f"- **板块方向:** {regime.market_direction}（{regime.mainline_count} 条主线）")
@@ -369,6 +379,58 @@ def _write_reasoning_md(
             lines.append("**否决记录：**")
             for v in ambush_veto[:8]:
                 lines.append(f"- ❌ {v}")
+            lines.append("")
+
+    # ── 情绪阶段状态机摘要（v2.1）──
+    sentiment_ctx = contexts.get("sentiment")
+    if sentiment_ctx:
+        stage_state = getattr(sentiment_ctx, "stage_state", None)
+        persistence = getattr(sentiment_ctx, "persistence_regime", None)
+        if stage_state or persistence:
+            lines.append("## 🧠 情绪阶段状态机")
+            lines.append("")
+            if stage_state:
+                direction_emoji = {"warming": "🔥", "cooling": "❄️", "stable": "⚪"}.get(
+                    stage_state.momentum_direction, "⚪"
+                )
+                lines.append(f"- **当前阶段:** {stage_state.current_stage}")
+                lines.append(f"- **持续天数:** {stage_state.dwell_days}")
+                lines.append(f"- **动量方向:** {direction_emoji} {stage_state.momentum_direction}")
+                if stage_state.contrarian_alert:
+                    lines.append("- ⚠️ **反向信号:** 触发（连续升温到极端 / 极端阶段超时）")
+                # 近 5 日阶段序列
+                recent = stage_state.stage_transitions[-5:]
+                if recent:
+                    lines.append(f"- **近5日阶段:** {' → '.join(recent)}")
+            if persistence:
+                persistence_label = {
+                    "high": "高持续（trending，异象显著）",
+                    "low": "低持续（mean-reverting，反转策略有效）",
+                    "medium": "中等持续",
+                }.get(persistence, persistence)
+                lines.append(f"- **情绪持续性:** {persistence_label}")
+            lines.append("")
+
+    # ── 跨节点时间线共振（Phase 6）──
+    if unified_ctx:
+        cross_signals = getattr(unified_ctx, "cross_node_signals", [])
+        if cross_signals:
+            lines.append("## 🔗 跨节点时间线共振")
+            lines.append("")
+            action_emoji = {
+                "strong_buy": "🟢",
+                "sell": "🔴",
+                "add": "🔵",
+                "short_term_reversal": "🟡",
+            }
+            for sig in cross_signals:
+                emoji = action_emoji.get(sig.suggested_action, "⚪")
+                lines.append(
+                    f"- {emoji} **{sig.signal_type}** (置信{sig.confidence:.0%}, "
+                    f"建议: {sig.suggested_action})"
+                )
+                lines.append(f"  - 参与节点: {', '.join(sig.component_nodes)}")
+                lines.append(f"  - {sig.reasoning}")
             lines.append("")
 
     for key in NODE_ORDER:

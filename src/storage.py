@@ -1234,6 +1234,13 @@ class CatalystRealizationRecord(Base):
     story_peak_date = Column(Date)                           # 事件影响达峰日期
     story_end_date = Column(Date)                            # 事件影响消退日期
     story_lifetime_days = Column(Integer)                    # 故事寿命（日历日）
+    # PEAD 多窗口收益追踪（v2.1 Phase 4：催化剂兑现轨迹）
+    day_1_return = Column(Float)                             # 板块 T+1 收益 (%)
+    day_3_return = Column(Float)                             # 板块 T+3 收益 (%)
+    day_5_return = Column(Float)                             # 板块 T+5 收益 (%)
+    max_return_window = Column(Integer)                      # 最大收益出现在第几天（1/3/5）
+    max_return_pct = Column(Float)                           # 最大收益率 (%)
+    pead_direction = Column(String(16))                      # 漂移方向：aligned / counter / neutral
     # 备注
     notes = Column(Text, default='')
     # 时间戳
@@ -1364,6 +1371,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             # 创建所有表
             Base.metadata.create_all(self._engine)
             self._migrate_node2_sector_trends()
+            self._migrate_catalyst_realizations()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1419,6 +1427,56 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 session.commit()
         except Exception as exc:
             logger.warning("[storage] node2_sector_trends 列迁移失败，降级运行: %s", exc)
+
+    def _migrate_catalyst_realizations(self) -> None:
+        """幂等轻量迁移：为 catalyst_realizations 补齐 PEAD 多窗口新列。
+
+        生产库若为旧版（无 day_1_return 等 6 列），create_all 不补列 →
+        check_and_record_realization flush 时 OperationalError。
+        模式同 _migrate_node2_sector_trends：PRAGMA table_info → ALTER TABLE。
+        """
+        if not self._is_sqlite_engine:
+            return
+        new_columns = {
+            "day_1_return": "FLOAT",
+            "day_3_return": "FLOAT",
+            "day_5_return": "FLOAT",
+            "max_return_window": "INTEGER",
+            "max_return_pct": "FLOAT",
+            "pead_direction": "VARCHAR(16)",
+        }
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='catalyst_realizations'"
+                    )
+                ).scalar()
+                if not table_exists:
+                    return
+                existing = {
+                    row[1]
+                    for row in session.execute(
+                        text("PRAGMA table_info(catalyst_realizations)")
+                    ).fetchall()
+                }
+                for col, col_type in new_columns.items():
+                    if col not in existing:
+                        session.execute(
+                            text(
+                                f"ALTER TABLE catalyst_realizations "
+                                f"ADD COLUMN {col} {col_type}"
+                            )
+                        )
+                        logger.info(
+                            "[storage] 迁移 catalyst_realizations: 新增列 %s", col
+                        )
+                session.commit()
+        except Exception as exc:
+            logger.warning(
+                "[storage] catalyst_realizations 列迁移失败，降级运行: %s", exc
+            )
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()

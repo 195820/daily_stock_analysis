@@ -1837,7 +1837,8 @@ class SectorAnalysisNode:
         - 硬触发 HI1：单日 score 崩≥20 → 立即降级；HI2：单日暴涨>8%+leading → 立即进主线
         - 2026-08-24 移除 HI3（大盘暴跌全局拦截）：职责与输出层主线裁剪重复，
           且破坏状态机马尔可夫性（未破位板块也被强制踢出，回主线需重走 2 天确认）。
-          暴跌日的风险控制已统一到 attack_power → 主线裁剪层（attack_power < 0.25 → max_mainline=1）。
+          暴跌日的风险控制已统一到 attack_power → 主线裁剪层
+          （5 档阶梯：<0.15→1 / <0.30→2 / <0.50→3 / <0.70→4 / ≥0.70→5）。
 
         破位/未破位判据（区分 高位降温(回调未坏) vs 衰竭(破位)）：
           BROKEN = OR(5日涨幅≤0, 跌破MA20, 过热exhausted且20日高位<0.60, 单日崩≥20)
@@ -2968,12 +2969,17 @@ class SectorAnalysisNode:
         # 低攻击力(暴跌/熊市)→保底 1 个；高攻击力(牛市)→最多 4-5 个
         # 2026-08-20：下限从 0 提到 1，避免独立行情主线被全裁
         # （当日实例：attack_power=0.22 但医药链 90+ 分共振，20→0 全灭）
-        if attack_power < 0.25:
-            max_mainline = self._MAINLINE_PRUNE_FLOOR
-        elif attack_power < 0.40:
+        # 2026-08-27：细粒度阶梯（替代原 0.25/0.40/0.70 硬阈值）
+        # 原问题：attack_power=0.2463 刚好 < 0.25，max_mainline=1，白银99.3/黄金71.5 全被踢
+        # 新方案：5 档阶梯，封顶 5 不变，低攻击力仍保底 1 条
+        if attack_power < 0.15:
             max_mainline = 1
-        elif attack_power < 0.70:
+        elif attack_power < 0.30:
+            max_mainline = 2
+        elif attack_power < 0.50:
             max_mainline = 3
+        elif attack_power < 0.70:
+            max_mainline = 4
         else:
             max_mainline = 5
 

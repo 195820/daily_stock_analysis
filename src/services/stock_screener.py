@@ -1446,6 +1446,26 @@ class StockScreenerPipeline:
         candidates = [c for c in candidates if not _is_limit_up(c)]
         logger.info(f"轮次 0: {len(candidates)} 只（剔除 {limit_up_count} 只涨停）")
 
+        # 轮次 0b: 软过滤——涨 ≥8% 不参与买入排序（P0-3 新增）
+        # 非涨停但涨幅过大，追高风险极高（创业板涨10%不算涨停但风险同样大）
+        # 归零保底：过滤后池不足 5 只时，按涨幅从低放回过热票补足并打标，
+        # 后续由 _score_risk 的 ≥8% -20 惩罚自然压后（防候选池归零）
+        OVERHEAT_THRESHOLD = 8.0
+        OVERHEAT_FLOOR = 5
+        hot_pool = [c for c in candidates if (c.get("change_pct", 0) or 0) >= OVERHEAT_THRESHOLD]
+        candidates = [c for c in candidates if (c.get("change_pct", 0) or 0) < OVERHEAT_THRESHOLD]
+        if len(candidates) < OVERHEAT_FLOOR and hot_pool:
+            hot_pool.sort(key=lambda c: c.get("change_pct", 0) or 0)
+            need = OVERHEAT_FLOOR - len(candidates)
+            for c in hot_pool[:need]:
+                candidates.append(c)
+            logger.info(
+                f"轮次 0b: {len(candidates)} 只（过滤 {len(hot_pool)} 只过热票，"
+                f"池不足放回 {min(need, len(hot_pool))} 只保底）"
+            )
+        else:
+            logger.info(f"轮次 0b: {len(candidates)} 只（过滤 {len(hot_pool)} 只涨≥8%过热票）")
+
         # 轮次 1: 信号过滤（排除衰竭板块）
         exhausted = [s.get("name") for s in got_context.get("sector_context", {}).get("exhausted_mainline", [])]
         candidates = [c for c in candidates if c["sector"] not in exhausted]
@@ -2184,6 +2204,14 @@ class StockScreenerPipeline:
                             score -= 8
                         elif abs(deviation) > 7:
                             score -= 3
+
+                # 6. 当日涨幅惩罚（P0-3 新增）
+                # 大涨后追高风险：创业板涨8%+、主板涨8%+ 风险极高
+                change_pct = c.get("change_pct", 0) or 0
+                if change_pct >= 8.0:
+                    score -= 20      # 大涨追高风险
+                elif change_pct >= 5.0:
+                    score -= 10      # 中度上涨追高风险
 
                 scores[c["code"]] = max(0, score)
             except Exception as e:

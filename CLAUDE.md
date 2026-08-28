@@ -1245,8 +1245,11 @@ push2.eastmoney.com HTTP 接口被东财反爬封锁（RemoteDisconnected），�
 - **数据库**: SQLite `data/stock_analysis.db`（自动建表）
 - **配置**: `.env`（LLM API Key、NGA Cookie、东财反爬等）
 
-```powershell
-conda activate daily_stock_analysis
+```bash
+# ⚠️ Claude Code 使用 Git Bash，必须 source conda profile 后再 activate
+# 禁止使用 conda run（Windows GBK 编码崩溃）
+source D:/ProgramData/miniconda3/etc/profile.d/conda.sh && conda activate daily_stock_analysis
+python main.py --got               # 全流程 GOT（Phase 1 + Phase 2）
 python main.py                     # 常规分析
 python main.py --screener          # 选股
 python main.py --schedule          # 定时模式

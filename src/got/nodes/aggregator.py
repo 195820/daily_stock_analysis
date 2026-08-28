@@ -36,6 +36,7 @@ from src.got.schemas import (
     AmbushCandidate,
     AmbushReservoirEntry,
     CatalystEvent,
+    CrossNodeTemporalSignal,
 )
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
@@ -53,6 +54,8 @@ from src.got.persistence import (
     save_current_context,
     load_ema_baseline,
     save_ema_baseline,
+    load_previous_regime_state,
+    load_regime_state_history,
     EMA_ALPHA,
     EMA_WARMUP_SAMPLES,
 )
@@ -111,13 +114,21 @@ class AggregatorNode:
 
         logger.info("[Node 6] 开始 v3 分层 GOT 聚合")
         today = date.today()
+        self._run_cache = {}  # 单次 run() 内归档回读缓存
 
         # ── Level 0: 全局环境感知 ──
         regime = self._compute_market_regime(market, sector, capital, news, sentiment)
+        # 状态机：跨日记忆 + 转换确认 + dwell 追踪（DISABLE_REGIME_STATE_MACHINE=true 回滚）
+        import os as _os
+        if _os.environ.get("DISABLE_REGIME_STATE_MACHINE", "").lower() == "true":
+            logger.info("[Node 6] DISABLE_REGIME_STATE_MACHINE=true，跳过状态机")
+        else:
+            regime = self._apply_regime_state_machine(regime)
         logger.info(
             f"[Node 6] Level 0 — regime={regime.regime}, "
             f"risk_budget={regime.risk_budget:.2f}, "
-            f"fear_greed={regime.fear_greed:.2f}"
+            f"fear_greed={regime.fear_greed:.2f}, "
+            f"dwell_days={regime.dwell_days}"
         )
 
         # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
@@ -159,6 +170,27 @@ class AggregatorNode:
         temporal = self._adaptive_temporal_check(regime)
         override = await self._simplified_news_override(news, market)
 
+        # ── 跨节点时间线共振（v2.1 Phase 6）──
+        # Rollback 开关：DISABLE_CROSS_NODE_SIGNALS=true 跳过共振检测；
+        # 检测异常降级为空信号，不阻塞 Node 6 主流程
+        import os as _os
+        if _os.environ.get("DISABLE_CROSS_NODE_SIGNALS", "").lower() == "true":
+            logger.info("[Node 6] DISABLE_CROSS_NODE_SIGNALS=true，跳过跨节点共振")
+            cross_node_signals = []
+        else:
+            try:
+                cross_node_signals = self._detect_cross_node_temporal_signals(
+                    regime, capital, sentiment, news,
+                )
+            except Exception as e:
+                logger.warning(f"[Node 6] 跨节点共振检测失败，降级为无信号: {e}")
+                cross_node_signals = []
+        if cross_node_signals:
+            logger.info(
+                f"[Node 6] 跨节点共振: {len(cross_node_signals)} 个信号 — "
+                f"{[s.signal_type for s in cross_node_signals]}"
+            )
+
         key_risks = self._collect_key_risks(news, sentiment, temporal)
         key_opportunities = self._collect_key_opportunities(sector_intels)
 
@@ -184,6 +216,7 @@ class AggregatorNode:
             ambush_pool=ambush_pool,
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
+            cross_node_signals=cross_node_signals,
         )
 
         # 持久化
@@ -193,6 +226,9 @@ class AggregatorNode:
         updated_ema = load_ema_baseline()
         if updated_ema:
             unified.ema_baseline = updated_ema.get("regime_score")
+
+        # ── 生产监控更新（Phase 6）──
+        self._update_monitoring(regime, capital, sentiment, cross_node_signals)
 
         logger.info(
             f"[Node 6] 聚合完成 — regime: {regime.regime}, "
@@ -329,6 +365,79 @@ class AggregatorNode:
             macro_overlay=macro_overlay,
         )
 
+    @staticmethod
+    def _apply_regime_state_machine(regime: MarketRegime) -> MarketRegime:
+        """Regime 状态机：跨日记忆 + 转换确认 + dwell 追踪。
+
+        状态转换规则（v2.1）：
+        - raw == previous → dwell_days += 1
+        - raw != previous 且 raw == transition_pending → 确认切换，dwell_days = 1
+        - raw != previous 且 raw != transition_pending → 保持 previous，
+          transition_pending = raw（首次出现，待次日确认）
+        - 冷启动（无归档/缺字段）→ current = raw，dwell_days = 1，不阻塞
+
+        transition_count：近 20 交易日确认切换次数（从归档序列统计）
+        """
+        # 加载前日 regime 状态
+        prev_state = load_previous_regime_state()
+
+        # 加载 20 日 regime 历史（用于 transition_count）
+        regime_history = load_regime_state_history(days=20)
+
+        raw_regime = regime.regime
+
+        if prev_state is None:
+            # 冷启动：无归档或归档中无 regime 字段
+            logger.info("[Node 6] Regime 状态机冷启动，无历史归档")
+            return regime.model_copy(update={
+                "dwell_days": 1,
+                "previous_regime": None,
+                "transition_count": 0,
+                "transition_pending": None,
+            })
+
+        prev_regime = prev_state["regime"]
+        prev_dwell = prev_state["dwell_days"]
+        prev_pending = prev_state["transition_pending"]
+
+        # 状态转换判定
+        if raw_regime == prev_regime:
+            # 情形 1：与昨日相同 → dwell+1，清除 pending
+            new_regime = prev_regime
+            new_dwell = prev_dwell + 1
+            new_pending = None
+        elif raw_regime == prev_pending:
+            # 情形 2：与 pending 相同 → 确认切换
+            new_regime = prev_pending
+            new_dwell = 1
+            new_pending = None
+            logger.info(
+                f"[Node 6] Regime 切换确认: {prev_regime} → {new_regime}"
+            )
+        else:
+            # 情形 3：新信号 ≠ pending → 保持昨日，设新 pending
+            new_regime = prev_regime
+            new_dwell = prev_dwell + 1
+            new_pending = raw_regime
+            logger.info(
+                f"[Node 6] Regime 首次出现: {raw_regime}，待次日确认"
+            )
+
+        # transition_count：统计历史序列中 regime 切换次数
+        transition_count = 0
+        if len(regime_history) >= 2:
+            for i in range(1, len(regime_history)):
+                if regime_history[i][1] != regime_history[i-1][1]:
+                    transition_count += 1
+
+        return regime.model_copy(update={
+            "regime": new_regime,
+            "dwell_days": new_dwell,
+            "previous_regime": prev_regime,
+            "transition_count": transition_count,
+            "transition_pending": new_pending,
+        })
+
     # =========================================================================
     # Level 1: 板块 mini GOT
     # =========================================================================
@@ -390,6 +499,25 @@ class AggregatorNode:
                 candidates.append((detail.name, detail, role_info))
                 seen_names.add(detail.name)
 
+        # 埋伏正式池中不在 Node 2 名单的板块（蓄水池升格 / 近失来源）：
+        # 升格成功时板块可能已移出 sector.ambush，但已获得入池资格，
+        # 必须补入候选才能拿到 SectorIntel 和 actionable 分类（否则 Phase 2 选股不可见）
+        for candidate in (ambush_pool or []):
+            if candidate.sector_name not in seen_names:
+                detail = self._resolve_pool_sector_detail(sector, candidate)
+                role_info = {
+                    "role": "ambush",
+                    "tier": None,
+                    "quality": None,
+                    "mainline_days": None,
+                }
+                candidates.append((candidate.sector_name, detail, role_info))
+                seen_names.add(candidate.sector_name)
+                logger.info(
+                    f"[Node 6] 池外板块补入 mini GOT 候选: {candidate.sector_name} "
+                    f"({'命中 Node 2 detail' if detail else '无 Node 2 detail，技术分取 strength_lookup'})"
+                )
+
         if not candidates:
             return []
 
@@ -439,6 +567,38 @@ class AggregatorNode:
         results.sort(key=lambda x: x.composite_score, reverse=True)
 
         return results
+
+    @staticmethod
+    def _resolve_pool_sector_detail(
+        sector: SectorContext,
+        candidate: AmbushCandidate,
+    ) -> Optional[SectorDetail]:
+        """为埋伏池板块查找 Node 2 detail（升格后可能已不在 ambush 列表）。
+
+        查找顺序：near_miss → ambush → cooling_down → top_by_score → exhausted；
+        均未命中时用 strength_lookup 合成最小 detail（缺数据时返回 None，
+        由 _compute_sector_scores 走默认技术分降级）。
+        """
+        for detail_list in (
+            sector.near_miss_ambush,
+            sector.ambush,
+            sector.cooling_down,
+            sector.top_by_score,
+            sector.exhausted_mainline,
+        ):
+            for d in detail_list or []:
+                if d.name == candidate.sector_name:
+                    return d
+
+        strength = sector.strength_lookup.get(candidate.sector_name)
+        if strength is None:
+            return None
+        return SectorDetail(
+            code=candidate.sector_code,
+            name=candidate.sector_name,
+            state="ambush",
+            strength_score=strength,
+        )
 
     def _compute_sector_scores(
         self,
@@ -904,36 +1064,37 @@ class AggregatorNode:
         capital: "CapitalContext",
         hot_sectors: list[str],
         today: date,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """4 层闸门流水线（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）。
 
         Returns:
-            (passed, fail_reason, accum_detail)
+            (passed, fail_reason, accum_detail, accum_strength)
             - passed=True: 闸门全通过，accum_detail 为吸筹确认细节
             - passed=False: fail_reason 为否决原因（空串=静默否决，不入 veto_log）
+            - accum_strength: strong / medium / weak / legacy（吸筹档位）
         """
         # 闸门 1: ★★★ 利空否决
         negative_block = self._check_negative_catalyst(sector_events)
         if negative_block:
-            return False, f"★★★利空否决 — {negative_block}", ""
+            return False, f"★★★利空否决 — {negative_block}", "", "legacy"
 
         # 闸门 2: 吸筹确认
-        accumulation_ok, accum_detail = self._check_accumulation_gate(name, capital)
+        accumulation_ok, accum_detail, accum_strength = self._check_accumulation_gate(name, capital)
         if not accumulation_ok:
-            return False, "", ""  # 静默否决（观望，不入 veto_log）
+            return False, "", "", accum_strength  # 静默否决（观望，不入 veto_log）
 
         # 闸门 3: 防买顶双闸
         anti_top_ok, anti_top_reason = self._check_anti_top_buy(
             name, hot_sectors, sector_events, today,
         )
         if not anti_top_ok:
-            return False, f"防买顶否决 — {anti_top_reason}", ""
+            return False, f"防买顶否决 — {anti_top_reason}", "", accum_strength
 
         # 闸门 4: 拥挤度黑名单
         if self._check_crowded_blacklist(name, hot_sectors):
-            return False, "拥挤度黑名单（多只个股上热榜，来晚了）", ""
+            return False, "拥挤度黑名单（多只个股上热榜，来晚了）", "", accum_strength
 
-        return True, "", accum_detail
+        return True, "", accum_detail, accum_strength
 
     # ── P1-2: 蓄水池跨日合并 + 升格 + 除名 ──
 
@@ -1102,7 +1263,7 @@ class AggregatorNode:
                 continue
 
             # 升格 → 重新走闸门
-            gate_passed, fail_reason, accum_detail = self._run_ambush_gates(
+            gate_passed, fail_reason, accum_detail, accum_strength = self._run_ambush_gates(
                 name, sector_events, capital_ctx, hot_sectors, today,
             )
 
@@ -1110,16 +1271,22 @@ class AggregatorNode:
                 score, top_event, category_tag, event_titles = self._compute_catalyst_score(
                     qualified_events, today,
                 )
+                # v2.1: 吸筹档位乘数（strong=1.0 / medium=0.8 / weak=0.6 / legacy=1.0）
+                accum_multiplier = {"strong": 1.0, "medium": 0.8, "weak": 0.6, "legacy": 1.0}.get(
+                    accum_strength, 1.0
+                )
+                adjusted_score = round(score * accum_multiplier, 3)
                 promoted_pool.append(AmbushCandidate(
                     sector_name=name,
                     sector_code=entry.sector_code,
-                    catalyst_score=round(score, 3),
+                    catalyst_score=adjusted_score,
                     category_tag=category_tag,
                     events=event_titles[:3],
                     top_event_date=top_event.event_date if top_event else None,
                     top_event_level=top_event.impact_level if top_event else 1,
                     accumulation_detail=accum_detail,
-                    gate_notes="蓄水池升格",
+                    gate_notes=f"蓄水池升格({accum_strength}×{accum_multiplier})",
+                    accum_strength=accum_strength,
                 ))
                 logger.info(
                     f"[Node 6] 蓄水池升格: {name} "
@@ -1189,7 +1356,7 @@ class AggregatorNode:
                 sector_events = events_by_sector.get(name, [])
 
                 # 闸门流水线（抽取为独立方法，供升格复用）
-                gate_passed, fail_reason, accum_detail = self._run_ambush_gates(
+                gate_passed, fail_reason, accum_detail, accum_strength = self._run_ambush_gates(
                     name, sector_events, capital, hot_sectors, today,
                 )
 
@@ -1222,16 +1389,23 @@ class AggregatorNode:
                     qualified_events, today,
                 )
 
+                # v2.1: 吸筹档位乘数（strong=1.0 / medium=0.8 / weak=0.6 / legacy=1.0）
+                accum_multiplier = {"strong": 1.0, "medium": 0.8, "weak": 0.6, "legacy": 1.0}.get(
+                    accum_strength, 1.0
+                )
+                adjusted_score = round(score * accum_multiplier, 3)
+
                 pool.append(AmbushCandidate(
                     sector_name=name,
                     sector_code=detail.code,
-                    catalyst_score=round(score, 3),
+                    catalyst_score=adjusted_score,
                     category_tag=category_tag,
                     events=event_titles[:3],
                     top_event_date=top_event.event_date if top_event else None,
                     top_event_level=top_event.impact_level if top_event else 1,
                     accumulation_detail=accum_detail,
-                    gate_notes="闸门全通过",
+                    gate_notes=f"闸门全通过({accum_strength}×{accum_multiplier})",
+                    accum_strength=accum_strength,
                 ))
 
         # ── P1-2: 蓄水池跨日合并 ──
@@ -1294,49 +1468,102 @@ class AggregatorNode:
                 return f"{event.title}({event.event_date})"
         return None
 
-    @staticmethod
     def _check_accumulation_gate(
+        self,
         sector_name: str,
         capital: CapitalContext,
-    ) -> tuple[bool, str]:
-        """吸筹确认闸门：连续 3 日小幅净流入
+    ) -> tuple[bool, str, str]:
+        """吸筹确认闸门（v2.1 三档升级）。
 
-        判定依据：capital.evidence.sector_flow 中的板块资金流方向。
-        注意：当前 CapitalContext 仅提供当日截面资金流（top_concepts/top_industries），
-        无逐日序列。降级为"当日正向流入即通过"，待 P6 接入逐日数据后升级。
+        判定逻辑（按优先级）：
+        1. 从归档回读逐日序列，检查板块连续正流入天数和累计值
+        2. 归档不可用时降级为当日截面判定
+
+        Returns:
+            (passed, detail, accum_strength)
+            - passed: 是否通过闸门
+            - detail: 人读友好的判定依据
+            - accum_strength: strong / medium / weak / legacy
         """
-        # 从 sector_flow_all 中查找板块净流入
         sector_flow = capital.evidence.sector_flow if capital and capital.evidence else None
         if not sector_flow:
-            return False, "资金面数据缺失"
+            return False, "资金面数据缺失", "legacy"
 
+        # 从 sector_flow_all 中查找板块当日净流入
         sector_flow_all = sector_flow.get("sector_flow_all") or {}
+        today_flow: Optional[float] = None
         for name, amount in sector_flow_all.items():
             if not isinstance(name, str) or not name:
                 continue
             clean = AggregatorNode._strip_generic_suffix(name)
             if AggregatorNode._fuzzy_match(sector_name, clean):
                 try:
-                    flow_val = float(amount)
+                    today_flow = float(amount)
                 except (TypeError, ValueError):
                     continue
-                if flow_val > 0:
-                    return True, f"当日净流入{flow_val:.1f}亿"
-                else:
-                    return False, f"当日净流出{abs(flow_val):.1f}亿"
+                break
 
-        # top_concepts / top_industries 模糊匹配
-        for key in ("top_concepts", "top_industries"):
-            items = sector_flow.get(key, [])
-            for item in items:
-                match = re.match(r'(.+?)\(([+-]?[\d.]+)亿\)', item)
-                if match and AggregatorNode._fuzzy_match(sector_name, match.group(1)):
-                    flow_val = float(match.group(2))
-                    if flow_val > 0:
-                        return True, f"当日净流入{flow_val:.1f}亿（{key}）"
-                    return False, f"当日净流出{abs(flow_val):.1f}亿（{key}）"
+        # top_concepts / top_industries 模糊匹配兜底
+        if today_flow is None:
+            for key in ("top_concepts", "top_industries"):
+                items = sector_flow.get(key, [])
+                for item in items:
+                    match = re.match(r'(.+?)\(([+-]?[\d.]+)亿\)', item)
+                    if match and AggregatorNode._fuzzy_match(sector_name, match.group(1)):
+                        today_flow = float(match.group(2))
+                        break
+                if today_flow is not None:
+                    break
 
-        return False, "未找到板块资金流数据"
+        if today_flow is None:
+            return False, "未找到板块资金流数据", "legacy"
+
+        # === v2.1: 从归档回读逐日序列，判定吸筹档位 ===
+        sector_flow_all_3d = sector_flow.get("sector_flow_all_3d") or {}
+        # 查找板块 3d 日均
+        flow_3d_avg: Optional[float] = None
+        for sname, val in sector_flow_all_3d.items():
+            clean = AggregatorNode._strip_generic_suffix(sname)
+            if AggregatorNode._fuzzy_match(sector_name, clean):
+                flow_3d_avg = float(val)
+                break
+
+        # 从归档回查板块逐日序列（计算连续正流入天数）
+        # 缓存：单次 run() 内只加载一次（_run_cache 在 run() 入口初始化）
+        consecutive_positive = 0
+        try:
+            from src.got.persistence import load_capital_flow_series
+            cache_key = "_capital_flow_series_5d"
+            if not hasattr(self, "_run_cache"):
+                self._run_cache = {}
+            if cache_key not in self._run_cache:
+                archive_series, _ = load_capital_flow_series(days=5)
+                self._run_cache[cache_key] = archive_series
+            else:
+                archive_series = self._run_cache[cache_key]
+            for sname, series in archive_series.items():
+                clean = AggregatorNode._strip_generic_suffix(sname)
+                if AggregatorNode._fuzzy_match(sector_name, clean):
+                    for _, flow in reversed(series):
+                        if flow > 0:
+                            consecutive_positive += 1
+                        else:
+                            break
+                    break
+        except Exception:
+            pass  # 归档不可用，降级
+
+        # 档位判定（strong/medium 追加当日正向确认，防止历史吸筹但当日出货仍判通过）
+        if consecutive_positive >= 3 and today_flow > 0:
+            return True, f"连续{consecutive_positive}日正流入+当日{today_flow:.1f}亿", "strong"
+        elif consecutive_positive >= 3:
+            return False, f"连续{consecutive_positive}日正流入但当日净流出{abs(today_flow):.1f}亿", "medium"
+        elif flow_3d_avg is not None and flow_3d_avg > 0 and today_flow > 0:
+            return True, f"3日均净流入{flow_3d_avg:.1f}亿+当日{today_flow:.1f}亿", "medium"
+        elif today_flow > 0:
+            return True, f"当日净流入{today_flow:.1f}亿", "weak"
+        else:
+            return False, f"当日净流出{abs(today_flow):.1f}亿", "weak"
 
     def _check_anti_top_buy(
         self,
@@ -1480,6 +1707,8 @@ class AggregatorNode:
 
         口径隔离：只统计主线/降温侧的 actionable，埋伏板块的仓位由
         Node 7 的 ROLE_MULTIPLIER 单独控制，不顶高全局仓位上限。
+
+        v2.1: dwell 感知缩放（替换硬编码 regime 系数）
         """
 
         actionable = [
@@ -1492,20 +1721,188 @@ class AggregatorNode:
             if actionable_count > 0 else 0.0
         )
 
-        if regime.regime == "bear":
-            # 熊市：低仓位
-            position = 0.2 + 0.1 * actionable_count
-        elif regime.regime == "transition":
-            # 震荡市：中等仓位
-            position = 0.3 + 0.1 * actionable_count + 0.1 * avg_confidence
-        else:  # bull
-            # 牛市：较高仓位
-            position = 0.4 + 0.08 * actionable_count + 0.1 * avg_confidence
+        # v2.1: 统一基础仓位 + dwell 感知缩放（REPLACE regime 差异，非相乘叠加）
+        # 原方案 bug：regime 基础公式已含 bear/transition/bull 差异，再乘 dwell 系数 → 三重叠加
+        # 修复：统一基础公式（bull 口径），regime+dwell 合并为单一缩放表
+        position = 0.4 + 0.08 * actionable_count + 0.1 * avg_confidence
+
+        dwell_stage = "established" if regime.dwell_days >= 5 else "fresh"
+        REGIME_DWELL_SCALE = {
+            ("bull", "established"): 1.0,
+            ("bull", "fresh"): 0.9,
+            ("bear", "established"): 0.5,
+            ("bear", "fresh"): 0.7,
+            ("transition", "established"): 0.6,
+            ("transition", "fresh"): 0.6,
+        }
+        dwell_coeff = REGIME_DWELL_SCALE.get(
+            (regime.regime, dwell_stage), 0.6
+        )
+        position *= dwell_coeff
+
+        # 震荡惩罚：transition_count ≥ 5 → × 0.8
+        if regime.transition_count >= 5:
+            position *= 0.8
 
         # 限制在 risk_budget 内
         position = min(position, regime.risk_budget)
 
         return clip(position, 0.0, 0.8)
+
+    @staticmethod
+    def _detect_cross_node_temporal_signals(
+        regime: MarketRegime,
+        capital: CapitalContext,
+        sentiment: SentimentContext,
+        news: NewsContext,
+    ) -> list[CrossNodeTemporalSignal]:
+        """跨节点时间线共振检测（v2.1 Phase 6）。
+
+        消费各节点的时间线状态，输出共振信号。
+        几何平均置信度（非算术平均）惩罚单组件极端值。
+        """
+        import math
+        signals: list[CrossNodeTemporalSignal] = []
+
+        # ── 提取时间线证据 ──
+        dwell = getattr(regime, "dwell_days", 1)
+        transition_count = getattr(regime, "transition_count", 0)
+        current_regime = regime.regime
+
+        # Node 3: 资金流加速度（从 evidence.sector_flow 提取）
+        evidence = getattr(capital, "evidence", None)
+        sector_flow = getattr(evidence, "sector_flow", None) or {}
+        flow_5d_avg_map = sector_flow.get("sector_flow_all_5d", {})
+        flow_1d_map = sector_flow.get("sector_flow_all", {})
+        # 市场级 5d 加速度：全板块平均的 5d 流 / 1d 流 - 1
+        if flow_5d_avg_map and flow_1d_map:
+            market_5d = sum(flow_5d_avg_map.values()) / max(len(flow_5d_avg_map), 1)
+            market_1d = sum(flow_1d_map.values()) / max(len(flow_1d_map), 1)
+            acceleration = (market_5d / market_1d - 1) if market_1d > 0 else None
+        else:
+            acceleration = None
+
+        # Node 5: 情绪阶段状态
+        stage_state = getattr(sentiment, "stage_state", None)
+        persistence_regime = getattr(sentiment, "persistence_regime", None)
+        contrarian_alert = getattr(stage_state, "contrarian_alert", False) if stage_state else False
+        momentum_dir = getattr(stage_state, "momentum_direction", "stable") if stage_state else "stable"
+        sentiment_stage = getattr(sentiment, "sentiment_stage", "neutral")
+
+        # ── 模式 1: bull_confirmation ──
+        # regime 刚确认切牛（dwell=1~2）+ 资金 5d 加速度 > 0.15
+        if current_regime == "bull" and dwell <= 2 and acceleration is not None and acceleration > 0.15:
+            # 置信度：regime 确认(0.8) × 资金加速度(clip(acceleration, 0, 1))
+            capital_conf = clip(acceleration, 0.0, 1.0)
+            components = {"regime_confirmation": 0.8, "capital_acceleration": capital_conf}
+            conf = math.prod(components.values()) ** (1 / len(components))
+            signals.append(CrossNodeTemporalSignal(
+                signal_type="bull_confirmation",
+                confidence=round(conf, 3),
+                component_nodes=["node6_regime", "node3_capital"],
+                component_evidence={
+                    "regime": current_regime,
+                    "dwell_days": dwell,
+                    "flow_5d_acceleration": round(acceleration, 3),
+                },
+                reasoning=(
+                    f"牛市初期确认（dwell={dwell}）+ 资金 5d 加速度 {acceleration:.2f} > 0.15，"
+                    f"机构订单拆分周期启动信号"
+                ),
+                suggested_action="strong_buy",
+            ))
+
+        # ── 模式 2: sentiment_top ──
+        # 反向卖出信号 + 资金 5d 流由正转负
+        if contrarian_alert and momentum_dir == "cooling" and acceleration is not None and acceleration < -0.1:
+            components = {"contrarian_signal": 0.75, "capital_withdrawal": clip(-acceleration, 0.0, 1.0)}
+            conf = math.prod(components.values()) ** (1 / len(components))
+            signals.append(CrossNodeTemporalSignal(
+                signal_type="sentiment_top",
+                confidence=round(conf, 3),
+                component_nodes=["node5_sentiment", "node3_capital"],
+                component_evidence={
+                    "sentiment_stage": sentiment_stage,
+                    "momentum_direction": momentum_dir,
+                    "contrarian_alert": True,
+                    "flow_5d_acceleration": round(acceleration, 3),
+                },
+                reasoning=(
+                    f"情绪反向信号（{sentiment_stage}+{momentum_dir}）+ "
+                    f"资金 5d 撤退（加速度 {acceleration:.2f}），泡沫破裂风险"
+                ),
+                suggested_action="sell",
+            ))
+
+        # ── 模式 3: catalyst_confirmation ──
+        # Node 4 催化兑现 day_3 > 5% + Node 3 对应板块 consistency_days >= 3
+        catalyst_cal = getattr(news, "catalyst_calendar", None)
+        if catalyst_cal:
+            # 查找近期兑现的高影响事件
+            from src.storage import CatalystRealizationRecord, DatabaseManager
+            try:
+                db = DatabaseManager()
+                with db.get_session() as session:
+                    recent_realized = (
+                        session.query(CatalystRealizationRecord)
+                        .filter(CatalystRealizationRecord.is_realized == True)
+                        .filter(CatalystRealizationRecord.day_3_return.isnot(None))
+                        .filter(CatalystRealizationRecord.day_3_return > 5.0)
+                        .order_by(CatalystRealizationRecord.event_date.desc())
+                        .limit(5)
+                        .all()
+                    )
+                for rec in recent_realized:
+                    # 检查该板块是否有 consistency_days >= 3
+                    sector_name = rec.sector
+                    consistency = sector_flow.get("mainline_consistency_days", {})
+                    if isinstance(consistency, dict):
+                        cons_days = consistency.get(sector_name, 0)
+                    else:
+                        cons_days = 0
+                    if cons_days >= 3:
+                        components = {"catalyst_realized": 0.8, "capital_persistent": clip(cons_days / 10.0, 0.0, 1.0)}
+                        conf = math.prod(components.values()) ** (1 / len(components))
+                        signals.append(CrossNodeTemporalSignal(
+                            signal_type="catalyst_confirmation",
+                            confidence=round(conf, 3),
+                            component_nodes=["node4_catalyst", "node3_capital"],
+                            component_evidence={
+                                "sector": sector_name,
+                                "day_3_return": rec.day_3_return,
+                                "consistency_days": cons_days,
+                                "pead_direction": rec.pead_direction,
+                            },
+                            reasoning=(
+                                f"{sector_name} 催化兑现 T+3={rec.day_3_return:.1f}% > 5% + "
+                                f"资金连续正流入 {cons_days} 天，PEAD 漂移延长"
+                            ),
+                            suggested_action="add",
+                        ))
+            except Exception:
+                pass  # DB 查询失败不阻塞
+
+        # ── 模式 4: range_reversal ──
+        # 高震荡（transition_count >= 5）+ 低持续性（persistence_regime == "low"）
+        if transition_count >= 5 and persistence_regime == "low":
+            components = {"regime_choppiness": clip(transition_count / 10.0, 0.0, 1.0), "low_persistence": 0.7}
+            conf = math.prod(components.values()) ** (1 / len(components))
+            signals.append(CrossNodeTemporalSignal(
+                signal_type="range_reversal",
+                confidence=round(conf, 3),
+                component_nodes=["node6_regime", "node5_sentiment"],
+                component_evidence={
+                    "transition_count": transition_count,
+                    "persistence_regime": persistence_regime,
+                },
+                reasoning=(
+                    f"高震荡（20 日切换 {transition_count} 次）+ "
+                    f"情绪低持续性（mean-reverting），短线反转策略有效"
+                ),
+                suggested_action="short_term_reversal",
+            ))
+
+        return signals
 
     @staticmethod
     def _determine_unified_signal(
@@ -1910,6 +2307,18 @@ class AggregatorNode:
                 resolution="资金强流入但情绪平淡，警惕资金单兵抢跑后回落，谨慎追涨",
             ))
 
+        # ── 矛盾 5: Regime 刚切换低置信（dwell < 2）──
+        dwell_days = getattr(regime, "dwell_days", 1)
+        if dwell_days < 2:
+            contradictions.append(Contradiction(
+                pair="regime_fresh_switch",
+                timeframe="cross",
+                description=f"regime 刚切换（dwell={dwell_days}），所有矛盾检测低置信度",
+                severity="low",
+                conflict_type="temporal",
+                resolution="regime 处于过渡期，信号不稳定，建议降低仓位或观望",
+            ))
+
         return contradictions
 
     @staticmethod
@@ -2216,6 +2625,74 @@ class AggregatorNode:
         if match:
             text = match.group(1)
         return json.loads(text)
+
+    def _update_monitoring(
+        self,
+        regime: MarketRegime,
+        capital: CapitalContext,
+        sentiment: SentimentContext,
+        cross_node_signals: list[CrossNodeTemporalSignal],
+    ) -> None:
+        """更新生产监控 JSON（Phase 6）。
+
+        每日 run() 末尾调用，汇总各节点时间线健康指标 + 异常告警。
+        """
+        from src.got.persistence import save_monitoring
+
+        # Node 1: regime 切换次数（从归档回读近 20 日统计）
+        from src.got.persistence import load_regime_history
+        try:
+            regime_hist = load_regime_history(days=20)
+            switch_count = sum(
+                1 for i in range(1, len(regime_hist))
+                if regime_hist[i][1] != regime_hist[i - 1][1]
+            )
+        except Exception:
+            switch_count = getattr(regime, "transition_count", 0)
+
+        # Node 3: 资金流非空率
+        evidence = getattr(capital, "evidence", None)
+        sector_flow = getattr(evidence, "sector_flow", None) or {}
+        flow_5d_map = sector_flow.get("sector_flow_all_5d", {})
+        flow_1d_map = sector_flow.get("sector_flow_all", {})
+        total_boards = max(len(flow_1d_map), 1)
+        non_null_5d = sum(1 for v in flow_5d_map.values() if v is not None and v != 0)
+        flow_5d_rate = non_null_5d / total_boards
+
+        # Node 3: 主线板块连续正流入天数平均值
+        consistency_days_map = sector_flow.get("mainline_consistency_days", {})
+        if isinstance(consistency_days_map, dict) and consistency_days_map:
+            consistency_avg = sum(consistency_days_map.values()) / len(consistency_days_map)
+        else:
+            consistency_avg = 0.0
+
+        # Node 5: 反向信号（今日是否触发，由 save_monitoring 维护 30 日窗口）
+        stage_state = getattr(sentiment, "stage_state", None)
+        contrarian_alert_today = bool(
+            stage_state and getattr(stage_state, "contrarian_alert", False)
+        )
+
+        # 情绪持续性
+        persistence_regime = getattr(sentiment, "persistence_regime", None)
+
+        # 跨节点信号计数
+        signal_counts: dict[str, int] = {}
+        for sig in cross_node_signals:
+            signal_counts[sig.signal_type] = signal_counts.get(sig.signal_type, 0) + 1
+
+        try:
+            save_monitoring(
+                regime_dwell=getattr(regime, "dwell_days", 1),
+                regime_switch_count_20d=switch_count,
+                flow_5d_non_null_rate=flow_5d_rate,
+                flow_5d_total_boards=total_boards,
+                mainline_consistency_avg=consistency_avg,
+                contrarian_alert_today=contrarian_alert_today,
+                persistence_regime=persistence_regime,
+                cross_node_signal_counts=signal_counts,
+            )
+        except Exception as e:
+            logger.warning(f"[Node 6] 监控写入失败: {e}")
 
     # =========================================================================
     # Mock 输出

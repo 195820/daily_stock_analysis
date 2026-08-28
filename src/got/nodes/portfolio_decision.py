@@ -382,6 +382,8 @@ class PortfolioDecisionNode:
 
         # 构建板块 → 强度映射（从 sector_context）
         sector_strength_map = self._build_sector_strength_map(sector_context)
+        # P0-2 修复：sector_context.strength_lookup 覆盖全量板块（双保险）
+        strength_lookup = getattr(sector_context, "strength_lookup", {}) or {}
 
         # 构建板块情报映射（从 Node 6 v3 的 confirmed_sectors）
         sector_intel_map = self._build_sector_intel_map(unified)
@@ -403,7 +405,11 @@ class PortfolioDecisionNode:
         for position in positions:
             symbol = position.get("symbol", "")
             name = position.get("name", symbol)
-            stock_sector_info = self._find_stock_sector(symbol, unified)
+            stock_sector_info = self._find_stock_sector(
+                symbol, unified,
+                sector_strength_map=sector_strength_map,
+                strength_lookup=strength_lookup,
+            )
             sector_name = stock_sector_info.get("sector_name", "")
             holding_candidates.append({
                 "code": symbol,
@@ -434,7 +440,11 @@ class PortfolioDecisionNode:
             pnl_pct_decimal = pnl_pct / 100.0
 
             # 查找该股票所属板块（从 sector_context 的 confirmed_sectors 匹配）
-            stock_sector_info = self._find_stock_sector(symbol, unified)
+            stock_sector_info = self._find_stock_sector(
+                symbol, unified,
+                sector_strength_map=sector_strength_map,
+                strength_lookup=strength_lookup,
+            )
             sector_name = stock_sector_info.get("sector_name", "")
             sector_type = stock_sector_info.get("sector_type", "")
             sector_strength = stock_sector_info.get("strength", 50.0)
@@ -995,7 +1005,9 @@ class PortfolioDecisionNode:
         return max(0.0, min(100.0, score))
 
     def _find_stock_sector(
-        self, symbol: str, unified_context: UnifiedContext
+        self, symbol: str, unified_context: UnifiedContext,
+        sector_strength_map: Dict[str, float] = None,
+        strength_lookup: Dict[str, float] = None,
     ) -> Dict[str, Any]:
         """查找股票所属板块及其强度
 
@@ -1018,7 +1030,11 @@ class PortfolioDecisionNode:
 
         # 正向映射未命中时，用反向查询补充
         if not sectors_list:
-            sectors_list = self._reverse_lookup_stock_sector(clean_symbol, unified_context)
+            sectors_list = self._reverse_lookup_stock_sector(
+                clean_symbol, unified_context,
+                sector_strength_map=sector_strength_map,
+                strength_lookup=strength_lookup,
+            )
             if sectors_list:
                 self._stock_sector_map[clean_symbol] = sectors_list
 
@@ -1160,7 +1176,9 @@ class PortfolioDecisionNode:
             logger.error(f"[板块映射] 构建失败: {e}")
 
     def _reverse_lookup_stock_sector(
-        self, symbol: str, unified_context: UnifiedContext
+        self, symbol: str, unified_context: UnifiedContext,
+        sector_strength_map: Dict[str, float] = None,
+        strength_lookup: Dict[str, float] = None,
     ) -> list:
         """反向查询股票所属板块，匹配 Node 6 聚合后的板块情报
 
@@ -1222,14 +1240,63 @@ class PortfolioDecisionNode:
             matched[0]["all_belong_boards"] = all_board_names
             return matched
 
-        # 降级：无匹配时，返回第一个板块用于显示（不影响评分）
+        # 降级：无匹配时，从 sector_strength_map / strength_lookup 查实际强度
+        # P0-2 修复：不再硬编码 50.0，优先用 Node 2 实际强度分
         if all_board_names:
+            _smap = sector_strength_map or {}
+            _slookup = strength_lookup or {}
+
+            def _lookup_strength(board_name: str):
+                """查板块强度：精确匹配 → 别名匹配 → 子串匹配 → None（未查到）"""
+                # 1. 精确匹配（is-not-None 防止 strength=0.0 穿透）
+                s = _smap.get(board_name)
+                if s is not None:
+                    return s
+                s = _slookup.get(board_name)
+                if s is not None:
+                    return s
+                # 2. 常见别名：贵金属↔黄金, 有色↔有色金属 等
+                _ALIASES = {
+                    "贵金属": ["黄金", "黄金概念"],
+                    "有色": ["有色金属", "稀缺资源"],
+                    "养殖": ["种业", "其他养殖"],
+                }
+                for alias, targets in _ALIASES.items():
+                    if alias in board_name:
+                        for t in targets:
+                            s = _smap.get(t)
+                            if s is not None:
+                                return s
+                            s = _slookup.get(t)
+                            if s is not None:
+                                return s
+                # 3. 子串匹配：遍历全部命中取最高分（避免 dict 插入序决定结果）
+                best: float | None = None
+                for map_key, map_val in {**_smap, **_slookup}.items():
+                    if board_name in map_key or map_key in board_name:
+                        if best is None or map_val > best:
+                            best = map_val
+                return best
+
+            # 遍历所有板块名，采纳实际强度分（含弱板块 <50，避免乐观偏差）；
+            # 仅当全部查不到时才兜底中性分 50（#9 修复）
             fallback_board = all_board_names[0]
-            logger.info(f"[反向查询] {symbol}: 所属板块 {all_board_names} 均不在 confirmed_sectors 中，降级显示第一个板块")
+            fallback_strength = None
+            for bname in all_board_names:
+                s = _lookup_strength(bname)
+                if s is not None and (fallback_strength is None or s > fallback_strength):
+                    fallback_strength = s
+                    fallback_board = bname
+            if fallback_strength is None:
+                fallback_strength = 50.0
+            logger.info(
+                f"[反向查询] {symbol}: 所属板块 {all_board_names} 均不在 confirmed_sectors 中，"
+                f"降级使用 {fallback_board}（强度 {fallback_strength:.1f}）"
+            )
             return [{
                 "sector_name": fallback_board,
                 "sector_type": "belong_board",  # 标记为非评分板块
-                "strength": 50.0,  # 中性评分
+                "strength": fallback_strength,  # P0-2: 实际强度分（非硬编码 50）
                 "weight": 0.5,  # 低权重
                 "sector_role": "neutral",
                 "is_fallback": True,  # 标记为降级匹配
@@ -1808,6 +1875,10 @@ class PortfolioDecisionNode:
             s.sector_name for s in unified_context.confirmed_sectors
             if s.classification == "actionable"
         }
+        # 埋伏正式池板块（含蓄水池升格）直接获得选股资格：
+        # 升格后掉出 Node 2 名单的板块可能不在 confirmed_sectors 中
+        for candidate in unified_context.ambush_pool:
+            actionable_names.add(candidate.sector_name)
         filtered_mainline = []
         for g in sector_ctx_dict.get("active_mainline", []):
             members = g.get("members")
@@ -1827,6 +1898,22 @@ class PortfolioDecisionNode:
             s for s in sector_ctx_dict.get("ambush", [])
             if s.get("name") in actionable_names
         ]
+        # 补入埋伏池中不在 Node 2 ambush 名单的板块（蓄水池升格路径）：
+        # _extract_got_universe 只读 sector_context.ambush，不补入则升格板块无法选股；
+        # strength_score 从 Node 2 的 strength_lookup 查表（升格消费专用字段）
+        strength_lookup = getattr(sector_context, "strength_lookup", {}) or {}
+        existing_ambush_names = {s.get("name") for s in sector_ctx_dict["ambush"]}
+        for candidate in unified_context.ambush_pool:
+            if candidate.sector_name not in existing_ambush_names:
+                sector_ctx_dict["ambush"].append({
+                    "name": candidate.sector_name,
+                    "strength_score": strength_lookup.get(candidate.sector_name, 0.0),
+                })
+                existing_ambush_names.add(candidate.sector_name)
+                logger.info(
+                    f"[Phase 2] 埋伏池板块补入选股池: {candidate.sector_name} "
+                    f"(不在 Node 2 当日 ambush 名单，catalyst_score={candidate.catalyst_score})"
+                )
         logger.info(
             f"[Phase 2] 选股池限定：{len(actionable_names)} 个 actionable 板块参与，"
             f"共 {len(unified_context.confirmed_sectors)} 个 confirmed_sectors"

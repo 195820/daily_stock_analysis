@@ -465,6 +465,25 @@ class HotStock(BaseModel):
     associated_sectors: list[str] = Field(default_factory=list)
 
 
+class SentimentStageState(BaseModel):
+    """情绪阶段状态机（v2.1 跨日记忆）
+
+    反身性 5 阶段的跨日连续性追踪：
+    - dwell_days：当前阶段持续天数（情绪持续性信号）
+    - momentum_direction：升温/降温/稳定（转换方向比绝对水平更重要）
+    - stage_transitions：近 10 日阶段序列（高频切换 → 震荡标记）
+    - contrarian_alert：连续升温到极端 / 极端阶段持续过久 → 反向信号
+
+    学术依据：Han et al. (2022) 情绪持续期携带信息；Da et al. (FEARS) 高频冲击预测短期反转
+    """
+    current_stage: str = Field(..., description="euphoria / optimism / neutral / pessimism / capitulation")
+    dwell_days: int = Field(default=1, description="当前阶段持续交易日数")
+    previous_stage: Optional[str] = Field(default=None, description="前一交易日的阶段")
+    momentum_direction: str = Field(default="stable", description="warming / cooling / stable")
+    stage_transitions: list[str] = Field(default_factory=list, description="近 10 日阶段序列（升序）")
+    contrarian_alert: bool = Field(default=False, description="反向信号（连续升温到极端或极端阶段超时）")
+
+
 class SentimentContext(BaseModel):
     """Node 5 输出：情绪面分析上下文"""
     status: str = Field(default="normal", description="normal / degraded / failed")
@@ -497,6 +516,15 @@ class SentimentContext(BaseModel):
     sentiment_momentum: float = Field(
         default=0.0,
         description="情绪动量（当前score与EMA5偏差，正=升温, 负=降温）",
+    )
+    # ── v2.1 跨日情绪状态机 ──
+    stage_state: Optional[SentimentStageState] = Field(
+        default=None,
+        description="情绪阶段状态机（dwell/方向/反向信号）",
+    )
+    persistence_regime: Optional[str] = Field(
+        default=None,
+        description="情绪持续性：high（AR(1)>0.7, trending）/ low（<0.3, mean-reverting）/ None",
     )
 
 
@@ -555,6 +583,34 @@ class MarketRegime(BaseModel):
     sentiment_momentum: float = Field(default=0.0, description="Node 5: 情绪动量")
     # ── 输出 ──
     macro_overlay: str = Field(default="", description="一句话宏观判断（LLM 或规则生成）")
+    # ── Regime 状态机（v2.1 跨日记忆）──
+    dwell_days: int = Field(default=1, description="当前 regime 持续交易日数")
+    previous_regime: Optional[str] = Field(default=None, description="前一交易日的 regime（用于状态转换）")
+    transition_count: int = Field(default=0, description="近 20 交易日 regime 确认切换次数（震荡度）")
+    transition_pending: Optional[str] = Field(default=None, description="待确认的新 regime（首次出现，待次日确认）")
+
+
+class CrossNodeTemporalSignal(BaseModel):
+    """跨节点时间线共振信号（v2.1 Phase 6）
+
+    四种共振模式：
+    - bull_confirmation: regime 刚确认切牛 + 资金 5d 加速度 > 0 → 强买入
+    - sentiment_top: 反向卖出 + 资金撤退 → 强卖出
+    - catalyst_confirmation: 催化兑现 T+3 > 5% + 资金连续正流入 → 加仓
+    - range_reversal: 高震荡 + 低持续性 → 短线反转策略有效
+
+    学术依据：Liu & Wang (2017), Han (2022), PEAD 文献
+    """
+    signal_type: str = Field(
+        ..., description="bull_confirmation / sentiment_top / catalyst_confirmation / range_reversal"
+    )
+    confidence: float = Field(..., ge=0.0, le=1.0, description="几何平均置信度（≥2 组件确认）")
+    component_nodes: list[str] = Field(default_factory=list, description="参与节点，如 ['node6', 'node3']")
+    component_evidence: dict = Field(default_factory=dict, description="各节点具体证据值")
+    reasoning: str = Field(default="", description="人读友好的解释")
+    suggested_action: str = Field(
+        default="", description="strong_buy / sell / add / short_term_reversal"
+    )
 
 
 class SectorIntel(BaseModel):
@@ -623,6 +679,10 @@ class AmbushCandidate(BaseModel):
     top_event_level: int = Field(default=1, ge=1, le=3, description="最高等级事件 ★ 数")
     accumulation_detail: str = Field(default="", description="吸筹确认细节")
     gate_notes: str = Field(default="", description="闸门通过备注")
+    accum_strength: str = Field(
+        default="legacy",
+        description="吸筹档位: strong(连续3日正) / medium(3日累计正) / weak(仅当日正) / legacy(冷启动)",
+    )
 
 
 class AmbushReservoirEntry(BaseModel):
@@ -724,6 +784,12 @@ class UnifiedContext(BaseModel):
     ambush_veto_log: list[str] = Field(
         default_factory=list,
         description="矛盾否决记录（★★★利空 / 拥挤黑名单等否决理由）",
+    )
+
+    # ── 跨节点时间线共振（v2.1 Phase 6）──
+    cross_node_signals: list[CrossNodeTemporalSignal] = Field(
+        default_factory=list,
+        description="跨节点时间线共振信号（bull_confirmation / sentiment_top / catalyst_confirmation / range_reversal）",
     )
 
 

@@ -23,8 +23,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from data_provider.base import DataFetcherManager
 from src.got.schemas import (
     SentimentContext,
+    SentimentStageState,
     HotStock,
     DataQuality,
+)
+from src.got.persistence import (
+    load_previous_stage_state,
+    load_sentiment_score_history,
 )
 
 logger = logging.getLogger(__name__)
@@ -155,6 +160,17 @@ class SentimentAnalysisNode:
         # Step 8b: 时序动量（与历史 EMA 对比）
         sentiment_momentum = self._compute_sentiment_momentum(sentiment_score)
 
+        # Step 8c: v2.1 情绪阶段状态机 + AR(1) 持续性
+        # Rollback 开关：DISABLE_SENTIMENT_STAGE_STATE=true 回退
+        import os as _os
+        if _os.environ.get("DISABLE_SENTIMENT_STAGE_STATE", "").lower() == "true":
+            logger.info("[Node 5] DISABLE_SENTIMENT_STAGE_STATE=true，跳过阶段状态机")
+            stage_state = None
+            persistence_regime = None
+        else:
+            stage_state = self._apply_stage_state_machine(stage)
+            persistence_regime = self._compute_ar1_persistence()
+
         # Step 9: LLM reasoning + hot_topics
         reasoning, hot_topics = await self._generate_reasoning(
             overall, sentiment_score, stage, forum_mood,
@@ -193,13 +209,24 @@ class SentimentAnalysisNode:
         result.sentiment_dispersion = dispersion_info.get("dispersion", 0.0)
         result.contrarian_signal = dispersion_info.get("contrarian_signal", False)
         result.sentiment_momentum = sentiment_momentum
+        # v2.1 阶段状态机 + 持续性
+        result.stage_state = stage_state
+        result.persistence_regime = persistence_regime
+        # 阶段状态机的反向信号合并到 contrarian_signal（OR 逻辑）
+        if stage_state and stage_state.contrarian_alert:
+            result.contrarian_signal = True
         logger.info(
             "[Node 5] 完成 — status=%s, score=%.2f, stage=%s, signal=%s, "
-            "dispersion=%.2f, momentum=%+.3f, contrarian=%s",
+            "dispersion=%.2f, momentum=%+.3f, contrarian=%s, "
+            "stage_state(dwell=%d, dir=%s, alert=%s), persistence=%s",
             status, sentiment_score, stage, signal,
             dispersion_info.get("dispersion", 0.0),
             sentiment_momentum,
-            dispersion_info.get("contrarian_signal", False),
+            result.contrarian_signal,
+            stage_state.dwell_days if stage_state else 0,
+            stage_state.momentum_direction if stage_state else "?",
+            stage_state.contrarian_alert if stage_state else False,
+            persistence_regime,
         )
         return result
 
@@ -929,6 +956,207 @@ class SentimentAnalysisNode:
             ema = alpha * s + (1 - alpha) * ema
 
         return round(current_score - ema, 3)
+
+    # =================================================================
+    # v2.1 情绪阶段状态机 + AR(1) 持续性 + 反向信号
+    # =================================================================
+
+    # 阶段序数（用于判断升温/降温方向）
+    _STAGE_ORDER = {
+        "capitulation": 0,
+        "pessimism": 1,
+        "neutral": 2,
+        "optimism": 3,
+        "euphoria": 4,
+    }
+
+    @staticmethod
+    def _apply_stage_state_machine(
+        raw_stage: str,
+    ) -> SentimentStageState:
+        """情绪阶段状态机（跨日记忆）。
+
+        逻辑（与 Node 6 Regime 状态机对齐）：
+        - raw == previous → dwell+1（阶段持续）
+        - raw != previous → 切换，dwell=1，记录 previous
+        - 冷启动（无归档）→ current=raw, dwell=1
+
+        额外输出：
+        - momentum_direction：基于近 3 日阶段变化方向
+        - stage_transitions：近 10 日阶段序列（升序）
+        - contrarian_alert：反向信号（见 _compute_stage_contrarian_alert）
+        """
+        prev_state = load_previous_stage_state()
+
+        if prev_state is None:
+            # 冷启动
+            return SentimentStageState(
+                current_stage=raw_stage,
+                dwell_days=1,
+                previous_stage=None,
+                momentum_direction="stable",
+                stage_transitions=[raw_stage],
+                contrarian_alert=False,
+            )
+
+        prev_stage = prev_state["current_stage"]
+        prev_dwell = prev_state["dwell_days"]
+        prev_transitions = prev_state.get("stage_transitions", [])
+
+        if raw_stage == prev_stage:
+            # 持续：dwell+1，清除 previous
+            new_dwell = prev_dwell + 1
+            new_previous = prev_stage
+        else:
+            # 切换：dwell=1
+            new_dwell = 1
+            new_previous = prev_stage
+
+        # 构建近 10 日阶段序列
+        new_transitions = list(prev_transitions[-9:]) + [raw_stage]
+
+        # 动量方向：看最近 3 日阶段变化
+        recent = new_transitions[-3:] if len(new_transitions) >= 3 else new_transitions
+        momentum = SentimentAnalysisNode._compute_momentum_direction(recent)
+
+        # 反向信号
+        contrarian = SentimentAnalysisNode._compute_stage_contrarian_alert(
+            current_stage=raw_stage,
+            dwell_days=new_dwell,
+            momentum_direction=momentum,
+            stage_transitions=new_transitions,
+        )
+
+        return SentimentStageState(
+            current_stage=raw_stage,
+            dwell_days=new_dwell,
+            previous_stage=new_previous,
+            momentum_direction=momentum,
+            stage_transitions=new_transitions,
+            contrarian_alert=contrarian,
+        )
+
+    @staticmethod
+    def _compute_momentum_direction(recent_stages: list[str]) -> str:
+        """从近 N 日阶段序列判断动量方向。
+
+        warming：阶段序数单调上升（至少 2 次上升）
+        cooling：阶段序数单调下降（至少 2 次下降）
+        stable：其他
+
+        Returns:
+            "warming" / "cooling" / "stable"
+        """
+        if len(recent_stages) < 2:
+            return "stable"
+
+        order = SentimentAnalysisNode._STAGE_ORDER
+        nums = [order.get(s, 2) for s in recent_stages]
+
+        # 计算连续上升/下降次数
+        rising = sum(1 for i in range(1, len(nums)) if nums[i] > nums[i - 1])
+        falling = sum(1 for i in range(1, len(nums)) if nums[i] < nums[i - 1])
+
+        if rising >= 2 and rising > falling:
+            return "warming"
+        if falling >= 2 and falling > rising:
+            return "cooling"
+        return "stable"
+
+    @staticmethod
+    def _compute_stage_contrarian_alert(
+        current_stage: str,
+        dwell_days: int,
+        momentum_direction: str,
+        stage_transitions: list[str],
+    ) -> bool:
+        """反向信号触发条件（学术依据：Han 2022 + Da FEARS）。
+
+        规则：
+        1. 连续 3 天升温（momentum_direction == "warming" 且最近 3 日阶段上升）
+           → contrarian_sell（散户狂热 = 顶部预警）
+        2. 连续 3 天降温（momentum_direction == "cooling" 且最近 3 日阶段下降）
+           → contrarian_buy（恐慌耗尽 = 底部预警）
+        3. euphoria 持续 > 5 天 → contrarian_sell（过度贪婪）
+        4. capitulation 持续 > 3 天 → contrarian_buy（恐慌耗尽）
+        5. 高频切换（10 日 ≥ 5 次变化）→ 震荡标记，不触发反向
+        """
+        # 高频切换 → 不触发反向（市场犹豫不决）
+        if len(stage_transitions) >= 5:
+            changes = sum(
+                1 for i in range(1, len(stage_transitions))
+                if stage_transitions[i] != stage_transitions[i - 1]
+            )
+            if changes >= 5:
+                return False
+
+        # 规则 3: euphoria 持续 > 5 天
+        if current_stage == "euphoria" and dwell_days > 5:
+            return True
+
+        # 规则 4: capitulation 持续 > 3 天
+        if current_stage == "capitulation" and dwell_days > 3:
+            return True
+
+        # 规则 1 & 2: 连续 3 天升温/降温
+        if momentum_direction == "warming" and len(stage_transitions) >= 3:
+            order = SentimentAnalysisNode._STAGE_ORDER
+            last3 = [order.get(s, 2) for s in stage_transitions[-3:]]
+            if last3[0] < last3[1] < last3[2]:
+                return True
+
+        if momentum_direction == "cooling" and len(stage_transitions) >= 3:
+            order = SentimentAnalysisNode._STAGE_ORDER
+            last3 = [order.get(s, 2) for s in stage_transitions[-3:]]
+            if last3[0] > last3[1] > last3[2]:
+                return True
+
+        return False
+
+    @staticmethod
+    def _compute_ar1_persistence() -> Optional[str]:
+        """计算近 20 日 sentiment_score 的 AR(1) 系数，判断情绪持续性。
+
+        AR(1) = Corr(score_t, score_{t-1})
+
+        学术依据（Han et al. 2022）：
+        - AR(1) > 0.7 → high_persistence（trending regime，异象显著）
+        - AR(1) < 0.3 → low_persistence（mean-reverting，反转策略有效）
+        - 0.3 ~ 0.7 → medium（中间态，不做特殊处理）
+
+        Returns:
+            "high" / "low" / "medium" / None（数据不足）
+        """
+        history = load_sentiment_score_history(days=20)
+        if len(history) < 20:
+            logger.info(
+                "[Node 5] AR(1) 数据不足（%d/20 日），标 unknown", len(history)
+            )
+            return None
+
+        scores = [s for _, s in history]
+
+        # 计算 AR(1) 系数：简单用 lag-1 自相关
+        n = len(scores)
+        mean_val = sum(scores) / n
+        numerator = sum(
+            (scores[t] - mean_val) * (scores[t - 1] - mean_val)
+            for t in range(1, n)
+        )
+        denominator = sum((s - mean_val) ** 2 for s in scores)
+
+        if denominator == 0:
+            # 常数序列 → 完全持续
+            return "high"
+
+        ar1 = numerator / denominator
+        logger.info("[Node 5] AR(1) = %.3f（%d 日历史）", ar1, n)
+
+        if ar1 > 0.7:
+            return "high"
+        if ar1 < 0.3:
+            return "low"
+        return "medium"
 
     # =================================================================
     # LLM reasoning

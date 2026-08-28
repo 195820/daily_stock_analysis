@@ -74,6 +74,50 @@ _INDUSTRY_WEIGHT = 0.35      # 行业板块权重
 _DDE_NET_INFLOW_SCALE = 1e8  # DDE 净流入额归一化基数（元）
 
 
+# =============================================================================
+# 数据新鲜度验证（Phase 6）
+# =============================================================================
+
+
+def _validate_data_freshness(df: pd.DataFrame, expected_date: str) -> dict:
+    """验证 akshare 返回的数据是否为当日（防反爬缓存）。
+
+    检查逻辑：
+    1. 如果 df 有 "日期" 列 → 精确匹配
+    2. 如果 df 有 "时间" 列 → 取最新时间戳的日期部分
+    3. 都没有 → 假设有效（无法验证时不阻塞）
+
+    Returns:
+        dict: {"is_fresh": bool, "stale_data": bool, "detail": str}
+    """
+    result = {"is_fresh": True, "stale_data": False, "detail": "无法验证（无日期列）"}
+
+    if df is None or df.empty:
+        result["detail"] = "空数据"
+        return result
+
+    # 精确日期匹配
+    if "日期" in df.columns:
+        dates = df["日期"].astype(str).str.strip()
+        latest = dates.iloc[-1][:10]  # 取最后一行的日期
+        result["is_fresh"] = latest == expected_date
+        result["stale_data"] = not result["is_fresh"]
+        result["detail"] = f"日期列最新={latest}, 期望={expected_date}"
+        return result
+
+    # 时间戳列
+    if "时间" in df.columns:
+        times = df["时间"].astype(str).str.strip()
+        latest_time = times.iloc[-1]
+        latest_date = latest_time[:10]
+        result["is_fresh"] = latest_date == expected_date
+        result["stale_data"] = not result["is_fresh"]
+        result["detail"] = f"时间列最新={latest_time}, 期望日期={expected_date}"
+        return result
+
+    return result
+
+
 class CapitalAnalysisNode:
     """资金面分析节点（GOT Node 3，实时版）"""
 
@@ -353,13 +397,25 @@ class CapitalAnalysisNode:
         1. 概念板块按净流入排名，Top N 均值为概念分数
         2. 行业板块同理
         3. 加权合并
-        4. 如果主线板块在 Top 10 中，额外加分
+        4. 主线板块加分（强度×持续性，上限 0.15）
+        5. 从归档回读多日序列，计算板块级 3d/5d 日均映射
         """
         if data is None:
             return None
 
         concept_df = data.get("concept")
         industry_df = data.get("industry")
+
+        # 数据新鲜度验证（防反爬缓存返回旧数据）
+        from datetime import date as _date_cls
+        _today_str = _date_cls.today().isoformat()
+        for _label, _df in [("concept", concept_df), ("industry", industry_df)]:
+            if _df is not None and not _df.empty:
+                _fresh = _validate_data_freshness(_df, _today_str)
+                if _fresh["stale_data"]:
+                    logger.warning(
+                        f"[Node 3] {_label} 数据陈旧: {_fresh['detail']}"
+                    )
 
         scores = []
         weights = []
@@ -416,25 +472,8 @@ class CapitalAnalysisNode:
         total_w = sum(weights)
         final_score = sum(s * w / total_w for s, w in zip(scores, weights))
 
-        # 主线板块加分：如果活跃主线的板块出现在概念 Top 10
-        mainline_bonus = 0.0
-        if sector_context and concept_df is not None and not concept_df.empty:
-            mainline_names = {
-                m.name for g in sector_context.active_mainline for m in g.members
-            }
-            net_col = _find_column(concept_df, ["净额", "净流"])
-            name_col = _find_column(concept_df, ["行业", "板块名称", "名称"])
-            if net_col and name_col:
-                top10_names = set(
-                    concept_df.nlargest(10, net_col)[name_col].tolist()
-                )
-                if mainline_names & top10_names:
-                    mainline_bonus = 0.15  # 主线资金确认加分
-
-        final_score = clip(final_score + mainline_bonus, -1.0, 1.0)
-
         # 构建全量板块名→净流入(亿)映射（~300 概念 + ~41 行业），供下游评分使用
-        sector_flow_all = {}
+        sector_flow_all: dict[str, float] = {}
         for _df in [concept_df, industry_df]:
             if _df is None or _df.empty:
                 continue
@@ -451,11 +490,99 @@ class CapitalAnalysisNode:
                 prev = sector_flow_all.get(_name, float("-inf"))
                 sector_flow_all[_name] = round(float(_amount), 2) if _amount > prev else prev
 
+        # === v2.1 多窗口扩展：从归档回读逐日序列 ===
+        # Rollback 开关：DISABLE_NODE3_MULTIDAY=true 回退到单日模式
+        import os as _os
+        _multiday_disabled = _os.environ.get("DISABLE_NODE3_MULTIDAY", "").lower() == "true"
+
+        sector_flow_all_3d: dict[str, float] = {}
+        sector_flow_all_5d: dict[str, float] = {}
+        mainline_consistency_days_map: dict[str, int] = {}
+        acceleration: Optional[float] = None
+
+        if _multiday_disabled:
+            logger.info("[Node 3] DISABLE_NODE3_MULTIDAY=true，回退单日模式")
+        else:
+            try:
+                from src.got.persistence import load_capital_flow_series
+                archive_sector_series, _ = load_capital_flow_series(days=5)
+            except Exception as e:
+                logger.warning(f"[Node 3] 归档回读失败，多窗口降级: {e}")
+                archive_sector_series = {}
+
+            if archive_sector_series:
+                # 板块级 3d/5d 日均映射
+                for sector_name, series in archive_sector_series.items():
+                    flows = [flow for _, flow in series]
+                    if len(flows) >= 3:
+                        sector_flow_all_3d[sector_name] = round(
+                            sum(flows[-3:]) / min(len(flows), 3), 2
+                        )
+                    if len(flows) >= 5:
+                        sector_flow_all_5d[sector_name] = round(
+                            sum(flows[-5:]) / min(len(flows), 5), 2
+                        )
+
+                # 主线板块连续性（连续正流入天数，按板块 dict）
+                if sector_context:
+                    mainline_names = {
+                        m.name for g in sector_context.active_mainline for m in g.members
+                    }
+                    for ml_name in mainline_names:
+                        series = archive_sector_series.get(ml_name, [])
+                        if not series:
+                            continue
+                        # 从最近一天往前数连续正流入天数
+                        consecutive = 0
+                        for _, flow in reversed(series):
+                            if flow > 0:
+                                consecutive += 1
+                            else:
+                                break
+                        mainline_consistency_days_map[ml_name] = consecutive
+
+            # 市场级加速度：口径对齐（仅计算同时有 1d 和 5d 数据的板块）
+            common_boards = set(sector_flow_all_5d.keys()) & set(sector_flow_all.keys())
+            if common_boards:
+                today_common = sum(sector_flow_all[b] for b in common_boards)
+                avg_5d_common = sum(sector_flow_all_5d[b] for b in common_boards)
+                if today_common > 0 and avg_5d_common > 0:
+                    acceleration = round(avg_5d_common / today_common - 1, 3)
+
+        # === 主线板块加分：强度×持续性（上限 0.15）===
+        mainline_bonus = 0.0
+        if sector_context and sector_flow_all:
+            # 强度：主线板块在当日的百分位排名（0~1）
+            sorted_flows = sorted(sector_flow_all.values())
+            n_sectors = len(sorted_flows)
+            mainline_names = {
+                m.name for g in sector_context.active_mainline for m in g.members
+            }
+            mainline_pct_ranks = []
+            for ml_name in mainline_names:
+                flow = sector_flow_all.get(ml_name)
+                if flow is not None and n_sectors > 0:
+                    # 计算百分位排名
+                    rank = sum(1 for f in sorted_flows if f <= flow) / n_sectors
+                    mainline_pct_ranks.append(rank)
+
+            if mainline_pct_ranks and mainline_consistency_days_map:
+                avg_pct = sum(mainline_pct_ranks) / len(mainline_pct_ranks)
+                max_consistency = max(mainline_consistency_days_map.values())
+                # 强度 × 持续性，上限 0.15
+                mainline_bonus = clip(avg_pct * max_consistency * 0.02, 0, 0.15)
+
+        final_score = clip(final_score + mainline_bonus, -1.0, 1.0)
+
         return final_score, {
             "score": round(final_score, 4),
             "top_concepts": top_concepts,
             "top_industries": top_industries,
             "sector_flow_all": sector_flow_all,
+            "sector_flow_all_3d": sector_flow_all_3d,
+            "sector_flow_all_5d": sector_flow_all_5d,
+            "mainline_consistency_days": mainline_consistency_days_map,
+            "acceleration": acceleration,
             "mainline_bonus": mainline_bonus > 0,
             "timestamp": data.get("timestamp"),
         }
@@ -466,6 +593,7 @@ class CapitalAnalysisNode:
 
         逻辑：全市场大单净流入金额合计 / 归一化基数 → clip(-1, 1)
         数据源：DdeFetcher (Playwright → push2.eastmoney.com)
+        v2.1 扩展：从归档回读 DDE 序列，计算累计值和连续正流入天数
         """
         if data is None:
             return None
@@ -485,11 +613,41 @@ class CapitalAnalysisNode:
         inflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) > 0)
         outflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) < 0)
 
+        # === v2.1 DDE 序列归档回查 ===
+        cumulative_3d: Optional[float] = None
+        cumulative_5d: Optional[float] = None
+        consecutive_positive_days = 0
+
+        try:
+            from src.got.persistence import load_capital_flow_series
+            _, dde_series = load_capital_flow_series(days=5)
+        except Exception as e:
+            logger.warning(f"[Node 3] DDE 归档回读失败: {e}")
+            dde_series = []
+
+        if dde_series:
+            # 累计值（最近 3d/5d 之和）
+            flows = [flow for _, flow in dde_series]
+            if len(flows) >= 3:
+                cumulative_3d = round(sum(flows[-3:]), 2)
+            if len(flows) >= 5:
+                cumulative_5d = round(sum(flows[-5:]), 2)
+
+            # 连续正流入天数（从最近一天往前数）
+            for _, flow in reversed(dde_series):
+                if flow > 0:
+                    consecutive_positive_days += 1
+                else:
+                    break
+
         return dde_score, {
             "score": round(dde_score, 4),
             "total_net_inflow": round(total_net / 1e8, 2),  # 亿元
             "inflow_stock_count": inflow_count,
             "outflow_stock_count": outflow_count,
+            "cumulative_3d": cumulative_3d,
+            "cumulative_5d": cumulative_5d,
+            "consecutive_positive_days": consecutive_positive_days,
             "timestamp": data.get("timestamp"),
         }
 
