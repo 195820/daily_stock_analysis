@@ -172,7 +172,7 @@ class TestAccumulationGateTiers(unittest.TestCase):
         from src.got.nodes.aggregator import AggregatorNode
         capital = self._make_capital({"半导体": 10.0})
         with patch("src.got.persistence.load_capital_flow_series", return_value=({}, [])):
-            passed, detail, strength = self.node._check_accumulation_gate("半导体", capital)
+            passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
         self.assertTrue(passed)
         self.assertEqual(strength, "weak")
 
@@ -186,7 +186,7 @@ class TestAccumulationGateTiers(unittest.TestCase):
         # Mock archive to return no consecutive data (so falls to medium)
         mock_series = {"半导体": [("20260825", -3.0), ("20260826", 8.0), ("20260827", 10.0)]}
         with patch("src.got.persistence.load_capital_flow_series", return_value=(mock_series, [])):
-            passed, detail, strength = self.node._check_accumulation_gate("半导体", capital)
+            passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
         self.assertTrue(passed)
         self.assertEqual(strength, "medium")
 
@@ -199,7 +199,7 @@ class TestAccumulationGateTiers(unittest.TestCase):
         )
         mock_series = {"半导体": [("20260825", 3.0), ("20260826", 8.0), ("20260827", 10.0)]}
         with patch("src.got.persistence.load_capital_flow_series", return_value=(mock_series, [])):
-            passed, detail, strength = self.node._check_accumulation_gate("半导体", capital)
+            passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
         self.assertTrue(passed)
         self.assertEqual(strength, "strong")
         self.assertIn("3", detail)  # 应含连续天数
@@ -208,11 +208,11 @@ class TestAccumulationGateTiers(unittest.TestCase):
         """当日负流入 → 闸门失败。"""
         from src.got.nodes.aggregator import AggregatorNode
         capital = self._make_capital({"半导体": -10.0})
-        passed, detail, strength = self.node._check_accumulation_gate("半导体", capital)
+        passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
         self.assertFalse(passed)
 
     def test_missing_sector_flow_fails(self):
-        """资金面数据缺失 → 闸门失败 + legacy。"""
+        """资金面数据缺失 → 闸门失败 + missing 三态（区分无信号与坏信号，调用方应转观察而非否决）。"""
         from src.got.nodes.aggregator import AggregatorNode
         from src.got.schemas import CapitalContext, CapitalEvidence
         capital = CapitalContext(
@@ -222,9 +222,16 @@ class TestAccumulationGateTiers(unittest.TestCase):
             confidence_multiplier=0.0,
             evidence=CapitalEvidence(),
         )
-        passed, detail, strength = self.node._check_accumulation_gate("半导体", capital)
+        passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
         self.assertFalse(passed)
-        self.assertEqual(strength, "legacy")
+        self.assertEqual(strength, "missing")
+
+    def test_unknown_sector_returns_missing(self):
+        """板块不在资金流覆盖且无别名映射 → missing 而非 legacy。"""
+        capital = self._make_capital({"半导体": -10.0})
+        passed, detail, strength, _evidence = self.node._check_accumulation_gate("量子面料", capital)
+        self.assertFalse(passed)
+        self.assertEqual(strength, "missing")
 
 
 class TestAmbushCandidateBackwardCompat(unittest.TestCase):

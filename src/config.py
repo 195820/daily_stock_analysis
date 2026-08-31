@@ -741,6 +741,17 @@ class Config:
     screener_auto_trade_min_score: float = 75.0            # 自动建仓最低评分
     screener_auto_trade_quantity: float = 100.0            # 自动建仓数量（股）
 
+    # === 过热检测 v2 九维权重（plan_overheat_v2.md §3.2 三案例标定后写入，合计 1.0）===
+    overheat_weight_divergence: float = 0.20               # D1 MACD 背离
+    overheat_weight_volume_divergence: float = 0.15        # D2 量能背离
+    overheat_weight_breadth: float = 0.10                  # D3 宽度极端
+    overheat_weight_turnover: float = 0.10                 # D4 换手极端
+    overheat_weight_ad: float = 0.05                       # D5 A/D 线分配
+    overheat_weight_vol_stall: float = 0.05                # D6 天量滞涨
+    overheat_weight_leader: float = 0.20                   # D7 龙头极端（高潮型核心）
+    overheat_weight_fatigue: float = 0.10                  # D8 主线疲劳（时间维度）
+    overheat_weight_chase: float = 0.05                    # D9 成分股追高（宽度辅助）
+
     # === 板块轮动服务 ===
     sector_rotation_enabled: bool = True
     sector_rotation_lookback_days: int = 5                  # 回溯天数
@@ -1556,6 +1567,15 @@ class Config:
             screener_weight_technical=parse_env_float(os.getenv('SCREENER_WEIGHT_TECHNICAL'), 0.30, field_name='SCREENER_WEIGHT_TECHNICAL', minimum=0.0, maximum=1.0),
             screener_weight_strategy=parse_env_float(os.getenv('SCREENER_WEIGHT_STRATEGY'), 0.20, field_name='SCREENER_WEIGHT_STRATEGY', minimum=0.0, maximum=1.0),
             screener_weight_risk=parse_env_float(os.getenv('SCREENER_WEIGHT_RISK'), 0.10, field_name='SCREENER_WEIGHT_RISK', minimum=0.0, maximum=1.0),
+            overheat_weight_divergence=parse_env_float(os.getenv('OVERHEAT_WEIGHT_DIVERGENCE'), 0.20, field_name='OVERHEAT_WEIGHT_DIVERGENCE', minimum=0.0, maximum=1.0),
+            overheat_weight_volume_divergence=parse_env_float(os.getenv('OVERHEAT_WEIGHT_VOLUME_DIVERGENCE'), 0.15, field_name='OVERHEAT_WEIGHT_VOLUME_DIVERGENCE', minimum=0.0, maximum=1.0),
+            overheat_weight_breadth=parse_env_float(os.getenv('OVERHEAT_WEIGHT_BREADTH'), 0.10, field_name='OVERHEAT_WEIGHT_BREADTH', minimum=0.0, maximum=1.0),
+            overheat_weight_turnover=parse_env_float(os.getenv('OVERHEAT_WEIGHT_TURNOVER'), 0.10, field_name='OVERHEAT_WEIGHT_TURNOVER', minimum=0.0, maximum=1.0),
+            overheat_weight_ad=parse_env_float(os.getenv('OVERHEAT_WEIGHT_AD'), 0.05, field_name='OVERHEAT_WEIGHT_AD', minimum=0.0, maximum=1.0),
+            overheat_weight_vol_stall=parse_env_float(os.getenv('OVERHEAT_WEIGHT_VOL_STALL'), 0.05, field_name='OVERHEAT_WEIGHT_VOL_STALL', minimum=0.0, maximum=1.0),
+            overheat_weight_leader=parse_env_float(os.getenv('OVERHEAT_WEIGHT_LEADER'), 0.20, field_name='OVERHEAT_WEIGHT_LEADER', minimum=0.0, maximum=1.0),
+            overheat_weight_fatigue=parse_env_float(os.getenv('OVERHEAT_WEIGHT_FATIGUE'), 0.10, field_name='OVERHEAT_WEIGHT_FATIGUE', minimum=0.0, maximum=1.0),
+            overheat_weight_chase=parse_env_float(os.getenv('OVERHEAT_WEIGHT_CHASE'), 0.05, field_name='OVERHEAT_WEIGHT_CHASE', minimum=0.0, maximum=1.0),
             screener_portfolio_enabled=parse_env_bool(os.getenv('SCREENER_PORTFOLIO_ENABLED'), default=True),
             screener_auto_trade=parse_env_bool(os.getenv('SCREENER_AUTO_TRADE'), default=False),
             screener_auto_trade_min_score=parse_env_float(os.getenv('SCREENER_AUTO_TRADE_MIN_SCORE'), 75.0, field_name='SCREENER_AUTO_TRADE_MIN_SCORE', minimum=0.0, maximum=100.0),

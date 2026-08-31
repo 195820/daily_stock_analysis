@@ -47,6 +47,13 @@ from src.got.catalyst_config import (
     CATALYST_CONFIDENCE_GATE,
     RESERVOIR_EXPIRY_DAYS,
     RESERVOIR_PROMOTION_MIN_DAYS,
+    REFINE_TOP_N,
+    REFINE_MAX_SECTORS,
+    AMBUSH_NOMINATION_MAX,
+    AMBUSH_NOMINATION_MIN_CONFIDENCE,
+    AMBUSH_NOMINATION_MULTIPLIER,
+    AMBUSH_NOMINATION_MIN_CONSECUTIVE,
+    AMBUSH_NOMINATION_DISABLED,
 )
 from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
@@ -132,8 +139,8 @@ class AggregatorNode:
         )
 
         # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
-        ambush_pool, ambush_reservoir, ambush_veto_log = self._build_ambush_channel(
-            sector, capital, news, sentiment,
+        ambush_pool, ambush_reservoir, ambush_veto_log = await self._build_ambush_channel(
+            sector, capital, news, sentiment, regime=regime,
         )
 
         # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
@@ -144,17 +151,28 @@ class AggregatorNode:
         # 将埋伏通道结果回写到 SectorIntel（供 reasoning.md 和 Phase 2 消费）
         self._enrich_ambush_sector_intel(sector_intels, ambush_pool, ambush_reservoir)
 
+        veto_n = sum(
+            1 for v in ambush_veto_log if not v.split(": ", 1)[-1].startswith("吸筹观察")
+        )
+        observe_n = len(ambush_veto_log) - veto_n
+        nominated_n = sum(1 for c in ambush_pool if getattr(c, "nominated", False))
         logger.info(
             f"[Node 6] Level 1 — {len(sector_intels)} 个板块情报, "
             f"actionable={sum(1 for s in sector_intels if s.classification == 'actionable')}, "
             f"caution={sum(1 for s in sector_intels if s.classification == 'caution')}, "
             f"exclude={sum(1 for s in sector_intels if s.classification == 'exclude')}"
-            f" | 埋伏通道: 正式池={len(ambush_pool)}, 蓄水池={len(ambush_reservoir)}, "
-            f"否决={len(ambush_veto_log)}"
+            f" | 埋伏通道: 正式池={len(ambush_pool)}(含提名{nominated_n}), "
+            f"蓄水池={len(ambush_reservoir)}, 否决={veto_n} 观察={observe_n}"
         )
 
-        # LLM 精炼板块情报
-        sector_intels = await self._llm_refine_sectors(sector_intels, regime)
+        # LLM 精炼板块情报（决策 20：视野扩围 + 注入催化事件，让 Agent 看见带催化的埋伏候选）
+        refine_calendar = getattr(news, "catalyst_calendar", None)
+        refine_events_map = self._group_events_by_sector(
+            refine_calendar.events if refine_calendar else []
+        )
+        sector_intels = await self._llm_refine_sectors(
+            sector_intels, regime, catalyst_events_by_sector=refine_events_map,
+        )
 
         # ── Level 2: 组合决策 ──
         position_limit = self._compute_position_from_regime(regime, sector_intels, market.position_limit)
@@ -190,6 +208,11 @@ class AggregatorNode:
                 f"[Node 6] 跨节点共振: {len(cross_node_signals)} 个信号 — "
                 f"{[s.signal_type for s in cross_node_signals]}"
             )
+
+        # T3: 矛盾仲裁者（仅 medium/high 严重度，串行 LLM，影子模式）
+        contradictions = await self._arbitrate_contradictions(
+            contradictions, regime, sector, capital, news, sentiment, cross_node_signals,
+        )
 
         key_risks = self._collect_key_risks(news, sentiment, temporal)
         key_opportunities = self._collect_key_opportunities(sector_intels)
@@ -523,6 +546,7 @@ class AggregatorNode:
 
         # 预提取各维度数据
         capital_flows = self._parse_capital_flows(capital)
+        capital_flow_map = self._parse_sector_level_flows(capital)  # A4: 全量 464 板块
         news_keywords = self._extract_news_keywords(news)
         hot_sectors = self._extract_hot_sectors(sentiment)
 
@@ -533,6 +557,7 @@ class AggregatorNode:
             sector_role = role_info.get("role", "mainline")
             composite, capital_check, news_check, other = self._compute_sector_scores(
                 name, detail, capital_flows, news_keywords, hot_sectors, role_info,
+                capital_flow_map=capital_flow_map,
             )
             raw_data.append((name, composite, capital_check, news_check, detail, sector_role, role_info, other))
 
@@ -608,6 +633,7 @@ class AggregatorNode:
         news_keywords: list[tuple[str, dict]],
         hot_sectors: list[str],
         role_info: Optional[dict] = None,
+        capital_flow_map: Optional[dict[str, float]] = None,
     ) -> tuple[float, str, str, dict]:
         """计算板块的 4 维评分和综合分（不含分类）
 
@@ -650,8 +676,10 @@ class AggregatorNode:
             tech_score = 50.0  # 默认中等
             tech_detail = "无 Node 2 数据"
 
-        # ── 维度 2: 资金面 ──
-        capital_check, capital_detail = self._cross_check_capital(name, capital_flows)
+        # ── 维度 2: 资金面（A4: 优先全量查找，Top-8 兜底）──
+        capital_check, capital_detail = self._cross_check_capital(
+            name, capital_flows, capital_flow_map=capital_flow_map,
+        )
 
         # ── 维度 3: 消息面（分级修正：影响等级 × 多源确认 × 海外联动）──
         news_check, news_detail, news_adjust = self._cross_check_news(name, news_keywords)
@@ -755,30 +783,45 @@ class AggregatorNode:
         self,
         name: str,
         flows: list[tuple[str, float]],
+        capital_flow_map: Optional[dict[str, float]] = None,
     ) -> tuple[str, str]:
-        """资金面交叉验证: (check, detail)"""
+        """资金面交叉验证: (check, detail)
+
+        A4: 优先从全量 sector_flow_all (464 板块) 精确查找，
+        Top-8 榜单作模糊兜底。
+        """
+        # A4: 全量查找（优先）
+        if capital_flow_map:
+            amount = capital_flow_map.get(name)
+            if amount is None:
+                # 归一化 + 别名
+                from src.got.board_aliases import sector_name_variants
+                for variant in sector_name_variants(name):
+                    amount = capital_flow_map.get(variant)
+                    if amount is not None:
+                        break
+            if amount is not None:
+                if amount > 10:
+                    return "aligned", f"{name}净流入{amount:.1f}亿(全量)"
+                elif amount > 0:
+                    return "aligned", f"{name}净流入{amount:.1f}亿(小额/全量)"
+                else:
+                    return "neutral", f"{name}净流出{abs(amount):.1f}亿(全量)"
+
+        # Top-8 兜底（A5: 统一匹配入口）
         if not flows:
             return "neutral", "资金面数据缺失"
 
-        # 模糊匹配：板块名是否出现在资金流 top 中
         for flow_name, amount in flows:
-            if self._fuzzy_match(name, flow_name):
+            hit, match_type = self._match_sector(name, flow_name)
+            if hit:
+                # A6: 泛化词匹配只给 neutral（不确认方向）
+                if match_type == "generic":
+                    return "neutral", f"泛化关联[{flow_name}]流入{amount:.1f}亿"
                 if amount > 10:
                     return "aligned", f"{flow_name}净流入{amount:.1f}亿"
                 else:
                     return "aligned", f"{flow_name}净流入{amount:.1f}亿（小额）"
-
-        # 子词匹配（剥离泛化后缀后）
-        clean_name = self._strip_generic_suffix(name)
-        name_parts = self._split_sector_name(clean_name)
-        for flow_name, amount in flows:
-            clean_flow = self._strip_generic_suffix(flow_name)
-            for part in name_parts:
-                if len(part) >= 2 and (part in clean_flow or clean_flow in part):
-                    if amount > 10:
-                        return "aligned", f"关联[{flow_name}]净流入{amount:.1f}亿"
-                    else:
-                        return "neutral", f"关联[{flow_name}]流入{amount:.1f}亿"
 
         return "neutral", f"{name}不在资金流入 top"
 
@@ -806,25 +849,27 @@ class AggregatorNode:
         if not keywords:
             return "neutral", "无消息催化", 0.0
 
-        name_parts = self._split_sector_name(name)
-        matched: list[dict] = []
+        # A5: 统一匹配入口替代 _split_sector_name 子词匹配。
+        # 注：不得以"关键词出现在标题中"作兜底——_extract_news_keywords 会把事件标题本身
+        # 作为关键词加入（kw == meta["title"]），该条件恒真，会导致所有板块匹配全部新闻。
+        # "标题含板块名"的合法场景已由 _match_sector 的 L3 受控子串覆盖。
+        matched: list[tuple[dict, str]] = []  # (meta, match_type)
 
         for kw, meta in keywords:
-            for part in name_parts:
-                if len(part) >= 2 and (part in kw or kw in part or part in meta["title"]):
-                    matched.append(meta)
-                    break
+            hit, match_type = self._match_sector(name, kw)
+            if hit:
+                matched.append((meta, match_type))
 
         if not matched:
             return "neutral", f"{name}无直接消息催化", 0.0
 
         # 去重（按标题）
         seen = set()
-        unique = []
-        for meta in matched:
+        unique: list[tuple[dict, str]] = []
+        for meta, mt in matched:
             if meta["title"] not in seen:
                 seen.add(meta["title"])
-                unique.append(meta)
+                unique.append((meta, mt))
 
         pos_adjust = 0.0
         neg_adjust = 0.0
@@ -832,7 +877,7 @@ class AggregatorNode:
         neg_count = 0
         global_hit = False
 
-        for meta in unique:
+        for meta, match_type in unique:
             sentiment = meta.get("sentiment", "neutral")
             if sentiment not in ("positive", "negative"):
                 continue
@@ -849,6 +894,9 @@ class AggregatorNode:
                 global_hit = True
             if meta.get("lifecycle_state") in ("fading", "archived"):
                 magnitude *= self._NEWS_FADING_MULTIPLIER
+            # A6: 泛化词根匹配降权（防止 "AI" 等短词假阳性加分）
+            if match_type == "generic":
+                magnitude *= 0.5
             if sentiment == "positive":
                 pos_adjust += magnitude
                 pos_count += 1
@@ -860,7 +908,7 @@ class AggregatorNode:
         neg_adjust = max(neg_adjust, self._NEWS_NEG_CAP)
         adjustment = pos_adjust + neg_adjust
 
-        top_title = unique[0]["title"][:30]
+        top_title = unique[0][0]["title"][:30]
         if pos_count > neg_count and adjustment >= 6:
             global_note = "（含海外联动）" if global_hit else ""
             check = "catalyzed"
@@ -880,24 +928,28 @@ class AggregatorNode:
         name: str,
         hot_sectors: list[str],
     ) -> tuple[str, str]:
-        """情绪面交叉验证: (check, detail)"""
+        """情绪面交叉验证: (check, detail) — A5 统一匹配"""
         if not hot_sectors:
             return "low", "无热榜数据"
 
-        # 检查板块名是否出现在热榜关联板块中
-        name_parts = self._split_sector_name(name)
+        # A5: 统一匹配入口替代 _split_sector_name 子词匹配
         match_count = 0
+        generic_count = 0
 
         for hot_sector in hot_sectors:
-            for part in name_parts:
-                if len(part) >= 2 and (part in hot_sector or hot_sector in part):
-                    match_count += 1
-                    break
+            hit, match_type = self._match_sector(name, hot_sector)
+            if hit:
+                match_count += 1
+                if match_type == "generic":
+                    generic_count += 1
 
-        if match_count >= 3:
-            return "high", f"{match_count}只关联股票上热榜"
-        elif match_count >= 1:
-            return "medium", f"{match_count}只关联股票上热榜"
+        # A6: 泛化词根匹配不计入有效匹配数
+        effective_count = match_count - generic_count
+
+        if effective_count >= 3:
+            return "high", f"{effective_count}只关联股票上热榜"
+        elif effective_count >= 1:
+            return "medium", f"{effective_count}只关联股票上热榜"
         else:
             return "low", f"{name}未上热榜"
 
@@ -973,21 +1025,48 @@ class AggregatorNode:
         self,
         sectors: list[SectorIntel],
         regime: MarketRegime,
+        catalyst_events_by_sector: Optional[dict] = None,
     ) -> list[SectorIntel]:
-        """LLM 精炼板块情报（可选，生成 narrative + 跨板块风险）"""
+        """LLM 精炼板块情报（可选，生成 narrative + 跨板块风险）
+
+        决策 20：视野扩围 — 基础片为 composite 降序前 REFINE_TOP_N，
+        追加全部埋伏角色候选（总量 ≤ REFINE_MAX_SECTORS），并注入合格催化事件，
+        避免低位带催化的埋伏候选（如 0831 短剧游戏）完全不在 Agent 视野内。
+        """
         if not sectors:
             return sectors
 
+        # ── 切片：基础片（前 REFINE_TOP_N）+ 埋伏候选追加片 ──
+        base = sectors[:REFINE_TOP_N]
+        extra = [
+            s for s in sectors[REFINE_TOP_N:]
+            if getattr(s, "sector_role", "mainline") == "ambush"
+        ][: max(0, REFINE_MAX_SECTORS - REFINE_TOP_N)]
+        view = base + extra
+
         # 构建板块情报文本
         sector_lines = []
-        for i, s in enumerate(sectors[:10], 1):  # 只取前 10 个
-            sector_lines.append(
+        for i, s in enumerate(view, 1):
+            lines = [
                 f"{i}. {s.sector_name} | {s.classification} | score={s.composite_score:.0f}\n"
                 f"   {s.tech_detail}\n"
                 f"   资金: {s.capital_check}（{s.capital_detail}）\n"
                 f"   催化: {s.news_check}（{s.news_detail}）\n"
                 f"   热度: {s.sentiment_check}（{s.sentiment_detail}）"
-            )
+            ]
+            # 埋伏候选注入合格催化事件（决策 20）：让 Agent 看见消息面证据
+            if getattr(s, "sector_role", "mainline") == "ambush" and catalyst_events_by_sector:
+                evs = [
+                    e for e in self._lookup_sector_events(s.sector_name, catalyst_events_by_sector)
+                    if e.confidence >= CATALYST_CONFIDENCE_GATE and e.direction != "negative"
+                ]
+                if evs:
+                    ev_desc = "; ".join(
+                        f"[{e.event_date} {'★' * e.impact_level}] {e.title[:40]}"
+                        for e in evs[:2]
+                    )
+                    lines.append(f"   日历催化剂: {ev_desc}")
+            sector_lines.append("\n".join(lines))
 
         sectors_text = "\n".join(sector_lines)
 
@@ -996,6 +1075,9 @@ class AggregatorNode:
 
 板块情报：
 {sectors_text}
+
+判断规则补充：埋伏角色（ambush）板块若带有日历催化剂但当前为 caution，
+可结合催化强度与资金面证据建议上调为 actionable；无催化剂支撑不要上调。
 
 请输出 JSON：
 {{
@@ -1064,37 +1146,54 @@ class AggregatorNode:
         capital: "CapitalContext",
         hot_sectors: list[str],
         today: date,
-    ) -> tuple[bool, str, str, str]:
-        """4 层闸门流水线（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）。
+    ) -> tuple[bool, str, str, str, dict]:
+        """4 层闸门流水线（★★★利空 + 防买顶 + 拥挤度 + 吸筹确认）。
+
+        闸门序（0831 短剧案例修正）：利空 → 防买顶 → 拥挤 → 吸筹。
+        吸筹放最后：它不是市场否决而是"时机未到"，且需要把证据透出给
+        Agent 提名通道（决策 21）；吸筹失败不再静默，以「吸筹观察」留痕。
+        正常入池路径的语义与结果不变（四闸全过才入池）。
 
         Returns:
-            (passed, fail_reason, accum_detail, accum_strength)
+            (passed, fail_reason, accum_detail, accum_strength, evidence)
             - passed=True: 闸门全通过，accum_detail 为吸筹确认细节
-            - passed=False: fail_reason 为否决原因（空串=静默否决，不入 veto_log）
-            - accum_strength: strong / medium / weak / legacy（吸筹档位）
+            - passed=False: fail_reason 为否决/观察原因（空串=静默否决）
+            - accum_strength: strong / medium / weak / legacy / missing
+              （missing = 资金流数据缺失，非市场信号，调用方应转观察而非否决）
+            - evidence: 吸筹证据 {today_flow, flow_3d_avg, consecutive_positive}，
+              供提名前置条件 G3 使用；吸筹未评估时为空 dict 兜底
         """
-        # 闸门 1: ★★★ 利空否决
+        empty_evidence = {"today_flow": None, "flow_3d_avg": None, "consecutive_positive": 0}
+
+        # 闸门 1: ★★★ 利空否决（否决权不可被 Agent 覆盖）
         negative_block = self._check_negative_catalyst(sector_events)
         if negative_block:
-            return False, f"★★★利空否决 — {negative_block}", "", "legacy"
+            return False, f"★★★利空否决 — {negative_block}", "", "legacy", empty_evidence
 
-        # 闸门 2: 吸筹确认
-        accumulation_ok, accum_detail, accum_strength = self._check_accumulation_gate(name, capital)
-        if not accumulation_ok:
-            return False, "", "", accum_strength  # 静默否决（观望，不入 veto_log）
-
-        # 闸门 3: 防买顶双闸
+        # 闸门 2: 防买顶双闸（真否决，提名不可覆盖）
         anti_top_ok, anti_top_reason = self._check_anti_top_buy(
             name, hot_sectors, sector_events, today,
         )
         if not anti_top_ok:
-            return False, f"防买顶否决 — {anti_top_reason}", "", accum_strength
+            return False, f"防买顶否决 — {anti_top_reason}", "", "legacy", empty_evidence
 
-        # 闸门 4: 拥挤度黑名单
+        # 闸门 3: 拥挤度黑名单（真否决，提名不可覆盖）
         if self._check_crowded_blacklist(name, hot_sectors):
-            return False, "拥挤度黑名单（多只个股上热榜，来晚了）", "", accum_strength
+            return False, "拥挤度黑名单（多只个股上热榜，来晚了）", "", "legacy", empty_evidence
 
-        return True, "", accum_detail, accum_strength
+        # 闸门 4: 吸筹确认（唯一可被 Agent 提名救回的闸门）
+        accumulation_ok, accum_detail, accum_strength, evidence = self._check_accumulation_gate(
+            name, capital,
+        )
+        if not accumulation_ok:
+            if accum_strength == "missing":
+                # 数据缺失保持静默（由调用方转蓄水池观察，语义不变）
+                return False, "", "", accum_strength, evidence
+            # S1 留痕：吸筹失败 = "时机未到的观察"而非市场否决，不再静默丢弃；
+            # 提名成功时调用方会移除此观察条目，未获提名则落盘为否决日志可见
+            return False, f"吸筹观察 — {accum_detail}", accum_detail, accum_strength, evidence
+
+        return True, "", accum_detail, accum_strength, evidence
 
     # ── P1-2: 蓄水池跨日合并 + 升格 + 除名 ──
 
@@ -1174,8 +1273,15 @@ class AggregatorNode:
             days = prev.get("days_in_reservoir", 0) + 1
 
             # 再评估：今日不在近失名单 + 驻留≥3天 → 除名
-            # "不再是近失"本身是最强的退出信号，不需要等到过期
-            if today_near_miss_names is not None and name not in today_near_miss_names and days >= 3:
+            # "不再是近失"本身是最强的退出信号，不需要等到过期；
+            # data_missing 条目豁免：它们是数据盲区而非"不再是近失"，退出由过期上限控制，
+            # 待别名表补上或数据源覆盖后自会经升格重走闸门救活
+            if (
+                prev.get("reason") != "data_missing"
+                and today_near_miss_names is not None
+                and name not in today_near_miss_names
+                and days >= 3
+            ):
                 logger.info(f"[Node 6] 蓄水池再评估除名: {name} (驻留{days}天, 已不在近失名单)")
                 continue
 
@@ -1231,6 +1337,16 @@ class AggregatorNode:
         events_by_sector = self._group_events_by_sector(all_events)
         hot_sectors = self._extract_hot_sectors(sentiment_ctx)
 
+        # A2 可观测性：蓄水池板块的催化事件覆盖率
+        covered = sum(
+            1 for e in reservoir_entries
+            if self._lookup_sector_events(e.sector_name, events_by_sector)
+        )
+        logger.info(
+            f"[Node 6] 蓄水池升格: {len(reservoir_entries)} 板块, "
+            f"催化事件覆盖 {covered} 个 (事件总数 {len(all_events)})"
+        )
+
         promoted_pool: list[AmbushCandidate] = []
         remaining: list[AmbushReservoirEntry] = []
 
@@ -1242,14 +1358,26 @@ class AggregatorNode:
                 remaining.append(entry)
                 continue
 
-            # 条件 2: 有合格催化剂
-            sector_events = events_by_sector.get(name, [])
+            # 条件 2: 有合格催化剂（A2: 归一化查找）
+            sector_events = self._lookup_sector_events(name, events_by_sector)
             qualified_events = [
                 e for e in sector_events
                 if e.confidence >= CATALYST_CONFIDENCE_GATE
                 and e.direction != "negative"
             ]
             if not qualified_events:
+                # A3 影子评估：若门槛降至 0.60 会放行吗？
+                shadow = [
+                    e for e in sector_events
+                    if 0.6 <= e.confidence < CATALYST_CONFIDENCE_GATE
+                    and e.direction != "negative"
+                ]
+                if shadow:
+                    logger.info(
+                        f"[Node 6 晋升影子] {name}: 门槛 0.60 会放行 "
+                        f"{len(shadow)} 个事件 (置信度 "
+                        f"{shadow[0].confidence:.2f})"
+                    )
                 remaining.append(entry)
                 continue
 
@@ -1262,8 +1390,8 @@ class AggregatorNode:
                 remaining.append(entry)
                 continue
 
-            # 升格 → 重新走闸门
-            gate_passed, fail_reason, accum_detail, accum_strength = self._run_ambush_gates(
+            # 升格 → 重新走闸门（升格路径不交叉提名：提名仅当日候选直入）
+            gate_passed, fail_reason, accum_detail, accum_strength, _ = self._run_ambush_gates(
                 name, sector_events, capital_ctx, hot_sectors, today,
             )
 
@@ -1301,19 +1429,24 @@ class AggregatorNode:
 
         return promoted_pool, remaining
 
-    def _build_ambush_channel(
+    async def _build_ambush_channel(
         self,
         sector: SectorContext,
         capital: CapitalContext,
         news: NewsContext,
         sentiment: SentimentContext,
+        regime: Optional[MarketRegime] = None,
     ) -> tuple[list[AmbushCandidate], list[AmbushReservoirEntry], list[str]]:
         """埋伏通道（P3+P1-2）：独立于主线 composite 的平行分支
 
         流水线：
-        1. 今日候选 → 闸门（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）→ 正式池/蓄水池
-        2. 跨日合并：今日蓄水池 + 前日留存 → 合并列表（天数递增，过期除名）
-        3. 升格检测：蓄水池中满足条件的板块 → 重新走闸门 → 正式池
+        1. 今日候选 → 闸门（★★★利空 + 吸筹确认 + 防买顶 + 拥挤度）→ 正式池/蓄水池；
+           资金流数据缺失（missing）转蓄水池观察（reason=data_missing），不当作市场否决；
+           缺失占比 >50% 时告警数据源故障（比例熔断）
+        2. 决策 21：仅被吸筹闸门拦下的候选（利空/防买顶/拥挤均已过）进入
+           Agent 催化剂先行提名（单次批量调用，满足 G2/G3 才进视野）
+        3. 跨日合并：今日蓄水池 + 前日留存 → 合并列表（天数递增，过期除名）
+        4. 升格检测：蓄水池中满足条件的板块 → 重新走闸门 → 正式池
 
         Returns:
             (ambush_pool, ambush_reservoir, veto_log)
@@ -1328,6 +1461,8 @@ class AggregatorNode:
         pool: list[AmbushCandidate] = []
         reservoir: list[AmbushReservoirEntry] = []
         veto_log: list[str] = []
+        nomination_queue: list[dict] = []  # 决策 21: 仅被吸筹拦下的候选，待 Agent 批量评审
+        missing_count = 0  # 资金流数据缺失候选数（轨道三熔断统计）
 
         # ── 近失板块直接入蓄水池（差 1 条闸门，观察）──
         near_miss_list = getattr(sector, "near_miss_ambush", []) or []
@@ -1353,14 +1488,61 @@ class AggregatorNode:
         if sector.ambush:
             for detail in sector.ambush:
                 name = detail.name
-                sector_events = events_by_sector.get(name, [])
+                sector_events = self._lookup_sector_events(name, events_by_sector)
 
                 # 闸门流水线（抽取为独立方法，供升格复用）
-                gate_passed, fail_reason, accum_detail, accum_strength = self._run_ambush_gates(
+                gate_passed, fail_reason, accum_detail, accum_strength, evidence = self._run_ambush_gates(
                     name, sector_events, capital, hot_sectors, today,
                 )
 
                 if not gate_passed:
+                    if fail_reason.startswith("吸筹观察"):
+                        # S1 留痕：非归档场景（终端/当日日志）也可追溯"资金未到的观察"
+                        logger.info(f"[Node 6] 吸筹闸门观察: {name}（{accum_detail}）")
+                        # ── 决策 21: 提名收集（G5 名额）──
+                        # G1（利空）/G4（防买顶+拥挤）已过：闸门序保证能走到吸筹即已过前三闸；
+                        # 这里只补检 G2（合格催化）+ G3（历史吸筹证据），拒绝纯消息裸奔
+                        if (
+                            not AMBUSH_NOMINATION_DISABLED
+                            and len(nomination_queue) < AMBUSH_NOMINATION_MAX
+                        ):
+                            qualified_nominate = [
+                                e for e in sector_events
+                                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                                and e.direction != "negative"
+                            ]
+                            consec = evidence.get("consecutive_positive", 0)
+                            flow_3d = evidence.get("flow_3d_avg")
+                            if qualified_nominate and (
+                                consec >= AMBUSH_NOMINATION_MIN_CONSECUTIVE
+                                or (flow_3d is not None and flow_3d > 0)
+                            ):
+                                nomination_queue.append({
+                                    "name": name,
+                                    "code": detail.code,
+                                    "strength": strength_lookup.get(name, detail.strength_score),
+                                    "qualified_events": qualified_nominate,
+                                    "evidence": evidence,
+                                    "accum_detail": accum_detail,
+                                })
+                    if accum_strength == "missing":
+                        # 数据缺失 ≠ 市场否决：转蓄水池观察，不入否决日志（区分"无信号"与"坏信号"）
+                        # ★★★利空仍否决：缺数据不代表可以无视明确利空
+                        negative_block = self._check_negative_catalyst(sector_events)
+                        if negative_block:
+                            veto_log.append(f"{name}: ★★★利空否决 — {negative_block}")
+                        else:
+                            reservoir.append(AmbushReservoirEntry(
+                                sector_name=name,
+                                sector_code=detail.code,
+                                reason="data_missing",
+                                entered_date=today,
+                                weeks_without_catalyst=0,
+                                days_in_reservoir=0,
+                                entered_strength=strength_lookup.get(name, detail.strength_score),
+                            ))
+                            missing_count += 1
+                        continue
                     if fail_reason:
                         veto_log.append(f"{name}: {fail_reason}")
                     continue
@@ -1373,6 +1555,17 @@ class AggregatorNode:
                 ]
 
                 if not qualified_events:
+                    # A3 影子评估
+                    shadow = [
+                        e for e in sector_events
+                        if 0.6 <= e.confidence < CATALYST_CONFIDENCE_GATE
+                        and e.direction != "negative"
+                    ]
+                    if shadow:
+                        logger.info(
+                            f"[Node 6 闸门影子] {name}: 门槛 0.60 会放行 "
+                            f"{len(shadow)} 个事件"
+                        )
                     # 无催化分支 → 蓄水池
                     reservoir.append(AmbushReservoirEntry(
                         sector_name=name,
@@ -1407,6 +1600,47 @@ class AggregatorNode:
                     gate_notes=f"闸门全通过({accum_strength}×{accum_multiplier})",
                     accum_strength=accum_strength,
                 ))
+
+        # ── 决策 21: Agent 催化剂先行提名（单次批量调用，仅候选非空时触发）──
+        if nomination_queue:
+            adopted = await self._llm_nominate_ambush(nomination_queue, regime, today)
+            for item in nomination_queue:
+                name = item["name"]
+                if name not in adopted:
+                    continue  # 未获提名 → 「吸筹观察」留痕保留在 veto_log
+                score, top_event, category_tag, event_titles = self._compute_catalyst_score(
+                    item["qualified_events"], today,
+                )
+                adjusted_score = round(score * AMBUSH_NOMINATION_MULTIPLIER, 3)
+                # accum_strength 记为 evidence 推导档位（不足按 weak）
+                ev = item["evidence"]
+                derived_strength = (
+                    "strong" if ev.get("consecutive_positive", 0) >= 3
+                    else "medium" if (ev.get("flow_3d_avg") or 0) > 0
+                    else "weak"
+                )
+                pool.append(AmbushCandidate(
+                    sector_name=name,
+                    sector_code=item["code"],
+                    catalyst_score=adjusted_score,
+                    category_tag=category_tag,
+                    events=event_titles[:3],
+                    top_event_date=top_event.event_date if top_event else None,
+                    top_event_level=top_event.impact_level if top_event else 1,
+                    accumulation_detail=item["accum_detail"],
+                    gate_notes=f"Agent提名({adopted[name]})",
+                    accum_strength=derived_strength,
+                    nominated=True,
+                ))
+                # 提名成功 → 移除 S1 观察条目（它不是市场否决）
+                veto_log[:] = [
+                    v for v in veto_log if not v.startswith(f"{name}: 吸筹观察")
+                ]
+                logger.info(
+                    f"[Node 6] Agent提名入池: {name} "
+                    f"(score={score:.3f}×{AMBUSH_NOMINATION_MULTIPLIER}={adjusted_score}, "
+                    f"理由: {adopted[name]})"
+                )
 
         # ── P1-2: 蓄水池跨日合并 ──
         prev_reservoir_map = self._load_previous_reservoir()
@@ -1444,21 +1678,152 @@ class AggregatorNode:
         pool.sort(key=lambda x: x.catalyst_score, reverse=True)
         pool = pool[:CATALYST_MAX_POOL_SIZE]
 
+        # 轨道三：比例熔断——无数据占比过半时大概率是数据源故障（Node 3 降级/接口变更），
+        # 而非个别板块盲区，显式告警避免静默空池
+        if sector.ambush and missing_count > len(sector.ambush) / 2:
+            logger.warning(
+                f"[Node 6] ⚠️ 资金流数据源覆盖异常: {missing_count}/{len(sector.ambush)} "
+                f"埋伏候选无资金流数据（>50%），疑似数据源故障，请检查 Node 3"
+            )
+
+        veto_n = sum(1 for v in veto_log if not v.split(": ", 1)[-1].startswith("吸筹观察"))
+        observe_n = len(veto_log) - veto_n
         logger.info(
             f"[Node 6] 埋伏通道: {len(sector.ambush)} 候选 → "
-            f"正式池={len(pool)}, 蓄水池={len(reservoir)}, 否决={len(veto_log)}"
+            f"正式池={len(pool)}, 蓄水池={len(reservoir)}(含数据缺失{missing_count}), "
+            f"否决={veto_n} 观察={observe_n}"
         )
         return pool, reservoir, veto_log
+
+    async def _llm_nominate_ambush(
+        self,
+        queue: list[dict],
+        regime: Optional[MarketRegime],
+        today: date,
+    ) -> dict[str, str]:
+        """Agent 催化剂先行提名评审（决策 21，单次批量调用）。
+
+        仅对"技术状态在埋伏 + 合格催化已在日历 + 唯一卡点是当日资金未确认"的
+        候选（调用方已过 G1利空/G4防买顶拥挤闸门，并补检 G2催化/G3吸筹证据）
+        请求 Agent 裁定是否提前入池。资金确认从硬闸门降为折扣+复核项。
+
+        Returns:
+            {sector_name: reason} 采纳的提名；失败/超时/解析异常 → 空 dict（全部不提名，R4 降级）
+        """
+        if AMBUSH_NOMINATION_DISABLED or not queue:
+            return {}
+
+        def _fmt_flow(v) -> str:
+            return f"{v:.1f}亿" if isinstance(v, (int, float)) else "无数据"
+
+        blocks: list[str] = []
+        for item in queue:
+            ev = item["evidence"]
+            event_lines = "\n".join(
+                f"    [★{e.impact_level}] {e.title}（{e.event_date}，置信度{e.confidence:.2f}）"
+                for e in item["qualified_events"][:2]
+            )
+            blocks.append(
+                f"- {item['name']}（强度分{item['strength']:.0f}）\n"
+                f"  吸筹证据: 连续正流入{ev.get('consecutive_positive', 0)}日 | "
+                f"3日均 {_fmt_flow(ev.get('flow_3d_avg'))} | 当日 {_fmt_flow(ev.get('today_flow'))}\n"
+                f"  合格催化剂:\n{event_lines}"
+            )
+
+        regime_desc = (
+            f"{regime.regime}（risk_budget={regime.risk_budget:.2f}）" if regime else "未知"
+        )
+        prompt = (
+            "你是「埋伏提名评审」。这些板块的资金确认数据尚不充分（当日资金未确认正流入），"
+            "请判断催化剂是否足以支撑提前埋伏。\n\n"
+            f"当前市场状态: {regime_desc}\n\n"
+            "候选板块:\n" + "\n".join(blocks) + "\n\n"
+            "评审纪律：\n"
+            "1. 说不出催化剂实质内容、或它与板块的关联牵强 → 拒绝\n"
+            "2. 事件日期已在 2 个交易日内（anticipation 大半走完）→ 倾向拒绝\n"
+            "3. 当日资金大幅净流出 → 拒绝\n"
+            "4. 历史吸筹证据是支持项，但不能替代当日确认；不确定时 nominate=false\n\n"
+            "只输出 JSON 数组（无其他文字）：\n"
+            '[{"sector": "板块名", "nominate": true/false, "confidence": 0~1, "reason": "≤40字"}]\n'
+            "对每个候选板块都给出一条判定。"
+        )
+
+        try:
+            raw_text = await self._call_llm_async(prompt, temperature=0.2, max_tokens=400)
+            parsed = self._parse_json(raw_text)
+            items = parsed if isinstance(parsed, list) else parsed.get("nominations", [])
+            queue_names = {q["name"] for q in queue}
+            adopted: dict[str, str] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                name = it.get("sector", "")
+                if name not in queue_names or not it.get("nominate"):
+                    continue
+                try:
+                    conf = float(it.get("confidence", 0))
+                except (TypeError, ValueError):
+                    continue
+                if conf < AMBUSH_NOMINATION_MIN_CONFIDENCE:
+                    logger.info(
+                        f"[Node 6] Agent提名未采纳: {name} 置信度{conf:.2f} < {AMBUSH_NOMINATION_MIN_CONFIDENCE}"
+                    )
+                    continue
+                adopted[name] = str(it.get("reason", ""))[:40]
+            if adopted:
+                logger.info(f"[Node 6] Agent提名采纳: {list(adopted.keys())}")
+            return adopted
+        except Exception as e:
+            logger.warning(f"[Node 6] Agent提名评审失败（降级：全部不提名）: {e}")
+            return {}
 
     @staticmethod
     def _group_events_by_sector(
         events: list[CatalystEvent],
     ) -> dict[str, list[CatalystEvent]]:
-        """将催化剂事件按板块名分组"""
+        """将催化剂事件按板块名分组（A2 归一化 + T5 扇出）
+
+        若事件有 affected_sectors（T5 多板块扇出），一条事件进入多个桶；
+        否则按 event.sector 单键分组。
+        """
+        from src.got.board_aliases import normalize_sector_name
         grouped: dict[str, list[CatalystEvent]] = {}
         for event in events:
-            grouped.setdefault(event.sector, []).append(event)
+            # T5: 多板块扇出；归一化后去重，防止别名变体（"芯片"+"芯片概念"）
+            # 使同一事件重复进同一桶导致冗余加成被放大（晋升分最多 +40%）
+            sectors = event.affected_sectors if event.affected_sectors else [event.sector]
+            seen_keys: set[str] = set()
+            for raw_sector in sectors:
+                key = normalize_sector_name(raw_sector)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                grouped.setdefault(key, []).append(event)
         return grouped
+
+    @staticmethod
+    def _lookup_sector_events(
+        name: str, events_by_sector: dict[str, list[CatalystEvent]]
+    ) -> list[CatalystEvent]:
+        """归一化板块名查找事件（A2：精确 → 别名变体 → 空）
+
+        解决晋升路径/P5 中板块名与事件 sector 命名不一致导致的事件饥荒。
+        """
+        # L1: 精确匹配
+        result = events_by_sector.get(name)
+        if result:
+            return result
+
+        # L2: 别名变体
+        from src.got.board_aliases import sector_name_variants
+        for variant in sector_name_variants(name):
+            if variant == name:
+                continue
+            result = events_by_sector.get(variant)
+            if result:
+                return result
+
+        return []
 
     @staticmethod
     def _check_negative_catalyst(events: list[CatalystEvent]) -> Optional[str]:
@@ -1468,11 +1833,74 @@ class AggregatorNode:
                 return f"{event.title}({event.event_date})"
         return None
 
+    # 资金流别名表缓存（进程内只加载一次；文件缺失 → 空表，不影响原逻辑）
+    _capital_flow_aliases_cache: Optional[dict[str, list[str]]] = None
+
+    @classmethod
+    def _load_capital_flow_aliases(cls) -> dict[str, list[str]]:
+        """加载资金流查找别名表（data/capital_flow_aliases.json）。
+
+        用途：Node 2 候选用 THS/问财命名（如"船舶"），东财 sector_flow_all 无同名板，
+        通过别名映射到代理板（如"中船系"）补齐资金面覆盖。
+        """
+        if cls._capital_flow_aliases_cache is not None:
+            return cls._capital_flow_aliases_cache
+        aliases: dict[str, list[str]] = {}
+        try:
+            from pathlib import Path
+            p = Path("data/capital_flow_aliases.json")
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                for k, v in (data.get("aliases") or {}).items():
+                    if isinstance(v, dict):
+                        targets = v.get("targets") or []
+                    elif isinstance(v, list):
+                        targets = v
+                    else:
+                        targets = [v] if v else []
+                    aliases[k] = [str(t) for t in targets if t]
+        except Exception as e:
+            logger.warning(f"[Node 6] 加载资金流别名表失败: {e}")
+        cls._capital_flow_aliases_cache = aliases
+        return aliases
+
+    @classmethod
+    def _lookup_flow_map(
+        cls,
+        sector_name: str,
+        flow_map: dict,
+    ) -> tuple[Optional[float], Optional[str]]:
+        """在资金流映射表中查找板块值。
+
+        两阶段：
+        1. 原名模糊匹配（保持原有行为，含子串/子词兜底）
+        2. 未命中 → 别名表代理板【严格匹配】（去泛化后缀后相等，避免"军民融合"经子词误中"电子竞技"）
+        """
+        for name, amount in flow_map.items():
+            if not isinstance(name, str) or not name:
+                continue
+            if cls._fuzzy_match(sector_name, cls._strip_generic_suffix(name)):
+                try:
+                    return float(amount), name
+                except (TypeError, ValueError):
+                    continue
+        for alias in cls._load_capital_flow_aliases().get(sector_name, []):
+            for name, amount in flow_map.items():
+                if not isinstance(name, str) or not name:
+                    continue
+                if cls._strip_generic_suffix(name) == cls._strip_generic_suffix(alias):
+                    try:
+                        return float(amount), name
+                    except (TypeError, ValueError):
+                        continue
+        return None, None
+
     def _check_accumulation_gate(
         self,
         sector_name: str,
         capital: CapitalContext,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, dict]:
         """吸筹确认闸门（v2.1 三档升级）。
 
         判定逻辑（按优先级）：
@@ -1480,28 +1908,21 @@ class AggregatorNode:
         2. 归档不可用时降级为当日截面判定
 
         Returns:
-            (passed, detail, accum_strength)
+            (passed, detail, accum_strength, evidence)
             - passed: 是否通过闸门
             - detail: 人读友好的判定依据
-            - accum_strength: strong / medium / weak / legacy
+            - accum_strength: strong / medium / weak / legacy / missing
+            - evidence: 吸筹证据 {today_flow, flow_3d_avg, consecutive_positive}，
+              供 Agent 提名前置条件 G3 使用（决策 21）
         """
+        evidence = {"today_flow": None, "flow_3d_avg": None, "consecutive_positive": 0}
         sector_flow = capital.evidence.sector_flow if capital and capital.evidence else None
         if not sector_flow:
-            return False, "资金面数据缺失", "legacy"
+            return False, "资金面数据缺失", "missing", evidence
 
-        # 从 sector_flow_all 中查找板块当日净流入
+        # 从 sector_flow_all 中查找板块当日净流入（原名模糊匹配；未命中再用别名表代理板严格匹配）
         sector_flow_all = sector_flow.get("sector_flow_all") or {}
-        today_flow: Optional[float] = None
-        for name, amount in sector_flow_all.items():
-            if not isinstance(name, str) or not name:
-                continue
-            clean = AggregatorNode._strip_generic_suffix(name)
-            if AggregatorNode._fuzzy_match(sector_name, clean):
-                try:
-                    today_flow = float(amount)
-                except (TypeError, ValueError):
-                    continue
-                break
+        today_flow, matched_name = self._lookup_flow_map(sector_name, sector_flow_all)
 
         # top_concepts / top_industries 模糊匹配兜底
         if today_flow is None:
@@ -1516,20 +1937,25 @@ class AggregatorNode:
                     break
 
         if today_flow is None:
-            return False, "未找到板块资金流数据", "legacy"
+            return False, "未找到板块资金流数据", "missing", evidence
+        evidence["today_flow"] = today_flow
+
+        # 代理板标记：命中名与原名不同源（经别名表映射）→ 细节中显式标注，避免误读为板块本体数据
+        is_proxy = matched_name is not None and not AggregatorNode._fuzzy_match(
+            sector_name, AggregatorNode._strip_generic_suffix(matched_name)
+        )
+        proxy_tag = f"[代理板{matched_name}]" if is_proxy else ""
 
         # === v2.1: 从归档回读逐日序列，判定吸筹档位 ===
         sector_flow_all_3d = sector_flow.get("sector_flow_all_3d") or {}
-        # 查找板块 3d 日均
-        flow_3d_avg: Optional[float] = None
-        for sname, val in sector_flow_all_3d.items():
-            clean = AggregatorNode._strip_generic_suffix(sname)
-            if AggregatorNode._fuzzy_match(sector_name, clean):
-                flow_3d_avg = float(val)
-                break
+        # 查找板块 3d 日均（与当日查找同策略：原名模糊优先，别名严格兜底）
+        flow_3d_avg, _ = self._lookup_flow_map(sector_name, sector_flow_all_3d)
+        evidence["flow_3d_avg"] = flow_3d_avg
 
         # 从归档回查板块逐日序列（计算连续正流入天数）
         # 缓存：单次 run() 内只加载一次（_run_cache 在 run() 入口初始化）
+        # 匹配策略：精确键优先 → 别名表严格兜底；不用模糊匹配，
+        # 避免"电力"经子串误中"电力物联网/绿色电力"导致档位不确定性抖动（历史 bug）
         consecutive_positive = 0
         try:
             from src.got.persistence import load_capital_flow_series
@@ -1541,29 +1967,36 @@ class AggregatorNode:
                 self._run_cache[cache_key] = archive_series
             else:
                 archive_series = self._run_cache[cache_key]
-            for sname, series in archive_series.items():
-                clean = AggregatorNode._strip_generic_suffix(sname)
-                if AggregatorNode._fuzzy_match(sector_name, clean):
-                    for _, flow in reversed(series):
-                        if flow > 0:
-                            consecutive_positive += 1
-                        else:
+            series = archive_series.get(sector_name)
+            if series is None:
+                for alias in self._load_capital_flow_aliases().get(sector_name, []):
+                    for key in archive_series:
+                        if AggregatorNode._strip_generic_suffix(key) == AggregatorNode._strip_generic_suffix(alias):
+                            series = archive_series[key]
                             break
-                    break
+                    if series is not None:
+                        break
+            if series is not None:
+                for _, flow in reversed(series):
+                    if flow > 0:
+                        consecutive_positive += 1
+                    else:
+                        break
         except Exception:
             pass  # 归档不可用，降级
+        evidence["consecutive_positive"] = consecutive_positive
 
         # 档位判定（strong/medium 追加当日正向确认，防止历史吸筹但当日出货仍判通过）
         if consecutive_positive >= 3 and today_flow > 0:
-            return True, f"连续{consecutive_positive}日正流入+当日{today_flow:.1f}亿", "strong"
+            return True, f"{proxy_tag}连续{consecutive_positive}日正流入+当日{today_flow:.1f}亿", "strong", evidence
         elif consecutive_positive >= 3:
-            return False, f"连续{consecutive_positive}日正流入但当日净流出{abs(today_flow):.1f}亿", "medium"
+            return False, f"{proxy_tag}连续{consecutive_positive}日正流入但当日净流出{abs(today_flow):.1f}亿", "medium", evidence
         elif flow_3d_avg is not None and flow_3d_avg > 0 and today_flow > 0:
-            return True, f"3日均净流入{flow_3d_avg:.1f}亿+当日{today_flow:.1f}亿", "medium"
+            return True, f"{proxy_tag}3日均净流入{flow_3d_avg:.1f}亿+当日{today_flow:.1f}亿", "medium", evidence
         elif today_flow > 0:
-            return True, f"当日净流入{today_flow:.1f}亿", "weak"
+            return True, f"{proxy_tag}当日净流入{today_flow:.1f}亿", "weak", evidence
         else:
-            return False, f"当日净流出{abs(today_flow):.1f}亿", "weak"
+            return False, f"{proxy_tag}当日净流出{abs(today_flow):.1f}亿", "weak", evidence
 
     def _check_anti_top_buy(
         self,
@@ -2064,6 +2497,56 @@ class AggregatorNode:
                 return True
         return False
 
+    # A6: 高频泛化词根（≤2 字），子串匹配命中时降权
+    _GENERIC_ROOTS = frozenset({
+        "AI", "芯片", "电力", "新能源", "医药", "军工", "消费", "金融",
+        "周期", "地产", "汽车", "数据", "软件", "硬件", "网络", "通信",
+        "光伏", "储能", "机器人", "智能", "科技", "信息", "生物",
+    })
+
+    @staticmethod
+    def _match_sector(name: str, target: str) -> tuple[bool, str]:
+        """统一板块名匹配入口（A5）
+
+        匹配链路：归一化精确 → 别名变体 → 受控子串（≥3 字）
+
+        Returns:
+            (matched, match_type): match_type = "exact" / "alias" / "substring" / "generic" / "none"
+            "generic" 表示命中泛化词根（A6 护栏），调用方应降权处理
+        """
+        if not name or not target:
+            return False, "none"
+
+        # L1: 归一化精确
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        norm_name = normalize_sector_name(name)
+        norm_target = normalize_sector_name(target)
+        if norm_name == norm_target:
+            return True, "exact"
+
+        # L2: 别名变体交叉
+        name_variants = sector_name_variants(name)
+        target_variants = sector_name_variants(target)
+        for nv in name_variants:
+            for tv in target_variants:
+                if nv == tv:
+                    return True, "alias"
+                if normalize_sector_name(nv) == normalize_sector_name(tv):
+                    return True, "alias"
+
+        # L3: 受控子串（≥3 字，剥离后缀后）
+        s = AggregatorNode._strip_generic_suffix(norm_name)
+        t = AggregatorNode._strip_generic_suffix(norm_target)
+        if len(s) >= 3 and len(t) >= 3:
+            if s in t or t in s:
+                # A6: 命中泛化词根 → 降级为 "generic"
+                core = s if s in t else t
+                if core in AggregatorNode._GENERIC_ROOTS:
+                    return True, "generic"
+                return True, "substring"
+
+        return False, "none"
+
     @staticmethod
     def _split_sector_name(name: str) -> list[str]:
         """拆分板块名为子词列表。
@@ -2226,6 +2709,186 @@ class AggregatorNode:
             missing_fields=[],
             fetch_failed_fields=failed,
         )
+
+    # =================================================================
+    # T3: 矛盾仲裁者（语义层裁决）
+    # =================================================================
+
+    _ARBITRATION_PROMPT = """你是 A 股市场矛盾的仲裁者。给定以下矛盾信息和多维度证据，判断规则层的矛盾判定是否需要修正。
+
+## 矛盾信息
+- 矛盾对: {pair}
+- 描述: {description}
+- 严重度: {severity}
+- 类型: {conflict_type}
+
+## 多维度证据
+{evidence_text}
+
+## 跨节点共振信号
+{cross_node_signals_text}
+
+## 仲裁规则
+1. 只有 confidence >= 0.6 的判断才有效
+2. upgrade: 如果规则层过度悲观，可以建议升级（如矛盾实际不严重）
+3. downgrade: 如果规则层遗漏风险，可以降级（但只允许降一级，不可直接排除）
+4. keep: 维持规则层判定
+
+## 输出格式
+JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning": "一句话理由（30字内）"}}
+
+只输出 JSON。"""
+
+    async def _arbitrate_contradictions(
+        self,
+        contradictions: list[Contradiction],
+        regime: MarketRegime,
+        sector: Optional[SectorContext],
+        capital: Optional[CapitalContext],
+        news: Optional[NewsContext],
+        sentiment: Optional[SentimentContext],
+        cross_node_signals: list,
+    ) -> list[Contradiction]:
+        """T3: 矛盾仲裁者 — 对 medium/high 矛盾调用 LLM 做语义裁决
+
+        设计原则：
+        - 仅处理 severity ∈ (medium, high)，low 不仲裁
+        - 单次最多 3 个矛盾（R7 成本预算）
+        - 权限受限：可 upgrade/downgrade 一级，不可 exclude
+        - confidence < 0.6 的仲裁结果忽略
+        - 降级时必须写 arbitration_reasoning
+        - 失败时等同现状（R4 可降级）
+        - 串行调用 + 空响应重试（R5）
+
+        Returns:
+            同输入列表，但符合条件的矛盾已填充 arbitration_* 字段
+        """
+        # 计划约束：regime 新切换（dwell_days<2）状态机尚未稳定，跳过仲裁，
+        # 避免对 _detect_contradictions 产出的 regime_fresh_switch 矛盾做语义裁决
+        if getattr(regime, "dwell_days", 1) < 2:
+            logger.info(
+                f"[T3仲裁] regime dwell_days={getattr(regime, 'dwell_days', 'N/A')}<2（新切换），跳过仲裁"
+            )
+            return contradictions
+
+        # 筛选需要仲裁的矛盾（medium/high，最多 3 个）
+        ARBITRATION_MIN_CONFIDENCE = 0.6
+        candidates = [
+            c for c in contradictions
+            if c.severity in ("medium", "high")
+        ][:3]
+
+        if not candidates:
+            return contradictions
+
+        logger.info(
+            f"[T3仲裁] {len(candidates)} 个矛盾候选仲裁 "
+            f"(总矛盾 {len(contradictions)})"
+        )
+
+        # 构建证据摘要
+        evidence_parts = []
+        if sector:
+            mainline = [s.group_name for s in (sector.active_mainline or [])[:3]]
+            evidence_parts.append(f"主线板块: {', '.join(mainline) if mainline else '无'}")
+        if capital:
+            evidence_parts.append(f"资金面评分: {getattr(capital, 'institutional_score', 'N/A')}")
+        if news:
+            major_count = len(getattr(news, 'major_events', []))
+            evidence_parts.append(f"重大事件: {major_count} 条")
+        if sentiment:
+            stage = getattr(sentiment, 'sentiment_stage', 'N/A')
+            evidence_parts.append(f"情绪阶段: {stage}")
+        # 状态机证据：dwell_days/transition_count 作为仲裁输入（计划约束）
+        evidence_parts.append(
+            f"regime={getattr(regime, 'regime', 'N/A')}, "
+            f"dwell_days={getattr(regime, 'dwell_days', 'N/A')}, "
+            f"transition_count={getattr(regime, 'transition_count', 'N/A')}"
+        )
+        evidence_text = "\n".join(evidence_parts) if evidence_parts else "无额外证据"
+
+        # 跨节点信号摘要
+        signals_text = "\n".join(
+            f"- {s.signal_type}: {getattr(s, 'description', '')[:40]}"
+            for s in cross_node_signals[:5]
+        ) if cross_node_signals else "无共振信号"
+
+        # 串行调用每个矛盾
+        from src.agent.llm_adapter import LLMToolAdapter
+        try:
+            from src.config import get_config
+            llm = LLMToolAdapter(get_config())
+        except Exception as exc:
+            logger.warning(f"[T3仲裁] LLM 初始化失败，降级跳过: {exc}")
+            return contradictions
+
+        for contradiction in candidates:
+            try:
+                prompt = self._ARBITRATION_PROMPT.format(
+                    pair=contradiction.pair,
+                    description=contradiction.description[:100],
+                    severity=contradiction.severity,
+                    conflict_type=contradiction.conflict_type,
+                    evidence_text=evidence_text,
+                    cross_node_signals_text=signals_text,
+                )
+
+                response_text = None
+                for attempt in range(3):
+                    try:
+                        response = await asyncio.to_thread(
+                            llm.call_text,
+                            messages=[
+                                {"role": "system", "content": "你是矛盾仲裁者，只输出 JSON。"},
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=0.3,
+                            max_tokens=300,
+                        )
+                        response_text = response.content if response else ""
+                        if response_text:
+                            break
+                    except Exception:
+                        pass
+
+                if not response_text:
+                    continue
+
+                # 解析响应
+                import json, re
+                match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+                if not match:
+                    continue
+                data = json.loads(match.group())
+
+                verdict = data.get("verdict", "keep")
+                confidence = float(data.get("confidence", 0))
+                reasoning = data.get("reasoning", "")[:60]
+
+                # 置信度低于阈值 → 忽略仲裁结果
+                if confidence < ARBITRATION_MIN_CONFIDENCE:
+                    logger.debug(
+                        f"[T3仲裁] {contradiction.pair}: 置信度 {confidence:.2f} < 0.6，忽略"
+                    )
+                    continue
+
+                if verdict not in ("upgrade", "downgrade", "keep"):
+                    verdict = "keep"
+
+                # 写入仲裁结果
+                contradiction.arbitration_verdict = verdict
+                contradiction.arbitration_reasoning = reasoning
+                contradiction.arbitration_confidence = confidence
+
+                logger.info(
+                    f"[T3仲裁] {contradiction.pair}: {verdict} "
+                    f"(置信度 {confidence:.2f}) — {reasoning}"
+                )
+
+            except Exception as exc:
+                logger.debug(f"[T3仲裁] {contradiction.pair} 仲裁失败: {exc}")
+
+        return contradictions
 
     @staticmethod
     def _detect_contradictions(

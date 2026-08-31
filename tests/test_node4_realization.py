@@ -49,7 +49,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
             ("2026-08-08", 107, 110),  # T+5
         ])
 
-        with patch.object(self.tracker, "_get_board_code", return_value="880001"), \
+        with patch.object(self.tracker, "_get_board_code", return_value=("880001", "exact")), \
              patch.object(self.tracker, "_fetch_board_kline", return_value=kline):
             result = self.tracker._compute_multi_window_returns("半导体", date(2026, 8, 1))
 
@@ -71,7 +71,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
             ("2026-08-05", 105, 103),
         ])
 
-        with patch.object(self.tracker, "_get_board_code", return_value="880001"), \
+        with patch.object(self.tracker, "_get_board_code", return_value=("880001", "exact")), \
              patch.object(self.tracker, "_fetch_board_kline", return_value=kline):
             result = self.tracker._compute_multi_window_returns("半导体", date(2026, 8, 1))
 
@@ -82,7 +82,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
 
     def test_no_board_code(self):
         """板块代码查不到 → 全 None。"""
-        with patch.object(self.tracker, "_get_board_code", return_value=None):
+        with patch.object(self.tracker, "_get_board_code", return_value=(None, "unresolved")):
             result = self.tracker._compute_multi_window_returns("未知板块", date(2026, 8, 1))
 
         self.assertIsNone(result["day_1"])
@@ -95,7 +95,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
             ("2026-07-02", 102, 104),
         ])
 
-        with patch.object(self.tracker, "_get_board_code", return_value="880001"), \
+        with patch.object(self.tracker, "_get_board_code", return_value=("880001", "exact")), \
              patch.object(self.tracker, "_fetch_board_kline", return_value=kline):
             result = self.tracker._compute_multi_window_returns("半导体", date(2026, 8, 1))
 
@@ -112,7 +112,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
             ("2026-08-08", 96, 95),    # T+5: -5%
         ])
 
-        with patch.object(self.tracker, "_get_board_code", return_value="880001"), \
+        with patch.object(self.tracker, "_get_board_code", return_value=("880001", "exact")), \
              patch.object(self.tracker, "_fetch_board_kline", return_value=kline):
             result = self.tracker._compute_multi_window_returns("半导体", date(2026, 8, 1))
 
@@ -122,7 +122,7 @@ class TestComputeMultiWindowReturns(unittest.TestCase):
 
     def test_empty_kline(self):
         """K 线为空 → 全 None。"""
-        with patch.object(self.tracker, "_get_board_code", return_value="880001"), \
+        with patch.object(self.tracker, "_get_board_code", return_value=("880001", "exact")), \
              patch.object(self.tracker, "_fetch_board_kline", return_value=pd.DataFrame()):
             result = self.tracker._compute_multi_window_returns("半导体", date(2026, 8, 1))
 

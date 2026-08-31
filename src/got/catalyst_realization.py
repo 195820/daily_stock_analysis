@@ -59,14 +59,22 @@ class CatalystRealizationTracker:
         """
         target_date = target_date or date.today()
         realized_count = 0
+        unresolvable_count = 0
 
         with self.db.get_session() as session:
-            # 加载未兑现事件
+            # 加载未兑现事件（排除已标记不可解析的记录，A1 三态化）
+            # 注意：SQL 中 NULL != 'unresolvable' 结果为 NULL (falsy)，
+            # 必须显式包含 resolution IS NULL 的记录
+            from sqlalchemy import or_
             unrealized = (
                 session.query(CatalystRealizationRecord)
                 .filter(
                     CatalystRealizationRecord.is_realized == False,
                     CatalystRealizationRecord.event_date < target_date,
+                    or_(
+                        CatalystRealizationRecord.resolution.is_(None),
+                        CatalystRealizationRecord.resolution != "unresolvable",
+                    ),
                 )
                 .all()
             )
@@ -79,6 +87,17 @@ class CatalystRealizationTracker:
 
             for record in unrealized:
                 try:
+                    # A1: 快速板块名解析（在取 K 线前先验证可解析性）
+                    _board_code, match_source = self._get_board_code(record.sector)
+                    if not _board_code:
+                        record.resolution = "unresolvable"
+                        unresolvable_count += 1
+                        logger.debug(
+                            f"[P6兑现] {record.event_id} 板块 '{record.sector}' "
+                            f"三级解析均失败 → 标记 unresolvable"
+                        )
+                        continue
+
                     # 计算 T+1/3/5 多窗口收益
                     window_returns = self._compute_multi_window_returns(
                         record.sector, record.event_date
@@ -135,7 +154,7 @@ class CatalystRealizationTracker:
                         f"T+1={window_returns.get('day_1')}, "
                         f"T+3={window_returns.get('day_3')}, "
                         f"T+5={window_returns.get('day_5')}, "
-                        f"pead={pead_direction}"
+                        f"pead={pead_direction}, 解析={match_source}"
                     )
 
                 except Exception as exc:
@@ -143,7 +162,19 @@ class CatalystRealizationTracker:
 
             session.commit()
 
-        logger.info(f"[P6兑现] 本次新兑现 {realized_count} 个事件")
+        # A1 可观测性：本次兑现 N / 不可解析 M / 总待兑现 K
+        total_scanned = realized_count + unresolvable_count
+        logger.info(
+            f"[P6兑现] 本次兑现 {realized_count} / "
+            f"不可解析 {unresolvable_count} / "
+            f"总待兑现 {len(unrealized)}"
+        )
+        if total_scanned > 0 and unresolvable_count / max(total_scanned, 1) > 0.5:
+            logger.warning(
+                f"[P6兑现] 不可解析占比 {unresolvable_count}/{total_scanned} > 50%，"
+                f"建议检查板块别名表或扩充 TDX_BOARD_REGISTRY"
+            )
+
         return realized_count
 
     def register_event(self, event: CatalystEvent, source_type: str = "forward") -> None:
@@ -414,7 +445,7 @@ class CatalystRealizationTracker:
             float: 涨幅百分比（%），或 None（数据不可用）
         """
         try:
-            board_code = self._get_board_code(sector)
+            board_code, _source = self._get_board_code(sector)
             if not board_code:
                 return None
 
@@ -468,7 +499,7 @@ class CatalystRealizationTracker:
         }
 
         try:
-            board_code = self._get_board_code(sector)
+            board_code, _source = self._get_board_code(sector)
             if not board_code:
                 return result
 
@@ -619,13 +650,82 @@ class CatalystRealizationTracker:
 
         return None
 
-    def _get_board_code(self, sector_name: str) -> Optional[str]:
-        """板块名 → TDX 代码映射（从 TDX_BOARD_REGISTRY 查找）"""
+    # 板块名反向查找表缓存（name → code，进程内只构建一次）
+    _name_to_code_cache: Optional[dict[str, str]] = None
+
+    @classmethod
+    def _build_name_to_code_map(cls) -> dict[str, str]:
+        """从 TDX_BOARD_REGISTRY 构建 name → code 反向映射"""
+        if cls._name_to_code_cache is not None:
+            return cls._name_to_code_cache
         try:
             from data_provider.tdx_board_mapping import TDX_BOARD_REGISTRY
-            return TDX_BOARD_REGISTRY.get(sector_name)
+            # TDX_BOARD_REGISTRY: {"880491": {"name": "半导体", ...}, ...}
+            mapping = {}
+            for code, info in TDX_BOARD_REGISTRY.items():
+                if isinstance(info, dict):
+                    name = info.get("name", "")
+                else:
+                    name = str(info)
+                if name:
+                    mapping[name] = code
+            cls._name_to_code_cache = mapping
+            return mapping
         except (ImportError, AttributeError):
-            return None
+            return {}
+
+    def _get_board_code(self, sector_name: str) -> tuple[Optional[str], str]:
+        """板块名 → TDX 代码映射（三级解析 A1）
+
+        TDX_BOARD_REGISTRY 的 key 是 6 位代码（如 "880491"），不是板块名。
+        因此 L1 需要 name → code 反向映射，而非直接 dict.get(name)。
+
+        解析链路：
+        L1: name → code 反向精确匹配
+        L2: normalize_sector_name + 别名表变体 → 反向匹配
+        L3: difflib 模糊匹配（阈值 0.68，与 board_name_resolver 对齐）
+
+        Returns:
+            (board_code, match_source): 代码 + 匹配来源标注
+            match_source: "exact" / "alias" / "fuzzy:<name>" / "failed"
+        """
+        if not sector_name:
+            return None, "failed"
+
+        name_map = self._build_name_to_code_map()
+        if not name_map:
+            return None, "failed"
+
+        # L1: 精确反向匹配
+        code = name_map.get(sector_name)
+        if code:
+            return code, "exact"
+
+        # L2: 归一化 + 别名表变体
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        normalized = normalize_sector_name(sector_name)
+        if normalized != sector_name:
+            code = name_map.get(normalized)
+            if code:
+                return code, "alias"
+        for variant in sector_name_variants(sector_name):
+            if variant in (sector_name, normalized):
+                continue
+            code = name_map.get(variant)
+            if code:
+                return code, "alias"
+
+        # L3: difflib 模糊匹配（阈值 0.68）
+        import difflib
+        all_names = list(name_map.keys())
+        matches = difflib.get_close_matches(
+            sector_name, all_names, n=1, cutoff=0.68
+        )
+        if matches:
+            logger.debug(f"[P6解析] '{sector_name}' → 模糊匹配 → '{matches[0]}'")
+            return name_map[matches[0]], f"fuzzy:{matches[0]}"
+
+        return None, "failed"
 
     def _check_direction(self, expected_direction: str, actual_return: float) -> bool:
         """判断漂移方向预判是否正确（旧版单窗口兼容）"""

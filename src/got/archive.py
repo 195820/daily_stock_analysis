@@ -252,8 +252,32 @@ def _write_reasoning_md(
                 )
             lines.append("")
 
-    # Node 2 v2: 数据质量摘要
+    # Node 2 v2: 过热检测明细（v2: 9 维度）
     sector_ctx = contexts.get("sector")
+    if sector_ctx:
+        overheat_sectors = []
+        # 从 active_mainline 收集过热板块
+        for group in getattr(sector_ctx, "active_mainline", []):
+            for m in getattr(group, "members", []):
+                sev = getattr(m, "overheat_severity", 0) or 0
+                if sev > 0.3:
+                    overheat_sectors.append((m.name, sev, getattr(m, "mainline_days", 0)))
+        # 从 ambush 收集
+        for m in getattr(sector_ctx, "ambush", []):
+            sev = getattr(m, "overheat_severity", 0) or 0
+            if sev > 0.3:
+                overheat_sectors.append((m.name, sev, 0))
+
+        if overheat_sectors:
+            overheat_sectors.sort(key=lambda x: -x[1])
+            lines.append("### ⚠️ 过热警示板块")
+            lines.append("")
+            for name, sev, days in overheat_sectors[:8]:
+                level = "🔴 exhausted" if sev > 0.5 else "🟡 warning"
+                lines.append(f"- {level} **{name}** severity={sev:.2f} (主线D{days})")
+            lines.append("")
+
+    # Node 2 v2: 数据质量摘要
     if sector_ctx:
         dq = getattr(sector_ctx, "data_quality", None)
         degradation = getattr(dq, "degradation_summary", None) if dq else None
@@ -296,16 +320,31 @@ def _write_reasoning_md(
         lines.append(f"## 📅 催化剂日历（{len(cal.events)} 事件，{len(three_star)} 个 ★★★）— {cal.refresh_mode}")
         lines.append("")
 
-        # ── 今日关键事件 ──
+        # ── 今日关键事件（拆分：今日发生 vs 持续传导，避免历史事件被误读为今日发生） ──
         today_events = [e for e in high_conf if e.event_date == today]
         if today_events:
-            lines.append(f"**今日（{today}）{len(today_events)} 个事件:**")
-            for e in sorted(today_events, key=lambda x: -x.impact_level)[:6]:
+            arrow_map = {"positive": "📈", "negative": "📉", "binary": "⚖️", "drift": "🌀"}
+
+            def _fmt_event(e) -> str:
                 stars = "★" * e.impact_level
-                arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️"}.get(e.direction, "•")
+                arrow = arrow_map.get(e.direction, "•")
                 tag = f" `{e.category_tag}`" if e.category_tag else ""
-                lines.append(f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%})")
-            lines.append("")
+                return f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%})"
+
+            fresh = [e for e in today_events if e.source != "global_map" and e.category_tag != "drift"]
+            carry = [e for e in today_events if e.source == "global_map" or e.category_tag == "drift"]
+
+            if fresh:
+                lines.append(f"**今日（{today}）{len(fresh)} 个事件:**")
+                for e in sorted(fresh, key=lambda x: -x.impact_level)[:6]:
+                    lines.append(_fmt_event(e))
+                lines.append("")
+
+            if carry:
+                lines.append(f"**持续传导（{len(carry)} 个，历史事件延续至生效，非今日发生）:**")
+                for e in sorted(carry, key=lambda x: -x.impact_level)[:6]:
+                    lines.append(_fmt_event(e) + " ←历史事件传导")
+                lines.append("")
 
         # ── 未来 2 周按日期展示（每日 Top 事件）──
         future_events = [e for e in high_conf if e.event_date > today]
@@ -321,7 +360,7 @@ def _write_reasoning_md(
                 day_events = sorted(by_date[d], key=lambda x: (-x.impact_level, -x.confidence))
                 top = day_events[0]
                 stars = "★" * top.impact_level
-                arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️"}.get(top.direction, "•")
+                arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️", "drift": "🌀"}.get(top.direction, "•")
                 extra = f" +{len(day_events)-1}个" if len(day_events) > 1 else ""
                 lines.append(f"- {d} {arrow} {stars} **{top.sector}**: {top.title}{extra}")
             lines.append("")
@@ -352,7 +391,10 @@ def _write_reasoning_md(
     ambush_reservoir = getattr(unified_ctx, "ambush_reservoir", []) if unified_ctx else []
     ambush_veto = getattr(unified_ctx, "ambush_veto_log", []) if unified_ctx else []
     if ambush_pool or ambush_reservoir or ambush_veto:
-        lines.append(f"## 🔍 埋伏通道（正式池 {len(ambush_pool)} / 蓄水池 {len(ambush_reservoir)} / 否决 {len(ambush_veto)}）")
+        # 吸筹观察 ≠ 市场否决（时机未到的留痕，决策 19），计数与图标区分
+        veto_n = sum(1 for v in ambush_veto if not v.split(": ", 1)[-1].startswith("吸筹观察"))
+        observe_n = len(ambush_veto) - veto_n
+        lines.append(f"## 🔍 埋伏通道（正式池 {len(ambush_pool)} / 蓄水池 {len(ambush_reservoir)} / 否决 {veto_n} / 观察 {observe_n}）")
         lines.append("")
         if ambush_pool:
             lines.append("**正式池（催化剂排序）：**")
@@ -360,8 +402,10 @@ def _write_reasoning_md(
                 stars = "★" * c.top_event_level
                 date_str = str(c.top_event_date) if c.top_event_date else "—"
                 tag_emoji = {"drift": "📈", "fade": "🔔", "binary": "⚖️"}.get(c.category_tag, "•")
+                # Agent 催化剂先行提名条目（决策 21）：行首 🤖 标记，便于归档校准统计兑现率
+                nominated_mark = "🤖 " if getattr(c, "nominated", False) else ""
                 lines.append(
-                    f"- {tag_emoji} **{c.sector_name}** ({stars}, "
+                    f"- {nominated_mark}{tag_emoji} **{c.sector_name}** ({stars}, "
                     f"score={c.catalyst_score:.2f}, {c.category_tag})"
                     f" — 最近事件 {date_str}: {', '.join(c.events[:2])}"
                 )
@@ -378,7 +422,9 @@ def _write_reasoning_md(
         if ambush_veto:
             lines.append("**否决记录：**")
             for v in ambush_veto[:8]:
-                lines.append(f"- ❌ {v}")
+                # ⏳ 吸筹观察（资金未到的留痕）与 ❌ 真否决区分显示（决策 19）
+                mark = "⏳" if v.split(": ", 1)[-1].startswith("吸筹观察") else "❌"
+                lines.append(f"- {mark} {v}")
             lines.append("")
 
     # ── 情绪阶段状态机摘要（v2.1）──

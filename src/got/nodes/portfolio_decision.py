@@ -1182,16 +1182,22 @@ class PortfolioDecisionNode:
     ) -> list:
         """反向查询股票所属板块，匹配 Node 6 聚合后的板块情报
 
-        用 get_belong_boards 查全量板块，与 unified_context.confirmed_sectors
-        （Node 6 板块 mini GOT 输出）匹配，获取 4 维验证后的评分。
+        用 get_belong_boards 查全量板块，三级匹配（2026-08-28 扩展）：
+        1. unified_context.confirmed_sectors（Node 6 板块 mini GOT 输出，4 维验证后的评分）
+        2. unified_context.ambush_pool（埋伏正式池）
+        3. unified_context.ambush_reservoir（埋伏蓄水池：综合分低于 floor 的板块
+           不在 confirmed_sectors 中，不扩展则其成分股会落入 fallback）
+        匹配前统一用别名表归一化板块名（同花顺口径"半导体概念" ↔ 东财口径"半导体"）。
+        二/三级命中的强度从 strength_lookup/sector_strength_map 查（查不到给中性 50）。
 
-        降级策略：若所属板块均不在 confirmed_sectors 中，返回第一个板块用于显示，
+        降级策略：若所属板块三级均未命中，返回第一个板块用于显示，
         标记 is_fallback=True，避免持仓股板块显示为"未知"。
 
         Returns:
             list of dict: 匹配的板块信息列表，每项含 sector_name/sector_type/strength/weight
         """
         from data_provider.base import DataFetcherManager
+        from src.got.board_aliases import normalize_sector_name
 
         manager = DataFetcherManager()
         boards = manager.get_belong_boards(symbol)
@@ -1207,24 +1213,25 @@ class PortfolioDecisionNode:
             if board_name:
                 all_board_names.append(board_name)
 
-        # 构建 Node 6 confirmed_sectors 的名称集合（用于匹配）
+        # 构建 Node 6 confirmed_sectors 的名称集合（用于匹配，归一化后建索引）
         # SectorIntel 包含 tech_score（Node 2 强度）、sector_role（主线/埋伏）等
-        confirmed_map = {}  # name -> SectorIntel
+        confirmed_map = {}  # 归一化名 -> SectorIntel
         for intel in unified_context.confirmed_sectors:
-            confirmed_map[intel.sector_name] = intel
+            confirmed_map[normalize_sector_name(intel.sector_name)] = intel
 
-        # 匹配反向查询结果与 Node 6 确认的板块
+        # 一级：匹配 confirmed_sectors
         matched = []
         for board in boards:
             board_name = board.get("name", "") or board.get("board_name", "")
-            if board_name in confirmed_map:
-                intel = confirmed_map[board_name]
+            canon = normalize_sector_name(board_name)
+            if canon in confirmed_map:
+                intel = confirmed_map[canon]
                 # 板块强度统一用综合口径（composite），不再用纯技术分（2026-08-18）
                 strength = intel.composite_score
                 # 主线板块权重更高
                 weight = 1.5 if intel.sector_role == "mainline" else 1.0
                 matched.append({
-                    "sector_name": board_name,
+                    "sector_name": intel.sector_name,
                     "sector_type": intel.sector_type,
                     "strength": strength,
                     "weight": weight,
@@ -1240,44 +1247,78 @@ class PortfolioDecisionNode:
             matched[0]["all_belong_boards"] = all_board_names
             return matched
 
+        # ── 二/三级：埋伏正式池 + 蓄水池（2026-08-28 扩展）──
+        # 综合分低于 floor 的板块落在蓄水池，不在 confirmed_sectors 中；
+        # 不扩展则其成分股会落入 fallback 显示行业板名（如 002158 → 机械设备）
+        ambush_map: Dict[str, str] = {}  # 归一化名 -> ambush / reservoir
+        for candidate in getattr(unified_context, "ambush_pool", None) or []:
+            ambush_map[normalize_sector_name(candidate.sector_name)] = "ambush"
+        for entry in getattr(unified_context, "ambush_reservoir", None) or []:
+            ambush_map.setdefault(normalize_sector_name(entry.sector_name), "reservoir")
+
+        _smap = sector_strength_map or {}
+        _slookup = strength_lookup or {}
+
+        def _lookup_strength(board_name: str):
+            """查板块强度：精确匹配 → 别名匹配 → 子串匹配 → None（未查到）"""
+            # 1. 精确匹配（is-not-None 防止 strength=0.0 穿透）
+            s = _smap.get(board_name)
+            if s is not None:
+                return s
+            s = _slookup.get(board_name)
+            if s is not None:
+                return s
+            # 2. 常见别名：贵金属↔黄金, 有色↔有色金属 等
+            _ALIASES = {
+                "贵金属": ["黄金", "黄金概念"],
+                "有色": ["有色金属", "稀缺资源"],
+                "养殖": ["种业", "其他养殖"],
+            }
+            for alias, targets in _ALIASES.items():
+                if alias in board_name:
+                    for t in targets:
+                        s = _smap.get(t)
+                        if s is not None:
+                            return s
+                        s = _slookup.get(t)
+                        if s is not None:
+                            return s
+            # 3. 子串匹配：遍历全部命中取最高分（避免 dict 插入序决定结果）
+            best: float | None = None
+            for map_key, map_val in {**_smap, **_slookup}.items():
+                if board_name in map_key or map_key in board_name:
+                    if best is None or map_val > best:
+                        best = map_val
+            return best
+
+        matched_ambush = []
+        for board in boards:
+            board_name = board.get("name", "") or board.get("board_name", "")
+            canon = normalize_sector_name(board_name)
+            if canon in ambush_map:
+                strength = _lookup_strength(board_name)
+                if strength is None and canon != board_name:
+                    strength = _lookup_strength(canon)
+                matched_ambush.append({
+                    "sector_name": canon,
+                    "sector_type": "ambush",
+                    "strength": strength if strength is not None else 50.0,
+                    "weight": 1.0,
+                    "sector_role": "ambush",
+                    "ambush_source": ambush_map[canon],
+                })
+
+        if matched_ambush:
+            logger.info(
+                f"[反向查询] {symbol}: 匹配到埋伏/蓄水池板块 "
+                f"{[(m['sector_name'], m['ambush_source']) for m in matched_ambush]}"
+            )
+            matched_ambush[0]["all_belong_boards"] = all_board_names
+            return matched_ambush
+
         # 降级：无匹配时，从 sector_strength_map / strength_lookup 查实际强度
         # P0-2 修复：不再硬编码 50.0，优先用 Node 2 实际强度分
         if all_board_names:
-            _smap = sector_strength_map or {}
-            _slookup = strength_lookup or {}
-
-            def _lookup_strength(board_name: str):
-                """查板块强度：精确匹配 → 别名匹配 → 子串匹配 → None（未查到）"""
-                # 1. 精确匹配（is-not-None 防止 strength=0.0 穿透）
-                s = _smap.get(board_name)
-                if s is not None:
-                    return s
-                s = _slookup.get(board_name)
-                if s is not None:
-                    return s
-                # 2. 常见别名：贵金属↔黄金, 有色↔有色金属 等
-                _ALIASES = {
-                    "贵金属": ["黄金", "黄金概念"],
-                    "有色": ["有色金属", "稀缺资源"],
-                    "养殖": ["种业", "其他养殖"],
-                }
-                for alias, targets in _ALIASES.items():
-                    if alias in board_name:
-                        for t in targets:
-                            s = _smap.get(t)
-                            if s is not None:
-                                return s
-                            s = _slookup.get(t)
-                            if s is not None:
-                                return s
-                # 3. 子串匹配：遍历全部命中取最高分（避免 dict 插入序决定结果）
-                best: float | None = None
-                for map_key, map_val in {**_smap, **_slookup}.items():
-                    if board_name in map_key or map_key in board_name:
-                        if best is None or map_val > best:
-                            best = map_val
-                return best
-
             # 遍历所有板块名，采纳实际强度分（含弱板块 <50，避免乐观偏差）；
             # 仅当全部查不到时才兜底中性分 50（#9 修复）
             fallback_board = all_board_names[0]

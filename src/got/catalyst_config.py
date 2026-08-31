@@ -152,6 +152,33 @@ RESERVOIR_EXPIRY_DAYS = 10           # 蓄水池驻留 ≥N 交易日 → 自动
 RESERVOIR_PROMOTION_MIN_DAYS = 2     # TODO: 待校准 — 升格最低驻留天数（太短无意义）
 RESERVOIR_MAX_SIZE = 15              # 蓄水池容量上限（超出按优先级驱逐最老条目）
 
+# =============================================================================
+# 影子模式开关（Track B agent 增强）
+# =============================================================================
+
+import os
+SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "true").lower() == "true"   # T5: 事件→板块对齐层（影子 1 周）
+NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
+AGENT_STOCK_REVIEW_ENABLED = os.environ.get("AGENT_STOCK_REVIEW_ENABLED", "false").lower() == "true"  # T1: Agent 终审
+AGENT_STOCK_REVIEW_MAX = 2           # T1: Agent 终审最大调用数（R7 成本预算）
+
+# =============================================================================
+# LLM 精炼视野扩围（0831 短剧案例修复，决策 20）
+# =============================================================================
+
+REFINE_TOP_N = 10                    # 基础片：composite 降序前 N（原硬编码上提）
+REFINE_MAX_SECTORS = 20              # 总量上限（基础片 + 埋伏候选追加片）
+
+# =============================================================================
+# Agent 催化剂先行提名（0831 短剧案例修复，决策 21）
+# =============================================================================
+
+AMBUSH_NOMINATION_MAX = 2            # 单次运行提名候选/采纳上限（R7 成本预算）
+AMBUSH_NOMINATION_MIN_CONFIDENCE = 0.6  # Agent 提名采纳置信度下限
+AMBUSH_NOMINATION_MULTIPLIER = 0.6   # 提名条目催化分折扣（未确认吸筹的保守折扣）
+AMBUSH_NOMINATION_MIN_CONSECUTIVE = 2   # G3: 归档连续正流入下限（或 3 日均 >0 二选一）
+AMBUSH_NOMINATION_DISABLED = os.environ.get("AMBUSH_NOMINATION_DISABLED", "").lower() == "true"  # 紧急回滚开关
+
 # 影响等级→权重映射
 IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 

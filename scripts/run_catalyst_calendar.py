@@ -9,6 +9,7 @@ if PROJECT_ROOT not in sys.path:
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+import argparse
 import asyncio
 import logging
 from datetime import date
@@ -20,6 +21,13 @@ logging.basicConfig(
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="催化剂日历构建验证")
+    parser.add_argument(
+        "--force-full", action="store_true",
+        help="强制全量重建（跳过增量判断，触发残留清理）",
+    )
+    args = parser.parse_args()
+
     # 反爬补丁
     try:
         from src.patches.eastmoney_patch import eastmoney_patch
@@ -36,7 +44,7 @@ async def main():
     print(f"催化剂日历构建 — {target}")
     print(f"{'='*60}\n")
 
-    calendar = await builder.build_calendar(target)
+    calendar = await builder.build_calendar(target, force_full=args.force_full)
 
     print(f"状态: {calendar.status}")
     print(f"模式: {calendar.refresh_mode}")
@@ -77,20 +85,33 @@ async def main():
     for tag, cnt in sorted(tag_counts.items()):
         print(f"  {tag}: {cnt}")
 
-    # 按板块分组展示（只展示 ★★+ 事件）
+    # 按事件分组展示（只展示 ★★+ 事件；同日期同标题的跨板块扇出记录合并为一行）
     print(f"\n--- 板块级催化剂（★★+ ） ---")
     high_events = [e for e in calendar.events if e.impact_level >= 2]
-    high_events.sort(key=lambda e: (e.event_date, -e.impact_level))
+
+    # 聚合：同 (日期, 标题) = 同一真实事件向多个受影响板块的扇出记录（2026-08-28）
+    from collections import OrderedDict
+    grouped = OrderedDict()
+    for e in sorted(high_events, key=lambda e: (e.event_date, -e.impact_level, e.title)):
+        key = (e.event_date, e.title)
+        if key not in grouped:
+            grouped[key] = {"event": e, "sectors": []}
+        grouped[key]["sectors"].append(e.sector)
 
     current_date = None
-    for e in high_events:
-        if e.event_date != current_date:
-            current_date = e.event_date
+    for (event_date, _title), group in grouped.items():
+        if event_date != current_date:
+            current_date = event_date
             print(f"\n  [{current_date}]")
+        e = group["event"]
         stars = "★" * e.impact_level
         conf_tag = "" if e.confidence >= 0.7 else f" ⚠️({e.confidence:.0%})"
         arrow = {"positive": "↑", "negative": "↓", "binary": "⚖", "drift": "↗", "fade": "⏳"}.get(e.direction, "•")
-        print(f"    {stars} {arrow} {e.sector}: {e.title} [{e.category_tag}]{conf_tag}")
+        sectors = group["sectors"]
+        sector_tag = sectors[0] if len(sectors) == 1 else f"{sectors[0]} 等{len(sectors)}板块"
+        print(f"    {stars} {arrow} {sector_tag}: {e.title} [{e.category_tag}]{conf_tag}")
+        if len(sectors) > 1:
+            print(f"        ↳ 影响 {len(sectors)} 个板块: {'/'.join(sectors)}")
 
     # 验证持久化
     print(f"\n--- 持久化验证 ---")

@@ -34,6 +34,7 @@ class TestApplyStateMachine(unittest.TestCase):
             overheat_level="normal", today_change=1.0,
             score_drop=0.0,
             is_ambush=False, is_defensive=False,
+            exit_pressure=0, tier="B",
         )
         base.update(overrides)
         return base
@@ -44,9 +45,9 @@ class TestApplyStateMachine(unittest.TestCase):
         assert SectorAnalysisNode._apply_state_machine(**e) == "neutral"
 
     def test_coldstart_leading_strong_enters_active(self):
-        """冷启动 + leading + score>60 + 未破位 → active_mainline（首次进入）。"""
+        """冷启动 + leading + score>60 + 未破位 → active_mainline（首次进入，S/A 级）。"""
         e = self._evidence(prev_state=None, q="leading", strength_score=65.0,
-                           price_chg_5d=0.03, above_ma20=True)
+                           price_chg_5d=0.03, above_ma20=True, tier="A")
         assert SectorAnalysisNode._apply_state_machine(**e) == "active_mainline"
 
     def test_active_stays_active_when_healthy(self):
@@ -162,6 +163,82 @@ class TestApplyStateMachine(unittest.TestCase):
                            price_chg_5d=-0.01, above_ma20=False,
                            score_drop=25.0)
         assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+    # ── 退出压力驱逐（2026-08-31 吸收原框逻辑）──
+
+    def test_exit_pressure_SA_tolerance_3(self):
+        """S/A 级退出压力容忍 3 天：pressure=3 → exhausted，pressure=2 → 驻留。"""
+        # pressure=2 < tolerance(3) → 驻留（需 q=leading 才触发驻留分支）
+        e = self._evidence(
+            prev_state="active_mainline", prev_dwell=5,
+            q="leading", strength_score=60.0,
+            price_chg_5d=0.01, above_ma20=True,
+            tier="S", exit_pressure=2,
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "active_mainline"
+        # pressure=3 >= tolerance(3) → 衰竭（压力驱逐优先于驻留）
+        e = self._evidence(
+            prev_state="active_mainline", prev_dwell=5,
+            q="leading", strength_score=60.0,
+            price_chg_5d=0.01, above_ma20=True,
+            tier="S", exit_pressure=3,
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+    def test_exit_pressure_B_tolerance_1(self):
+        """B 级退出压力容忍 1 天：pressure=1 → exhausted。"""
+        e = self._evidence(
+            prev_state="active_mainline", prev_dwell=3,
+            q="weakening", strength_score=55.0,
+            price_chg_5d=0.01, above_ma20=True,
+            tier="B", exit_pressure=1,
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+    def test_exit_pressure_priority_after_broken(self):
+        """退出压力驱逐优先级：在 broken 判定之后。破位优先于压力驱逐。"""
+        e = self._evidence(
+            prev_state="active_mainline", prev_dwell=3,
+            q="lagging", strength_score=40.0,
+            price_chg_5d=-0.03, above_ma20=False,
+            tier="S", exit_pressure=5,
+        )
+        # broken=True → exhausted（破位优先）
+        assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+    # ── 入口门槛分档（2026-08-31 吸收原框入框门槛）──
+
+    def test_entry_threshold_SA_61_enters(self):
+        """S/A 级入口：score=61 > 60 → active_mainline。"""
+        e = self._evidence(
+            prev_state=None, q="leading", strength_score=61.0,
+            price_chg_5d=0.02, above_ma20=True, tier="S",
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "active_mainline"
+
+    def test_entry_threshold_B_80_enters(self):
+        """B 级入口：score=80 恰好进入（>= 对齐原框 "score < min_score 才拒绝" 语义）。"""
+        e = self._evidence(
+            prev_state=None, q="leading", strength_score=80.0,
+            price_chg_5d=0.02, above_ma20=True, tier="B",
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "active_mainline"
+
+    def test_entry_threshold_SA_60_rejected(self):
+        """S/A 级入口：score=60 不进（严格 >60）。"""
+        e = self._evidence(
+            prev_state=None, q="leading", strength_score=60.0,
+            price_chg_5d=0.02, above_ma20=True, tier="A",
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "neutral"
+
+    def test_entry_threshold_B_79_rejected(self):
+        """B 级入口：score=79 < 80 → neutral。"""
+        e = self._evidence(
+            prev_state=None, q="leading", strength_score=79.0,
+            price_chg_5d=0.02, above_ma20=True, tier="B",
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "neutral"
 
 
 # =================================================================
@@ -280,3 +357,124 @@ class TestSchemaCoolingDown(unittest.TestCase):
         )
         assert rrg.rs_ratio_raw == 0.6
         assert rrg.rs_momentum_raw == 0.4
+
+
+# =================================================================
+# 6. exit_pressure 计算逻辑（_compute_exit_pressure 直测）
+# =================================================================
+class TestComputeExitPressure(unittest.TestCase):
+    """验证 _compute_exit_pressure 累计规则（吸收原框 consecutive_low_days）。
+
+    累计规则：
+    - 仅前日为主线（active_mainline）才累计，其余状态归 0（等价原框只跟踪框内成员）
+    - strength_score < 50 → prev + 1；score >= 50 → 归 0（叠加前）
+    - today_change < -3.0 → 额外 +2；< -1.5 → 额外 +1（T-0 止损）
+    """
+
+    def test_low_score_accumulates_from_prev(self):
+        """前日主线 + 今日低分 → prev+1（连续 3 天低分累计到 3）。"""
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", 0, 48.0, 0.5)
+        assert ep == 1
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", ep, 47.0, 0.5)
+        assert ep == 2
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", ep, 46.0, 0.5)
+        assert ep == 3
+
+    def test_recovery_resets_pressure(self):
+        """前日主线 + 今日 score>=50 → 归 0（即使带小额下跌）。"""
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", 2, 55.0, -1.0)
+        assert ep == 0
+
+    def test_recovery_with_small_drop_adds_one(self):
+        """score>=50 归 0 后叠加 T-0 -2.0% → 1。"""
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", 2, 55.0, -2.0)
+        assert ep == 1
+
+    def test_t0_crash_on_healthy_score(self):
+        """score>=50 归 0 + 单日暴跌 -3.5% → +2（T-0 硬止损）。"""
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", 0, 65.0, -3.5)
+        assert ep == 2
+
+    def test_low_score_plus_crash_stacks(self):
+        """score<50 (+1) + today<-3.0 (+2) = prev+3。"""
+        ep = SectorAnalysisNode._compute_exit_pressure("active_mainline", 0, 45.0, -3.5)
+        assert ep == 3
+
+    def test_non_mainline_prev_no_accumulation(self):
+        """前日非主线（neutral/ambush/cooling）→ 不累计，归 0（等价原框只跟踪框内成员）。"""
+        for prev in (None, "neutral", "ambush", "high_position_cooling",
+                     "exhausted_mainline", "defensive_rotation"):
+            ep = SectorAnalysisNode._compute_exit_pressure(prev, 2, 40.0, -4.0)
+            assert ep == 0, f"prev={prev} 不应累计退出压力"
+
+
+# =================================================================
+# 6b. exit_pressure 驱逐边集成（经 _apply_state_machine）
+# =================================================================
+class TestExitPressureEviction(unittest.TestCase):
+    """验证压力值传入状态机后的驱逐行为（与累计规则端到端衔接）。"""
+
+    def test_exit_pressure_combines_low_score_and_crash(self):
+        """score<50 (+1) + today<-3.0 (+2) = 累计 +3。
+
+        通过 _apply_state_machine 间接验证：B 级 pressure=3 → exhausted。
+        """
+        e = TestApplyStateMachine._evidence(
+            prev_state="active_mainline", prev_dwell=2,
+            q="weakening", strength_score=45.0,
+            price_chg_5d=0.01, above_ma20=True,
+            tier="B", exit_pressure=3,  # 模拟：score<50(+1) + crash(-3.5%→+2) = 3
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+    def test_exit_pressure_reset_on_recovery(self):
+        """score>=50 → 压力归零（即使有 T-0 小额下跌）。
+
+        模拟：score=60(>=50 → reset=0) + today=-1.0(< -1.5? no) = 0
+        """
+        e = TestApplyStateMachine._evidence(
+            prev_state="active_mainline", prev_dwell=5,
+            q="leading", strength_score=60.0,
+            price_chg_5d=0.02, above_ma20=True,
+            tier="S", exit_pressure=0,  # score>=50 → reset
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "active_mainline"
+
+    def test_exit_pressure_t0_crash_only(self):
+        """score>=50 (reset=0) + today<-3.0 (+2) = pressure=2。
+
+        B 级容忍 1 天 → pressure=2 >= 1 → exhausted。
+        """
+        e = TestApplyStateMachine._evidence(
+            prev_state="active_mainline", prev_dwell=3,
+            q="leading", strength_score=65.0,
+            price_chg_5d=0.02, above_ma20=True,
+            tier="B", exit_pressure=2,  # reset=0 + crash=+2
+        )
+        assert SectorAnalysisNode._apply_state_machine(**e) == "exhausted_mainline"
+
+
+# =================================================================
+# 7. SectorDetail exit_pressure_days 字段
+# =================================================================
+class TestSectorDetailExitPressure(unittest.TestCase):
+    def test_exit_pressure_days_field(self):
+        """SectorDetail 接受 exit_pressure_days 字段。"""
+        detail = SectorDetail(
+            code="880328",
+            name="黄金",
+            state="active_mainline",
+            strength_score=78.0,
+            exit_pressure_days=2,
+        )
+        assert detail.exit_pressure_days == 2
+
+    def test_exit_pressure_days_default_none(self):
+        """exit_pressure_days 默认 None。"""
+        detail = SectorDetail(
+            code="880328",
+            name="黄金",
+            state="neutral",
+            strength_score=50.0,
+        )
+        assert detail.exit_pressure_days is None

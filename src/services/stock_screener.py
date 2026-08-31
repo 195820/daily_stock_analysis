@@ -96,6 +96,11 @@ class ScreenerStock:
     catalyst_event_type: str = ""          # earnings / lockup / narrative / global / macro
     catalyst_confidence: float = 0.0       # 催化剂置信度 0-1
 
+    # T1 Agent 终审字段
+    agent_verdict: str = ""                # confirm / warn / reject / "" (未调用)
+    agent_notes: str = ""                  # Agent 审查备注
+    agent_decision_signal: str = ""        # reject 时的降级信号: "demoted" / ""
+
 
 @dataclass
 class ScreenerRunResult:
@@ -1078,12 +1083,20 @@ class StockScreenerPipeline:
                 logger.warning(f"[选股池] {sector_name}({sector_type}) 问财返回 0 只，该板块无候选股")
 
             for stock_info in constituents:
+                # 提取过热与生命周期信息（v2 过热检测升级，Phase 3 联动）
+                overheat_sev = sector_info.get("overheat_severity", 0) or 0
+                lifecycle_info = sector_info.get("lifecycle") or {}
+                lifecycle_phase = lifecycle_info.get("phase", "") if isinstance(lifecycle_info, dict) else ""
+
                 universe.append({
                     "code": stock_info["code"],
                     "name": stock_info.get("name", ""),
                     "sector": sector_name,
                     "sector_type": sector_type,
                     "sector_score": sector_score,
+                    # v2: 过热与生命周期（供漏斗联动使用）
+                    "sector_overheat_severity": overheat_sev,
+                    "sector_lifecycle_phase": lifecycle_phase,
                     # 保留问财量价+DDE 数据（供资金面/技术面评分使用）
                     "price": stock_info.get("price", 0),
                     "dde_net_pct": stock_info.get("dde_net_pct", 0),
@@ -1466,10 +1479,34 @@ class StockScreenerPipeline:
         else:
             logger.info(f"轮次 0b: {len(candidates)} 只（过滤 {len(hot_pool)} 只涨≥8%过热票）")
 
-        # 轮次 1: 信号过滤（排除衰竭板块）
+        # 轮次 1: 信号过滤（排除衰竭板块 + 过热 exhausted 板块）
         exhausted = [s.get("name") for s in got_context.get("sector_context", {}).get("exhausted_mainline", [])]
         candidates = [c for c in candidates if c["sector"] not in exhausted]
-        logger.info(f"轮次 1: {len(candidates)} 只（排除衰竭板块）")
+
+        # v2: 过热 exhausted 过滤（overheat_severity > 0.5 → 排除，带保底防归零）
+        OVERHEAT_EXHAUSTED_FLOOR = 5
+        overheat_exhausted = [c for c in candidates if c.get("sector_overheat_severity", 0) > 0.5]
+        normal_pool = [c for c in candidates if c.get("sector_overheat_severity", 0) <= 0.5]
+        if len(normal_pool) < OVERHEAT_EXHAUSTED_FLOOR and overheat_exhausted:
+            # 池不足：按 severity 从低到高放回保底（放回票在 _score_risk 被 -25 重扣压制）
+            overheat_exhausted.sort(key=lambda c: c.get("sector_overheat_severity", 0))
+            need = OVERHEAT_EXHAUSTED_FLOOR - len(normal_pool)
+            restored = overheat_exhausted[:need]
+            for c in restored:
+                c["_overheat_fallback"] = True
+                normal_pool.append(c)
+            restored_desc = ", ".join(
+                f"{c.get('code')}({c.get('sector')})" for c in restored
+            )
+            logger.info(
+                f"轮次 1: {len(normal_pool)} 只（排除衰竭+过热板块，"
+                f"池不足放回 {len(restored)} 只保底: {restored_desc}）"
+            )
+        else:
+            logger.info(
+                f"轮次 1: {len(normal_pool)} 只（排除衰竭板块 + {len(overheat_exhausted)} 只过热exhausted）"
+            )
+        candidates = normal_pool
 
         # 轮次 1.5: 横盘过滤（排除多窗口小涨幅的停滞票）
         candidates = self._filter_stagnation(candidates, fetcher_manager)
@@ -1508,14 +1545,15 @@ class StockScreenerPipeline:
             c["news_score"] = news_scores.get(c["code"], 0)
             c["news_available"] = news_avail.get(c["code"], False)
 
-        # P5: 催化剂关联度重排（仅 ambush 板块，置信度 >= 0.7 时生效）
+        # P5: 催化剂关联度重排（仅 ambush 板块，置信度 >= CATALYST_CONFIDENCE_GATE 时生效，A3 统一口径）
+        from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE
         catalyst_scores, catalyst_details = self._score_catalyst_relevance(candidates, got_context)
         max_catalyst_confidence = max(
             (d.get("confidence", 0) for d in catalyst_details.values()),
             default=0.0,
         )
         ambush_candidates = [c for c in candidates if c.get("sector_type") == "ambush"]
-        if catalyst_scores and max_catalyst_confidence >= 0.7 and ambush_candidates:
+        if catalyst_scores and max_catalyst_confidence >= CATALYST_CONFIDENCE_GATE and ambush_candidates:
             # 对 ambush 候选按催化剂关联度重排
             for c in candidates:
                 c["catalyst_relevance_score"] = catalyst_scores.get(c["code"], 0)
@@ -1532,7 +1570,7 @@ class StockScreenerPipeline:
             )
         elif catalyst_scores:
             logger.info(
-                f"P5催化剂重排跳过: max_confidence={max_catalyst_confidence:.2f} < 0.7"
+                f"P5催化剂重排跳过: max_confidence={max_catalyst_confidence:.2f} < {CATALYST_CONFIDENCE_GATE}"
             )
 
         # 轮次 5: 板块分散 Top N（每个板块最多 1 只）
@@ -1579,7 +1617,175 @@ class StockScreenerPipeline:
                 break
         logger.info(f"轮次 5: {len(finalists)} 只（板块分散）")
 
+        # T1: Agent 终审（默认关闭，AGENT_STOCK_REVIEW_ENABLED=true 开启）
+        from src.got.catalyst_config import AGENT_STOCK_REVIEW_ENABLED
+        if AGENT_STOCK_REVIEW_ENABLED and finalists:
+            finalists = self._agent_final_review(finalists, got_context)
+
         return finalists
+
+    # =================================================================
+    # T1: 候选股 Agent 终审
+    # =================================================================
+
+    _AGENT_REVIEW_PROMPT = """你是 A 股个股终审分析师。给定以下候选股票信息和市场环境，给出你的终审意见。
+
+## 市场环境
+- 大盘regime: {regime}
+- 板块角色: {sector_type}
+- 催化剂: {catalyst_info}
+
+## 候选股
+- 代码: {code}
+- 名称: {name}
+- 板块: {sector}
+- 技术评分: {tech_score:.0f}/100
+- 风险评分: {risk_score:.0f}/100（越高越安全）
+- 资金面: {capital_score:.0f}/100
+- 消息面: {news_score:.0f}/100
+
+## 输出要求
+以 JSON 格式输出你的终审意见：
+```json
+{{
+    "verdict": "confirm/warn/reject",
+    "confidence": 0.0-1.0,
+    "reasoning": "一句话理由（30字内）",
+    "risk_flags": ["风险点1", "风险点2"]
+}}
+```
+
+verdict 含义：
+- confirm: 确认推荐，无明显风险
+- warn: 可推荐但有明确风险需关注
+- reject: 建议否决，存在严重风险
+
+只输出 JSON，不要其他文字。"""
+
+    def _agent_final_review(
+        self, finalists: List[ScreenerStock], got_context: dict
+    ) -> List[ScreenerStock]:
+        """T1: Agent 终审 — 对 Top N 候选股调用个股 Agent 做最终审查
+
+        设计原则：
+        - 只有否决权：reject → 降级展示（保留、标注、移末位），不删除
+        - 默认关闭（AGENT_STOCK_REVIEW_ENABLED）
+        - 最多审查 AGENT_STOCK_REVIEW_MAX 只（R7 成本预算）
+        - 串行调用 + 空响应重试（R5 串行原则）
+        - 失败时等同现状（R4 可降级）
+
+        Returns:
+            同输入列表，但 stock.agent_verdict/agent_notes/agent_decision_signal 已填充
+        """
+        from src.got.catalyst_config import AGENT_STOCK_REVIEW_MAX
+        from src.agent.factory import build_agent_executor
+
+        # 截断到预算上限
+        review_targets = finalists[:AGENT_STOCK_REVIEW_MAX]
+        if len(finalists) > AGENT_STOCK_REVIEW_MAX:
+            logger.info(
+                f"[T1终审] 候选 {len(finalists)} 只，截断到 Top {AGENT_STOCK_REVIEW_MAX}"
+            )
+
+        # 提取市场环境信息
+        market_ctx = got_context.get("market_context", {})
+        regime = market_ctx.get("market_state", {}).get("regime", "unknown")
+
+        try:
+            executor = build_agent_executor()
+        except Exception as exc:
+            logger.warning(f"[T1终审] Agent 构建失败，降级跳过: {exc}")
+            return finalists
+
+        for stock in review_targets:
+            try:
+                catalyst_info = (
+                    f"{stock.catalyst_event_title} ({stock.catalyst_event_type}, "
+                    f"置信度{stock.catalyst_confidence:.0%})"
+                    if stock.catalyst_event_title
+                    else "无催化剂事件"
+                )
+
+                prompt = self._AGENT_REVIEW_PROMPT.format(
+                    regime=regime,
+                    sector_type=stock.sector_type,
+                    catalyst_info=catalyst_info,
+                    code=stock.code,
+                    name=stock.name,
+                    sector=stock.sector_name,
+                    tech_score=stock.tech_wave_score,
+                    risk_score=stock.risk_score_safe,
+                    capital_score=stock.capital_score,
+                    news_score=stock.news_score,
+                )
+
+                # 串行调用，空响应重试。
+                # 注：executor.run() 返回 AgentResult dataclass（非 dict），结果在 .content
+                response_text = None
+                for attempt in range(3):
+                    try:
+                        result = executor.run(prompt)
+                        response_text = (
+                            result.content if result and result.success else ""
+                        )
+                        if response_text:
+                            break
+                    except Exception as exc:
+                        logger.debug(f"[T1终审] {stock.code} 第{attempt+1}次调用失败: {exc}")
+
+                if not response_text:
+                    stock.agent_verdict = "warn"
+                    stock.agent_notes = "Agent 调用失败，降级为 warn"
+                    continue
+
+                # 解析 JSON 响应
+                verdict_data = self._parse_agent_verdict(response_text)
+                stock.agent_verdict = verdict_data.get("verdict", "warn")
+                stock.agent_notes = verdict_data.get("reasoning", "")
+
+                # reject → 降级信号（保留但标注）
+                if stock.agent_verdict == "reject":
+                    stock.agent_decision_signal = "demoted"
+                    logger.info(
+                        f"[T1终审] {stock.code} {stock.name}: REJECT — {stock.agent_notes}"
+                    )
+
+            except Exception as exc:
+                logger.warning(f"[T1终审] {stock.code} 审查异常: {exc}")
+                stock.agent_verdict = "warn"
+                stock.agent_notes = f"审查异常: {str(exc)[:30]}"
+
+        # reject 的候选移到末位（不删除）
+        confirmed = [s for s in review_targets if s.agent_verdict != "reject"]
+        rejected = [s for s in review_targets if s.agent_verdict == "reject"]
+        remaining = finalists[AGENT_STOCK_REVIEW_MAX:]
+        finalists = confirmed + remaining + rejected
+
+        logger.info(
+            f"[T1终审] 完成: {len(confirmed)} confirm/warn, "
+            f"{len(rejected)} reject（降级到末位）"
+        )
+        return finalists
+
+    @staticmethod
+    def _parse_agent_verdict(response_text: str) -> Dict:
+        """解析 Agent 终审 JSON 响应"""
+        import re
+        # 提取 JSON（兼容 markdown code block）
+        match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if not match:
+            return {"verdict": "warn", "reasoning": "JSON 解析失败"}
+        try:
+            data = json.loads(match.group())
+            verdict = data.get("verdict", "warn")
+            if verdict not in ("confirm", "warn", "reject"):
+                verdict = "warn"
+            return {
+                "verdict": verdict,
+                "reasoning": data.get("reasoning", "")[:60],
+            }
+        except json.JSONDecodeError:
+            return {"verdict": "warn", "reasoning": "JSON 解析失败"}
 
     def _score_capital(
         self, candidates: List[Dict], capital_ctx: dict
@@ -2213,6 +2419,28 @@ class StockScreenerPipeline:
                 elif change_pct >= 5.0:
                     score -= 10      # 中度上涨追高风险
 
+                # 7. 板块过热惩罚（v2 过热检测升级，Phase 3 联动）
+                overheat_sev = c.get("sector_overheat_severity", 0) or 0
+                if overheat_sev > 0.5:
+                    # exhausted 票在轮次 1 已排除，能走到这里的都是保底放回票（_overheat_fallback）
+                    # 重扣压制，保证"放回但不冒头"（计划 §5.4）
+                    score -= 25
+                    if c.get("_overheat_fallback"):
+                        logger.info(
+                            f"[过热保底] {c['code']} {c.get('name','')} ({c['sector']}) "
+                            f"severity={overheat_sev:.2f} 保底放回 -25 压制"
+                        )
+                elif 0.3 < overheat_sev <= 0.5:
+                    score -= 15      # 过热警告：板块高潮风险
+                    logger.debug(f"[过热警告] {c['code']} {c.get('name','')} ({c['sector']}) severity={overheat_sev:.2f}")
+
+                # 8. 板块生命周期 mature 惩罚（软过滤，防追高成熟期板块）
+                lifecycle_phase = c.get("sector_lifecycle_phase", "")
+                if lifecycle_phase == "mature":
+                    score -= 10      # 成熟期板块：上涨空间有限
+                elif lifecycle_phase == "late_stage":
+                    score -= 20      # 晚期板块：即将衰竭
+
                 scores[c["code"]] = max(0, score)
             except Exception as e:
                 logger.warning(f"计算风险评分失败 {c['code']}: {e}")
@@ -2273,8 +2501,9 @@ class StockScreenerPipeline:
             sector = evt.get("sector", "")
             title = evt.get("title", "")
 
-            # 低置信事件不参与评分（但仍记录）
-            if confidence < 0.7:
+            # 低置信事件不参与评分（A3: 统一引用 CATALYST_CONFIDENCE_GATE）
+            from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE
+            if confidence < CATALYST_CONFIDENCE_GATE:
                 continue
 
             # 个股级事件：从 title 提取股票代码
@@ -2283,9 +2512,19 @@ class StockScreenerPipeline:
                 for code in codes:
                     individual_events.setdefault(code, []).append(evt)
 
-            # 板块级事件：按 sector 分组（与个股级互斥，防止同一事件重复计分）
+            # 板块级事件：按 sector 分组（A2 归一化 + T5 扇出；归一化后去重防重复计分）
             elif sector:
-                sector_events.setdefault(sector, []).append(evt)
+                from src.got.board_aliases import normalize_sector_name
+                # T5: 若事件有多板块扇出，进入多个桶；
+                # 归一化后去重，避免别名变体使同一事件重复进同一桶（取 max 时无放大但冗余）
+                affected = evt.get("affected_sectors") or [sector]
+                seen_keys = set()
+                for s in affected:
+                    normalized_sector = normalize_sector_name(s)
+                    if normalized_sector in seen_keys:
+                        continue
+                    seen_keys.add(normalized_sector)
+                    sector_events.setdefault(normalized_sector, []).append(evt)
 
         # ── 为每只候选股评分 ──
         scores: Dict[str, float] = {}
@@ -2314,8 +2553,20 @@ class StockScreenerPipeline:
                 # 每只候选股只匹配自己所属 sector 的事件，取 max 去重，不会重复计分。
 
             # 2. 板块级事件 → confidence × impact × proximity × 50
-            if best_score < 100 and sector in sector_events:
-                for evt in sector_events[sector]:
+            # A2: 归一化查找（精确 → 别名变体）
+            matched_events = []
+            if best_score < 100:
+                matched_events = sector_events.get(sector, [])
+                if not matched_events:
+                    from src.got.board_aliases import sector_name_variants
+                    for variant in sector_name_variants(sector):
+                        if variant == sector:
+                            continue
+                        matched_events = sector_events.get(variant, [])
+                        if matched_events:
+                            break
+            if best_score < 100 and matched_events:
+                for evt in matched_events:
                     confidence = float(evt.get("confidence", 0))
                     impact = int(evt.get("impact_level", 1))
 
@@ -2357,6 +2608,19 @@ class StockScreenerPipeline:
         matched = sum(1 for v in scores.values() if v > 0)
         if matched > 0:
             logger.info(f"[P5催化剂] {matched}/{len(candidates)} 只匹配到催化剂事件")
+
+        # A3 影子评估：若门槛降至 0.60 会多放行哪些事件
+        shadow_events = [
+            evt for evt in events
+            if 0.6 <= float(evt.get("confidence", 0)) < CATALYST_CONFIDENCE_GATE
+        ]
+        if shadow_events:
+            shadow_sectors = {evt.get("sector", "?") for evt in shadow_events}
+            logger.info(
+                f"[P5影子] 门槛 0.60 会多放行 {len(shadow_events)} 个事件 "
+                f"({len(shadow_sectors)} 板块): "
+                f"{', '.join(list(shadow_sectors)[:5])}"
+            )
 
         return scores, details
 

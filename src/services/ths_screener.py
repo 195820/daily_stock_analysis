@@ -196,12 +196,23 @@ class THSScreenerService:
             seen_codes.add(code)
 
             # 提取各字段（键名带日期后缀，需模糊匹配）
+            # 问财字段名可能变更（如 现价→最新价，涨跌幅:前复权→最新涨跌幅），兼容新旧
             name = row.get('股票简称', '')
-            price = self._safe_float(row.get('现价', 0))
-            change_pct = self._find_float_field(row, '涨跌幅:前复权')
+            price = self._safe_float(
+                row.get('最新价') or row.get('现价', 0)
+            )
+            change_pct = (
+                self._find_float_field(row, '最新涨跌幅')
+                or self._find_float_field(row, '涨跌幅:前复权')
+                or self._find_float_field(row, '涨跌幅')
+            )
             dde_net = self._find_float_field(row, 'dde大单净量')
-            turnover = self._safe_float(row.get('换手率', 0))
-            volume = self._safe_float(row.get('成交量', 0))
+            turnover = self._safe_float(
+                row.get('换手率') or self._find_float_field(row, '换手率')
+            )
+            volume = self._safe_float(
+                row.get('成交量') or self._find_float_field(row, '成交量')
+            )
             sector = row.get('所属板块', '')
 
             # 动态查找行业字段（问财的 key 可能有编码差异）

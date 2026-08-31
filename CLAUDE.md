@@ -26,7 +26,9 @@
 │  GOT 层（市场分析）                                              │
 │  Phase 1: GOT 七节点（大盘→板块→资金‖消息‖情绪 → 聚合）         │
 │  Phase 2: 统一决策节点（风险评估→统一打分→组合优化→埋伏退出）    │
-│  催化剂系统: 日历构建(P1) + 关联度重排(P5) + 兑现追踪(P6)       │
+│  催化剂系统: 日历构建(D1-D4守卫/T5对齐/T2校验) + P5重排 + P6兑现 │
+│  跨日记忆 v2.1: persistence.py 归档读取 + 跨节点时序共振         │
+│  生产监控: monitoring.json 运行时指标                            │
 │  src/got/                                                        │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
@@ -40,7 +42,7 @@
 │  数据层                                                          │
 │  DataFetcherManager（11 个数据源策略模式 + 自动故障切换）         │
 │  MootdxFetcher(P0 TCP) + EfinanceFetcher(P0) + AkshareFetcher(P1)│
-│  data_provider/ + src/storage.py（SQLite 25+ 表）               │
+│  data_provider/ + src/storage.py（SQLite 30+ 表）               │
 │  em_rate_limiter.py（东财 HTTP 统一限流）                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -63,34 +65,34 @@ daily_stock_analysis/
 │   │
 │   ├── got/                     # GOT 架构（市场分析）
 │   │   ├── nodes/               # 7 个 GOT 节点（Phase 1: 6 个 + Phase 2: 1 个）
-│   │   │   ├── market_analysis.py    # Node 1: 大盘（4维技术评分/多时间框架/连续仓位）
-│   │   │   ├── sector_analysis.py    # Node 2: 板块（4维百分位/启动检测/主线家族/主线框）
-│   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向/降级机制）
-│   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化）
-│   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数）
-│   │   │   ├── aggregator.py         # Node 6: 聚合（3层分级GOT/L0全局/L1板块/L2组合）
-│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线）
-│   │   ├── catalyst_calendar.py   # 催化剂日历构建（5源事件/全量5日刷新/增量更新）
-│   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/常量/宏观日历规则）
-│   │   ├── catalyst_realization.py # P6: 催化兑现追踪（事后验证/故事寿命/参数校准源）
-│   │   ├── schemas.py           # 节点输入输出 Pydantic Schema（~40 模型）
-│   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度）
-│   │   ├── indicators.py        # 纯规则指标函数（ADX/MACD/A-D线/截面百分位）
-│   │   ├── persistence.py       # 上下文持久化（data/aggregator_contexts/，EMA 基线）
-│   │   ├── archive.py           # 每日历史档（data/got_daily/YYYYMMDD/，全量 ctx + reasoning）
-│   │   └── news_feeds.py        # Node 4 新闻采集（7源推送型：新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）
+│   │   │   ├── market_analysis.py    # Node 1: 大盘（4维技术评分/多时间框架/跨指数一致性/波动率仓位）
+│   │   │   ├── sector_analysis.py    # Node 2: 板块（4维百分位/RRG状态机/主线家族/6维埋伏评分）
+│   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向永久豁免/降级机制）
+│   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化/原始新闻跨日检测）
+│   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数/时序动量）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（A5匹配/A6泛化词/T3仲裁/埋伏通道/跨节点共振）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+埋伏退出）
+│   │   ├── catalyst_calendar.py   # 催化剂日历（D1回声/D2周末/D3过期/D4置信守卫/T5对齐/T2校验）
+│   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/影子模式开关/可调参数集中管理）
+│   │   ├── catalyst_realization.py # P6: 催化兑现追踪（A1三级解析/PEAD多窗口/故事寿命/resolution三态）
+│   │   ├── schemas.py           # 节点输入输出 Pydantic Schema（~45 模型）
+│   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度/use_mock主控）
+│   │   ├── indicators.py        # 纯规则指标函数（ADX/MACD/A-D线/截面百分位/RRG）
+│   │   ├── persistence.py       # 4存储区（EMA基线/跨日ctx/时序数据/生产监控）
+│   │   ├── archive.py           # 每日历史档 + 跨日记忆读取（data/got_daily/YYYYMMDD/）
+│   │   └── news_feeds.py        # Node 4 新闻采集（7源推送型：新浪/CLS/华尔街见闻/东财/NewsNow/同花顺/东方财富）
 │   │
 │   ├── services/                # 核心服务
-│   │   ├── technical_indicator.py    # 短线技术指标（需扩展 ADX/MACD）
+│   │   ├── technical_indicator.py    # 短线技术指标（ADX/MACD/RSI/布林带/均线系统）
 │   │   ├── sector_rotation.py        # 板块轮动分析
-│   │   ├── forum_sentiment.py        # NGA 舆情（后续切雪球）
-│   │   ├── stock_screener.py         # 选股流水线（GOT 模式：DDE 初筛 + 5 轮漏斗）
+│   │   ├── forum_sentiment.py        # 舆情分析（雪球/东财千股千评）
+│   │   ├── stock_screener.py         # 选股流水线（GOT 模式：DDE 初筛 + 5轮漏斗 + P5催化重排 + T1 Agent终审）
 │   │   ├── ths_screener.py           # 同花顺问财
 │   │   ├── portfolio_service.py      # 持仓管理
 │   │   ├── risk_assessment.py        # 风险评估
 │   │   ├── strategy_filter.py        # YAML 策略筛选
 │   │   ├── dde_fetcher.py            # DDE 大单净量
-│   │   ├── board_name_resolver.py    # 板块名解析（TDX→THS 三层：清洗/别名表/模糊匹配）
+│   │   ├── board_name_resolver.py    # 板块名解析（TDX→THS 四层：清洗/别名表/模糊匹配/kind区分）
 │   │   ├── ths_hot_list.py           # 同花顺热榜（4端点：热门股/板块/话题/期货）
 │   │   ├── portfolio_ocr_import.py   # 持仓OCR导入（券商截图→PaddleOCR→交易事件）
 │   │   └── ...
@@ -115,14 +117,16 @@ daily_stock_analysis/
 │   │   └── decision_action.py        # 决策动作分类
 │   │
 │   ├── repositories/            # 数据访问层
-│   ├── storage.py               # SQLAlchemy ORM（25+ 表）
+│   ├── storage.py               # SQLAlchemy ORM（30+ 表）
 │   ├── notification_sender/     # 多渠道通知
 │   ├── llm/                     # LLM 配置
 │   └── patches/                 # 反爬补丁
 │
 ├── data/                        # 数据文件
-│   ├── stock_analysis.db             # SQLite 数据库
-│   └── aggregator_contexts/          # GOT 上下文持久化（新建）
+│   ├── stock_analysis.db             # SQLite 数据库（30+ 表）
+│   ├── aggregator_contexts/          # GOT 上下文持久化（EMA基线/跨日ctx）
+│   ├── got_daily/YYYYMMDD/           # 每日历史档（6节点JSON+reasoning+meta）
+│   └── got_timeseries/               # 时序数据（monitoring.json）
 │
 ├── strategies/custom/           # 自定义选股策略（YAML）
 ├── tests/                       # 191 个测试文件
@@ -167,13 +171,13 @@ daily_stock_analysis/
      │  ┌─────────┐            │  │       │          │      │              │
      │  │ Node 2  │←─ attack_ │  │       ▼          │      │              │
      │  │ 板块    │   power   │  │  ┌──────────────┐│      │              │
-     │  │         │           │  │  │催化剂日历    ││      │              │
-     │  │ 4维百分位│           │  │  │CatalystCal   ││      │              │
-     │  │ RRG状态机│           │  │  │Builder       ││      │              │
-     │  │ 主线框   │           │  │  │(5源事件+    ││      │              │
-     │  │ 埋伏检测 │           │  │  │ LLM叙事)    ││      │              │
-     │  └────┬────┘            │  │  └──────┬───────┘│      │              │
-     │       │ SectorContext   │  │         │        │      │              │
+     │  │         │           │  │  │CatalystCal   ││      │              │
+     │  │ 4维百分位│           │  │  │Builder       ││      │              │
+     │  │ RRG状态机│           │  │  │(D1-D4守卫+  ││      │              │
+     │  │ 6维埋伏 │           │  │  │ T5对齐+T2校验││      │              │
+     │  │ 埋伏检测 │           │  │  └──────┬───────┘│      │              │
+     │  └────┬────┘            │  │         │        │      │              │
+     │       │ SectorContext   │  │         ▼        │      │              │
      │       ▼                 │  │         ▼        │      │              │
      │  ┌─────────┐            │  │  catalyst_calendar│  │              │
      │  │ Node 3  │←─ mainline│  │  嵌入 NewsContext │  │              │
@@ -192,22 +196,25 @@ daily_stock_analysis/
                     ┌──────────────────────────┐                          │
                     │     Node 6: 聚合          │                          │
                     │                          │                          │
-                    │  L0: 全局环境研判         │                          │
-                    │   (regime_score → bull/bear/transition)             │
+                    │  L0: MarketRegime状态机    │                          │
+                    │   (regime+dwell_days+     │                          │
+                    │    transition_pending)     │                          │
                     │                          │                          │
                     │  L1: 板块 mini-GOT        │                          │
-                    │   (4维交叉验证: tech+capital+news+sentiment)        │
+                    │   (4维交叉验证+A5匹配     │                          │
+                    │    +A6泛化词护栏)          │                          │
                     │                          │                          │
                     │  L1': 埋伏通道 (P3)       │◄── catalyst_calendar    │
-                    │   (3层闸门 + B公式排序    │                          │
-                    │    + 蓄水池)              │                          │
+                    │   (6维评分+B公式排序      │                          │
+                    │    +蓄水池+跨节点共振)     │                          │
                     │                          │                          │
                     │  L2: 组合级决策           │                          │
-                    │   (矛盾检测 + 仓位日限幅) │                          │
+                    │   (T3矛盾仲裁+仓位日限幅) │                          │
                     └────────────┬─────────────┘                          │
                                  │ UnifiedContext                         │
-                                 │ (regime + confirmed_sectors            │
-                                 │  + ambush_pool + ambush_reservoir)     │
+                                 │ (market_regime+cross_node_signals      │
+                                 │  +confirmed_sectors+ambush_pool        │
+                                 │  +ambush_reservoir)                    │
                                  ▼                                        │
                     ┌──────────────────────────┐                          │
                     │   Node 7: 统一决策 (Phase 2)                        │
@@ -235,8 +242,9 @@ daily_stock_analysis/
                                                                           │
                     ┌──────────────────────────┐                          │
                     │   P6: 催化兑现追踪        │                          │
-                    │   (事后验证: 预期 vs 实际) │                          │
-                    │   (故事寿命统计)           │                          │
+                    │   (PEAD多窗口验证:        │                          │
+                    │    预期 vs 实际收益)       │                          │
+                    │   (故事寿命+方向正确性)    │                          │
                     │   → CatalystRealization   │                          │
                     │     Record (SQLite)       │                          │
                     └──────────────────────────┘                          │
@@ -244,33 +252,33 @@ daily_stock_analysis/
 
 ### 编排流程
 
-`GOTOrchestrator.run()` 入口，`asyncio.gather` 分组并行：
+`GOTOrchestrator.run()` 入口，`use_mock` 主控开关，`asyncio.gather` 分组并行：
 
 ```
-run()
+run(use_mock=False)
  ├─ asyncio.gather(
  │    tech_path:  Node 1 → Node 2 → Node 3     （串行，后者消费前者输出）
  │    data_path:  Node 4 ‖ Node 5               （并行，独立采集）
  │  )
- ├─ Node 6: 聚合（消费全部 5 个 context）
- ├─ archive_daily_run()（Phase 1 归档 → data/got_daily/YYYYMMDD/）
- ├─ Phase 2: PortfolioDecision（消费 6 个 context）
- ├─ archive_phase2()（Phase 2 归档）
- └─ CatalystRealizationTracker.check_and_record_realization()（P6，失败不阻塞）
+ ├─ Node 6: 聚合（消费全部 5 个 context + 跨日记忆 + 催化剂日历）
+ ├─ [仅生产模式] archive_daily_run()（Phase 1 归档 → data/got_daily/YYYYMMDD/）
+ ├─ [仅生产模式] Phase 2: PortfolioDecision（消费 6 个 context）
+ ├─ [仅生产模式] archive_phase2()（Phase 2 归档）
+ └─ [仅生产模式] CatalystRealizationTracker.check_and_record_realization()（P6）
 ```
 
-**催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（消费 `Node4EventRecord`）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排
+**催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（D1回声守卫+D2周末守卫+T5语义对齐+T2叙事校验）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排（P5）→ P6 兑现追踪（PEAD多窗口验证）
 
 ### 节点 Schema 数据流
 
 | 节点 | 输入 | 输出 Schema | 关键输出字段 | 持久化 |
 |------|------|-------------|-------------|--------|
-| **Node 1** 大盘 | 无（直取 5 指数 250d K线 + breadth + T-0 行情） | `MarketContext` | `tech_growth.score/trend`, `market_state.attack_power/regime`, `position_limit`, `confidence` | — |
-| **Node 2** 板块 | `MarketContext`（`attack_power` → 主线数量限制, `today_change` → 弱市检测） | `SectorContext` | `active_mainline[]`, `ambush[]`, `cooling_down[]`, `industry_top[]`, `theme_families[]` | `node2_sector_trends`（RRG 状态机）, `sector_frames`（主线框） |
-| **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound`, `status` | — |
-| **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT） |
-| **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
-| **Node 6** 聚合 | 全部 5 个 context | `UnifiedContext` | `market_regime`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]` | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` |
+| **Node 1** 大盘 | 无（直取 5 指数 250d K线 + breadth + T-0 行情） | `MarketContext` | `tech_growth.score/trend`, `market_state.attack_power/regime/crash_override`, `realized_volatility`, `vol_adjusted_position`, `regime_scale`, `position_limit`, `confidence` | — |
+| **Node 2** 板块 | `MarketContext`（`attack_power` → 主线数量限制, `today_change` → 弱市检测） | `SectorContext` | `active_mainline[]`, `ambush[]`, `near_miss_ambush[]`, `cooling_down[]`, `industry_top[]`, `theme_families[]`, `strength_lookup{}` | `node2_sector_trends`（RRG 状态机+6态Markov） |
+| **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound(永久豁免)`, `status`, `confidence_multiplier` | — |
+| **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
+| **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
+| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/transition_count/transition_pending), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json` |
 | **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]` | `ambush_position_snapshots`（买入/退出快照） |
 
 ### 持久化层总览
@@ -280,20 +288,22 @@ run()
 | 表名 | 写入方 | 用途 |
 |------|--------|------|
 | `node2_sector_trends` | Node 2 | 板块轨迹追踪（6 态状态机 + RRG EMA + 生命周期 + 强度轨迹 JSON） |
-| `sector_frames` | Node 2 | 主线框管理（框名/成员/进出时间/驻留天数/is_active） |
+| ~~`sector_frames`~~ | ~~Node 2~~ | **已废除(2026-08-31)**，职责收编到状态机 `exit_pressure_days` |
 | `node4_events` | Node 4 | 事件生命周期（emerging→fermenting→peak→fading→archived, 7 日自动归档） |
+| `node4_raw_news` | Node 4 | 原始新闻持久化（title 归一化 + Jaccard 去重 + 跨日发酵检测） |
 | `catalyst_events` | CatalystCalendar | 催化剂日历事件（event_id UPSERT, 14 日窗口） |
 | `catalyst_refresh` | CatalystCalendar | 日历刷新节奏（单行表, 全量 5 日 / 增量其余） |
 | `ambush_position_snapshots` | Phase 2 (P4) | 埋伏仓位快照（买入价 + 退出信号 + 退出价 + is_open） |
-| `catalyst_realizations` | P6 | 催化兑现归档（预期 vs 实际收益 + 方向正确性 + 故事寿命天数） |
+| `catalyst_realizations` | P6 | 催化兑现归档（预期 vs 实际收益 + 方向正确性 + 故事寿命 + resolution三态） |
 
 **文件持久化**：
 
 | 路径 | 写入方 | 内容 |
 |------|--------|------|
 | `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总）+ `meta.json` + `portfolio_decision.json` + `trading_recommendations.md` |
-| `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准） |
+| `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准 + 跨日记忆读取） |
 | `data/aggregator_contexts/ema_baseline.json` | `persistence.py` | EMA 基线（α=0.3, regime_score + 滚动标准差, 冷启动 5 日预热） |
+| `data/got_timeseries/monitoring.json` | `persistence.py` | 生产监控指标（运行耗时/数据质量/LLM调用次数/降级事件） |
 
 ### 关键设计决策速览
 
@@ -304,11 +314,19 @@ run()
 | 矛盾检测 | 规则决策树（Node 6） | 比 LLM 推断更稳定、可解释 |
 | 仓位计算 | 连续函数（波动率×状态缩放） | 比离散映射更平滑 |
 | 选股消息面 | 1次LLM评100板块 + 字典查找 | 比40次LLM评40只股快10倍 |
-| 框系统 | SQLite 持久化（主线框个体级进出）| 比硬编码更灵活、可回溯；埋伏板块不持久化，每日实时判定 |
+| 状态机 | RRG四象限 + 6态Markov（exit_pressure_days替代主线框） | ~~主线框~~已废除(2026-08-31)，职责收编到状态机 |
+| 埋伏检测 | 6维加权评分（非AND闸门）+ 冷启动惩罚 + 方向惩罚 | 硬闸门候选池归零；Track1(状态机)与Track2(评分)真并集合并 |
 | 埋伏仓位 | 类型化系数（drift×1.0 / fade×0.7 / binary×0.4）| 二元事件限仓压缩（Yee 2025）；漂移型给最大仓位 |
 | 催化剂排序 | B 公式（影响权重×临近度×置信度 + 冗余加成封顶 40%）| 事件驱动前瞻维度注入选股，仅 ambush 板块参与重排 |
-| 兑现追踪 | 事后验证 + 故事寿命统计（P6, 零 LLM）| 所有可配参数的 A 股本地化校准源（0.7 阈值/10 日衰竭/4 周除名） |
-| 板块名解析 | 三层：清洗→别名表（自动学习）→模糊匹配 | TDX 与 THS 板块名不一致是选股流水线的常见故障源 |
+| 兑现追踪 | PEAD多窗口验证 + 故事寿命统计（P6, 零 LLM）| 所有可配参数的 A 股本地化校准源（0.7 阈值/10 日衰竭/4 周除名） |
+| 板块名解析 | 四层：清洗→别名表（自动学习）→模糊匹配→统一入口 `_match_sector` | TDX 与 THS 板块名不一致是选股流水线的常见故障源；`_match_sector` 统一归一化精确→别名变体→受控子串≥3字 |
+| 板块名反向映射 | `_build_name_to_code_map` 从 TDX_BOARD_REGISTRY 构建 name→code 反查 | TDX_REGISTRY 键是 6 位代码而非板块名，直接 `get(name)` 恒空 |
+| 事件→板块扇出 | T5 LLM 语义对齐 + `affected_sectors` 多板块字段 | 规则别名表无法 scale（89 个名字还在增长），LLM 擅长语义映射 |
+| 催化剂守卫 | D1回声检测 + D2周末守卫 + D3过期守卫 + D4置信度守卫 | 防止已发生事件回声、周末无效事件、低置信事件污染日历 |
+| 矛盾仲裁 | 规则检测 + LLM 语义裁决（T3, 仅 medium/high）| 规则层可能过度悲观/遗漏风险，LLM 补充语义判断但权限受限（不可 exclude） |
+| Agent 终审 | 只有否决权（reject→降级展示），默认关闭 | 防止 Agent 幻觉误删合格候选；影子模式验证准确率后再开写权限 |
+| 影子先行 | Track B 全部 `SHADOW=true` 默认，积累数据后转正 | 避免"一上来就 agent 化"掩盖管道 bug；用归档数据验证准确率 |
+| 北向资金 | 永久豁免维度（`EXEMPT_DIMENSIONS`） | 2024-08 起官方停披，不计入 missing_dimensions 和 confidence 分母 |
 
 ### GOT 驱动选股流水线
 
@@ -316,20 +334,24 @@ run()
 > 消费：`data/got_daily/YYYYMMDD/` 下 6 个节点 JSON
 
 **问财初筛策略**：
-- 主线板块：`dde大单净量>=0.8%`（确认主力当日介入）
+- 主线板块：`dde大单净量>=0.5%`（确认主力当日介入）；≤2只时自动放松至≥0.3%补充
 - 埋伏板块：`dde连续3天为正`（持续吸筹信号，不要求当天爆发）
+- 横盘过滤：停滞校准标记 `_STAGNATION_CALIBRATION_DATE`，建议每 3 个月重新校准
 
-**5 轮漏斗 + P5 催化重排**：
+**5 轮漏斗 + P5 催化重排 + T1 Agent 终审**：
 
 | 轮次 | 过滤逻辑 | 保留数 |
 |------|---------|--------|
 | Round 0 | 去除涨停股（无法买入） | ~30-40 |
-| Round 1 | 排除 exhausted 板块 + 多窗口停滞过滤 | ~20-30 |
+| Round 0b | ≥8%涨幅软过滤（追高风险） | ~25-35 |
+| Round 1 | 排除 exhausted 板块 + 多窗口停滞过滤（4死区） | ~20-30 |
+| Round 1.5 | 停滞过滤（量价停滞+动量停滞+宽度停滞+趋势停滞） | ~18-28 |
 | Round 2 | 资金面评分 Top 20（DDE 百分位 + 板块资金流） | 20 |
 | Round 3 | 波段技术评分 Top 15（8 维连续评分：MA20/布林/RSI/MACD 等） | 15 |
-| Round 4 | 风险评分 Top 8（RSI 超买/5 日涨幅/波动率） | 8 |
+| Round 4 | 风险评分：Top 6 主线(risk>50) + ≤2只保底(risk>35) | 6-8 |
 | **P5** | **催化剂关联度重排**（仅 ambush 板块, confidence≥0.7） | 不变 |
 | Round 5 | 板块分散（每板块最多 1 只）→ Top N | 2-3 |
+| **T1** | **Agent 终审**（默认关，只有否决权，reject→降级移末位） | 不变 |
 
 **5 维评分权重**：资金面 15% + 消息面 15% + 板块强度 25% + 技术面(波段) 25% + 风险因子 20%
 
@@ -352,31 +374,31 @@ run()
 
 | 服务 | 扩展内容 |
 |------|---------|
-| `TechnicalIndicatorService` | 新增 `_calc_adx()` + `_calc_macd()` |
+| `TechnicalIndicatorService` | ✅ 已完成：ADX + MACD + RSI + 布林带 + 均线系统 |
 
 ### 需要新建
 
 | 模块 | 内容 |
 |------|------|
-| `src/got/` | 6 个节点 + 编排器 + Schema + 指标函数 |
-| 北向资金 Service | 恢复 `market_analyzer.py` 中废弃代码 |
-| 大宗交易 Service | akshare `stock_dzjy_*` |
-| 市场宽度函数 | 涨跌家数/涨停跌停统计 |
+| ~~`src/got/`~~ | ✅ 已完成：6 个节点 + 编排器 + Schema + 指标函数 |
+| ~~市场宽度函数~~ | ✅ 已完成：新浪优先，push2 降级 |
+| 北向资金 Service | 官方停披(2024-08)，已标记为永久豁免维度 |
+| ~~大宗交易 Service~~ | ✅ 已完成：akshare `stock_dzjy_*`（Node 3 已集成） |
 
 ---
 
 ## 缺失能力（按优先级）
 
-| 优先级 | 能力 | 对应节点 |
-|--------|------|---------|
-| P0 | ADX 计算 | Node 1 |
-| P0 | MACD 集成 | Node 1 |
-| P0 | 北向资金 | Node 3 |
-| P1 | 市场宽度 | Node 1 |
-| P1 | 龙虎榜机构席位过滤 | Node 3 |
-| P1 | ETF 申赎/融资融券 | Node 3 |
-| P1 | Volume Profile | Node 1 (P3-2) |
-| P1 | 大宗交易 | Node 3 (P3-5) |
+| 优先级 | 能力 | 对应节点 | 状态 |
+|--------|------|---------|------|
+| P0 | ADX 计算 | Node 1 | ✅ 完成 |
+| P0 | MACD 集成 | Node 1 | ✅ 完成 |
+| P0 | 北向资金 | Node 3 | 官方停披(2024-08)，永久豁免维度 |
+| P1 | 市场宽度 | Node 1 | ✅ 完成（新浪优先，push2降级） |
+| P1 | 龙虎榜机构席位过滤 | Node 3 | ✅ 已完成（`stock_lhb_jgmmtj_em`） |
+| P1 | ETF 申赎/融资融券 | Node 3 | ETF 申赎无历史数据；融资融券仅沪市 |
+| P1 | Volume Profile | Node 1 (P3-2) | 待开发 |
+| P1 | 大宗交易 | Node 3 (P3-5) | ✅ 已完成 |
 
 ---
 
@@ -428,6 +450,8 @@ run()
 - `scripts/run_node2.py`（新建）：本地运行脚本 + 反爬补丁预加载
 - `scripts/diagnose_network.py`（新建）：网络连通性诊断工具
 
+> ⚠️ **后续演进**：Phase 1c-1 的 5 维评分体系已被 Node 2 v2（08-04）重写为 4 维截面百分位排名；主线框系统已于 2026-08-31 废除，职责收编到状态机 `exit_pressure_days`
+
 **Phase 1c-2 Node 3 实现记录：**
 - ✅ 5 维度评分体系（北向资金/龙虎榜/ETF申赎/融资融券/大宗交易，权重 0.25/0.25/0.25/0.15/0.10）
 - ✅ 降级机制（P2-4）：缺失维度权重归一化 + 置信度按可用比例下调
@@ -447,7 +471,7 @@ run()
 - **实际可用维度**：3/5（龙虎榜 + 融资融券 + 大宗交易），置信度 0.6
 
 **Phase 1c-2 已知限制：**
-- 北向资金维度失效：2024-08 后数据不可用，需寻找替代数据源（如 Tushare `hsgt_top10` 或 Wind API）
+- 北向资金维度失效：2024-08 后数据不可用 → **已标记为永久豁免维度(2026-08-25)**，不计入 confidence 分母
 - ETF 申赎维度失效：无历史份额序列，需逐日积累数据或使用第三方数据源
 - 融资融券仅沪市：`macro_china_market_margin_sh` 只覆盖上交所，深市数据需额外接入 `macro_china_market_margin_sz`
 - 龙虎榜去重：同一股票可能因多日上榜出现重复，当前仅取 top 5 不严格去重
@@ -513,10 +537,10 @@ run()
 - NewsNow 的 cls-hot 与 S2 CLS 有内容重叠，但去重会处理（不同数据通道，cls-hot 可捕获 CLS 签名版窗口外的热榜条目）
 
 **待办：事件生命周期追踪（持久化层）**
-- [ ] 每次 `_fetch_news()` 后将全量原始数据写入 SQLite（`node4_raw_news` 表），按 title + source + date 去重
-- [ ] 下次运行时：当前窗口数据 + 历史库 = 完整视图
-- [ ] 中热度事件检测：出现在历史库但不在当前窗口 → 标记"已消退"；连续多天出现 → 标记"正在发酵"
-- [ ] 可复用 `src/got/persistence.py`（GOT 上下文持久化）或 `src/storage.py`（SQLite 25+ 表）
+- [x] 每次 `_fetch_news()` 后将全量原始数据写入 SQLite（`node4_raw_news` 表），按 title + source + date 去重 ← **已完成(2026-08-25, v3.3.1 P1-1)**
+- [x] 下次运行时：当前窗口数据 + 历史库 = 完整视图 ← **已完成**
+- [x] 中热度事件检测：出现在历史库但不在当前窗口 → 标记"已消退"；连续多天出现 → 标记"正在发酵" ← **已完成（跨日发酵检测）**
+- [x] 可复用 `src/got/persistence.py`（GOT 上下文持久化）或 `src/storage.py`（SQLite 25+ 表）← **已使用 storage.py**
 
 **关键发现：**
 - 新浪有两个完全不同的 API：`zhibo.sina.com.cn`（直播流，38 分钟）vs `feed.sina.com.cn`（文章归档流，21+ 小时）
@@ -874,7 +898,7 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - breadth_health 依赖 mootdx K 线是否返回 up_count/down_count（待验证）
 - 行业板块的 breadth_health 暂缺，用其他 3 维权重归一化降级
 
-**Node 2 v2 文件改动清单**（待执行）：
+**Node 2 v2 文件改动清单**（已执行）：
 - `src/got/indicators.py`（+10 行）：新增 `percentile_rank()` 函数
 - `src/got/schemas.py`（+20 行）：新增 `ThemeFamily`，`SectorContext` 加 `industry_top`/`theme_families`/`confidence_level` 字段
 - `src/got/nodes/sector_analysis.py`（核心重写）：评分体系 + 双视角 + 主线家族 + 降级可见性
@@ -911,6 +935,8 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `data_provider/tdx_board_mapping.py`：TDX_BOARD_REGISTRY（添加 TODO 注释）
 - `scripts/find_missing_board_codes.py`（新建）：查找缺失板块 TDX 代码的工具脚本
 
+> ⚠️ **后续演进**：白名单补全已被"板块噪声过滤升级 v2"（2026-08-25）覆盖——从白名单思路改为黑名单思路（222 条精确集合 + 语义模式兜底），覆盖 652 条 TDX 板块全量分析
+
 **Node 2 状态机 HI3 移除（2026-08-24）：**
 
 > HI3（大盘暴跌全局拦截）与输出层主线裁剪职责重复，且破坏状态机马尔可夫性——未破位板块（如白银 96.4 分、leading）也被强制踢成 exhausted，回主线需重走 2 天确认。暴跌日的风险控制已统一到 attack_power → 主线裁剪层。
@@ -929,6 +955,8 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 
 **文件改动清单**：
 - `src/got/nodes/sector_analysis.py`：`_apply_state_machine` 删 `market_crash` 参数+分支 + `_determine_state_v3` 删 `market_crash` 计算
+
+> ⚠️ **后续演进**：主线框系统（`sector_frames` 表）已于 2026-08-31 彻底废除，职责收编到状态机 `exit_pressure_days`（RRG 四象限 + 6 态 Markov 统一管控）
 
 **v3.3.1 硬闸门消除 + 埋伏评分质量修复（2026-08-25）：**
 
@@ -1067,6 +1095,48 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - `src/services/stock_screener.py`：`_apply_r4_filter` + `_score_risk` 梯度化 + 布林带修正 + stagnation 标记 + DDE 放松轮
 - `tests/services/test_stock_screener.py`（+323 行）：R4 软保底 5 个场景测试
 
+**GOT 结构缺陷修复与 Agent 化增强（2026-08-28）：**
+
+> 基于 `plan_agent_enhancement.md` 的两轨道实施。轨道 A 修复规则层结构缺陷（板块名契约/匹配标准分裂/门槛硬编码），轨道 B 补充语义层 Agent 能力（事件对齐/叙事校验/Agent 终审/矛盾仲裁）。
+
+**轨道 A：规则层结构修复（无 Agent）**
+
+- ✅ **A1 P6 兑现闭环复活**：`_get_board_code` 三级解析（name→code 反向映射 + 别名变体 + difflib 模糊 0.68）；`CatalystRealizationRecord` 新增 `resolution` 列三态化（NULL/resolved/unresolvable）；不可解析记录不再无限扫描；可观测性："本次兑现 N / 不可解析 M / 总待兑现 K"；清理脚本 `scripts/fix_p6_resolution.py`（366 滞留记录 → 260 可解析/106 不可解析）
+- ✅ **A2 晋升路径归一化**：`_group_events_by_sector` 归一化 key + T5 多板块扇出消费；新增 `_lookup_sector_events` 别名变体查找替代精确匹配；晋升/P5 事件覆盖率从 2/15 上升；可观测性："蓄水池 N 板块，催化事件覆盖 M 个"
+- ✅ **A3 置信度门槛统一**：`stock_screener.py` 0.7 字面量改为引用 `CATALYST_CONFIDENCE_GATE`；影子评估日志："门槛 0.60 会多放行 N 个事件"
+- ✅ **A4 mini-GOT 全量资金**：`_cross_check_capital` 优先从 `sector_flow_all`（464 板块）查找，Top-8 保留作兜底；归一化 + 别名查找
+- ✅ **A5 板块规范层收口**：新增 `_match_sector(name, target)` 统一入口（归一化精确 → 别名变体 → 受控子串 ≥3 字）；替代 `_cross_check_news/sentiment/capital` 4 处 ad-hoc 匹配
+- ✅ **A6 泛化词护栏**：`_GENERIC_ROOTS` 集合（AI/芯片/电力等 ≤2 字高频词根）；命中时降权 50%（消息面 magnitude ×0.5）或降级为 neutral（资金面）/ 不计入有效匹配（情绪面）
+
+**轨道 B：Agent 化增强（全部带影子开关）**
+
+- ✅ **T5 事件→板块语义对齐层**（最高优先级）：`CatalystEvent` 新增 `affected_sectors` 字段；`_align_events_to_sectors` LLM 批量映射叙事/全球事件到板块宇宙（≤150 个）；一次调用产出多板块扇出，同时喂饱 A2 晋升/P5 重排/A1 解析兜底；影子模式 `SECTOR_ALIGN_SHADOW=true`（默认）；验证结果：12/12 事件对齐，8/12 多板块扇出，板块覆盖从 12 → 21（+75%）
+- ✅ **T2 叙事校验者**：`_critic_verify_narrative` 反 Sycophancy 批判角色；4 项检查（时态/方向/板块映射/证据支撑）；批处理一次调用；影子模式 `NARRATIVE_CRITIC_SHADOW=true`（默认，2 周）；验证结果：成功识别时态回声 + 证据缺失事件
+- ✅ **T1 Agent 终审**：`_agent_final_review` 复用 `src/agent/factory.py` 对 Top N 候选股做最终审查；只有否决权（reject → 降级展示移末位，不删除）；`ScreenerStock` 新增 3 字段（agent_verdict/agent_notes/agent_decision_signal）；默认关闭 `AGENT_STOCK_REVIEW_ENABLED=false`；预算上限 `AGENT_STOCK_REVIEW_MAX=2`
+- ✅ **T3 矛盾仲裁者**：`_arbitrate_contradictions` 对 medium/high 矛盾调用 LLM 语义裁决；输入：矛盾描述 + 4 维证据 + 跨节点共振信号；权限受限（可 upgrade/downgrade 一级，不可 exclude）；`confidence < 0.6` 忽略；`Contradiction` 新增 3 字段（arbitration_verdict/reasoning/confidence）
+- ✅ **T4 参数校准脚本**：`scripts/calibrate_catalyst_params.py` 读 P6 兑现统计 + 故事寿命 + PEAD 分析 → 产出 `reports/param_calibration_YYYYMMDD.md`；样本 < 30 只提示不出建议
+
+**影子模式开关（`catalyst_config.py`）**：
+
+| 开关 | 默认值 | 对应任务 | 转正条件 |
+|------|--------|---------|---------|
+| `SECTOR_ALIGN_SHADOW` | `true` | T5 对齐层 | 影子 1 周 + 人工抽查 ≥30 条准确率 ≥85% |
+| `NARRATIVE_CRITIC_SHADOW` | `true` | T2 校验者 | 影子 2 周 + 误杀率 <20%（依赖 A1 兑现数据） |
+| `AGENT_STOCK_REVIEW_ENABLED` | `false` | T1 Agent 终审 | 手动开启，归档重拍对比次日走势 |
+| `AGENT_STOCK_REVIEW_MAX` | `2` | T1 成本预算 | R7 约束，单次全流程新增 LLM ≤8 次 |
+
+**文件改动清单**：
+- `src/got/catalyst_realization.py`：`_get_board_code` 三级解析 + `_build_name_to_code_map` + `check_and_record_realization` 三态标记 + NULL 安全查询
+- `src/got/nodes/aggregator.py`：`_lookup_sector_events` + `_match_sector` + `_GENERIC_ROOTS` + `_arbitrate_contradictions` + `_cross_check_capital` 全量化 + A5/A6 三处 cross_check 统一
+- `src/services/stock_screener.py`：`_agent_final_review` + `_parse_agent_verdict` + `_score_catalyst_relevance` 归一化 + 影子评估
+- `src/got/catalyst_calendar.py`：`_align_events_to_sectors` + `_critic_verify_narrative`
+- `src/got/schemas.py`：`CatalystEvent.affected_sectors` + `Contradiction` 3 仲裁字段
+- `src/got/catalyst_config.py`：4 个影子开关常量
+- `src/storage.py`：`CatalystRealizationRecord.resolution` 列
+- `scripts/fix_p6_resolution.py`（新建）：A1 存量清理
+- `scripts/calibrate_catalyst_params.py`（新建）：T4 校准脚本
+- `scripts/verify_t5_alignment.py`（新建）：T5 端到端验证
+
 **历史档系统（2026-07-24）：**
 - ✅ `src/got/archive.py`（新建）：每日历史档存档模块
 - ✅ `main.py`（修改）：新增 `--got` 入口（`python main.py --got`）
@@ -1086,7 +1156,7 @@ AI硬件 / AI软件 / 机器人 / 智能驾驶 / 新能源 / 医药 / 金融 / �
 - ✅ 动态加载：读取 `data/got_daily/YYYYMMDD/` 下的 6 个节点 JSON，不硬编码任何板块
 - ✅ 选股池提取：从 `sector_context` 提取主线（`active_mainline`）+ 埋伏（`ambush`）板块成分股
 - ✅ 5 轮漏斗筛选：信号过滤 → 资金面 Top 15 → 波段技术 Top 8 → 风险排雷 Top 5 → 板块分散 Top N
-- ✅ 评分体系（消息+资金主导）：资金面 30% + 消息面 20% + 板块强度 20% + 技术面(波段) 15% + 风险因子 15%
+- ✅ 评分体系（消息+资金主导）：资金面 30% + 消息面 20% + 板块强度 20% + 技术面(波段) 15% + 风险因子 15% → **已更新为**资金面 15% + 消息面 15% + 板块强度 25% + 技术面(波段) 25% + 风险因子 20%（2026-08-25）
 - ✅ 波段技术指标：MA20趋势/布林带位置/周线趋势/RSI12/20日突破/MACD金叉/均线多头排列
 - ✅ 回测支持：保存买入价/目标价(+10%)/止损价(-7%)到 `data/got_screener/YYYYMMDD.json`，次日可回测胜率
 
@@ -1168,7 +1238,7 @@ python scripts/backtest_got_screener.py --date 2026-07-29
 - ✅ 每板块从 10 只降到 5 只，总候选从 80-100 降到 30-40
 - ✅ Stage 2 耗时从 100s 降到 ~50s
 - ✅ **板块类型适配 DDE 筛选**（2026-08-03）：
-  - 主线板块：`dde>=0.8%`（当天强势，确认主力介入）
+  - 主线板块：`dde>=0.8%`（当天强势，确认主力介入）→ **已放松至0.5%，≤2只时再降至0.3%(2026-08-25)**
   - 埋伏板块：`dde连续3天为正`（持续吸筹信号，不要求当天爆发）
   - 学术依据：DDE 连续性比单日阈值更重要（主力可操纵单日 DDE，但难以连续 3 天伪装）
   - 测试效果：主线板块平均 DDE=4.11%，埋伏板块平均 DDE=0.03%（连续为正）
@@ -1235,7 +1305,7 @@ push2.eastmoney.com HTTP 接口被东财反爬封锁（RemoteDisconnected），�
 ### 已知限制
 - **push2 HTTP 被封**：当前网络环境下 push2/push2his 返回 RemoteDisconnected（东财反爬）
 - **mootdx TCP 可用**：TCP 7709 不受 HTTP 反爬影响，K线+行情正常
-- **北向资金停披**：2024-08 后 `当日成交净买额` 全 NaN，Node 3 自动降级
+- **北向资金停披**：2024-08 后 `当日成交净买额` 全 NaN → **已标记为永久豁免维度**（不计入 confidence 分母）
 - **ETF 申赎无历史**：akshare 仅返回快照，无法计算日度变化
 - **雪球热榜保留直调**：Node 5 的雪球 3 榜仍需特定过滤逻辑，暂未走 Manager
 
@@ -1262,6 +1332,7 @@ python main.py --schedule          # 定时模式
 - **GOT 独立模块**：`src/got/` 与现有 Agent 层并行，零侵入
 - **直接调用服务**：不包装 Tool，仅 LLM 推理节点调用 `LLMToolAdapter`
 - **数据降级**：维度缺失时权重归一化 + 置信度下调，不做硬降级
-- **路径级失败**：技术分析路/独立数据路任一完全失败 → 聚合节点报错
+- **路径级失败**：技术分析路/独立数据路任一完全失败 → 聚合节点报错（use_mock 模式下跳过）
 - **非交易日跳过**：`trading_calendar.is_market_open()` 判断
-- **上下文持久化**：`data/aggregator_contexts/` 按交易日存储 JSON，支持时间一致性校验
+- **上下文持久化**：`data/aggregator_contexts/` 按交易日存储 JSON，支持时间一致性校验 + 跨日记忆读取
+- **生产监控**：`data/got_timeseries/monitoring.json` 记录运行指标

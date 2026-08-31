@@ -58,7 +58,7 @@ from src.config import get_config
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-CURRENT_SCHEMA_VERSION = "2026-08-17-node2-state-machine"
+CURRENT_SCHEMA_VERSION = "2026-08-31-exit-pressure"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -1051,6 +1051,7 @@ class Node2SectorTrendRecord(Base):
     ambush_days = Column(Integer, default=0)  # 连续埋伏天数
     strength_trajectory = Column(Text)  # JSON array: [0.45, 0.48, 0.52]（最近 7 天强度）
     trend_direction = Column(String(20), index=True)  # increasing/stable/decreasing
+    exit_pressure_days = Column(Integer, default=0)  # 退出压力计数器（交易日粒度，同日去重）
     created_at = Column(DateTime, default=utc_naive_now)
 
     __table_args__ = (
@@ -1075,11 +1076,9 @@ class Node2SectorTrendRecord(Base):
 class SectorFrameRecord(Base):
     """板块持久框记录（仅主线框）。
 
-    设计原则：
-    - 主线框按产业主题（frame_group）管理，而非单个板块
-    - 每个 frame_group 在同一时刻只属于一个框（frame_type 唯一）
-    - 强组容忍 3 天低分，弱组 1 天零容忍
-    - 埋伏板块不使用框系统，由 state=ambush 每日实时判定
+    .. deprecated:: 2026-08-31
+       主线框系统已废除，职责收编到状态机 exit_pressure_days 计数器。
+       表保留历史数据作审计，停止读写。
     """
 
     __tablename__ = 'sector_frames'
@@ -1131,6 +1130,8 @@ class CatalystEventRecord(Base):
     category_tag = Column(String(10), default='')
     is_global = Column(Boolean, default=False)
     source_news = Column(String(200), nullable=True)  # 来源新闻标题（LLM 叙事回声检测）
+    # T5 多板块扇出（JSON 数组，空/NULL = 未对齐，仅 event.sector 生效）
+    affected_sectors = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
     expires_at = Column(Date, index=True)
@@ -1241,6 +1242,8 @@ class CatalystRealizationRecord(Base):
     max_return_window = Column(Integer)                      # 最大收益出现在第几天（1/3/5）
     max_return_pct = Column(Float)                           # 最大收益率 (%)
     pead_direction = Column(String(16))                      # 漂移方向：aligned / counter / neutral
+    # 板块名解析状态（A1 三态化：避免不可解析记录无限重复扫描）
+    resolution = Column(String(16))                          # None / "resolved" / "unresolvable"
     # 备注
     notes = Column(Text, default='')
     # 时间戳
@@ -1372,6 +1375,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             Base.metadata.create_all(self._engine)
             self._migrate_node2_sector_trends()
             self._migrate_catalyst_realizations()
+            self._migrate_catalyst_events()
+            self._migrate_deactivate_ambush_frames()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1406,6 +1411,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             "dwell_days": "INTEGER",
             "rrg_ratio_ema": "FLOAT",
             "rrg_momentum_ema": "FLOAT",
+            "exit_pressure_days": "INTEGER DEFAULT 0",
         }
         try:
             with self._SessionLocal() as session:
@@ -1444,6 +1450,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             "max_return_window": "INTEGER",
             "max_return_pct": "FLOAT",
             "pead_direction": "VARCHAR(16)",
+            # A1 三态列：存量库必须补列，否则 P6 的 SELECT/INSERT 抛 OperationalError
+            # 被上层静默吞掉（违反 R3），清理脚本跑之前 P6 整体瘫痪
+            "resolution": "VARCHAR(16)",
         }
         try:
             with self._SessionLocal() as session:
@@ -1477,6 +1486,79 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             logger.warning(
                 "[storage] catalyst_realizations 列迁移失败，降级运行: %s", exc
             )
+
+    def _migrate_catalyst_events(self) -> None:
+        """幂等轻量迁移：为 catalyst_events 补齐 T5 扇出新列（affected_sectors）。
+
+        模式同 _migrate_catalyst_realizations：PRAGMA table_info → ALTER TABLE。
+        """
+        if not self._is_sqlite_engine:
+            return
+        new_columns = {
+            "affected_sectors": "TEXT",
+        }
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='catalyst_events'"
+                    )
+                ).scalar()
+                if not table_exists:
+                    return
+                existing = {
+                    row[1]
+                    for row in session.execute(
+                        text("PRAGMA table_info(catalyst_events)")
+                    ).fetchall()
+                }
+                for col, col_type in new_columns.items():
+                    if col not in existing:
+                        session.execute(
+                            text(
+                                f"ALTER TABLE catalyst_events "
+                                f"ADD COLUMN {col} {col_type}"
+                            )
+                        )
+                        logger.info(
+                            "[storage] 迁移 catalyst_events: 新增列 %s", col
+                        )
+                session.commit()
+        except Exception as exc:
+            logger.warning(
+                "[storage] catalyst_events 列迁移失败，降级运行: %s", exc
+            )
+
+    def _migrate_deactivate_ambush_frames(self) -> None:
+        """主线框废除迁移：将 frame_type='ambush' 的死记录标记为 is_active=0。
+
+        框系统已废除（2026-08-31），sector_frames 表停止读写，保留历史审计。
+        幂等：仅影响 frame_type='ambush' 且 is_active=1 的记录。
+        """
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='sector_frames'")
+                ).scalar()
+                if not table_exists:
+                    return
+                result = session.execute(
+                    text(
+                        "UPDATE sector_frames SET is_active = 0 "
+                        "WHERE frame_type = 'ambush' AND is_active = 1"
+                    )
+                )
+                session.commit()
+                if result.rowcount > 0:
+                    logger.info(
+                        "[storage] 框废除迁移: 置 is_active=0 %d 条 ambush 记录",
+                        result.rowcount,
+                    )
+        except Exception as exc:
+            logger.warning("[storage] 框废除迁移失败，降级运行: %s", exc)
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()

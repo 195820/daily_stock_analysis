@@ -216,17 +216,28 @@ class OverheatSeverity(BaseModel):
       severity 0.3~0.5 → "warning"（过热警告，降 confidence）
       severity < 0.3 → "normal"
 
+    9 维度（v2 升级）：
+    - D1-D6: 背离型见顶（MACD背离/量能背离/宽度极端/换手极端/A-D线/天量滞涨）
+    - D7-D9: 高潮型见顶（龙头极端/主线疲劳/成分股追高）
+
     论文依据：
     - MACD 背离渐进式（Kang 2023）
     - A/D Line distribution（72% 重大下跌前出现）
     - 天量滞涨 = 分配信号（Hsu 2016）
+    - Minervini 领涨股恶化模式（龙头极端强势 = 高潮信号）
+    - O'Neil Stall Day（高位放量滞涨 = 机构派发）
     """
-    divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="MACD 背离强度（渐进式）")
-    volume_divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="量能背离强度")
-    breadth_score: float = Field(default=0.0, ge=0.0, le=1.0, description="宽度极端强度")
-    turnover_score: float = Field(default=0.0, ge=0.0, le=1.0, description="换手极端强度")
-    ad_distribution: bool = Field(default=False, description="A/D Line 分配信号")
-    volume_stall: bool = Field(default=False, description="天量滞涨信号")
+    # 背离型维度（D1-D6）
+    divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D1: MACD 背离强度")
+    volume_divergence_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D2: 量能背离强度")
+    breadth_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D3: 宽度极端强度")
+    turnover_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D4: 换手极端强度")
+    ad_distribution: bool = Field(default=False, description="D5: A/D Line 分配信号")
+    volume_stall: bool = Field(default=False, description="D6: 天量滞涨信号")
+    # 高潮型维度（D7-D9, v2 新增）
+    leader_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D7: 龙头极端行为（板块涨幅代理）")
+    fatigue_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D8: 主线疲劳（mainline_days ≥ 5 且仍 acceleration）")
+    chase_score: float = Field(default=0.0, ge=0.0, le=1.0, description="D9: 成分股追高（breadth_health 代理）")
     severity: float = Field(default=0.0, ge=0.0, le=1.0, description="加权总严重度")
     level: str = Field(default="normal", description="normal / warning / exhausted")
 
@@ -283,6 +294,10 @@ class SectorDetail(BaseModel):
     near_miss_conditions: Optional[list[str]] = Field(
         default=None,
         description="埋伏近失条件列表（差 1 条通过埋伏闸门时填充，供 Node 6 蓄水池观察）",
+    )
+    exit_pressure_days: Optional[int] = Field(
+        default=None,
+        description="退出压力计数器（状态机吸收原框 consecutive_low_days，日粒度去重）",
     )
 
 
@@ -425,6 +440,7 @@ class CatalystEvent(BaseModel):
     category_tag: str = Field(default="", description="drift / fade / binary（退出策略分型依据）")
     is_global: bool = Field(default=False, description="是否来自全球事件映射")
     source_news: Optional[str] = Field(default=None, description="来源新闻标题（LLM 叙事事件用于回声检测）")
+    affected_sectors: list[str] = Field(default_factory=list, description="T5: LLM 语义对齐后的受影响板块列表（叙事/global 事件多板块扇出）")
     created_at: Optional[date] = None
 
 
@@ -533,7 +549,7 @@ class SentimentContext(BaseModel):
 # =============================================================================
 
 class Contradiction(BaseModel):
-    """矛盾（v2：新增 conflict_type 分类）"""
+    """矛盾（v2：新增 conflict_type 分类 + T3 仲裁字段）"""
     pair: str
     timeframe: str
     description: str
@@ -541,6 +557,10 @@ class Contradiction(BaseModel):
     conflict_type: str = Field(default="opinion", description="factual / temporal / opinion（参考 ConflictRAG）")
     resolution: Optional[str] = None
     confidence_adjustment: float = Field(default=0.0)
+    # T3 仲裁字段
+    arbitration_verdict: Optional[str] = Field(default=None, description="upgrade / downgrade / keep / None")
+    arbitration_reasoning: str = Field(default="", description="仲裁理由")
+    arbitration_confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="仲裁置信度")
 
 
 class NewsOverride(BaseModel):
@@ -683,6 +703,10 @@ class AmbushCandidate(BaseModel):
         default="legacy",
         description="吸筹档位: strong(连续3日正) / medium(3日累计正) / weak(仅当日正) / legacy(冷启动)",
     )
+    nominated: bool = Field(
+        default=False,
+        description="Agent 催化剂先行提名条目（吸筹未确认但催化先行，决策 21）",
+    )
 
 
 class AmbushReservoirEntry(BaseModel):
@@ -693,7 +717,7 @@ class AmbushReservoirEntry(BaseModel):
     """
     sector_name: str
     sector_code: str = ""
-    reason: str = Field(description="入池原因: no_catalyst / near_miss:{条件} / reverse_query_pending / reverse_query_weak")
+    reason: str = Field(description="入池原因: no_catalyst / near_miss:{条件} / data_missing / reverse_query_pending / reverse_query_weak")
     entered_date: date = Field(description="入池日期")
     weeks_without_catalyst: int = Field(default=0, description="[遗留] 已被 days_in_reservoir 替代")
     reverse_query_result: Optional[str] = Field(default=None, description="反向查询结果摘要")
@@ -726,7 +750,7 @@ class AmbushPositionSnapshot(BaseModel):
 
 
 class Contradiction(BaseModel):
-    """矛盾（v2：新增 conflict_type 分类）"""
+    """矛盾（v2：新增 conflict_type 分类 + T3 仲裁字段）"""
     pair: str
     timeframe: str
     description: str
@@ -734,6 +758,10 @@ class Contradiction(BaseModel):
     conflict_type: str = Field(default="opinion", description="factual / temporal / opinion（参考 ConflictRAG）")
     resolution: Optional[str] = None
     confidence_adjustment: float = Field(default=0.0)
+    # T3 仲裁字段
+    arbitration_verdict: Optional[str] = Field(default=None, description="upgrade / downgrade / keep / None")
+    arbitration_reasoning: str = Field(default="", description="仲裁理由")
+    arbitration_confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="仲裁置信度")
 
 
 class UnifiedContext(BaseModel):
