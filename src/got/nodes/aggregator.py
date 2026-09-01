@@ -83,6 +83,36 @@ SYSTEMIC_KEYWORDS = [
     "印花税", "暂停", "熔断", "救市", "护盘",
 ]
 
+# ── 波次生命周期折扣系数（v3.5 S3：老波折扣，纠正动量偏见）──
+# 决策 5：不做 fresh boost，只做老波折扣（先靠折扣纠正倒挂，boost 待校准数据到位再评估）
+# 决策 6：不叠加过热系数（Phase 2 _compute_overheat_penalty 已有，避免双重惩罚）
+WAVE_LIFECYCLE_COEFF = {
+    "fresh_cap": 5,        # wave_days ≤ 5 视为新鲜期，系数 1.0（不折扣）
+    "aging_start": 6,      # wave_days 6 开始折扣
+    "aging_coeff": 0.90,   # wave_days 6-7 → ×0.90
+    "late_start": 8,       # wave_days 8 进入晚期
+    "late_coeff": 0.85,    # wave_days ≥8 → ×0.85
+}
+
+
+def _wave_coeff(wave_days: Optional[int]) -> float:
+    """计算波次生命周期折扣系数（v3.5 S3）。
+
+    Args:
+        wave_days: 当前波次持续天数，None 或非主线 → 返回 1.0（不折扣）
+
+    Returns:
+        折扣系数（0.85 / 0.90 / 1.0）
+    """
+    if wave_days is None:
+        return 1.0
+    if wave_days >= WAVE_LIFECYCLE_COEFF["late_start"]:
+        return WAVE_LIFECYCLE_COEFF["late_coeff"]
+    if wave_days >= WAVE_LIFECYCLE_COEFF["aging_start"]:
+        return WAVE_LIFECYCLE_COEFF["aging_coeff"]
+    return 1.0
+
+
 # 仓位日限幅
 POSITION_LIMIT_DELTA = 0.2
 
@@ -225,6 +255,16 @@ class AggregatorNode:
         key_risks = self._collect_key_risks(news, sentiment, temporal)
         key_opportunities = self._collect_key_opportunities(sector_intels)
 
+        # ── 主线续航评估（v3.5 S4：对 active_mainline 家族逐一生成）──
+        mainline_endurance = self._synthesize_mainline_endurance(
+            sector_intels, sector, news, regime,
+        )
+        if mainline_endurance:
+            logger.info(
+                f"[Node 6] 主线续航评估: {len(mainline_endurance)} 个家族 — "
+                f"{[e.name for e in mainline_endurance]}"
+            )
+
         # ── 构建输出 ──
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
@@ -248,6 +288,7 @@ class AggregatorNode:
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
             crowded_families=getattr(sector, "crowded_families", []) or [],
+            mainline_endurance=mainline_endurance,
             cross_node_signals=cross_node_signals,
         )
 
@@ -1030,16 +1071,18 @@ class AggregatorNode:
         # ── Pass 2: 按综合分排名，TOP-N → actionable（组粒度竞争名额）──
         # 主线组成员展开仅为反向查询服务，不参与名额竞争：
         # 同族多成员若各自占名额会挤压其他家族的 actionable 配额（2026-09-01）
+        # ── 波次生命周期折扣（v3.5 S3：纠正动量偏见）──
+        # 排序键改为 adjusted = composite × wave_coeff(wave_days)
         eligible = sorted(
-            [(name, score) for name, score, *_ in candidates
+            [(name, score, detail) for name, score, *_rest, detail, _role in candidates
              if name not in result and name not in member_to_group],
-            key=lambda x: x[1],
+            key=lambda x: x[1] * _wave_coeff(getattr(x[2], "wave_days", None) if x[2] else None),
             reverse=True,
         )
 
         actionable_groups = set()
         actionable_count = 0
-        for name, score in eligible:
+        for name, score, _detail in eligible:
             if actionable_count < top_n and score >= 50:
                 result[name] = "actionable"
                 actionable_groups.add(name)
@@ -2694,6 +2737,211 @@ class AggregatorNode:
                 parts.extend(stripped.split(sep))
         # 过滤掉泛化后缀本身和过短词
         return [p for p in parts if len(p) >= 2 and p not in GENERIC_SUFFIXES]
+
+    def _synthesize_mainline_endurance(
+        self,
+        sector_intels: list[SectorIntel],
+        sector: SectorContext,
+        news: NewsContext,
+        regime: MarketRegime,
+    ) -> list[MainlineEndurance]:
+        """合成主线续航评估（v3.5 S4）。
+
+        对 active_mainline 家族逐一生成续航评估：
+        - 警示信号加权计分（评分制，不做硬闸门）
+        - 支撑信号：全成员 leading、family_resonance ≥0.7、有催化剂、资金 passed、梯队仍有新补涨成员
+        - band：警示分 ≤1 惯性期；2-3 分化期；≥4 见顶风险期（阈值可配）
+        """
+        from src.got.schemas import MainlineEndurance
+        from collections import defaultdict
+
+        # 仅处理 actionable 板块（主线角色）
+        actionable_intels = [
+            intel for intel in sector_intels
+            if intel.classification == "actionable" and intel.sector_role == "mainline"
+        ]
+        if not actionable_intels:
+            return []
+
+        # 按家族分组（使用 frame_group 字段）
+        families = defaultdict(list)
+        for intel in actionable_intels:
+            family_name = intel.frame_group or intel.sector_name
+            families[family_name].append(intel)
+
+        endurance_list = []
+        crowded_families = set(getattr(sector, "crowded_families", []) or [])
+
+        for family_name, members in families.items():
+            # ── 基础指标 ──
+            wave_days_list = [getattr(m, "wave_days", 0) or 0 for m in members if getattr(m, "detail", None)]
+            max_wave_days = max(wave_days_list) if wave_days_list else 0
+
+            # lifecycle_phase：取最老成员（wave_days 最大）的 phase
+            oldest_member = max(
+                members,
+                key=lambda m: getattr(getattr(m, "detail", None), "wave_days", 0) or 0,
+                default=None,
+            )
+            lifecycle_phase = None
+            if oldest_member and getattr(oldest_member, "detail", None):
+                lifecycle = getattr(oldest_member.detail, "lifecycle", None)
+                if lifecycle:
+                    lifecycle_phase = lifecycle.phase
+
+            # RRG leading count
+            rrg_leading_count = sum(
+                1 for m in members
+                if getattr(m, "detail", None) and getattr(m.detail, "rrg", None)
+                and m.detail.rrg.quadrant == "leading"
+            )
+            member_count = len(members)
+
+            # ── 厚度指标 ──
+            # family_resonance：成员强度标准差的倒数（一致性越高，共振度越高）
+            strengths = [m.composite_score for m in members]
+            if len(strengths) >= 2:
+                import statistics
+                std_dev = statistics.stdev(strengths)
+                family_resonance = max(0.0, 1.0 - std_dev / 50.0)  # 50 分为满分标准差
+            else:
+                family_resonance = 1.0
+
+            # 梯队分层
+            tiers = {"veteran": [], "mid": [], "new": []}
+            for m in members:
+                w = getattr(getattr(m, "detail", None), "wave_days", 0) or 0
+                if w >= 6:
+                    tiers["veteran"].append(m.sector_name)
+                elif w >= 3:
+                    tiers["mid"].append(m.sector_name)
+                else:
+                    tiers["new"].append(m.sector_name)
+
+            # ── 跨节点信号 ──
+            max_overheat = max(
+                (getattr(m, "overheat_severity", 0) or 0) for m in members
+            )
+            crowded = family_name in crowded_families
+
+            # capital_stance：成员 capital_check 聚合
+            capital_checks = [m.capital_check for m in members]
+            if all(c == "passed" for c in capital_checks):
+                capital_stance = "passed"
+            elif any(c == "rejected" for c in capital_checks):
+                capital_stance = "rejected"
+            else:
+                capital_stance = "missing"
+
+            # has_catalyst：Node 4 日历前 2 周内有无关联事件
+            has_catalyst = any(
+                getattr(m, "catalyst_events", None) for m in members
+            )
+
+            # ── 警示信号计分（评分制，不做硬闸门）──
+            warning_signals = []
+            warning_score = 0
+
+            # 过热 ≥0.3（+1）/≥0.5（+2）
+            if max_overheat >= 0.5:
+                warning_signals.append(f"严重过热（{max_overheat:.2f}）")
+                warning_score += 2
+            elif max_overheat >= 0.3:
+                warning_signals.append(f"过热警告（{max_overheat:.2f}）")
+                warning_score += 1
+
+            # 拥挤家族（+1）
+            if crowded:
+                warning_signals.append("家族拥挤（≥3板块同族）")
+                warning_score += 1
+
+            # 资金 missing/rejected（+1）
+            if capital_stance in ("missing", "rejected"):
+                warning_signals.append(f"资金面未确认（{capital_stance}）")
+                warning_score += 1
+
+            # 无催化剂（+1）
+            if not has_catalyst:
+                warning_signals.append("无近期催化剂")
+                warning_score += 1
+
+            # 破位信号（+2，独立于过热，决策 9）：T-0 板块跌幅 <-3 或强度轨迹 decreasing
+            break_signal = False
+            for m in members:
+                if getattr(m, "detail", None):
+                    detail = m.detail
+                    if getattr(detail, "today_change", None) and detail.today_change < -3:
+                        break_signal = True
+                        break
+                    if getattr(detail, "trend_direction", None) == "decreasing":
+                        break_signal = True
+                        break
+            if break_signal:
+                warning_signals.append("破位信号（跌幅>3%或趋势下行）")
+                warning_score += 2
+
+            # wave_days ≥6（+1）
+            if max_wave_days >= 6:
+                warning_signals.append(f"老波（wave_days={max_wave_days}）")
+                warning_score += 1
+
+            # ── 支撑信号 ──
+            support_signals = []
+            if rrg_leading_count == member_count and member_count > 0:
+                support_signals.append("全成员 RRG leading")
+            if family_resonance >= 0.7:
+                support_signals.append(f"高共振（{family_resonance:.2f}）")
+            if has_catalyst:
+                support_signals.append("有催化剂")
+            if capital_stance == "passed":
+                support_signals.append("资金面确认")
+            if tiers["new"]:
+                support_signals.append(f"梯队有新补涨（{len(tiers['new'])}个）")
+
+            # ── 续航区间（启发式）──
+            if warning_score <= 1:
+                endurance_band = "inertia"
+            elif warning_score <= 3:
+                endurance_band = "divergence"
+            else:
+                endurance_band = "topping_risk"
+
+            # ── 次日观察点 ──
+            exit_watch = ""
+            if endurance_band == "topping_risk":
+                exit_watch = "见顶风险期，密切关注破位信号"
+            elif endurance_band == "divergence":
+                exit_watch = "分化期，观察梯队是否跟涨"
+            else:
+                exit_watch = "惯性期，维持观察"
+
+            # 构建 MainlineEndurance
+            endurance = MainlineEndurance(
+                name=family_name,
+                wave_days=max_wave_days,
+                lifecycle_phase=lifecycle_phase,
+                rrg_leading_count=rrg_leading_count,
+                member_count=member_count,
+                family_resonance=round(family_resonance, 2),
+                tiers=tiers,
+                max_overheat=round(max_overheat, 2),
+                crowded=crowded,
+                capital_stance=capital_stance,
+                has_catalyst=has_catalyst,
+                support_signals=support_signals,
+                warning_signals=warning_signals,
+                endurance_band=endurance_band,
+                exit_watch=exit_watch,
+            )
+            endurance_list.append(endurance)
+
+        # 按 warning_score 降序排列（风险高的排前面）
+        endurance_list.sort(
+            key=lambda e: len(e.warning_signals),
+            reverse=True,
+        )
+
+        return endurance_list
 
     @staticmethod
     def _has_critical(temporal: list[TemporalInconsistency]) -> bool:

@@ -1384,6 +1384,22 @@ def main() -> int:
                             severity = "⚠️ 高" if warning['severity'] == 'high' else "⚡ 中"
                             print(f"  {severity} {warning['suggestion']}")
 
+                    # ── v3.5 S4：主线续航评估展示 ──
+                    mainline_endurance = getattr(decision, "mainline_endurance", [])
+                    if mainline_endurance:
+                        print(f"\n主线续航评估 ({len(mainline_endurance)} 个家族，启发式):")
+                        band_emoji = {"inertia": "🟢", "divergence": "🟡", "topping_risk": "🔴"}
+                        for endurance in mainline_endurance[:5]:  # 最多展示 5 个
+                            emoji = band_emoji.get(endurance.endurance_band, "⚪")
+                            print(
+                                f"  {emoji} {endurance.name}: "
+                                f"wave={endurance.wave_days}天, "
+                                f"区间={endurance.endurance_band}, "
+                                f"共振={endurance.family_resonance:.2f}"
+                            )
+                            if endurance.warning_signals:
+                                print(f"    ⚠ {', '.join(endurance.warning_signals[:2])}")
+
                     if decision.warnings:
                         print(f"\n风险提示:")
                         for warning in decision.warnings:

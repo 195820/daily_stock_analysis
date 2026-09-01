@@ -1052,6 +1052,10 @@ class Node2SectorTrendRecord(Base):
     strength_trajectory = Column(Text)  # JSON array: [0.45, 0.48, 0.52]（最近 7 天强度）
     trend_direction = Column(String(20), index=True)  # increasing/stable/decreasing
     exit_pressure_days = Column(Integer, default=0)  # 退出压力计数器（交易日粒度，同日去重）
+    # ── 波次计数器（v3.5 S2：以回撤结构判波，支撑生命周期折扣/续航评估）──
+    wave_days = Column(Integer, default=0)  # 当前波次持续天数（出框间隙≥2日+回撤≥10分→重置）
+    wave_start_date = Column(Date)  # 当前波次起始日期
+    wave_peak_strength = Column(Float)  # 当前波次峰值强度（滚动更新）
     created_at = Column(DateTime, default=utc_naive_now)
 
     __table_args__ = (
@@ -1412,6 +1416,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             "rrg_ratio_ema": "FLOAT",
             "rrg_momentum_ema": "FLOAT",
             "exit_pressure_days": "INTEGER DEFAULT 0",
+            # v3.5 S2: 波次计数器
+            "wave_days": "INTEGER DEFAULT 0",
+            "wave_start_date": "DATE",
+            "wave_peak_strength": "FLOAT",
         }
         try:
             with self._SessionLocal() as session:

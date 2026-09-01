@@ -155,6 +155,7 @@ class PortfolioDecisionNode:
             rotation_signals=rotation_signals,
             crowding_warnings=crowding_warnings,
             ambush_exit_signals=ambush_exit_signals,
+            mainline_endurance=getattr(unified_context, "mainline_endurance", []),
         )
 
         logger.info(
@@ -2713,6 +2714,17 @@ class PortfolioDecisionNode:
         # 置信度低
         if unified.overall_confidence < 0.5:
             warnings.append("研判置信度较低，建议谨慎操作")
+
+        # ── v3.5 S4：主线续航见顶风险警告 ──
+        mainline_endurance = getattr(unified, "mainline_endurance", [])
+        topping_risk_families = [
+            e for e in mainline_endurance if e.endurance_band == "topping_risk"
+        ]
+        if topping_risk_families:
+            family_names = ", ".join(e.name for e in topping_risk_families[:3])
+            warnings.append(
+                f"主线家族进入见顶风险期（{family_names}），密切关注破位信号"
+            )
 
         return warnings
 

@@ -654,6 +654,42 @@ def archive_phase2(
                 f.write(f"- {warning}\n")
             f.write("\n")
 
+        # v3.5 S4：主线续航评估
+        mainline_endurance = getattr(decision, "mainline_endurance", [])
+        if mainline_endurance:
+            f.write(f"## 📊 主线续航评估（{len(mainline_endurance)} 个家族，启发式）\n\n")
+            band_emoji = {"inertia": "🟢", "divergence": "🟡", "topping_risk": "🔴"}
+            for endurance in mainline_endurance:
+                emoji = band_emoji.get(endurance.endurance_band, "⚪")
+                f.write(f"### {emoji} {endurance.name}\n\n")
+                f.write(f"- **波次天数:** {endurance.wave_days} 天\n")
+                f.write(f"- **续航区间:** {endurance.endurance_band}\n")
+                f.write(f"- **成员数:** {endurance.member_count}（RRG leading: {endurance.rrg_leading_count}）\n")
+                f.write(f"- **家族共振:** {endurance.family_resonance:.2f}\n")
+                f.write(f"- **资金立场:** {endurance.capital_stance}\n")
+                f.write(f"- **催化剂:** {'✓' if endurance.has_catalyst else '✗'}\n")
+                if endurance.crowded:
+                    f.write(f"- **拥挤警告:** 家族拥挤\n")
+                if endurance.max_overheat > 0:
+                    f.write(f"- **过热严重度:** {endurance.max_overheat:.2f}\n")
+
+                if endurance.tiers.get("veteran") or endurance.tiers.get("mid") or endurance.tiers.get("new"):
+                    f.write(f"- **梯队分层:** ")
+                    tier_parts = []
+                    if endurance.tiers.get("veteran"):
+                        tier_parts.append(f"老龙头({len(endurance.tiers['veteran'])})")
+                    if endurance.tiers.get("mid"):
+                        tier_parts.append(f"中生代({len(endurance.tiers['mid'])})")
+                    if endurance.tiers.get("new"):
+                        tier_parts.append(f"新补涨({len(endurance.tiers['new'])})")
+                    f.write(" / ".join(tier_parts) + "\n")
+
+                if endurance.support_signals:
+                    f.write(f"- **支撑信号:** {', '.join(endurance.support_signals)}\n")
+                if endurance.warning_signals:
+                    f.write(f"- **警示信号:** {', '.join(endurance.warning_signals)}\n")
+                f.write(f"- **次日观察:** {endurance.exit_watch}\n\n")
+
         # P4：埋伏持仓退出信号
         ambush_exits = getattr(decision, "ambush_exit_signals", [])
         if ambush_exits:

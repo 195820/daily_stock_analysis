@@ -278,6 +278,20 @@ class SectorDetail(BaseModel):
         default=None,
         description="连续主线天数（用于检测 late_stage）",
     )
+    # ── 波次计数器（v3.5 S2：以回撤结构判波，支撑生命周期折扣/续航评估）──
+    wave_days: Optional[int] = Field(
+        default=None,
+        description="当前波次持续天数（出框间隙≥2日+回撤≥10分→重置，用于生命周期折扣）",
+    )
+    wave_start_date: Optional[date] = Field(
+        default=None,
+        description="当前波次起始日期",
+    )
+    wave_peak_strength: Optional[float] = Field(
+        default=None,
+        ge=0.0, le=100.0,
+        description="当前波次峰值强度（滚动更新，用于计算回撤幅度）",
+    )
     frame_group: Optional[str] = Field(
         default=None,
         description="所属产业主题组名（如 AI产业链 / 黄金 / 华为系）",
@@ -786,6 +800,43 @@ class Contradiction(BaseModel):
     arbitration_confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="仲裁置信度")
 
 
+class MainlineEndurance(BaseModel):
+    """主线续航评估（v3.5 S4：合成层放 aggregator，唯一同时持有 sector+capital+catalyst 的位置）。
+
+    定位：信号展示 + 降权提示，不触发强制卖出（评分制原则，不做硬闸门）。
+    """
+    name: str = Field(..., description="家族/主线组名")
+    wave_days: int = Field(..., description="当前波次持续天数（组内最大值）")
+    lifecycle_phase: Optional[str] = Field(default=None, description="生命周期阶段（组内最老成员）")
+    rrg_leading_count: int = Field(default=0, description="RRG leading 象限成员数")
+    member_count: int = Field(default=0, description="家族总成员数")
+
+    # ── 厚度指标 ──
+    family_resonance: float = Field(default=0.0, ge=0.0, le=1.0, description="家族共振度（成员强度一致性）")
+    tiers: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="梯队分层：{'veteran': wave≥6, 'mid': 3-5, 'new': ≤2}（板块名列表）",
+    )
+
+    # ── 跨节点信号 ──
+    max_overheat: float = Field(default=0.0, ge=0.0, le=1.0, description="成员最高过热严重度")
+    crowded: bool = Field(default=False, description="是否属于拥挤家族（∈ crowded_families）")
+    capital_stance: str = Field(
+        default="missing",
+        description="资金面立场：passed / rejected / missing（成员 capital_check 聚合）",
+    )
+    has_catalyst: bool = Field(default=False, description="Node 4 日历前 2 周内有无关联事件")
+
+    # ── 输出信号 ──
+    support_signals: list[str] = Field(default_factory=list, description="支撑信号列表")
+    warning_signals: list[str] = Field(default_factory=list, description="警示信号列表")
+    endurance_band: str = Field(
+        default="inertia",
+        description="续航区间：inertia（惯性期）/ divergence（分化期）/ topping_risk（见顶风险期），启发式",
+    )
+    exit_watch: str = Field(default="", description="次日观察点（如'RRG 翻 weakening 即离场信号'）")
+
+
 class UnifiedContext(BaseModel):
     """Node 6 输出：GOT 最终输出（v3 分层架构）"""
     status: str = Field(..., description="normal / manual_review_required")
@@ -839,6 +890,11 @@ class UnifiedContext(BaseModel):
     crowded_families: list[str] = Field(
         default_factory=list,
         description="拥挤家族名称列表（来自 Node 2，用于 Phase 2 追加降权）",
+    )
+    # ── 主线续航评估（v3.5 S4：信号展示 + 降权提示，不触发强制卖出）──
+    mainline_endurance: list[MainlineEndurance] = Field(
+        default_factory=list,
+        description="主线家族续航评估（对 active_mainline 家族逐一生成，警示分档+观察点）",
     )
 
     # ── 跨节点时间线共振（v2.1 Phase 6）──
@@ -939,4 +995,9 @@ class PortfolioDecision(BaseModel):
     ambush_exit_signals: list[dict] = Field(
         default_factory=list,
         description="埋伏持仓退出信号汇总: {symbol, sector, category_tag, exit_signal, reason}",
+    )
+    # ── v3.5 S4 主线续航评估（从 UnifiedContext 透传）──
+    mainline_endurance: list[MainlineEndurance] = Field(
+        default_factory=list,
+        description="主线家族续航评估（信号展示+降权提示，不触发强制卖出）",
     )
