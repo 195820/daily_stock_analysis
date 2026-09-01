@@ -116,9 +116,10 @@ class TestWaveDaysCalculation:
             wave_peak_strength=85.0,
         )
 
-        # Mock 查询
+        # Mock 查询：第一次取最近记录（gap_record2），第二次取出框前锚点（prev_record）；
+        # 间隙记录查询返回 [gap_record1, gap_record2]（2 交易日）
         mock_session.query.return_value.filter.return_value.order_by.return_value.first = MagicMock(
-            return_value=gap_record2
+            side_effect=[gap_record2, prev_record]
         )
         mock_session.query.return_value.filter.return_value.all = MagicMock(
             return_value=[gap_record1, gap_record2]
@@ -185,15 +186,20 @@ class TestWaveDaysCalculation:
         assert wave_peak == 70.0
 
     def test_single_day_deep_v_no_reset(self, node, mock_session):
-        """测试 ④：单日深 V 不重置但落观察日志。"""
-        # 构造历史：前日前是 active_mainline，wave_days=3，峰值 80
-        # 前日是 exhausted，强度 60（深 V，回撤 20 分）
-        # 昨日是 exhausted（间隙仅 1 日）
-        # 今日是 active_mainline
+        """测试 ④：单日深 V 不重置但落观察日志。
+
+        夹具修正（2026-09-01 审核）：原构造为 2 日间隙（T-2/T-1 各一条），与用例名"单日深 V"、
+        注释"间隙仅 1 日"矛盾；而 2 日间隙 + 回撤 ≥10 分按结论 B 应重置（复合铜箔型）。
+        现改为真正的单日深 V：T-2 active → T-1 单日深跌（回撤 20 分）→ 今日回归，
+        对应粮食概念 09-01 型（100→78→100），读法 A：单日深 V 冻结不重置。
+        """
+        # 构造历史：前日前是 active_mainline，wave_days=3，峰值 80，平台强度 75
+        # 前日（T-1）单日 exhausted，强度 60（深 V，自峰值回撤 20 分）
+        # 今日是 active_mainline（强度回升但未破位）
         prev_record = Node2SectorTrendRecord(
             sector_code="880999",
             sector_name="深V测试",
-            tracking_date=date.today() - timedelta(days=3),
+            tracking_date=date.today() - timedelta(days=2),
             state="active_mainline",
             strength_score=75.0,
             wave_days=3,
@@ -204,31 +210,20 @@ class TestWaveDaysCalculation:
         gap_record1 = Node2SectorTrendRecord(
             sector_code="880999",
             sector_name="深V测试",
-            tracking_date=date.today() - timedelta(days=2),
-            state="exhausted_mainline",
-            strength_score=60.0,  # 深 V 回撤
-            wave_days=3,
-            wave_start_date=date.today() - timedelta(days=5),
-            wave_peak_strength=80.0,
-        )
-
-        gap_record2 = Node2SectorTrendRecord(
-            sector_code="880999",
-            sector_name="深V测试",
             tracking_date=date.today() - timedelta(days=1),
             state="exhausted_mainline",
-            strength_score=62.0,
+            strength_score=60.0,  # 单日深 V 回撤（自峰值 80 回撤 20 分）
             wave_days=3,
             wave_start_date=date.today() - timedelta(days=5),
             wave_peak_strength=80.0,
         )
 
-        # Mock 查询
+        # Mock 查询：第一次取最近记录（gap_record1），第二次取锚点（prev_record）
         mock_session.query.return_value.filter.return_value.order_by.return_value.first = MagicMock(
-            return_value=gap_record2
+            side_effect=[gap_record1, prev_record]
         )
         mock_session.query.return_value.filter.return_value.all = MagicMock(
-            return_value=[gap_record1, gap_record2]
+            return_value=[gap_record1]
         )
 
         # 计算今日 wave_days
@@ -240,7 +235,7 @@ class TestWaveDaysCalculation:
             date.today(),
         )
 
-        # 验证：单日深 V，间隙 <2 日，应冻结继承（同波延续）
+        # 验证：单日深 V（间隙 1 交易日 <2）→ 冻结继承，不重置（读法 A）
         assert wave_days == 3, f"Expected wave_days=3 (frozen, single day deep V), got {wave_days}"
         assert wave_start == prev_record.wave_start_date
         assert wave_peak == 80.0  # 继承前波峰值

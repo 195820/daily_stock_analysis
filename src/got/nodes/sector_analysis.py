@@ -51,6 +51,116 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# 波次计数器（v3.5 S2：回撤结构判波）——常量与共享判波核心
+# 在线 _calc_wave_days 与 scripts/backfill_wave_days.py 共用 decide_wave_days，
+# 禁止各自维护分叉实现（审核 P1 修复，2026-09-01）。
+# =============================================================================
+
+# 主线族状态（波次存续域：降温/衰竭仍属"在波中"）
+MAINLINE_FAMILY_STATES = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
+# 非主线族状态（经此退出 → 波次无条件重置）
+NON_MAINLINE_RESET_STATES = {"neutral", "ambush", "defensive_rotation"}
+
+# 波次重置阈值（决策 2，11 起样本弱先验，待 S5 校准迭代）
+WAVE_GAP_MIN_DAYS = 2          # 出框间隙 ≥2 交易日（按记录条数计，规避日历日跨周末误判）
+WAVE_STRENGTH_DRAWDOWN = 10    # 隙期强度自波峰回撤 ≥10 分 → 判真洗盘再启动
+
+
+def decide_wave_days(
+    current_state: str,
+    current_strength: float,
+    today: date,
+    prev_record,
+    anchor_record,
+    gap_records: list,
+) -> tuple[int, Optional[date], float]:
+    """波次判定核心（在线 _calc_wave_days 与回填脚本共用，决策 2）。
+
+    语义：
+    - 无前记录 / 今日经非主线族退出 → 重置 1（新波）
+    - 前日非主线族 → 无条件重置 1（经 neutral/ambush/defensive 退出）
+    - 降温期（今日 cooling/exhausted）→ 冻结继承（同波存续，天数不累加）
+    - 前日 active → +1，波峰滚动更新
+    - cooling/exhausted → active 回归 → 两段式回撤结构判定：
+      间隙 <2 交易日（单日闪断/单日深 V）→ 冻结；
+      隙期自出框前平台回撤 ≥10 分 → 真洗盘再启动，重置 1；否则冻结。
+      回撤取隙期最低强度（非最高）：真实样本中 4 起真二波有 3 起隙期带反弹回升段，
+      若取隙期最高强度，回升段会抵消回撤、漏判焦炭加工/煤炭开采/航运概念；
+      判据只认回撤深度不认形态：复合铜箔（真二波，隙期 47→78 回升）与种植业 08-27（噪声，浅 V）
+      均呈 V 形，V 形态无判别力；单日深 V 的"2 日确认"由后续交易日的回撤判定自然完成（读法 A）。
+    - 冻结时波峰滚动更新（波峰仅作展示/埋点口径，不参与重置判定）。
+    - 回撤基准 = 出框前平台强度（锚点日 strength，plan.md 口径），不用存储波峰（可能被旧逻辑污染）。
+    - 间隙出现非主线族记录 → 视为已经退出过，无条件重置。
+    - 冻结继承的 wave_days 兜底 ≥1（防御旧记录 wave_days 为 NULL）。
+
+    Args:
+        current_state:   当日状态
+        current_strength: 当日强度分（0-100）
+        today:           当日日期（交易日历）
+        prev_record:     最近一条历史记录（< today），无前记录传 None；
+                         需带 state/wave_days/wave_start_date/wave_peak_strength/tracking_date/strength_score
+        anchor_record:   最近一条 active_mainline 历史记录（出框前平台锚点），无则 None；
+                         仅 current=active 且 prev 为 cooling/exhausted 时需要，其余场景可传 None
+        gap_records:     anchor（不含）至今日（不含）之间的记录列表，可不排序（内部按日期升序）
+    """
+    strength = float(current_strength or 0)
+
+    # 无前记录 → 新波起点；今日经非主线族退出 → 波终结重置（冷却位不存续）
+    if prev_record is None or current_state not in MAINLINE_FAMILY_STATES:
+        return 1, today, strength
+
+    prev_state = prev_record.state
+    prev_wd = int(getattr(prev_record, "wave_days", 0) or 0)
+    prev_start = getattr(prev_record, "wave_start_date", None) or prev_record.tracking_date
+    prev_peak = float(getattr(prev_record, "wave_peak_strength", 0) or 0)
+
+    # 前日非主线族（neutral/ambush/defensive）→ 波已终结，无条件重置；
+    # state 为 None 的旧版本记录同样视为波间断（保守重置）
+    if not prev_state or prev_state in NON_MAINLINE_RESET_STATES:
+        return 1, today, strength
+
+    # ── 今昨均在主线族 ──
+    # 降温期（cooling/exhausted）：冻结继承，天数不累加；波峰照常滚动（仅展示口径，不参与重置判定）
+    if current_state != "active_mainline":
+        return max(prev_wd, 1), prev_start, max(prev_peak, strength)
+
+    # 前日 active → 当前波延续，波峰滚动更新
+    if prev_state == "active_mainline":
+        return prev_wd + 1, prev_start, max(prev_peak, strength)
+
+    # ── cooling/exhausted → active 回归：决策 2 回撤结构判定 ──
+    if anchor_record is None:
+        return 1, today, strength
+
+    anc_wd = int(getattr(anchor_record, "wave_days", 0) or 0)
+    anc_start = getattr(anchor_record, "wave_start_date", None) or anchor_record.tracking_date
+    anc_peak = float(getattr(anchor_record, "wave_peak_strength", 0) or 0)
+    # 出框前平台强度（锚点日强度，回撤基准；plan.md"低于出框前平台 ≥10 分"口径）
+    anc_platform = float(getattr(anchor_record, "strength_score", 0) or 0)
+
+    gaps = sorted(gap_records or [], key=lambda r: r.tracking_date)
+
+    # 间隙中出现非主线族退出态 → 波已断过，无条件重置（结论 B）
+    if any(getattr(r, "state", None) in NON_MAINLINE_RESET_STATES for r in gaps):
+        return 1, today, strength
+
+    # 间隙按交易日计（记录条数）；单日闪断/单日深 V 不重置 → 冻结继承（锚点口径）
+    if len(gaps) < WAVE_GAP_MIN_DAYS:
+        return max(anc_wd, 1), anc_start, max(anc_peak, strength)
+
+    # 回撤结构：隙期最低强度自出框前平台回撤 ≥10 分 → 真洗盘再启动，重置波次（复合铜箔型）；
+    # 取最低而非最高：回升段不能抵消回撤（焦炭加工/煤炭开采/航运三起真二波均带隙期回升）；
+    # 基准用锚点日平台强度而非存储波峰（波峰可能被旧逻辑污染）；
+    # 不另设 V 形回升豁免（真实样本验证：V 形态对真二波/噪声无判别力）
+    gap_strengths = [float(getattr(r, "strength_score", 0) or 0) for r in gaps]
+    if anc_platform - min(gap_strengths) >= WAVE_STRENGTH_DRAWDOWN:
+        return 1, today, strength
+
+    # 回撤不足 → 同波延续，冻结继承（种业型：状态翻动但强度未回撤；种植业 08-27 型浅 V）
+    return max(anc_wd, 1), anc_start, max(anc_peak, strength)
+
+
+# =============================================================================
 # 主线家族关键词（Node 2 v2：替代旧的 CONCEPT_UNIVERSE + _FRAME_GROUP_KEYWORDS）
 # ~10 个家族，每个板块名命中首个匹配的家族，未命中 → "其他"
 # =============================================================================
@@ -4086,8 +4196,7 @@ class SectorAnalysisNode:
         from pathlib import Path
 
         # 仅主线族板块参与校准（非主线无波次概念）
-        mainline_family = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
-        mainline_sectors = [s for s in sectors if s.state in mainline_family]
+        mainline_sectors = [s for s in sectors if s.state in MAINLINE_FAMILY_STATES]
 
         if not mainline_sectors:
             return
@@ -4098,17 +4207,38 @@ class SectorAnalysisNode:
             calibration_path = project_root / "data" / "wave_calibration.jsonl"
             calibration_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(calibration_path, "a", encoding="utf-8") as f:
-                for sector in mainline_sectors:
-                    record = {
-                        "date": today.isoformat(),
-                        "sector_code": sector.code,
-                        "sector_name": sector.name,
-                        "wave_days": sector.wave_days or 0,
-                        "strength": sector.strength_score,
-                        "wave_peak": sector.wave_peak_strength or sector.strength_score,
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # 同日重跑幂等（审核 P2 修复）：先剔除当日旧样本，再以本次运行结果为准重写，
+            # 避免同日重复埋点污染校准统计；损坏行（无法解析）原样保留交人工处理。
+            today_str = today.isoformat()
+            kept_lines: list[str] = []
+            if calibration_path.exists():
+                with open(calibration_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if not line.strip():
+                            continue
+                        try:
+                            if json.loads(line).get("date") == today_str:
+                                continue
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                        kept_lines.append(line)
+
+            new_lines = []
+            for sector in mainline_sectors:
+                record = {
+                    "date": today_str,
+                    "sector_code": sector.code,
+                    "sector_name": sector.name,
+                    "wave_days": sector.wave_days or 0,
+                    "strength": sector.strength_score,
+                    "wave_peak": sector.wave_peak_strength or sector.strength_score,
+                }
+                new_lines.append(json.dumps(record, ensure_ascii=False))
+
+            with open(calibration_path, "w", encoding="utf-8") as f:
+                for line in kept_lines + new_lines:
+                    f.write(line + "\n")
 
             logger.debug(
                 "[Node 2] 波次校准埋点: %d 条主线板块 → %s",
@@ -4184,20 +4314,17 @@ class SectorAnalysisNode:
         current_state: str,
         current_strength: float,
         today: date,
-    ) -> tuple[int, date, float]:
+    ) -> tuple[int, Optional[date], float]:
         """计算波次计数器（v3.5 S2：以回撤结构判波）。
 
-        决策 2 判据：
-        - 前日 active_mainline → wave_days + 1，wave_peak_strength = max(prev_peak, today)
-        - 前日 cooling/exhausted → 间隙≥2日 且 隙期强度回撤≥10分 → 重置 1；否则冻结继承
-        - 前日非主线族状态或无记录 → 重置 1
-
-        Returns: (wave_days, wave_start_date, wave_peak_strength)
+        判定语义全部委托模块级 decide_wave_days（与回填脚本共用，禁止分叉实现）。
+        本方法只负责两段式取数：
+        1) 最近一条历史记录（prev）；
+        2) 仅当 prev 为 cooling/exhausted 且今日回归 active 时，
+           追查出框前锚点（最近 active 日）与锚点至今的间隙记录（按交易日计）。
+        深 V 冻结场景另落观察日志（S5 校准埋点另行写入）。
         """
-        # 主线族状态（active/cooling/exhausted 都算"在波中"）
-        mainline_family = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
-
-        # 加载前日记录
+        # 取数 1：最近一条历史记录（同一查询链 .filter().order_by().first()，兼容单测 mock）
         prev_record = (
             session.query(Node2SectorTrendRecord)
             .filter(
@@ -4208,58 +4335,53 @@ class SectorAnalysisNode:
             .first()
         )
 
-        # 无前记录或非主线族状态 → 重置
-        if prev_record is None or current_state not in mainline_family:
-            return 1, today, current_strength
-
-        prev_state = prev_record.state
-        prev_wave_days = int(getattr(prev_record, "wave_days", 0) or 0)
-        prev_wave_start = getattr(prev_record, "wave_start_date", None) or prev_record.tracking_date
-        prev_wave_peak = float(getattr(prev_record, "wave_peak_strength", 0) or 0)
-
-        # 前日也是主线族 → 延续当前波
-        if prev_state in mainline_family:
-            new_wave_days = prev_wave_days + 1
-            new_wave_peak = max(prev_wave_peak, current_strength)
-            return new_wave_days, prev_wave_start, new_wave_peak
-
-        # 前日非主线族（neutral/ambush/defensive）→ 无条件重置（维持现行语义）
-        if prev_state in {"neutral", "ambush", "defensive_rotation"}:
-            return 1, today, current_strength
-
-        # 前日 cooling/exhausted → 按回撤结构判波（决策 2）
-        # 计算间隙天数（今日 - 前日）
-        gap_days = (today - prev_record.tracking_date).days
-
-        # 间隙不足 2 交易日 → 冻结继承（同波延续）
-        if gap_days < 2:
-            return prev_wave_days, prev_wave_start, prev_wave_peak
-
-        # 检查隙期强度回撤：查找间隙期间的最高强度
-        gap_records = (
-            session.query(Node2SectorTrendRecord)
-            .filter(
-                Node2SectorTrendRecord.sector_code == sector_code,
-                Node2SectorTrendRecord.tracking_date > prev_record.tracking_date,
-                Node2SectorTrendRecord.tracking_date < today,
+        anchor_record = None
+        gap_records: list = []
+        if (
+            prev_record is not None
+            and current_state == "active_mainline"
+            and prev_record.state in ("high_position_cooling", "exhausted_mainline")
+        ):
+            # 取数 2：出框前锚点（最近一次 active 日）
+            anchor_record = (
+                session.query(Node2SectorTrendRecord)
+                .filter(
+                    Node2SectorTrendRecord.sector_code == sector_code,
+                    Node2SectorTrendRecord.state == "active_mainline",
+                    Node2SectorTrendRecord.tracking_date < today,
+                )
+                .order_by(Node2SectorTrendRecord.tracking_date.desc())
+                .first()
             )
-            .all()
+            if anchor_record is not None:
+                # 取数 3：锚点（不含）至今日（不含）的间隙记录（交易日口径）
+                gap_records = (
+                    session.query(Node2SectorTrendRecord)
+                    .filter(
+                        Node2SectorTrendRecord.sector_code == sector_code,
+                        Node2SectorTrendRecord.tracking_date > anchor_record.tracking_date,
+                        Node2SectorTrendRecord.tracking_date < today,
+                    )
+                    .all()
+                )
+
+        wave_days, wave_start, wave_peak = decide_wave_days(
+            current_state, current_strength, today,
+            prev_record, anchor_record, gap_records,
         )
 
-        if gap_records:
-            gap_max_strength = max(
-                float(getattr(r, "strength_score", 0) or 0) for r in gap_records
+        # 深 V/浅回撤观察埋点：多日间隙但冻结继承（回撤不足 10 分）→ 留日志供复盘（读法 A）
+        if (
+            anchor_record is not None
+            and len(gap_records) >= WAVE_GAP_MIN_DAYS
+            and wave_days > 1
+        ):
+            logger.info(
+                "[Node 2] 波次深V观察 %s: 间隙 %d 日未重置（冻结 wave_days=%d，锚点 %s）",
+                sector_code, len(gap_records), wave_days, anchor_record.tracking_date,
             )
-        else:
-            gap_max_strength = 0
 
-        # 回撤不足 10 分 → 冻结继承（同波延续）
-        strength_dropout = prev_wave_peak - gap_max_strength
-        if strength_dropout < 10:
-            return prev_wave_days, prev_wave_start, prev_wave_peak
-
-        # 间隙≥2日 且 回撤≥10分 → 真洗盘再启动，重置波次
-        return 1, today, current_strength
+        return wave_days, wave_start, wave_peak
 
     def _load_sector_trend_history(self, sector_code: str, days: int = 7) -> Optional[dict]:
         """加载板块趋势历史用于 LLM prompt 注入。"""

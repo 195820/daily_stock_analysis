@@ -4,17 +4,21 @@
 按时间序全量重算所有板块的 wave_days/wave_start_date/wave_peak_strength。
 幂等可重跑（覆盖写入，不累积）。
 
+判波语义复用 sector_analysis.decide_wave_days（审核 P1 修复：消除双实现分叉），
+--since 时仍全量加载历史计算（保证窗口首条记录有完整前文语境），仅写回窗口内行（审核 P2 修复）。
+
 注意：08-17 前数据为旧逻辑产物，回填值仅作连续性需要，不作为校准样本。
 
 使用：
     python scripts/backfill_wave_days.py              # 回填全部
-    python scripts/backfill_wave_days.py --since 2026-08-17  # 仅回填指定日期之后
-    python scripts/backfill_wave_days.py --dry-run    # 仅预览，不写入
+    python scripts/backfill_wave_days.py --since 2026-08-17  # 仅写回指定日期之后（计算仍全量）
+    python scripts/backfill_wave_days.py --dry-run    # 仅预览，不写入（内存快照，不碰 ORM 对象）
 """
 
 import argparse
 import sys
 from collections import defaultdict
+from collections import namedtuple
 from datetime import date, datetime
 from pathlib import Path
 
@@ -22,90 +26,60 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from sqlalchemy import text
+from src.got.nodes.sector_analysis import decide_wave_days
 from src.storage import DatabaseManager, Node2SectorTrendRecord
 
 
-# 主线族状态（与 sector_analysis.py 保持一致）
-MAINLINE_FAMILY = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
+# 内存快照（dry-run 下不触碰 ORM 对象，避免脏会话意外提交）
+_Snap = namedtuple(
+    "_Snap",
+    ["state", "strength_score", "tracking_date", "wave_days", "wave_start_date", "wave_peak_strength"],
+)
 
-# 波次重置阈值（弱先验，11 起样本）
-WAVE_GAP_MIN_DAYS = 2  # 间隙≥2 交易日
-WAVE_STRENGTH_DRAWDOWN = 10  # 强度回撤≥10 分
 
-
-def calc_wave_days_for_sector(records: list[Node2SectorTrendRecord]) -> list[tuple[int, date, float]]:
-    """为单个板块的历史记录序列计算波次计数器。
+def calc_wave_days_for_sector(records: list) -> list[tuple[int, date, float]]:
+    """为单个板块的历史记录序列计算波次计数器（与在线逻辑共用 decide_wave_days）。
 
     Args:
-        records: 按 tracking_date 升序排列的记录列表
+        records: 按 tracking_date 升序排列的 ORM 记录列表（只读，不修改）
 
     Returns:
         [(wave_days, wave_start_date, wave_peak_strength), ...] 与 records 一一对应
     """
-    results = []
-    prev_record = None
-    prev_wave_days = 0
-    prev_wave_start = None
-    prev_wave_peak = 0.0
+    results: list[tuple[int, date, float]] = []
+    # 内存快照序列：decide_wave_days 从快照读 wave_* 字段（等价于在线从已落库记录读取）
+    snaps = [
+        _Snap(r.state, float(r.strength_score or 0), r.tracking_date, None, None, None)
+        for r in records
+    ]
 
-    for record in records:
-        current_state = record.state
-        current_strength = float(record.strength_score or 0)
-        current_date = record.tracking_date
+    for i, snap in enumerate(snaps):
+        prev_snap = snaps[i - 1] if i > 0 else None
 
-        # 无前记录或非主线族状态 → 重置
-        if prev_record is None or current_state not in MAINLINE_FAMILY:
-            wave_days = 1
-            wave_start = current_date
-            wave_peak = current_strength
-        else:
-            prev_state = prev_record.state
+        # 两段式取数（与在线 _calc_wave_days 同构）：锚点 = 最近一次 active 日，间隙 = 锚点至今的记录
+        anchor_snap = None
+        gap_snaps: list = []
+        if (
+            prev_snap is not None
+            and snap.state == "active_mainline"
+            and prev_snap.state in ("high_position_cooling", "exhausted_mainline")
+        ):
+            for j in range(i - 1, -1, -1):
+                if snaps[j].state == "active_mainline":
+                    anchor_snap = snaps[j]
+                    gap_snaps = snaps[j + 1:i]
+                    break
 
-            # 前日也是主线族 → 延续当前波
-            if prev_state in MAINLINE_FAMILY:
-                wave_days = prev_wave_days + 1
-                wave_start = prev_wave_start
-                wave_peak = max(prev_wave_peak, current_strength)
-            # 前日非主线族（neutral/ambush/defensive）→ 无条件重置
-            elif prev_state in {"neutral", "ambush", "defensive_rotation"}:
-                wave_days = 1
-                wave_start = current_date
-                wave_peak = current_strength
-            else:
-                # 前日 cooling/exhausted → 按回撤结构判波
-                # 计算间隙天数
-                gap_days = (current_date - prev_record.tracking_date).days
-
-                # 间隙不足 2 交易日 → 冻结继承
-                if gap_days < WAVE_GAP_MIN_DAYS:
-                    wave_days = prev_wave_days
-                    wave_start = prev_wave_start
-                    wave_peak = prev_wave_peak
-                else:
-                    # 检查隙期强度回撤
-                    # 查找间隙期间的最高强度（这里简化为前日强度，实际应查询中间记录）
-                    gap_max_strength = float(prev_record.strength_score or 0)
-                    strength_dropout = prev_wave_peak - gap_max_strength
-
-                    # 回撤不足 10 分 → 冻结继承
-                    if strength_dropout < WAVE_STRENGTH_DRAWDOWN:
-                        wave_days = prev_wave_days
-                        wave_start = prev_wave_start
-                        wave_peak = prev_wave_peak
-                    else:
-                        # 真洗盘再启动，重置波次
-                        wave_days = 1
-                        wave_start = current_date
-                        wave_peak = current_strength
-
+        wave_days, wave_start, wave_peak = decide_wave_days(
+            snap.state, snap.strength_score, snap.tracking_date,
+            prev_snap, anchor_snap, gap_snaps,
+        )
         results.append((wave_days, wave_start, wave_peak))
 
-        # 更新 prev
-        prev_record = record
-        prev_wave_days = wave_days
-        prev_wave_start = wave_start
-        prev_wave_peak = wave_peak
+        # 回写快照，供后续日期消费（等价于在线流水线的落库→次日读取）
+        snaps[i] = snap._replace(
+            wave_days=wave_days, wave_start_date=wave_start, wave_peak_strength=wave_peak,
+        )
 
     return results
 
@@ -123,14 +97,12 @@ def backfill_wave_days(since_date: date | None = None, dry_run: bool = False) ->
     db = DatabaseManager()
 
     with db.get_session() as session:
-        # 查询所有记录，按板块分组
+        # 全量加载（审核 P2 修复）：--since 时不按日期过滤查询，
+        # 保证窗口首条记录的前文语境完整，避免首条必判"重置 1"污染后续波次起点。
         query = session.query(Node2SectorTrendRecord).order_by(
             Node2SectorTrendRecord.sector_code,
             Node2SectorTrendRecord.tracking_date,
         )
-
-        if since_date:
-            query = query.filter(Node2SectorTrendRecord.tracking_date >= since_date)
 
         all_records = query.all()
 
@@ -150,18 +122,23 @@ def backfill_wave_days(since_date: date | None = None, dry_run: bool = False) ->
             max_date = max(r.tracking_date for r in all_records)
             stats["date_range"] = (min_date, max_date)
 
-        print(f"开始回填: {len(sectors)} 个板块, {len(all_records)} 条记录")
+        print(f"开始回填: {len(sectors)} 个板块, {len(all_records)} 条记录（全量计算）")
         if stats["date_range"]:
             print(f"日期范围: {stats['date_range'][0]} ~ {stats['date_range'][1]}")
+        if since_date:
+            print(f"写回窗口: ≥ {since_date}（窗口外记录仅参与计算不写入）")
         print(f"模式: {'预览（不写入）' if dry_run else '执行写入'}")
         print()
 
         for sector_code, records in sectors.items():
-            # 计算波次
+            # 计算波次（全量历史）
             wave_data = calc_wave_days_for_sector(records)
 
-            # 更新记录
+            # 更新记录（仅写回窗口内行）
             for record, (wave_days, wave_start, wave_peak) in zip(records, wave_data):
+                if since_date and record.tracking_date < since_date:
+                    continue
+
                 if dry_run:
                     # 仅打印前 5 条样例
                     if stats["records_updated"] < 5:

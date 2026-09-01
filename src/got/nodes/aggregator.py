@@ -2769,31 +2769,46 @@ class AggregatorNode:
             family_name = intel.frame_group or intel.sector_name
             families[family_name].append(intel)
 
+        # ── sector_name → SectorDetail 查表（审核 P0 修复）──
+        # SectorIntel 不携带 detail/wave_days/RRG 等字段，续航合成所需的波次/趋势/RRG
+        # 原始数据在 Node 2 的 SectorDetail 上，从 SectorContext 各桶建立查表。
+        detail_lookup: dict[str, SectorDetail] = {}
+        for _group in getattr(sector, "active_mainline", None) or []:
+            for _member in getattr(_group, "members", None) or []:
+                detail_lookup.setdefault(_member.name, _member)
+        for _bucket in ("cooling_down", "exhausted_mainline", "top_by_score"):
+            for _d in getattr(sector, _bucket, None) or []:
+                detail_lookup.setdefault(_d.name, _d)
+
         endurance_list = []
         crowded_families = set(getattr(sector, "crowded_families", []) or [])
 
         for family_name, members in families.items():
             # ── 基础指标 ──
-            wave_days_list = [getattr(m, "wave_days", 0) or 0 for m in members if getattr(m, "detail", None)]
+            member_details = [detail_lookup.get(m.sector_name) for m in members]
+            wave_days_list = [
+                getattr(d, "wave_days", 0) or 0 for d in member_details if d is not None
+            ]
             max_wave_days = max(wave_days_list) if wave_days_list else 0
 
             # lifecycle_phase：取最老成员（wave_days 最大）的 phase
-            oldest_member = max(
-                members,
-                key=lambda m: getattr(getattr(m, "detail", None), "wave_days", 0) or 0,
-                default=None,
-            )
+            oldest_detail = None
+            oldest_wave = -1
+            for d in member_details:
+                if d is not None:
+                    w = getattr(d, "wave_days", 0) or 0
+                    if w > oldest_wave:
+                        oldest_wave = w
+                        oldest_detail = d
             lifecycle_phase = None
-            if oldest_member and getattr(oldest_member, "detail", None):
-                lifecycle = getattr(oldest_member.detail, "lifecycle", None)
-                if lifecycle:
-                    lifecycle_phase = lifecycle.phase
+            if oldest_detail is not None and getattr(oldest_detail, "lifecycle", None):
+                lifecycle_phase = oldest_detail.lifecycle.phase
 
             # RRG leading count
             rrg_leading_count = sum(
-                1 for m in members
-                if getattr(m, "detail", None) and getattr(m.detail, "rrg", None)
-                and m.detail.rrg.quadrant == "leading"
+                1 for d in member_details
+                if d is not None and getattr(d, "rrg", None)
+                and getattr(d.rrg, "quadrant", None) == "leading"
             )
             member_count = len(members)
 
@@ -2807,10 +2822,10 @@ class AggregatorNode:
             else:
                 family_resonance = 1.0
 
-            # 梯队分层
+            # 梯队分层（波次口径：wave_days ≥6 veteran / 3-5 mid / ≤2 new）
             tiers = {"veteran": [], "mid": [], "new": []}
-            for m in members:
-                w = getattr(getattr(m, "detail", None), "wave_days", 0) or 0
+            for m, d in zip(members, member_details):
+                w = getattr(d, "wave_days", 0) or 0 if d is not None else 0
                 if w >= 6:
                     tiers["veteran"].append(m.sector_name)
                 elif w >= 3:
@@ -2824,18 +2839,20 @@ class AggregatorNode:
             )
             crowded = family_name in crowded_families
 
-            # capital_stance：成员 capital_check 聚合
-            capital_checks = [m.capital_check for m in members]
-            if all(c == "passed" for c in capital_checks):
+            # capital_stance：成员 capital_check 聚合（审核 P0 修复：SectorIntel 值域为
+            # aligned/neutral/divergent，映射到续航三态 passed/rejected/missing）
+            capital_checks = [getattr(m, "capital_check", "neutral") for m in members]
+            if capital_checks and all(c == "aligned" for c in capital_checks):
                 capital_stance = "passed"
-            elif any(c == "rejected" for c in capital_checks):
+            elif any(c == "divergent" for c in capital_checks):
                 capital_stance = "rejected"
             else:
                 capital_stance = "missing"
 
-            # has_catalyst：Node 4 日历前 2 周内有无关联事件
+            # has_catalyst：成员消息面已被催化（Node 4 日历交叉验证结果，审核 P0 修复：
+            # SectorIntel 无 catalyst_events 字段，改用 news_check 三态判定）
             has_catalyst = any(
-                getattr(m, "catalyst_events", None) for m in members
+                getattr(m, "news_check", "neutral") == "catalyzed" for m in members
             )
 
             # ── 警示信号计分（评分制，不做硬闸门）──
@@ -2865,17 +2882,19 @@ class AggregatorNode:
                 warning_signals.append("无近期催化剂")
                 warning_score += 1
 
-            # 破位信号（+2，独立于过热，决策 9）：T-0 板块跌幅 <-3 或强度轨迹 decreasing
+            # 破位信号（+2，独立于过热，决策 9）：T-0 板块跌幅 <-3 或强度轨迹 decreasing；
+            # 审核 P0 修复：字段取自 SectorDetail 查表（原读 SectorIntel.detail 恒 None 永不触发）
             break_signal = False
-            for m in members:
-                if getattr(m, "detail", None):
-                    detail = m.detail
-                    if getattr(detail, "today_change", None) and detail.today_change < -3:
-                        break_signal = True
-                        break
-                    if getattr(detail, "trend_direction", None) == "decreasing":
-                        break_signal = True
-                        break
+            for d in member_details:
+                if d is None:
+                    continue
+                today_change = getattr(d, "today_change", None)
+                if today_change is not None and today_change < -3:
+                    break_signal = True
+                    break
+                if getattr(d, "trend_direction", None) == "decreasing":
+                    break_signal = True
+                    break
             if break_signal:
                 warning_signals.append("破位信号（跌幅>3%或趋势下行）")
                 warning_score += 2
