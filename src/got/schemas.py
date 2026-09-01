@@ -377,6 +377,19 @@ class SectorContext(BaseModel):
         default_factory=dict,
         description="板块名→当日强度评分（覆盖全量 analyzed 板块，Node 6 升格时查表）",
     )
+    # ── 过热降权链路（Part 1: 过热评分降权）──
+    overheat_lookup: dict[str, float] = Field(
+        default_factory=dict,
+        description="板块名→当日过热严重度(0~1)，覆盖全部参与评分板块，Node 6 透传到 SectorIntel",
+    )
+    crowded_families: list[str] = Field(
+        default_factory=list,
+        description="拥挤家族名称列表（家族内 >=3 板块 severity>0.3），用于追加降权",
+    )
+    frame_group_lookup: dict[str, str] = Field(
+        default_factory=dict,
+        description="板块名→家族名（覆盖全量 analyzed 板块，合成 detail 回退时查表），用于拥挤降权",
+    )
 
 
 # =============================================================================
@@ -666,6 +679,15 @@ class SectorIntel(BaseModel):
         description="confirmed / divergent / watch / avoid / speculative",
     )
     reasoning: str = Field(default="", description="一句话推理")
+    # ── 过热降权字段（Part 1: 过热评分降权）──
+    overheat_severity: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0,
+        description="过热严重度（0~1），来自 Node 2 overheat_lookup，用于 Phase 2 评分降权",
+    )
+    frame_group: Optional[str] = Field(
+        default=None,
+        description="所属主线家族名称（来自 Node 2 ThemeFamily），用于拥挤家族追加降权",
+    )
     # ── 埋伏通道字段（P3 新增，仅 sector_role=="ambush" 时有效）──
     ambush_catalyst_score: Optional[float] = Field(
         default=None, ge=0.0, le=2.0,
@@ -813,6 +835,11 @@ class UnifiedContext(BaseModel):
         default_factory=list,
         description="矛盾否决记录（★★★利空 / 拥挤黑名单等否决理由）",
     )
+    # ── 过热降权（Part 1: 家族拥挤信号透传）──
+    crowded_families: list[str] = Field(
+        default_factory=list,
+        description="拥挤家族名称列表（来自 Node 2，用于 Phase 2 追加降权）",
+    )
 
     # ── 跨节点时间线共振（v2.1 Phase 6）──
     cross_node_signals: list[CrossNodeTemporalSignal] = Field(
@@ -844,6 +871,9 @@ class UnifiedScoringResult(BaseModel):
     action_recommendation: str = Field(description="buy_trend/buy_dip/hold/sell/avoid")
     confidence: float = Field(ge=0.0, le=1.0, description="评分置信度")
     reasoning: str = Field(description="一句话理由")
+    # ── 板块归属（修复：sector_name 缺失导致"板块已踢出"误报）──
+    sector_name: Optional[str] = Field(default=None, description="匹配到的板块名（来自 confirmed_sectors）")
+    sector_classification: Optional[str] = Field(default=None, description="板块分类: actionable/caution/exclude")
     # 生命周期字段（用于 Step 3 吃鱼身+高切低策略）
     lifecycle_phase: Optional[str] = Field(default=None, description="板块生命周期阶段: launch/acceleration/mature/late_stage/mature_exhausted")
     lifecycle_day: Optional[int] = Field(default=None, description="生命周期已运行天数")

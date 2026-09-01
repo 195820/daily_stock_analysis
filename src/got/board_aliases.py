@@ -11,6 +11,7 @@ from typing import Set
 # 同花顺概念板命名 → Node 2 东财板块名
 SECTOR_NAME_CANONICAL = {
     "半导体概念": "半导体", "芯片概念": "芯片",
+    "券商概念": "券商",
     "PCB概念": "PCB", "CPO概念": "CPO",
     "EDA概念": "EDA", "OLED概念": "OLED",
     "算力概念": "算力", "液冷概念": "液冷",

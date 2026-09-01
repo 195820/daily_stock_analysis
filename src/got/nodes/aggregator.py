@@ -54,6 +54,7 @@ from src.got.catalyst_config import (
     AMBUSH_NOMINATION_MULTIPLIER,
     AMBUSH_NOMINATION_MIN_CONSECUTIVE,
     AMBUSH_NOMINATION_DISABLED,
+    ACCUMULATION_TOLERANCE,
 )
 from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
@@ -174,6 +175,13 @@ class AggregatorNode:
             sector_intels, regime, catalyst_events_by_sector=refine_events_map,
         )
 
+        # ── 确定性提升兜底（LLM 概率上调之外的硬规则保障）──
+        promoted_n = self._deterministic_catalyst_promotion(
+            sector_intels, ambush_pool, refine_events_map,
+        )
+        if promoted_n:
+            logger.info(f"[Node 6] 确定性提升: {promoted_n} 个埋伏板块上调为 actionable")
+
         # ── Level 2: 组合决策 ──
         position_limit = self._compute_position_from_regime(regime, sector_intels, market.position_limit)
         unified_signal = self._determine_unified_signal(regime, sector_intels)
@@ -239,6 +247,7 @@ class AggregatorNode:
             ambush_pool=ambush_pool,
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
+            crowded_families=getattr(sector, "crowded_families", []) or [],
             cross_node_signals=cross_node_signals,
         )
 
@@ -484,8 +493,9 @@ class AggregatorNode:
         # 收集候选板块：(name, detail, role_info)
         candidates = []
         seen_names = set()
+        member_to_group: dict[str, str] = {}  # 主线组成员→组名（组粒度分类用）
 
-        # 主线板块（用组内最强成员代表）
+        # 主线板块（组名 + 成员展开，确保反向查询能匹配到任意成员）
         for group in sector.active_mainline:
             best_member = max(group.members, key=lambda m: m.strength_score) if group.members else None
             role_info = {
@@ -494,8 +504,15 @@ class AggregatorNode:
                 "quality": group.mainline_quality,
                 "mainline_days": best_member.mainline_days if best_member else None,
             }
+            # 组名（最强成员代表）
             candidates.append((group.group_name, best_member, role_info))
             seen_names.add(group.group_name)
+            # 展开其他成员（继承组级属性，Phase 2 反向查询可命中）
+            for member in group.members:
+                if member.name not in seen_names:
+                    candidates.append((member.name, member, role_info))
+                    seen_names.add(member.name)
+                    member_to_group[member.name] = group.group_name
 
         # 埋伏板块
         for detail in sector.ambush:
@@ -569,7 +586,9 @@ class AggregatorNode:
             for name, composite, capital_check, news_check, detail, sector_role, _, _ in raw_data
             if sector_role != "ambush"
         ]
-        classification_map = self._classify_all_sectors(classify_input, top_n=12)
+        classification_map = self._classify_all_sectors(
+            classify_input, top_n=12, member_to_group=member_to_group,
+        )
 
         ambush_pool_names = {c.sector_name for c in (ambush_pool or [])}
         for name, composite, capital_check, news_check, detail, sector_role, _, _ in raw_data:
@@ -585,6 +604,8 @@ class AggregatorNode:
             intel = self._build_sector_intel_from_scores(
                 name, detail, sector_role, role_info,
                 composite, capital_check, news_check, classification, other,
+                overheat_lookup=sector.overheat_lookup,
+                frame_group_lookup=sector.frame_group_lookup,
             )
             results.append(intel)
 
@@ -752,9 +773,24 @@ class AggregatorNode:
         news_check: str,
         classification: str,
         other: dict,
+        overheat_lookup: Optional[dict[str, float]] = None,
+        frame_group_lookup: Optional[dict[str, str]] = None,
     ) -> SectorIntel:
         """从预计算的评分创建 SectorIntel（分类已由批量分类器决定）"""
         reasoning = f"{name}: {classification}, score={composite:.0f}, {other['tech_detail']}"
+
+        # 过热降权链路透传（Part 1）：从 SectorDetail 取 overheat_severity + frame_group；
+        # detail 缺失或为合成最小 detail（回退链）时，用 Node 2 全量 lookup 兜底，
+        # 保证升格/池外埋伏板块的降权链路不静默失效（overheat_lookup 覆盖全量 analyzed）
+        overheat_severity = None
+        frame_group = None
+        if detail:
+            overheat_severity = getattr(detail, "overheat_severity", None)
+            frame_group = getattr(detail, "frame_group", None)
+        if overheat_severity is None and overheat_lookup:
+            overheat_severity = overheat_lookup.get(name)
+        if frame_group is None and frame_group_lookup:
+            frame_group = frame_group_lookup.get(name)
 
         return SectorIntel(
             sector_name=name,
@@ -777,6 +813,8 @@ class AggregatorNode:
             confidence=round(other["confidence"], 3),
             classification=classification,
             reasoning=reasoning,
+            overheat_severity=overheat_severity,
+            frame_group=frame_group,
         )
 
     def _cross_check_capital(
@@ -957,6 +995,7 @@ class AggregatorNode:
         self,
         candidates: list[tuple[str, float, str, str, Optional[SectorDetail], str]],
         top_n: int = 12,
+        member_to_group: Optional[dict[str, str]] = None,
     ) -> dict[str, str]:
         """批量板块分类（TOP-N + conviction 分级）
 
@@ -980,6 +1019,7 @@ class AggregatorNode:
         if not candidates:
             return {}
 
+        member_to_group = member_to_group or {}
         result = {}
 
         # ── Pass 1: 标记硬拒绝（不可被 TOP-N 覆盖）──
@@ -987,20 +1027,32 @@ class AggregatorNode:
             if self._is_hard_exclude(composite, capital_check, news_check, detail):
                 result[name] = "exclude"
 
-        # ── Pass 2: 按综合分排名，TOP-N → actionable，其余 → caution ──
+        # ── Pass 2: 按综合分排名，TOP-N → actionable（组粒度竞争名额）──
+        # 主线组成员展开仅为反向查询服务，不参与名额竞争：
+        # 同族多成员若各自占名额会挤压其他家族的 actionable 配额（2026-09-01）
         eligible = sorted(
-            [(name, score) for name, score, *_ in candidates if name not in result],
+            [(name, score) for name, score, *_ in candidates
+             if name not in result and name not in member_to_group],
             key=lambda x: x[1],
             reverse=True,
         )
 
+        actionable_groups = set()
         actionable_count = 0
         for name, score in eligible:
             if actionable_count < top_n and score >= 50:
                 result[name] = "actionable"
+                actionable_groups.add(name)
                 actionable_count += 1
             else:
                 result[name] = "caution"
+
+        # 组成员继承组分类（不占名额）；硬拒绝成员已在 Pass 1 独立判定，不会走到这里
+        for name, *_ in candidates:
+            if name in result:
+                continue
+            grp = member_to_group.get(name)
+            result[name] = "actionable" if grp in actionable_groups else "caution"
 
         return result
 
@@ -1132,6 +1184,73 @@ class AggregatorNode:
         except Exception as e:
             logger.warning(f"[Node 6] LLM 精炼板块情报失败: {e}")
             return sectors
+
+    def _deterministic_catalyst_promotion(
+        self,
+        sectors: list[SectorIntel],
+        ambush_pool: list,
+        events_by_sector: dict,
+    ) -> int:
+        """确定性提升兜底规则（LLM 概率上调之外的硬规则保障）
+
+        对象：sector_role == "ambush" 且 classification == "caution" 的 SectorIntel
+        条件 A（合格催化）：命中事件 confidence >= CATALYST_CONFIDENCE_GATE(0.7)
+                           且 direction != "negative" 且 impact_level >= 2
+        条件 B（证据，二选一）：
+          - 该板块在 ambush_pool 中且 accum_strength ∈ {strong, medium, weak} 或 nominated=True
+          - 不在池中时 capital_check == "aligned"
+        两条件同时满足 → classification = "actionable"
+
+        Returns:
+            int: 被提升的板块数量
+        """
+        ambush_pool_names = {c.sector_name for c in (ambush_pool or [])}
+        ambush_pool_map = {c.sector_name: c for c in (ambush_pool or [])}
+        promoted_count = 0
+
+        for s in sectors:
+            # 只处理埋伏 + caution
+            if s.sector_role != "ambush" or s.classification != "caution":
+                continue
+
+            # 条件 A：合格催化事件
+            events = self._lookup_sector_events(s.sector_name, events_by_sector)
+            qualified_events = [
+                e for e in events
+                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                and e.direction != "negative"
+                and e.impact_level >= 2
+            ]
+            if not qualified_events:
+                continue  # 条件 A 不满足
+
+            # 条件 B：吸筹证据
+            in_pool = s.sector_name in ambush_pool_names
+            has_evidence = False
+            if in_pool:
+                pool_entry = ambush_pool_map[s.sector_name]
+                accum_strength = getattr(pool_entry, "accum_strength", "")
+                nominated = getattr(pool_entry, "nominated", False)
+                if accum_strength in ("strong", "medium", "weak") or nominated:
+                    has_evidence = True
+            else:
+                if s.capital_check == "aligned":
+                    has_evidence = True
+
+            if not has_evidence:
+                continue  # 条件 B 不满足
+
+            # 双条件满足 → 提升
+            s.classification = "actionable"
+            event_titles = "; ".join(e.title[:30] for e in qualified_events[:2])
+            s.reasoning += f" [确定性提升: 日历催化×吸筹证据] {event_titles}"
+            promoted_count += 1
+            logger.info(
+                f"[Node 6] 确定性提升: {s.sector_name} caution→actionable "
+                f"(催化{len(qualified_events)}条, 池内={in_pool})"
+            )
+
+        return promoted_count
 
     # =========================================================================
     # Level 1 平行分支: 埋伏通道（P3）
@@ -1987,14 +2106,21 @@ class AggregatorNode:
         evidence["consecutive_positive"] = consecutive_positive
 
         # 档位判定（strong/medium 追加当日正向确认，防止历史吸筹但当日出货仍判通过）
-        if consecutive_positive >= 3 and today_flow > 0:
+        # ACCUMULATION_TOLERANCE: 净流出 < 0.5 亿视为噪声持平，不算否决
+        tol = ACCUMULATION_TOLERANCE
+        if consecutive_positive >= 3 and today_flow >= -tol:
             return True, f"{proxy_tag}连续{consecutive_positive}日正流入+当日{today_flow:.1f}亿", "strong", evidence
         elif consecutive_positive >= 3:
             return False, f"{proxy_tag}连续{consecutive_positive}日正流入但当日净流出{abs(today_flow):.1f}亿", "medium", evidence
-        elif flow_3d_avg is not None and flow_3d_avg > 0 and today_flow > 0:
+        elif flow_3d_avg is not None and flow_3d_avg > 0 and today_flow >= -tol:
             return True, f"{proxy_tag}3日均净流入{flow_3d_avg:.1f}亿+当日{today_flow:.1f}亿", "medium", evidence
-        elif today_flow > 0:
-            return True, f"{proxy_tag}当日净流入{today_flow:.1f}亿", "weak", evidence
+        elif today_flow >= -tol:
+            detail = (
+                f"{proxy_tag}当日净流入{today_flow:.1f}亿"
+                if today_flow > 0
+                else f"{proxy_tag}当日资金持平({today_flow:.1f}亿，噪声容忍)"
+            )
+            return True, detail, "weak", evidence
         else:
             return False, f"{proxy_tag}当日净流出{abs(today_flow):.1f}亿", "weak", evidence
 

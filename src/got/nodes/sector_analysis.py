@@ -3255,6 +3255,25 @@ class SectorAnalysisNode:
             key=lambda s: s.strength_score, reverse=True,
         )[:5]
 
+        # ── 过热降权链路数据（Part 1）──
+        # overheat_lookup: 全部 analyzed 板块的过热严重度（口径同 strength_lookup）
+        overheat_lookup = {
+            s.name: s.overheat_severity
+            for s in analyzed
+            if s.overheat_severity is not None and s.overheat_severity > 0
+        }
+        # crowded_families: 家族内 >=3 板块 severity>0.3 → 列入拥挤名单；
+        # frame_group_lookup: 板块名→家族名全量表，供 Node 6 合成 detail 回退时查表（同 overheat_lookup 口径）
+        _family_overheat_count: dict[str, int] = {}
+        frame_group_lookup: dict[str, str] = {}
+        for s in analyzed:
+            fg = s.frame_group
+            if fg:
+                frame_group_lookup[s.name] = fg
+                if (s.overheat_severity or 0) > 0.3:
+                    _family_overheat_count[fg] = _family_overheat_count.get(fg, 0) + 1
+        crowded_families = [fg for fg, cnt in _family_overheat_count.items() if cnt >= 3]
+
         return SectorContext(
             active_mainline=mainline_groups,
             exhausted_mainline=exhausted_mainline,
@@ -3267,6 +3286,9 @@ class SectorAnalysisNode:
             notes=[n for n in raw_result.notes if "埋伏板块" not in n],
             reasoning=raw_result.reasoning,
             data_quality=raw_result.data_quality,
+            overheat_lookup=overheat_lookup,
+            crowded_families=crowded_families,
+            frame_group_lookup=frame_group_lookup,
         )
 
     @staticmethod

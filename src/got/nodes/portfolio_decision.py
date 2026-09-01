@@ -14,6 +14,7 @@ Phase 2: 统一决策节点（FINCON 风格的 Manager 角色）
 """
 
 import asyncio
+import json
 import logging
 from datetime import date
 from typing import Any, Dict, List, Optional
@@ -462,6 +463,17 @@ class PortfolioDecisionNode:
                 sector_strength, sector_name, sector_intel_map
             )
 
+            # ── 过热降权（Part 1）：对板块维度施加乘性惩罚 ──
+            overheat_penalty = self._compute_overheat_penalty(
+                sector_name, sector_intel_map, unified,
+            )
+            if overheat_penalty < 1.0:
+                logger.info(
+                    f"[Phase 2] [过热降权] {symbol} 板块={sector_name} "
+                    f"系数={overheat_penalty:.2f}"
+                )
+                sector_score *= overheat_penalty
+
             # 技术面：优先使用真实技术指标，降级为 P&L 代理
             tech_score = tech_scores_real.get(symbol)
             if tech_score is None:
@@ -498,8 +510,8 @@ class PortfolioDecisionNode:
                 intel = sector_intel_map[sector_name]
                 lifecycle_phase = intel.get('lifecycle_phase')
                 lifecycle_day = intel.get('lifecycle_day')
-                # overheat_severity 从 sector_context 获取（需要额外处理）
-                # family_name 从 sector_context 获取（需要额外处理）
+                overheat_severity = intel.get('overheat_severity')
+                family_name = intel.get('frame_group')
 
             # 动作建议：生命周期驱动 + 板块踢出检测
             sector_strength = stock_sector_info.get("strength", 50.0)
@@ -585,6 +597,7 @@ class PortfolioDecisionNode:
                 )
 
             # 构建多板块信息字符串
+            in_intel_map = sector_name and sector_name in sector_intel_map
             if len(all_sectors) > 1:
                 # 多个板块：显示加权平均和所有板块
                 sectors_str = ", ".join(
@@ -592,24 +605,28 @@ class PortfolioDecisionNode:
                     for s in all_sectors[:3]  # 最多显示3个
                 )
                 sector_display = f"板块加权{sector_score:.0f}分[{sectors_str}]"
+            elif sector_name and in_intel_map:
+                # 正常匹配（含修复后的成员展开）
+                intel = sector_intel_map[sector_name]
+                cls_label = "✓主线" if intel.get('classification') == 'actionable' else "⚠"
+                sector_display = f"板块[{sector_name}]强度{sector_score:.0f}{sector_intel_info} {cls_label}"
             elif sector_name:
-                # 单个板块（正常匹配）
+                # 有板块名但不在 intel map 中
                 if is_fallback:
-                    # 降级匹配：显示板块名称但标注非主线
                     boards_str = "/".join(all_belong_boards[:3]) if all_belong_boards else sector_name
-                    sector_display = f"板块[{boards_str}]（非主线，无评分）"
+                    sector_display = f"板块[{boards_str}]（未确认，强度{sector_score:.0f}）"
                 else:
-                    sector_display = f"板块[{sector_name}]强度{sector_score:.0f}{sector_intel_info}"
+                    sector_display = f"板块[{sector_name}]强度{sector_score:.0f}"
             else:
                 # 无板块匹配：尝试显示所属板块列表
                 if all_belong_boards:
                     boards_str = "/".join(all_belong_boards[:3])
-                    sector_display = f"板块[{boards_str}]（非主线，无评分）"
+                    sector_display = f"板块[{boards_str}]（未在追踪范围）"
                 else:
                     sector_display = "板块[未知]"
 
-            # 增强 reasoning：标注板块踢出情况
-            if lifecycle_phase is None and sector_name:
+            # 增强 reasoning：标注板块踢出情况（仅在板块名确实不在 intel map 时触发）
+            if lifecycle_phase is None and sector_name and not in_intel_map:
                 lifecycle_info = "（板块已踢出）"
             elif lifecycle_phase:
                 lifecycle_info = f"[{lifecycle_phase}]"
@@ -641,6 +658,11 @@ class PortfolioDecisionNode:
                 else:
                     reasoning += f", [埋伏持有:{snap.category_tag}]"
 
+            # 板块分类（用于输出可观测性）
+            sector_classification = None
+            if sector_name and sector_name in sector_intel_map:
+                sector_classification = sector_intel_map[sector_name].get('classification')
+
             results.append(
                 UnifiedScoringResult(
                     symbol=symbol,
@@ -657,6 +679,8 @@ class PortfolioDecisionNode:
                     action_recommendation=action,
                     confidence=0.6,
                     reasoning=reasoning,
+                    sector_name=sector_name or None,
+                    sector_classification=sector_classification,
                     lifecycle_phase=lifecycle_phase,
                     lifecycle_day=lifecycle_day,
                     overheat_severity=overheat_severity,
@@ -712,7 +736,8 @@ class PortfolioDecisionNode:
                 'sector_role': getattr(sector_intel, 'sector_role', 'mainline'),
                 'lifecycle_phase': lifecycle_phase,
                 'lifecycle_day': lifecycle_day,
-                'overheat_severity': None,  # 从 sector_context 获取
+                'overheat_severity': getattr(sector_intel, 'overheat_severity', None),
+                'frame_group': getattr(sector_intel, 'frame_group', None),
             }
 
         return sector_intel_map
@@ -723,7 +748,7 @@ class PortfolioDecisionNode:
         """根据板块情报调整股票评分
 
         调整逻辑（新版 conviction-weighted）：
-        - actionable: 主线 +10, 埋伏 +5
+        - actionable: 主线 +10, 埋伏 +8（2026-09-01 确定性提升效果强化：+5→+8）
         - caution: 主线 +3, 埋伏 +1（缩小但仍参与）
         - exclude: -20
         """
@@ -741,7 +766,7 @@ class PortfolioDecisionNode:
             if role == 'mainline':
                 adjustment += 10.0  # 主线 actionable +10
             else:
-                adjustment += 5.0   # 埋伏 actionable +5
+                adjustment += 8.0   # 埋伏 actionable +8（提升与主线差距从 4→2）
         elif classification == 'caution':
             if role == 'mainline':
                 adjustment += 3.0   # 主线 caution +3（缩小）
@@ -774,6 +799,48 @@ class PortfolioDecisionNode:
         # 应用调整，限制在 [0, 100]
         adjusted_score = max(0.0, min(100.0, base_score + adjustment))
         return adjusted_score
+
+    @staticmethod
+    def _compute_overheat_penalty(
+        sector_name: str,
+        sector_intel_map: Dict[str, Dict[str, Any]],
+        unified: Any,
+    ) -> float:
+        """计算过热降权系数（乘性，作用于板块维度评分）
+
+        三档降权：
+        - severity > 0.5 → ×0.75（严重过热）
+        - severity > 0.3 → ×0.90（过热警告）
+        - severity <= 0.3 → ×1.0（正常）
+
+        追加降权：
+        - 板块 frame_group ∈ crowded_families → 追加 ×0.90（与上两档连乘）
+
+        Returns:
+            float: 降权系数 [0.75*0.9, 1.0] = [0.675, 1.0]
+        """
+        if not sector_name or sector_name not in sector_intel_map:
+            return 1.0
+
+        intel = sector_intel_map[sector_name]
+        severity = intel.get('overheat_severity') or 0.0
+        frame_group = intel.get('frame_group')
+
+        # 基础降权
+        if severity > 0.5:
+            coefficient = 0.75
+        elif severity > 0.3:
+            coefficient = 0.90
+        else:
+            coefficient = 1.0
+
+        # 家族拥挤追加降权
+        if frame_group:
+            crowded_families = getattr(unified, 'crowded_families', None) or []
+            if frame_group in crowded_families:
+                coefficient *= 0.90
+
+        return coefficient
 
     def _build_sector_strength_map(
         self, sector_context: SectorContext
@@ -817,10 +884,12 @@ class PortfolioDecisionNode:
         用 efinance.get_belong_board() 验证问财返回的板块标签是否真实。
         防止蹭概念票（如利君股份被问财错误归类为 TOPCon电）。
 
-        验证逻辑：
+        验证逻辑（2026-09-01 升级为别名归一化 + LLM 兜底仲裁）：
         1. 对每只候选股，调用 efinance 获取其实际所属板块列表
-        2. 检查 screener 标签的板块是否在 efinance 返回列表中
-        3. 如果不在，清空板块标签（打分时板块维度给中性分 50）
+        2. L1 别名归一化匹配：处理跨口径命名差异（如"券商" vs "券商概念"）
+        3. L2 LLM 仲裁：L1 未命中时批量交由 LLM 判断是否同一概念，
+           LLM 不可用时降级为信任问财（保留标签）
+        4. 两者都未命中，清空板块标签（打分时板块维度给中性分 50）
 
         注意：只在候选股数量较少时（≤15）执行，避免过多 API 调用。
         """
@@ -828,9 +897,11 @@ class PortfolioDecisionNode:
             return finalists
 
         from data_provider.base import DataFetcherManager
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
 
         manager = DataFetcherManager()
         verified = []
+        pending: List[Dict[str, Any]] = []   # 待 LLM 仲裁的 [{tagged, boards, stock}]
 
         for stock in finalists:
             tagged_sector = getattr(stock, 'sector', '') or getattr(stock, 'sector_name', '') or ''
@@ -860,28 +931,29 @@ class PortfolioDecisionNode:
                     for b in boards
                 }
 
-                # 检查标签板块是否在实际板块中
-                if tagged_sector in actual_board_names:
-                    # 验证通过
+                # L1 别名归一化匹配：同花顺口径（"券商概念"）↔ 东财口径（"券商"）
+                tagged_canon = normalize_sector_name(tagged_sector)
+                tagged_variants = sector_name_variants(tagged_sector)
+                matched_board = next(
+                    (b for b in actual_board_names
+                     if b and (b in tagged_variants or normalize_sector_name(b) == tagged_canon)),
+                    None,
+                )
+
+                if matched_board:
+                    # 验证通过（精确或别名命中）
                     logger.debug(
                         f"[板块验证] {stock.code} {stock.name}: "
-                        f"✓ '{tagged_sector}' 在 efinance 板块列表中"
+                        f"✓ '{tagged_sector}' 命中 efinance 板块 '{matched_board}'"
                     )
                     verified.append(stock)
                 else:
-                    # 验证失败：问财标签不在 efinance 返回列表中
-                    logger.warning(
-                        f"[板块验证] {stock.code} {stock.name}: "
-                        f"✗ 问财标签'{tagged_sector}'不在 efinance 板块{list(actual_board_names)[:5]}...中，"
-                        f"清空板块标签"
-                    )
-                    # 清空板块标签，打分时板块维度会给中性分
-                    if hasattr(stock, 'sector'):
-                        stock.sector = ""
-                    if hasattr(stock, 'sector_name'):
-                        stock.sector_name = ""
-                    # 保留 sector_score 但降低权重（打分时会处理）
-                    verified.append(stock)
+                    # L1 未命中 → 收集待 LLM 仲裁，不立即清空
+                    pending.append({
+                        "tagged": tagged_sector,
+                        "boards": sorted(b for b in actual_board_names if b),
+                        "stock": stock,
+                    })
 
             except Exception as e:
                 # 验证过程出错，保留原标签（降级为信任问财）
@@ -891,12 +963,132 @@ class PortfolioDecisionNode:
                 )
                 verified.append(stock)
 
+        # L2: LLM 批量仲裁（同一(标签,板块列表)只问一次）
+        if pending:
+            case_index: Dict[tuple, int] = {}
+            unique_cases: List[Dict[str, Any]] = []
+            for item in pending:
+                key = (item["tagged"], tuple(item["boards"]))
+                if key not in case_index:
+                    case_index[key] = len(unique_cases)
+                    unique_cases.append({"tagged": item["tagged"], "boards": item["boards"]})
+
+            arbitration = await self._llm_arbitrate_sector_match(unique_cases)
+
+            if arbitration is None:
+                # LLM 不可用 → 降级为信任问财，全部保留标签
+                logger.warning(
+                    f"[板块验证] LLM 仲裁不可用，{len(pending)} 只待验证股保留问财标签"
+                )
+                verified.extend(item["stock"] for item in pending)
+            else:
+                for item in pending:
+                    case_idx = case_index[(item["tagged"], tuple(item["boards"]))]
+                    stock = item["stock"]
+                    matched_board = arbitration.get(case_idx)
+                    if matched_board:
+                        logger.info(
+                            f"[板块验证] {stock.code} {stock.name}: "
+                            f"LLM 仲裁 ✓ '{item['tagged']}' ≈ '{matched_board}'，保留标签"
+                        )
+                        verified.append(stock)
+                    else:
+                        logger.warning(
+                            f"[板块验证] {stock.code} {stock.name}: "
+                            f"✗ 问财标签'{item['tagged']}'与 efinance 板块{item['boards'][:5]}...不匹配，"
+                            f"清空板块标签"
+                        )
+                        # 清空板块标签，打分时板块维度会给中性分
+                        if hasattr(stock, 'sector'):
+                            stock.sector = ""
+                        if hasattr(stock, 'sector_name'):
+                            stock.sector_name = ""
+                        verified.append(stock)
+
         logger.info(
             f"[板块验证] 完成: {len(finalists)} 只候选股，"
             f"{len([s for s in verified if not (getattr(s, 'sector', '') or getattr(s, 'sector_name', ''))])} 只被清空标签"
         )
 
         return verified
+
+    async def _llm_arbitrate_sector_match(
+        self,
+        cases: List[Dict[str, Any]],
+    ) -> Optional[Dict[int, Optional[str]]]:
+        """LLM 仲裁：判断问财标签板块与 efinance 板块列表中某个板块是否同一概念。
+
+        Args:
+            cases: [{"tagged": 问财标签板块名, "boards": [efinance 实际板块列表]}]
+
+        Returns:
+            {case 索引: 命中的板块名或 None}；LLM 不可用/解析失败时返回 None，
+            由调用方降级为信任问财。
+        """
+        if not cases:
+            return {}
+
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        lines = []
+        for i, case in enumerate(cases):
+            boards_text = ", ".join(case["boards"][:40])
+            lines.append(f'{i}. 标签板块: "{case["tagged"]}" | 实际所属板块: [{boards_text}]')
+        cases_text = "\n".join(lines)
+
+        prompt = f"""你是 A 股板块分类专家。判断每个"问财标签板块"与该股"实际所属板块列表"中某个板块是否为同一概念。
+
+## 待判断案例
+{cases_text}
+
+## 判断规则
+- 同一概念的命名差异算命中，如"券商"与"券商概念"、"半导体"与"半导体概念"
+- 相关但不同的概念不算命中，如"券商"与"参股券商"、"光伏"与"光伏建筑一体化"
+- matched_board 必须是该案例实际所属板块列表中的原文之一，不得自行构造名称，无命中则输出 null
+- 只输出 JSON 数组，不要其他文字：
+[{{"index": 案例编号, "matched_board": "命中的板块名或 null"}}]"""
+
+        try:
+            adapter = LLMToolAdapter()
+            response = adapter.call_text(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=1000,
+                timeout=30,
+            )
+            if not response or not getattr(response, "content", None):
+                logger.warning("[板块验证] LLM 仲裁返回空")
+                return None
+
+            import re
+            match = re.search(r'\[[\s\S]*\]', response.content)
+            if not match:
+                logger.warning("[板块验证] LLM 仲裁无法提取 JSON 数组")
+                return None
+
+            items = json.loads(match.group())
+            if not isinstance(items, list):
+                return None
+
+            result: Dict[int, Optional[str]] = {i: None for i in range(len(cases))}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= idx < len(cases):
+                    continue
+                board = str(item.get("matched_board") or "").strip()
+                # 防幻觉：命中名必须存在于该案例的板块列表中，否则丢弃（matched_board 可能是字符串 "null"）
+                if board and board != "null" and board in cases[idx]["boards"]:
+                    result[idx] = board
+            return result
+
+        except Exception as e:
+            logger.warning(f"[板块验证] LLM 仲裁失败({e})，降级为信任问财")
+            return None
 
     def _get_sector_capital_score(
         self, sector_name: str, sector_intel_map: Dict[str, Dict], global_capital: float
@@ -2016,6 +2208,17 @@ class PortfolioDecisionNode:
                 stock.sector_score, stock_sector, sector_intel_map
             )
 
+            # ── 过热降权（Part 1）：候选股同样适用 ──
+            overheat_penalty = self._compute_overheat_penalty(
+                stock_sector, sector_intel_map, unified_context,
+            )
+            if overheat_penalty < 1.0:
+                logger.info(
+                    f"[Phase 2] [过热降权] {stock.code} {stock.name} 板块={stock_sector} "
+                    f"系数={overheat_penalty:.2f}"
+                )
+                adjusted_sector_score *= overheat_penalty
+
             # 缺失维度跳过 + 权重归一化
             dimension_scores = {
                 "capital": capital_score,
@@ -2069,6 +2272,11 @@ class PortfolioDecisionNode:
             else:
                 action = "watch"
 
+            # 板块分类（用于输出可观测性）
+            sector_classification = None
+            if stock_sector and stock_sector in sector_intel_map:
+                sector_classification = sector_intel_map[stock_sector].get('classification')
+
             results.append(
                 UnifiedScoringResult(
                     symbol=stock.code,
@@ -2088,6 +2296,8 @@ class PortfolioDecisionNode:
                         (stock.ai_reasoning or f"综合评分 {adjusted_composite:.1f}")
                         + sector_intel_info
                     ),
+                    sector_name=stock_sector or None,
+                    sector_classification=sector_classification,
                     lifecycle_phase=lifecycle_phase,
                     lifecycle_day=lifecycle_day,
                     family_name=family_name,
