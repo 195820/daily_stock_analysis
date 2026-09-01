@@ -3899,6 +3899,8 @@ class SectorAnalysisNode:
 
             with db.get_session() as session:
                 for sector in sectors:
+                    # ── 写入侧 NUL 剥离（v3.5 S1：防止幽灵行污染）──
+                    sector_name_clean = sector.name.strip().strip('\x00') if sector.name else ""
                     # 计算强度趋势
                     trend_data = self._calc_strength_trend(session, sector.code, sector.strength_score)
 
@@ -3912,6 +3914,11 @@ class SectorAnalysisNode:
                     is_ambush = sector.state == "ambush"
                     ambush_days = self._calc_ambush_days(session, sector.code, is_ambush)
 
+                    # ── 波次计数器（v3.5 S2：以回撤结构判波）──
+                    wave_days, wave_start_date, wave_peak_strength = self._calc_wave_days(
+                        session, sector.code, sector.state, sector.strength_score, today,
+                    )
+
                     # 驻留天数：同状态累加、跨状态归 1（HMM 持久性：切换需驻留确认）
                     prev_state, prev_dwell = self._load_prev_state(session, sector.code)
                     dwell_days = (prev_dwell + 1) if prev_state == sector.state else 1
@@ -3924,6 +3931,10 @@ class SectorAnalysisNode:
                     sector.strength_trajectory = trend_data["trajectory"]
                     sector.trend_direction = trend_data["trend_direction"]
                     sector.mainline_days = mainline_days
+                    # ── 波次计数器回填（v3.5 S2）──
+                    sector.wave_days = wave_days
+                    sector.wave_start_date = wave_start_date
+                    sector.wave_peak_strength = wave_peak_strength
 
                     # 创建或更新记录
                     db_record = session.query(Node2SectorTrendRecord).filter_by(
@@ -3944,13 +3955,17 @@ class SectorAnalysisNode:
                         db_record.is_mainline = is_mainline
                         db_record.mainline_days = mainline_days
                         db_record.ambush_days = ambush_days
+                        # ── 波次计数器（v3.5 S2）──
+                        db_record.wave_days = wave_days
+                        db_record.wave_start_date = wave_start_date
+                        db_record.wave_peak_strength = wave_peak_strength
                         db_record.set_strength_trajectory(trend_data["trajectory"])
                         db_record.trend_direction = trend_data["trend_direction"]
                     else:
                         # 创建新记录
                         db_record = Node2SectorTrendRecord(
                             sector_code=sector.code,
-                            sector_name=sector.name,
+                            sector_name=sector_name_clean,
                             tracking_date=today,
                             state=sector.state,
                             dwell_days=dwell_days,
@@ -3964,6 +3979,10 @@ class SectorAnalysisNode:
                             ambush_days=ambush_days,
                             exit_pressure_days=sector.exit_pressure_days or 0,
                             trend_direction=trend_data["trend_direction"],
+                            # ── 波次计数器（v3.5 S2）──
+                            wave_days=wave_days,
+                            wave_start_date=wave_start_date,
+                            wave_peak_strength=wave_peak_strength,
                         )
                         db_record.set_strength_trajectory(trend_data["trajectory"])
                         session.add(db_record)
@@ -4015,9 +4034,11 @@ class SectorAnalysisNode:
                         "active_mainline", "exhausted_mainline", "high_position_cooling",
                     )
                     # 补写：状态按驱逐/熄灭判定，exit_pressure +1，其余字段从 prev 复制
+                    # ── 写入侧 NUL 剥离（v3.5 S1：防止幽灵行污染）──
+                    name_clean = name.strip().strip('\x00') if name else ""
                     session.add(Node2SectorTrendRecord(
                         sector_code=code,
-                        sector_name=name,
+                        sector_name=name_clean,
                         tracking_date=today,
                         state=new_state,
                         dwell_days=(
@@ -4047,10 +4068,54 @@ class SectorAnalysisNode:
 
                 session.commit()
 
+            # ── 波次校准埋点（v3.5 S2：次日补齐涨跌幅，供 S5 校准脚本消费）──
+            self._write_wave_calibration(sectors, today)
+
             logger.info("[Node 2] 板块趋势持久化完成: %d 个板块", len(sectors))
 
         except Exception as e:
             logger.error("[Node 2] 板块趋势持久化失败: %s", e, exc_info=True)
+
+    def _write_wave_calibration(self, sectors: list[SectorDetail], today: date) -> None:
+        """写入波次校准埋点到 JSONL（v3.5 S2）。
+
+        格式：每行 {date, sector_code, sector_name, wave_days, strength, wave_peak}
+        次日运行由 calibrate_wave_coeff.py 补齐涨跌幅后消费。
+        """
+        import json
+        from pathlib import Path
+
+        # 仅主线族板块参与校准（非主线无波次概念）
+        mainline_family = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
+        mainline_sectors = [s for s in sectors if s.state in mainline_family]
+
+        if not mainline_sectors:
+            return
+
+        try:
+            # 数据目录：data/wave_calibration.jsonl
+            project_root = Path(__file__).resolve().parent.parent.parent.parent
+            calibration_path = project_root / "data" / "wave_calibration.jsonl"
+            calibration_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(calibration_path, "a", encoding="utf-8") as f:
+                for sector in mainline_sectors:
+                    record = {
+                        "date": today.isoformat(),
+                        "sector_code": sector.code,
+                        "sector_name": sector.name,
+                        "wave_days": sector.wave_days or 0,
+                        "strength": sector.strength_score,
+                        "wave_peak": sector.wave_peak_strength or sector.strength_score,
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            logger.debug(
+                "[Node 2] 波次校准埋点: %d 条主线板块 → %s",
+                len(mainline_sectors), calibration_path,
+            )
+        except Exception as e:
+            logger.warning("[Node 2] 波次校准埋点写入失败（不阻塞主流程）: %s", e)
 
     def _calc_strength_trend(self, session, sector_code: str, current_strength: float) -> dict:
         """计算强度趋势（最近 7 天）。"""
@@ -4111,6 +4176,90 @@ class SectorAnalysisNode:
             else:
                 break
         return days + 1  # +1 for today
+
+    def _calc_wave_days(
+        self,
+        session,
+        sector_code: str,
+        current_state: str,
+        current_strength: float,
+        today: date,
+    ) -> tuple[int, date, float]:
+        """计算波次计数器（v3.5 S2：以回撤结构判波）。
+
+        决策 2 判据：
+        - 前日 active_mainline → wave_days + 1，wave_peak_strength = max(prev_peak, today)
+        - 前日 cooling/exhausted → 间隙≥2日 且 隙期强度回撤≥10分 → 重置 1；否则冻结继承
+        - 前日非主线族状态或无记录 → 重置 1
+
+        Returns: (wave_days, wave_start_date, wave_peak_strength)
+        """
+        # 主线族状态（active/cooling/exhausted 都算"在波中"）
+        mainline_family = {"active_mainline", "high_position_cooling", "exhausted_mainline"}
+
+        # 加载前日记录
+        prev_record = (
+            session.query(Node2SectorTrendRecord)
+            .filter(
+                Node2SectorTrendRecord.sector_code == sector_code,
+                Node2SectorTrendRecord.tracking_date < today,
+            )
+            .order_by(Node2SectorTrendRecord.tracking_date.desc())
+            .first()
+        )
+
+        # 无前记录或非主线族状态 → 重置
+        if prev_record is None or current_state not in mainline_family:
+            return 1, today, current_strength
+
+        prev_state = prev_record.state
+        prev_wave_days = int(getattr(prev_record, "wave_days", 0) or 0)
+        prev_wave_start = getattr(prev_record, "wave_start_date", None) or prev_record.tracking_date
+        prev_wave_peak = float(getattr(prev_record, "wave_peak_strength", 0) or 0)
+
+        # 前日也是主线族 → 延续当前波
+        if prev_state in mainline_family:
+            new_wave_days = prev_wave_days + 1
+            new_wave_peak = max(prev_wave_peak, current_strength)
+            return new_wave_days, prev_wave_start, new_wave_peak
+
+        # 前日非主线族（neutral/ambush/defensive）→ 无条件重置（维持现行语义）
+        if prev_state in {"neutral", "ambush", "defensive_rotation"}:
+            return 1, today, current_strength
+
+        # 前日 cooling/exhausted → 按回撤结构判波（决策 2）
+        # 计算间隙天数（今日 - 前日）
+        gap_days = (today - prev_record.tracking_date).days
+
+        # 间隙不足 2 交易日 → 冻结继承（同波延续）
+        if gap_days < 2:
+            return prev_wave_days, prev_wave_start, prev_wave_peak
+
+        # 检查隙期强度回撤：查找间隙期间的最高强度
+        gap_records = (
+            session.query(Node2SectorTrendRecord)
+            .filter(
+                Node2SectorTrendRecord.sector_code == sector_code,
+                Node2SectorTrendRecord.tracking_date > prev_record.tracking_date,
+                Node2SectorTrendRecord.tracking_date < today,
+            )
+            .all()
+        )
+
+        if gap_records:
+            gap_max_strength = max(
+                float(getattr(r, "strength_score", 0) or 0) for r in gap_records
+            )
+        else:
+            gap_max_strength = 0
+
+        # 回撤不足 10 分 → 冻结继承（同波延续）
+        strength_dropout = prev_wave_peak - gap_max_strength
+        if strength_dropout < 10:
+            return prev_wave_days, prev_wave_start, prev_wave_peak
+
+        # 间隙≥2日 且 回撤≥10分 → 真洗盘再启动，重置波次
+        return 1, today, current_strength
 
     def _load_sector_trend_history(self, sector_code: str, days: int = 7) -> Optional[dict]:
         """加载板块趋势历史用于 LLM prompt 注入。"""
