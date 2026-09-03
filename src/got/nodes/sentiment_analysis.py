@@ -903,17 +903,21 @@ class SentimentAnalysisNode:
         up_down_gap = up_avg - down_avg
 
         # 一致看多（高分+低分歧）或一致看空（低分+低分歧）→ 反向信号
+        # 注：dispersion/mean_score 均为 numpy.float64，比较与 and 的结果会是
+        # numpy.bool_ 而非 Python bool。pydantic 严格序列化拒绝 numpy 标量
+        # （0902 实盘 Phase 2 因此整体失败：Unable to serialize unknown type:
+        # <class 'numpy.bool'>），故在此边界处显式转 bool。
         mean_score = scores.mean()
-        contrarian = (
+        contrarian = bool(
             dispersion < 0.35
             and (mean_score > 70 or mean_score < 30)
         )
 
         return {
-            "dispersion": round(dispersion, 3),
-            "up_down_gap": round(up_down_gap, 2),
+            "dispersion": round(float(dispersion), 3),
+            "up_down_gap": round(float(up_down_gap), 2),
             "contrarian_signal": contrarian,
-            "mean_score": round(mean_score, 2),
+            "mean_score": round(float(mean_score), 2),
         }
 
     @staticmethod

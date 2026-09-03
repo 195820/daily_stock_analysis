@@ -202,6 +202,25 @@ FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
         "BC电池", "钙钛矿电", "TOPCon电", "钠电池", "固态电池",
         "麒麟电池", "刀片电池", "动力电池回收", "换电",
     ]),
+    # 2026-09-02 P2-4 新增：终结"其他"家族垃圾箱
+    # 复盘：0902 全部 96 板块中 64 个 frame_group="其他"，农业/环保链板块与
+    # 军贸概念被聚合成同一 MainlineGroup（组名取最强成员名，产生"军贸概念
+    # 包含风沙治理"的视觉错觉）。新增农业/生态环保族拆散该组；
+    # "军贸"归军工族。
+    #
+    # 位置要求：农业族必须早于医药族。_build_frame_group 按声明顺序短路匹配
+    # （首个命中的家族胜出），医药族含关键词"基因"，若农业在后则"转基因"
+    # 被误归医药（登海种业/苏垦农发实测）。已做夺占检测：农业词与前 5 族
+    # （AI硬件/AI软件/机器人/智能驾驶/新能源）无子串交集，前置安全。
+    ("农业", [
+        "粮食", "种业", "种子", "种植", "农林牧渔", "渔业", "水产品",
+        "养殖", "畜牧", "饲料", "土地流转", "乡村振兴", "供销社",
+        "草甘膦", "氮肥", "农药", "化肥", "虫害防治", "人造肉",
+        "生态农业", "农产品", "农业概念",
+        # 林业属农林牧渔一级行业（成分反查：永安林业/福建金森/平潭发展
+        # 均挂 林业Ⅲ + 农林牧渔）
+        "林业", "转基因", "水产养殖", "粮食种植", "农业种植",
+    ]),
     ("医药", [
         "创新药", "生物医药", "生物制药", "CXO", "医疗器械", "医药",
         # 新增
@@ -212,6 +231,9 @@ FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
     ]),
     ("金融", [
         "券商", "保险", "银行", "信托", "多元金融",
+        # 2026-09-02 补：工行/招行/宁波银行成分反查均有"金融地产风格"，
+        # 城商行Ⅲ 等三级行业名也需覆盖
+        "金融地产", "互联网金融", "城商行", "股份制银行", "国有大型银行",
     ]),
     ("周期资源", [
         "黄金", "有色", "铜", "铝", "稀土", "锂矿",
@@ -221,6 +243,7 @@ FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
     ]),
     ("军工", [
         "军工", "航空", "船舶", "航运", "航天", "国防", "军民融合", "商业航天",
+        "军贸",  # 2026-09-02 P2-4：军贸概念归属军工，避免滞留"其他"组
     ]),
     ("消费", [
         "白酒", "白酒概念", "食品", "家电", "旅游", "酒店", "零售",
@@ -232,6 +255,14 @@ FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
     ]),
     ("前沿科技", [
         "可控核聚变", "量子科技",
+    ]),
+    ("生态环保", [
+        "环保", "风沙", "生态园林", "生态治理", "园林", "污水处理", "水务",
+        "水利建设", "土壤修复", "绿色生态", "碳交易", "碳中和", "节能",
+        "固废", "垃圾处理",
+        # 2026-09-02 补：成分反查（蒙草生态/铁汉生态/碧水源）所得真实板块名
+        "环境治理", "海绵城市", "垃圾分类", "新型城镇化", "水务及水治理",
+        "园林工程",
     ]),
 ]
 
@@ -1096,9 +1127,9 @@ class SectorAnalysisNode:
                 name = code_name_map.get(code, code)
                 candidate_codes[code] = name
 
-        # Registry 保底
+        # Registry 保底（也需噪声过滤，防止硬编码列表混入统计指数）
         for b in registry_boards:
-            if b["code"] not in candidate_codes:
+            if b["code"] not in candidate_codes and not _is_noise_board(b["name"]):
                 candidate_codes[b["code"]] = b["name"]
 
         # === 通道 4（时间线维护，2026-08-31）===
@@ -1108,6 +1139,9 @@ class SectorAnalysisNode:
         timeline_count = 0
         for code, name in timeline_boards:
             if code in candidate_codes:
+                continue
+            # 噪声过滤：统计指数/行情事件/财务标签等不应参与主线分析
+            if _is_noise_board(name):
                 continue
             if timeline_count >= self._TIMELINE_SUPPLY_MAX:
                 break
@@ -1409,7 +1443,8 @@ class SectorAnalysisNode:
 
         # 4) 状态判定（RRG 驱动，替代旧的 8 分支优先级链）
         # 2026-08-31：返回 (state, exit_pressure, tier) 三元组
-        state, exit_pressure_days, tier = self._determine_state_v3(
+        # 2026-09-02：追加 break_signals（P2-5 落盘，供状态机决策离线复现）
+        state, exit_pressure_days, tier, break_signals = self._determine_state_v3(
             strength_score, indicators, rrg,
             sector_info, market_context, df,
             prev_trend=prev_trend,
@@ -1471,6 +1506,7 @@ class SectorAnalysisNode:
             rrg=rrg,
             near_miss_conditions=near_miss,
             exit_pressure_days=exit_pressure_days,
+            break_signals=break_signals,
         )
 
     # =================================================================
@@ -2136,13 +2172,14 @@ class SectorAnalysisNode:
         if df is None or len(df) == 0:
             return None, False, 1.0, "normal"
         close = df["close"]
-        price_chg_5d = (close.iloc[-1] / close.iloc[-5] - 1.0) if len(close) >= 5 and close.iloc[-5] > 0 else 0.0
-        above_ma20 = (
+        # 全部转 native 类型：pandas 比较/除法产出 numpy 标量，沿 context 泄漏进 Phase 2 会崩序列化
+        price_chg_5d = float(close.iloc[-1] / close.iloc[-5] - 1.0) if len(close) >= 5 and close.iloc[-5] > 0 else 0.0
+        above_ma20 = bool(
             close.iloc[-1] > close.rolling(20).mean().iloc[-1]
             if len(close) >= 20 else False
         )
         if len(close) >= 20 and max(close.iloc[-20:]) > 0:
-            high20_pos = close.iloc[-1] / max(close.iloc[-20:])
+            high20_pos = float(close.iloc[-1] / max(close.iloc[-20:]))
         else:
             high20_pos = 1.0
         overheat = self._detect_overheat_signal(
@@ -2225,19 +2262,33 @@ class SectorAnalysisNode:
           S/A 容忍 3 天、B 容忍 1 天；优先级在 broken 之后、E1 驻留之前。
 
         破位/未破位判据（区分 高位降温(回调未坏) vs 衰竭(破位)）：
-          BROKEN = OR(5日涨幅≤0, 跌破MA20, 过热exhausted且20日高位<0.60, 单日崩≥20)
+          BROKEN = OR(5日涨幅≤0, 跌破MA20, 过热exhausted且20日高位<0.60, 单日崩≥20,
+                      单日暴跌≤-4%)  ← 2026-09-02 P0-3 新增
         """
         # HI2 硬触发：单日暴涨>8% + leading + score>70 → 当日进 active（豁免驻留）
         if today_change is not None and today_change > 8.0 and q == "leading" and strength_score > 70:
             return "active_mainline"
 
         # 破位判据（含 HI1 单日崩≥20 自然落位）
+        # 注：单日暴跌 < -4% 不在此处判定。跨 29 日校准（2026-09-02 审核）显示，
+        # active_mainline 池中 3 次命中（黄金 -5.88% / 种业 -7.14% / 粮食概念 -4.26%），
+        # 其中黄金、种业为真实主线单日回调，若在此并入 broken 会走 E3 当天踢出，
+        # 跳过 high_position_cooling 缓冲 → 误伤。改由主线分支的 _ONE_DAY_DROP 专用逻辑处理。
         broken = bool(
             (price_chg_5d is not None and price_chg_5d <= 0)
             or (not above_ma20)
             or (overheat_level == "exhausted" and high20_pos < 0.60)
             or (score_drop >= 20)
         )
+
+        # 单日暴跌信号（P0-3）：强度证据尚存时只降温观察，趋势同步破坏才驱逐
+        one_day_drop = (
+            today_change is not None
+            and today_change < SectorAnalysisNode._BROKEN_ONE_DAY_DROP_PCT
+        )
+        # 趋势破坏佐证：价与结构同时转弱（5日涨幅为负 或 跌破MA20），
+        # 单日暴跌本身不足以证明趋势终结（黄金 08-11 -5.88% 后仍在主线）
+        trend_damaged = (price_chg_5d is not None and price_chg_5d <= 0) or (not above_ma20)
 
         # ── 冷启动 / neutral：入口探测 ──
         if prev_state in (None, "neutral"):
@@ -2258,6 +2309,15 @@ class SectorAnalysisNode:
 
         # ── 主线：只有 驻留 / 高位降温 / 衰竭 三条路 ──
         if prev_state == "active_mainline":
+            # P0-3 单日暴跌：结构性修复 S/A-tier exit_pressure 上限恒 2 < 容忍度 3
+            # 的驱逐路径锁死。分级处理（跨 29 日校准，避免误伤真实回调）：
+            #   暴跌 + 趋势破坏 → 当天驱逐（粮食概念 09-02 -4.26% 且 breadth 0.133 下行）
+            #   暴跌但趋势尚存 → 降温观察（黄金 08-11 -5.88% 属主线深回调）
+            # 降温后若次日再破位，由 high_position_cooling 分支 E7 转 exhausted。
+            if one_day_drop and trend_damaged:
+                return "exhausted_mainline"
+            if one_day_drop:
+                return "high_position_cooling"
             if broken:
                 return "exhausted_mainline"       # E3 破位当天踢出
             # 退出压力驱逐（吸收原框 consecutive_low_days 逻辑，2026-08-31）
@@ -2389,7 +2449,7 @@ class SectorAnalysisNode:
         df: pd.DataFrame,
         prev_trend: Optional[dict] = None,
         market_direction: str = "分化",
-    ) -> tuple[str, int, str]:
+    ) -> tuple[str, int, str, dict]:
         """规则版马尔可夫状态机驱动（2026-08-17 文献校准，替代 P0-P5 优先级链）。
 
         核心变更：
@@ -2405,7 +2465,9 @@ class SectorAnalysisNode:
           exit_pressure 吸收原框 consecutive_low_days 逻辑到状态机。
 
         Returns:
-            (new_state, exit_pressure_days, tier)
+            (new_state, exit_pressure_days, tier, break_signals)
+            break_signals 为破位判据输入快照（P2-5），随 SectorDetail 落盘，
+            使 broken 的 OR 链可在归档数据上离线复现。
         """
         prev_state = (prev_trend or {}).get("state")
         prev_dwell = int((prev_trend or {}).get("dwell_days") or 0)
@@ -2473,7 +2535,19 @@ class SectorAnalysisNode:
             exit_pressure=exit_pressure,
             tier=tier,
         )
-        return state, exit_pressure, tier
+
+        # 破位判据输入快照（P2-5 落盘：broken = OR(price_chg_5d<=0, 跌破MA20,
+        # overheat exhausted 且 high20_pos<0.60, 单日崩>=20, 单日暴跌<-4%)）
+        # 强制转 native 类型：above_ma20 是 numpy 比较结果（np.bool_），
+        # round(np.float64) 也保持 numpy 标量，袋子里混 numpy 会导致 Phase 2 序列化崩溃
+        break_signals = {
+            "price_chg_5d": round(float(price_chg_5d), 4) if price_chg_5d is not None else None,
+            "above_ma20": bool(above_ma20),
+            "high20_pos": round(float(high20_pos), 4),
+            "overheat_level": overheat_level,
+            "score_drop": round(float(score_drop), 2),
+        }
+        return state, exit_pressure, tier, break_signals
 
     # =================================================================
     # 埋伏评分化（P0-1: 6 维加权 + 排名截断，替代 6 AND 硬闸门）
@@ -3168,11 +3242,29 @@ class SectorAnalysisNode:
     _MAINLINE_WEAK_TOLERANCE_DAYS = 1    # 弱组（全 B 成员）零容忍
     _MAINLINE_LATE_STAGE_SCORE_THRESHOLD = 60
 
+    # 破位单日暴跌阈值（P0-3，2026-09-02 审核新增）
+    # 跨 29 日 / 930 sector-day 校准：active_mainline 池 3 次命中中 2 次为真实
+    # 主线深回调（黄金 08-11 -5.88% 但 5 日 +4.1%、种业 08-21 -7.14% 但 5 日 +1.2%），
+    # 故不并入 broken（那会走 E3 当天踢出），而在主线分支分级处理：
+    #   暴跌 + 趋势破坏（5日涨幅≤0 或 跌破MA20）→ exhausted_mainline
+    #   暴跌但趋势尚存 → high_position_cooling（给一天缓冲）
+    # 设计意图：S/A-tier 的 exit_pressure 因 strength>=50 归零恒上限 2 < 容忍度 3，
+    # 驱逐路径结构性不可达，单日暴跌是唯一能当日生效的驱逐触发器。
+    _BROKEN_ONE_DAY_DROP_PCT = -4.0
+
     # 主线裁剪常量（2026-08-20：保底 + 独立行情豁免）
     _MAINLINE_PRUNE_FLOOR = 1            # 熊市也保留最强一条主线，防止全裁
     _INDEPENDENT_MARKET_SCORE = 90.0     # 独立行情豁免：组分数门槛
-    _INDEPENDENT_MARKET_MIN_STRONG = 3   # 独立行情豁免：S/A 级成员数门槛（家族级共振）
+    # 2026-09-02 P2-4 配套调整（原值 3）：
+    # 该门槛要求「同一 frame_group 组内」S/A 成员数达标才算家族级共振。
+    # P2-4 拆分"其他"垃圾箱后分组粒度变细——0902 实证：军贸组由 3 个 A 级成员
+    # （军贸概念+风沙治理+粮食概念，实为不相关主题）降为 1 个，豁免失效，
+    # 主线组数 3→2，风沙治理(93.2)、银行(88.7) 被误裁。
+    # 拆组后一个真实家族有 2 个 S/A 成员已是强共振信号，故下调至 2 以补偿
+    # 分组粒度变化。group_score>=90 的硬门槛仍保留，豁免不会失控。
+    _INDEPENDENT_MARKET_MIN_STRONG = 2  # 独立行情豁免：S/A 级成员数门槛（家族级共振）
     _INDEPENDENT_MARKET_EXEMPT_MAX = 2   # 豁免名额上限
+    _MAINLINE_FAMILY_MAX_MEMBERS = 3     # 家族内部成员裁剪：只保留 Top 3 最强成员
 
     def _build_mainline_output(
         self,
@@ -3217,13 +3309,20 @@ class SectorAnalysisNode:
             group_score = max(b.strength_score for b in boards)
             has_strong = best_tier in ("S", "A")
             sorted_boards = sorted(boards, key=lambda s: s.strength_score, reverse=True)
+            # 家族内部成员裁剪：只保留 Top N 最强成员（防膨胀）
             display_name = sorted_boards[0].name
+            pruned_boards = sorted_boards[:self._MAINLINE_FAMILY_MAX_MEMBERS]
+            if len(sorted_boards) > len(pruned_boards):
+                logger.debug(
+                    f"[Node 2] 家族成员裁剪: {fg} {len(sorted_boards)}→{len(pruned_boards)} "
+                    f"(保留: {[b.name for b in pruned_boards]})"
+                )
             mainline_groups.append(MainlineGroup(
                 group_name=display_name,
                 group_score=group_score,
                 tier=best_tier,
                 mainline_quality="strong" if has_strong else "weak",
-                members=sorted_boards,
+                members=pruned_boards,
             ))
         mainline_groups.sort(key=lambda g: g.group_score, reverse=True)
 

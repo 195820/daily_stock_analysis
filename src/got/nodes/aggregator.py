@@ -37,6 +37,7 @@ from src.got.schemas import (
     AmbushReservoirEntry,
     CatalystEvent,
     CrossNodeTemporalSignal,
+    MainlineEndurance,
 )
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
@@ -116,8 +117,22 @@ def _wave_coeff(wave_days: Optional[int]) -> float:
 # 仓位日限幅
 POSITION_LIMIT_DELTA = 0.2
 
+# ── 过热准入闸门（2026-09-01：压制过热、避免高位接票）──
+# 过热严重度超过阈值的板块不得成为主线（不占 TOP-N 名额、不进选股池）。
+# 与成员继承无关：组被拦后其成员自然继承 caution；不影响其他家族池子广度。
+# 与 Phase 2 _compute_overheat_penalty 不冲突：这里是准入闸门，非评分叠加惩罚。
+# 阈值与过热降权链路的 warning 口径对齐（0.3）。
+OVERHEAT_ADMISSION_LIMIT = 0.3
+
 # 泛化后缀：匹配时需剥离，防止 "概念" 等无意义后缀造成假阳性
 GENERIC_SUFFIXES = ("概念",)
+
+# 不可靠匹配类型（P0-1，2026-09-02）
+# generic：命中泛化词根（A6 护栏），大类的资金流/热度不代表该细分板块
+# narrow ：目标比查询更窄（查询是目标的子串），如"化工"→"磷化工"，
+#          窄类不代表宽类，否则以偏概全（0902 实测 11/15 通用名会误配到细分）
+# 两类均须降权/不确认方向，三处调用方（资金面/消息面/情绪面）统一处理。
+_UNRELIABLE_MATCH_TYPES = frozenset({"generic", "narrow"})
 
 
 # =============================================================================
@@ -629,6 +644,7 @@ class AggregatorNode:
         ]
         classification_map = self._classify_all_sectors(
             classify_input, top_n=12, member_to_group=member_to_group,
+            overheat_lookup=sector.overheat_lookup,
         )
 
         ambush_pool_names = {c.sector_name for c in (ambush_pool or [])}
@@ -858,6 +874,83 @@ class AggregatorNode:
             frame_group=frame_group,
         )
 
+    # 资金面背离阈值（P0-1，2026-09-02 审核新增）
+    # capital_check 的 "divergent" 分支原为死代码（审核结论：所有板块大额净流出时
+    # 仍判 neutral，资金面验证形同虚设）。
+    #
+    # 判定维度必须是「相对」而非「绝对」（审核校准修订）：
+    #   净流出绝对金额同时编码了板块体量与市场水位两个无关因子。0902 全市场大单
+    #   净流出 255.57 亿、板块中位流出 12.2 亿时，-50 亿只是略差于中位（373 板块中
+    #   53 个命中 = 14%）；0901 更达 89 个。绝对阈值在普跌日把「常态」判成「背离」，
+    #   与 P0-5 吸筹闸门的一刀切同型。
+    # 故改为：板块净流出落在当日全市场最差 CAPITAL_DIVERGENT_TAIL_PCT 分位才算背离，
+    # 自动随市场水位缩放；样本不足时回退到绝对下限兜底。
+    _CAPITAL_DIVERGENT_TAIL_PCT = 0.05       # 全市场最差 5% 视为背离
+    _CAPITAL_DIVERGENT_MIN_SAMPLES = 60      # 分位判定所需最小板块样本数
+    _CAPITAL_DIVERGENT_FALLBACK_YI = -80.0   # 样本不足时的绝对兜底阈值（亿）
+
+    # 净流入判定下限（P0-1 配套，2026-09-02）
+    # 原判据 `amount > 0` 对浮点噪声也成立：0902 实测"橡胶"经子串匹配后取到
+    # 0.02 亿（200 万元），被判 aligned 并加 10 分——该量级对板块资金面无意义
+    # （全市场板块净额中位约 -15 亿）。匹配率从 33% 提到 80% 后此类噪声必然暴露。
+    _CAPITAL_ALIGNED_MIN_YI = 1.0        # ≥1 亿才算有意义的净流入
+
+    @classmethod
+    def _divergent_threshold(cls, capital_flow_map: dict[str, float]) -> float:
+        """按当日全市场净流出分布，计算背离阈值（返回负数，单位：亿）。
+
+        取全市场板块净流出的最差 TAIL_PCT 分位。样本不足时回退绝对兜底，
+        避免小样本下分位抖动。
+        """
+        amounts = sorted(
+            v for v in capital_flow_map.values() if isinstance(v, (int, float))
+        )
+        if len(amounts) < cls._CAPITAL_DIVERGENT_MIN_SAMPLES:
+            return cls._CAPITAL_DIVERGENT_FALLBACK_YI
+        idx = int(len(amounts) * cls._CAPITAL_DIVERGENT_TAIL_PCT)
+        return min(amounts[idx], cls._CAPITAL_DIVERGENT_FALLBACK_YI)
+
+    def _lookup_capital_flow(
+        self,
+        name: str,
+        capital_flow_map: dict[str, float],
+    ) -> tuple[Optional[float], Optional[str], str]:
+        """在全量资金流表中定位板块，返回 (amount, matched_name, match_type)。
+
+        match_type: "exact" / "alias" / "substring" / "narrow" / "generic"（A6 护栏）/ None（未命中）
+
+        P0-1（2026-09-02 审核）：原实现只用 `dict.get` + 别名循环，实测 0902
+        15 个确认板块仅命中 5 个（33%）——资金流表有 476 个板块且命名口径与
+        Node 2 不同（"旅游" vs "旅游概念"、"橡胶" vs "橡胶制品"）。
+        改为复用统一匹配入口 _match_sector，子串门槛放宽到 2 字后匹配率 33%→80%。
+
+        三道约束（放宽门槛的必要代价控制）：
+          1. 多候选取「最短包含串」——"旅游"同时匹配"旅游概念"与"旅游及酒店"时，
+             最短者语义最贴近，不按 dict 遍历顺序随机取。
+          2. "narrow"（目标比查询更窄，如"化工"→"磷化工"）与 generic 同等降级：
+             窄类的资金流不能代表宽类，否则以偏概全（实测 11/15 通用名会误配）。
+          3. 泛化大类（"石油贸易"→"贸易"）判 generic，调用方须走 neutral。
+        """
+        direct = capital_flow_map.get(name)
+        if direct is not None:
+            return direct, name, "exact"
+
+        candidates: list[tuple[int, str, float, str]] = []
+        for flow_name, amount in capital_flow_map.items():
+            hit, match_type = self._match_sector(name, flow_name, min_substr_len=2)
+            if hit:
+                candidates.append((len(flow_name), flow_name, amount, match_type))
+
+        if not candidates:
+            return None, None, ""
+
+        # 可靠匹配优先（exact/alias/substring）；全不可靠时才退到 generic/narrow
+        solid = [c for c in candidates if c[3] not in _UNRELIABLE_MATCH_TYPES]
+        pool = solid or candidates
+        pool.sort(key=lambda c: c[0])   # 同级取最短（语义最贴近）
+        _, matched_name, amount, match_type = pool[0]
+        return amount, matched_name, match_type
+
     def _cross_check_capital(
         self,
         name: str,
@@ -866,26 +959,35 @@ class AggregatorNode:
     ) -> tuple[str, str]:
         """资金面交叉验证: (check, detail)
 
-        A4: 优先从全量 sector_flow_all (464 板块) 精确查找，
-        Top-8 榜单作模糊兜底。
+        A4: 优先从全量 sector_flow_all (464 板块) 查找，Top-8 榜单作模糊兜底。
         """
         # A4: 全量查找（优先）
         if capital_flow_map:
-            amount = capital_flow_map.get(name)
-            if amount is None:
-                # 归一化 + 别名
-                from src.got.board_aliases import sector_name_variants
-                for variant in sector_name_variants(name):
-                    amount = capital_flow_map.get(variant)
-                    if amount is not None:
-                        break
+            amount, matched_name, match_type = self._lookup_capital_flow(
+                name, capital_flow_map,
+            )
             if amount is not None:
+                label = name if matched_name == name else f"{name}[{matched_name}]"
+                # A6: 泛化关联不确认方向（大类的资金流不代表该细分板块）；
+                # narrow 同理——目标比查询更窄，窄类资金流亦不代表宽类
+                if match_type in _UNRELIABLE_MATCH_TYPES:
+                    return "neutral", (
+                        f"{label}关联净额{amount:.1f}亿(全量，{match_type}匹配不确认方向)"
+                    )
                 if amount > 10:
-                    return "aligned", f"{name}净流入{amount:.1f}亿(全量)"
-                elif amount > 0:
-                    return "aligned", f"{name}净流入{amount:.1f}亿(小额/全量)"
+                    return "aligned", f"{label}净流入{amount:.1f}亿(全量)"
+                elif amount >= self._CAPITAL_ALIGNED_MIN_YI:
+                    return "aligned", f"{label}净流入{amount:.1f}亿(小额/全量)"
+                elif amount < self._divergent_threshold(capital_flow_map):
+                    # P0-1: 复活 divergent 生产分支（此前为死代码）。
+                    # 阈值随当日全市场水位自适应，普跌日不会把常态流出误判为背离。
+                    thr = self._divergent_threshold(capital_flow_map)
+                    return "divergent", (
+                        f"{label}净流出{abs(amount):.1f}亿(全量)，居全市场最差"
+                        f"{self._CAPITAL_DIVERGENT_TAIL_PCT:.0%}（阈值{thr:.1f}亿）"
+                    )
                 else:
-                    return "neutral", f"{name}净流出{abs(amount):.1f}亿(全量)"
+                    return "neutral", f"{label}净流出{abs(amount):.1f}亿(全量)"
 
         # Top-8 兜底（A5: 统一匹配入口）
         if not flows:
@@ -973,9 +1075,11 @@ class AggregatorNode:
                 global_hit = True
             if meta.get("lifecycle_state") in ("fading", "archived"):
                 magnitude *= self._NEWS_FADING_MULTIPLIER
-            # A6: 泛化词根匹配降权（防止 "AI" 等短词假阳性加分）
-            if match_type == "generic":
-                magnitude *= 0.5
+            # A6: 泛化词根匹配降权（防止 "AI" 等短词假阳性加分）；
+            # narrow（目标比查询更窄，如"化工"→"磷化工"）同样降权——窄类事件
+            # 不代表宽类板块，与 generic 同处理
+            if match_type in _UNRELIABLE_MATCH_TYPES:
+                    magnitude *= 0.5
             if sentiment == "positive":
                 pos_adjust += magnitude
                 pos_count += 1
@@ -1019,10 +1123,11 @@ class AggregatorNode:
             hit, match_type = self._match_sector(name, hot_sector)
             if hit:
                 match_count += 1
-                if match_type == "generic":
+                # narrow 与 generic 同等：窄类热榜不代表宽类板块热度
+                if match_type in _UNRELIABLE_MATCH_TYPES:
                     generic_count += 1
 
-        # A6: 泛化词根匹配不计入有效匹配数
+        # A6: 泛化词根匹配不计入有效匹配数；narrow（目标比查询更窄）同理
         effective_count = match_count - generic_count
 
         if effective_count >= 3:
@@ -1037,6 +1142,7 @@ class AggregatorNode:
         candidates: list[tuple[str, float, str, str, Optional[SectorDetail], str]],
         top_n: int = 12,
         member_to_group: Optional[dict[str, str]] = None,
+        overheat_lookup: Optional[dict[str, float]] = None,
     ) -> dict[str, str]:
         """批量板块分类（TOP-N + conviction 分级）
 
@@ -1080,24 +1186,67 @@ class AggregatorNode:
             reverse=True,
         )
 
+        # ── 主线组拥挤判定（2026-09-01）──
+        # 组的热度本质是成员热度的扩散，扩散成员死得比过热还快：
+        # 同组过热成员（含组代表自身）≥3 判拥挤（口径参考 Node 2 crowded_families 的 ≥3/>0.3）。
+        # 注意不用 Node 2 crowded_families：其家族含"[其他]"这类百员杂物家族，
+        # 家族级拦截会伤及无关干净板块；组级判定只碰主线组自身。
+        # 拥挤组整组拦截、名额让渡，其成员全部继承 caution 不进选股池。
+        hot_count: dict[str, int] = {}
+        for name, _composite, _capital, _news, detail, _role in candidates:
+            grp = member_to_group.get(name) or name  # 无组成员的候选（组代表自身）计入自己的组
+            if self._resolve_overheat(name, detail, overheat_lookup) > OVERHEAT_ADMISSION_LIMIT:
+                hot_count[grp] = hot_count.get(grp, 0) + 1
+        crowded_groups = {g for g, n in hot_count.items() if n >= 3}
+        for g in sorted(crowded_groups):
+            logger.info(f"[Node 6] 主线组拥挤拦截: {g}（过热成员 {hot_count[g]} 个，整组不得入池）")
+
         actionable_groups = set()
         actionable_count = 0
         for name, score, _detail in eligible:
             if actionable_count < top_n and score >= 50:
+                # 过热准入闸门：自身过热或组内拥挤的板块不当主线（名额让渡给下一位候选），
+                # 其组成员也因此继承 caution，不进 Phase 2 选股池（2026-09-01）
+                if (
+                    self._resolve_overheat(name, _detail, overheat_lookup) > OVERHEAT_ADMISSION_LIMIT
+                    or name in crowded_groups
+                ):
+                    result[name] = "caution"
+                    continue
                 result[name] = "actionable"
                 actionable_groups.add(name)
                 actionable_count += 1
             else:
                 result[name] = "caution"
 
-        # 组成员继承组分类（不占名额）；硬拒绝成员已在 Pass 1 独立判定，不会走到这里
-        for name, *_ in candidates:
+        # 组成员继承组分类（不占名额）；硬拒绝成员已在 Pass 1 独立判定，不会走到这里。
+        # 过热过滤：过热成员不得继承（不进 Phase 2 池，避免高位接票），
+        # 其余成员照常继承——非上限截断，不影响池子广度（2026-09-01）
+        for name, _composite, _capital, _news, detail, _role in candidates:
             if name in result:
                 continue
             grp = member_to_group.get(name)
-            result[name] = "actionable" if grp in actionable_groups else "caution"
+            if (
+                grp in actionable_groups
+                and self._resolve_overheat(name, detail, overheat_lookup) <= OVERHEAT_ADMISSION_LIMIT
+            ):
+                result[name] = "actionable"
+            else:
+                result[name] = "caution"
 
         return result
+
+    @staticmethod
+    def _resolve_overheat(
+        name: str,
+        detail: Optional[SectorDetail],
+        overheat_lookup: Optional[dict[str, float]] = None,
+    ) -> float:
+        """解析板块过热严重度（0~1）：detail 优先，缺失时查 Node 2 全量 lookup"""
+        sev = getattr(detail, "overheat_severity", None) if detail else None
+        if sev is None and overheat_lookup:
+            sev = overheat_lookup.get(name)
+        return sev or 0.0
 
     @staticmethod
     def _is_hard_exclude(
@@ -1212,6 +1361,15 @@ class AggregatorNode:
                         # 禁止下调：confirmed → watch 等
                         logger.warning(
                             f"[Node 6] 跳过降级: {sector_name} {s.classification}→{new_class}（{reason}）"
+                        )
+                    elif (
+                        new_class == "actionable"
+                        and (getattr(s, "overheat_severity", None) or 0.0) > OVERHEAT_ADMISSION_LIMIT
+                    ):
+                        # 过热闸门：LLM 不得把过热板块抬回主线（防绕过准入闸门）
+                        logger.warning(
+                            f"[Node 6] 拦截 LLM 上调（过热）: {sector_name} "
+                            f"overheat={s.overheat_severity:.2f}（{reason}）"
                         )
                     else:
                         s.classification = new_class
@@ -2674,15 +2832,34 @@ class AggregatorNode:
     })
 
     @staticmethod
-    def _match_sector(name: str, target: str) -> tuple[bool, str]:
+    def _match_sector(
+        name: str,
+        target: str,
+        min_substr_len: int = 3,
+    ) -> tuple[bool, str]:
         """统一板块名匹配入口（A5）
 
-        匹配链路：归一化精确 → 别名变体 → 受控子串（≥3 字）
+        匹配链路：归一化精确 → 别名变体 → 受控子串（≥min_substr_len 字）
+
+        Args:
+            min_substr_len: L3 子串匹配的最小字数门槛，默认 3。
+                P0-1（2026-09-02 审核）：资金面全量表口径差异大，大量中文板块名
+                是 2 字（橡胶/航空/种业/渔业），默认门槛会把它们整体排除在子串
+                匹配外。资金面路径显式传 2 以提升匹配率；其余调用方保持默认 3
+                ——2 字子串误命中风险高（如"银行"命中"参股银行"），不宜全局放宽。
 
         Returns:
-            (matched, match_type): match_type = "exact" / "alias" / "substring" / "generic" / "none"
+            (matched, match_type): match_type = "exact" / "alias" / "substring"
+                / "narrow" / "generic" / "none"
             "generic" 表示命中泛化词根（A6 护栏），调用方应降权处理
+            "narrow" 表示目标比查询更窄（查询是目标的子串），见下方说明
         """
+
+        # 子串方向判定（2026-09-02 P0-1 修复）
+        #   查询"化工" 命中"磷化工"：目标更窄 → 拿窄类资金流代表宽类是**以偏概全**
+        #     （0902 实测：化工/农业/电子/材料/医疗 等通用名 11/15 被匹配到细分窄类）
+        #   查询"旅游概念" 命中"旅游"：目标更宽 → 宽类包含查询，语义可接受
+        # 故目标更长者判 "narrow"，调用方须与 generic 同等降级。
         if not name or not target:
             return False, "none"
 
@@ -2703,15 +2880,18 @@ class AggregatorNode:
                 if normalize_sector_name(nv) == normalize_sector_name(tv):
                     return True, "alias"
 
-        # L3: 受控子串（≥3 字，剥离后缀后）
+        # L3: 受控子串（≥min_substr_len 字，剥离后缀后）
         s = AggregatorNode._strip_generic_suffix(norm_name)
         t = AggregatorNode._strip_generic_suffix(norm_target)
-        if len(s) >= 3 and len(t) >= 3:
+        if len(s) >= min_substr_len and len(t) >= min_substr_len:
             if s in t or t in s:
                 # A6: 命中泛化词根 → 降级为 "generic"
                 core = s if s in t else t
                 if core in AggregatorNode._GENERIC_ROOTS:
                     return True, "generic"
+                # 目标比查询更长（即查询是目标的子串）→ 窄类代表宽类，不可靠
+                if s in t and len(t) > len(s):
+                    return True, "narrow"
                 return True, "substring"
 
         return False, "none"

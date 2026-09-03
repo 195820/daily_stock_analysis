@@ -313,6 +313,11 @@ class SectorDetail(BaseModel):
         default=None,
         description="退出压力计数器（状态机吸收原框 consecutive_low_days，日粒度去重）",
     )
+    break_signals: Optional[dict] = Field(
+        default=None,
+        description="破位判据输入快照（price_chg_5d/above_ma20/high20_pos/overheat_level/score_drop），"
+                    "落盘供状态机决策离线复现（P2-5，2026-09-02 审核新增）",
+    )
 
 
 class MainlineGroup(BaseModel):
