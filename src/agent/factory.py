@@ -393,5 +393,164 @@ def _build_orchestrator(config, registry, llm_adapter, skill_manager, *, technic
     )
 
 
+# ---------------------------------------------------------------------------
+# §15 审查层 Review Executor（轻量 Agent，用于 T1 候选股终审 / T1-H 持仓审查）
+# ---------------------------------------------------------------------------
+
+# 缓存审查专用工具注册表（只构建一次）
+_REVIEW_TOOL_REGISTRY = None
+
+# 审查专用系统提示词（T1 候选股终审）：输出纯 JSON {verdict, reasoning, confidence, risk_flags}
+# verdict 词表：confirm / warn / reject（§15.3）
+_REVIEW_SYSTEM_PROMPT_T1 = """你是一名个股审查分析师。你的任务是根据提供的股票信息，做出审查判断。
+
+## 输出格式
+
+**必须**输出且仅输出以下 JSON 结构（不要输出其他内容）：
+
+```json
+{
+  "verdict": "confirm|warn|reject",
+  "reasoning": "简短判断依据（≤60字）",
+  "confidence": 0.0-1.0,
+  "risk_flags": ["风险提示1", ...]
+}
+```
+
+- `verdict`: confirm（确认推荐）/ warn（存疑但不过滤）/ reject（强烈不推荐）
+- `confidence`: 判断置信度
+- `risk_flags`: 识别到的风险因素列表（可为空）
+
+## 判断标准
+
+- **confirm**: 技术面+基本面+催化剂共振，无明显风险
+- **warn**: 存在不确定性但不足以否决，标注风险点
+- **reject**: 存在严重风险信号（如：高位放量滞涨、利好兑现迹象、板块整体走弱）
+
+## 约束
+
+- 你**只能**输出 JSON，不要输出任何解释或前言
+- 基于提供的数据做判断，不要臆测
+- 保守原则：不确定时给 warn，不轻易 reject"""
+
+
+# 审查专用系统提示词（T1-H 持仓审查）：verdict 词表 hold / add / reduce / exit（§15.4）
+# 与 T1 词表不同：下游 _compute_holding_penalty 仅对 reduce/exit 施加降档惩罚
+_REVIEW_SYSTEM_PROMPT_T1H = """你是一名持仓审查分析师。你的任务是根据提供的持仓股票信息，给出处置意见。
+
+## 输出格式
+
+**必须**输出且仅输出以下 JSON 结构（不要输出其他内容）：
+
+```json
+{
+  "verdict": "hold|add|reduce|exit",
+  "reasoning": "一句话理由（30字内）",
+  "confidence": 0.0-1.0,
+  "risk_flags": ["风险点1", ...]
+}
+```
+
+- `verdict`: hold（继续持有）/ add（看好加仓）/ reduce（存在风险减仓）/ exit（严重风险清仓）
+- `confidence`: 判断置信度（0.0-1.0，不要使用百分制）
+- `risk_flags`: 识别到的风险因素列表（可为空）
+
+## 判断标准
+
+- **hold**: 维持现状，无明显加减仓理由
+- **add**: 催化剂兑现、趋势向好，可加仓
+- **reduce**: 出现风险信号（浮亏扩大、生命周期 late_stage、板块走弱），建议减仓
+- **exit**: 严重风险（利好兑现、退出信号触发、高位放量滞涨），建议清仓
+
+## 约束
+
+- 你**只能**输出 JSON，不要输出任何解释或前言
+- 基于提供的数据做判断，不要臆测
+- 保守原则：不确定时给 hold，不轻易 exit"""
+
+
+# 兼容旧名：默认指向 T1 词表
+_REVIEW_SYSTEM_PROMPT = _REVIEW_SYSTEM_PROMPT_T1
+
+# 审查 profile：review_type → (系统提示词, call_type 归因)
+_REVIEW_PROFILES = {
+    "t1": {"system_prompt": _REVIEW_SYSTEM_PROMPT_T1, "call_type": "agent_review_t1"},
+    "t1h": {"system_prompt": _REVIEW_SYSTEM_PROMPT_T1H, "call_type": "agent_review_t1h"},
+}
+
+
+def _get_review_tool_registry():
+    """返回审查专用轻量工具注册表（仅 3 个工具）。"""
+    global _REVIEW_TOOL_REGISTRY
+    if _REVIEW_TOOL_REGISTRY is not None:
+        return _REVIEW_TOOL_REGISTRY
+
+    from src.agent.tools.registry import ToolRegistry
+
+    full_registry = get_tool_registry()
+    from src.got.catalyst_config import AGENT_REVIEW_TOOLS
+
+    review_registry = ToolRegistry()
+    for tool_name in AGENT_REVIEW_TOOLS:
+        tool_def = full_registry.get(tool_name)
+        if tool_def:
+            review_registry.register(tool_def)
+        else:
+            logger.warning(f"[ReviewExecutor] 工具 {tool_name!r} 未注册，跳过")
+
+    _REVIEW_TOOL_REGISTRY = review_registry
+    logger.info(f"[ReviewExecutor] 轻量工具注册表构建完成（{len(review_registry._tools)} 个工具）")
+    return review_registry
+
+
+def build_review_executor(config=None, review_type: str = "t1") -> "AgentExecutor":
+    """构建审查专用轻量 AgentExecutor（§15 T1/T1-H）。
+
+    与全量 Agent 的区别：
+    - 系统提示词：审查专用（输出纯 JSON verdict），按 review_type 选词表
+    - 工具子集：仅 get_realtime_quote / get_daily_history / search_stock_news
+    - max_steps: 4（全量默认 10）
+    - temperature: AGENT_REVIEW_TEMPERATURE（确定性输出，§15.2 前置 B2）
+    - call_type: agent_review_t1 / agent_review_t1h（§15.6 成本红线可度量）
+    - 无 skill_instructions / default_skill_policy（审查不需要交易技能）
+
+    Args:
+        config: 可选配置对象（None → get_config()）
+        review_type: "t1"（候选股终审，verdict=confirm/warn/reject）或
+                     "t1h"（持仓审查，verdict=hold/add/reduce/exit）
+
+    Returns:
+        配置好的 AgentExecutor 实例
+    """
+    if config is None:
+        from src.config import get_config
+        config = get_config()
+
+    from src.agent.llm_adapter import LLMToolAdapter
+    from src.agent.executor import AgentExecutor
+    from src.got.catalyst_config import (
+        AGENT_REVIEW_MAX_STEPS,
+        AGENT_REVIEW_TIMEOUT_S,
+        AGENT_REVIEW_TEMPERATURE,
+    )
+
+    profile = _REVIEW_PROFILES.get(review_type, _REVIEW_PROFILES["t1"])
+    review_registry = _get_review_tool_registry()
+    llm_adapter = LLMToolAdapter(config)
+
+    return AgentExecutor(
+        tool_registry=review_registry,
+        llm_adapter=llm_adapter,
+        skill_instructions="",       # 审查不需要技能
+        default_skill_policy="",     # 审查不需要技能策略
+        use_legacy_default_prompt=False,
+        max_steps=AGENT_REVIEW_MAX_STEPS,
+        timeout_seconds=AGENT_REVIEW_TIMEOUT_S,
+        system_prompt_override=profile["system_prompt"],
+        temperature=AGENT_REVIEW_TEMPERATURE,
+        call_type=profile["call_type"],
+    )
+
+
 # Keep legacy alias so any external callers using the old name still work.
 build_executor = build_agent_executor

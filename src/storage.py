@@ -94,51 +94,57 @@ class DatabaseSchemaMigration(Base):
 class StockDaily(Base):
     """
     股票日线数据模型
-    
+
     存储每日行情数据和计算的技术指标
     支持多股票、多日期的唯一约束
     """
     __tablename__ = 'stock_daily'
-    
+
     # 主键
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # 股票代码（如 600519, 000001）
     code = Column(String(10), nullable=False, index=True)
-    
+
+    # §9 canonical_id 双写：指数感知身份标识（如 sh000300 / sh600519 / AAPL）
+    # 指数感知：裸码 000300 → sh000300（指数），而非 sz000300（股票）
+    # 当前只写不读，后续 PR 切读路径
+    canonical_id = Column(String(32), index=True)
+
     # 交易日期
     date = Column(Date, nullable=False, index=True)
-    
+
     # OHLC 数据
     open = Column(Float)
     high = Column(Float)
     low = Column(Float)
     close = Column(Float)
-    
+
     # 成交数据
     volume = Column(Float)  # 成交量（股）
     amount = Column(Float)  # 成交额（元）
     pct_chg = Column(Float)  # 涨跌幅（%）
-    
+
     # 技术指标
     ma5 = Column(Float)
     ma10 = Column(Float)
     ma20 = Column(Float)
     volume_ratio = Column(Float)  # 量比
-    
+
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
-    
+
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
+
     # 唯一约束：同一股票同一日期只能有一条数据
     __table_args__ = (
         UniqueConstraint('code', 'date', name='uix_code_date'),
         Index('ix_code_date', 'code', 'date'),
+        Index('ix_canonical_id_date', 'canonical_id', 'date'),
     )
-    
+
     def __repr__(self):
         return f"<StockDaily(code={self.code}, date={self.date}, close={self.close})>"
     
@@ -160,6 +166,57 @@ class StockDaily(Base):
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
         }
+
+
+def generate_canonical_id(code: str) -> str:
+    """§9 生成 canonical_id（指数感知身份标识）。
+
+    消歧规则（与 index_registry.parse_analysis_target 保持一致）：
+    - 裸码默认按**股票**解释（stock_daily 存的是股票日线）：
+      6xxxxx → sh，0xxxxx/3xxxxx → sz，8xxxxx/4xxxxx → bj
+    - 仅当输入为**显式指数身份**（前缀 sh000001 / 后缀 000001.SH / 中文名 / 别名）
+      时才查 IndexRegistry 返回指数 canonical_id
+    - 无法识别：返回空字符串
+
+    Examples:
+        "000001"    → "sz000001"（平安银行，裸码默认股票）
+        "600519"    → "sh600519"（贵州茅台）
+        "300750"    → "sz300750"（宁德时代）
+        "sh000001"  → "sh000001"（显式前缀 → 上证指数）
+        "000001.SH" → "sh000001"（显式后缀 → 上证指数）
+    """
+    if not code or not isinstance(code, str):
+        return ""
+
+    code = code.strip()
+    if not code:
+        return ""
+
+    # 显式指数身份（带前/后缀、中文名、别名）→ 采用 IndexRegistry 的 canonical_id。
+    # 裸码（如 "000001"）经 parse_analysis_target 判定为**股票**，不进入本分支，
+    # 从而避免把平安银行(000001)误标成上证指数(sh000001)。
+    try:
+        from src.got.index_registry import parse_analysis_target
+        target = parse_analysis_target(code)
+        if target.asset_type == "index" and target.canonical_id:
+            return target.canonical_id
+    except Exception:
+        pass  # Registry 不可用时降级到代码模式推断
+
+    # 股票代码模式推断（A 股规则）
+    # 6xxxxx → SH（上交所主板）
+    # 0xxxxx → SZ（深交所主板）
+    # 3xxxxx → SZ（深交所创业板）
+    # 8xxxxx/4xxxxx → BJ（北交所）
+    code_upper = code.upper()
+    if code_upper.startswith("6"):
+        return f"sh{code}"
+    elif code_upper.startswith("0") or code_upper.startswith("3"):
+        return f"sz{code}"
+    elif code_upper.startswith("8") or code_upper.startswith("4"):
+        return f"bj{code}"
+    else:
+        return ""  # 无法识别
 
 
 class NewsIntel(Base):
@@ -1297,6 +1354,87 @@ class Node4RawNewsRecord(Base):
     )
 
 
+class IntelligenceSourceRecord(Base):
+    """Intelligence 情报源配置（§6 远端整合）。
+
+    与 news_feeds 的区别：
+    - news_feeds: 硬编码 5 源推送型，滚动窗口无持久化
+    - IntelligenceService: 可配置源（NewsNow/RSS），持久化到 SQLite，支持 scope 查询
+
+    源类型：
+    - newsnow: NewsNow 热榜（需 template_id，如 cls-hot / xueqiu-hotstock）
+    - rss: RSS 订阅（需 url）
+    """
+
+    __tablename__ = 'intelligence_sources'
+
+    source_id = Column(String(64), primary_key=True)  # 如 "newsnow-cls-hot"
+    source_type = Column(String(20), nullable=False)  # newsnow / rss
+    template_id = Column(String(50))  # NewsNow 模板 ID（如 cls-hot）
+    url = Column(Text)  # RSS URL（仅 rss 类型）
+    scope_type = Column(String(20))  # symbol / market / sector（可选，限定查询范围）
+    scope_value = Column(String(50))  # 具体值（如 "600519.SH" / "cn" / "半导体"）
+    market = Column(String(10), default='cn')  # 市场标识
+    enabled = Column(Boolean, default=True)
+    name = Column(String(100))  # 人类可读名称
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_intel_source_type', 'source_type'),
+        Index('ix_intel_source_enabled', 'enabled'),
+    )
+
+
+class IntelligenceItemRecord(Base):
+    """Intelligence 情报条目（§6 远端整合）。
+
+    持久化采集到的情报，支持：
+    - 按 scope 查询（symbol / market / sector）
+    - 按时间范围查询
+    - retention 管理（自动清理过期条目）
+
+    与 Node4RawNewsRecord 的区别：
+    - Node4RawNewsRecord: 原始新闻，用于 LLM 事件提取前的跨日发酵检测
+    - IntelligenceItemRecord: 结构化情报，带 scope 标签，用于 GOT 直接消费
+    """
+
+    __tablename__ = 'intelligence_items'
+
+    item_id = Column(String(64), primary_key=True)  # MD5(title + source + published_at)
+    source_id = Column(String(64), nullable=False, index=True)  # 关联 intelligence_sources.source_id
+    title = Column(Text, nullable=False)
+    summary = Column(Text)
+    url = Column(Text)
+    published_at = Column(DateTime, index=True)  # 发布时间
+    fetched_at = Column(DateTime, default=utc_naive_now)  # 采集时间
+    # scope 标签（支持按 symbol/market/sector 查询）
+    scope_type = Column(String(20))  # symbol / market / sector
+    scope_value = Column(String(50))
+    market = Column(String(10), default='cn')
+    # 元数据
+    extra_data = Column(Text)  # JSON 扩展字段（如热度分数、评论数等）
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        Index('ix_intel_item_source_date', 'source_id', 'published_at'),
+        Index('ix_intel_item_scope', 'scope_type', 'scope_value'),
+    )
+
+    def get_extra_data(self) -> Dict:
+        """反序列化 extra_data JSON 字段"""
+        if not self.extra_data:
+            return {}
+        try:
+            return json.loads(self.extra_data)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def set_extra_data(self, data: Dict):
+        """序列化 extra_data 为 JSON"""
+        self.extra_data = json.dumps(data, ensure_ascii=False) if data else None
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1381,6 +1519,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._migrate_catalyst_realizations()
             self._migrate_catalyst_events()
             self._migrate_deactivate_ambush_frames()
+            self._migrate_stock_daily_canonical_id()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1441,6 +1580,75 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 session.commit()
         except Exception as exc:
             logger.warning("[storage] node2_sector_trends 列迁移失败，降级运行: %s", exc)
+
+    def _migrate_stock_daily_canonical_id(self) -> None:
+        """幂等轻量迁移：为 stock_daily 补齐 §9 canonical_id 列 + 索引，并回填存量行。
+
+        SQLAlchemy create_all 只建新表、不补旧表列。老库缺 canonical_id 列会导致
+        save_daily_data 的 INSERT/UPDATE 抛 OperationalError，故此处 PRAGMA 检查缺列
+        → ALTER TABLE ADD COLUMN → CREATE INDEX IF NOT EXISTS → 回填 NULL 行。
+        幂等：已存在的列/索引跳过；回填只更新 canonical_id IS NULL 的行。
+        失败不阻塞启动：canonical_id 当前只写不读。
+        """
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='stock_daily'"
+                    )
+                ).scalar()
+                if not table_exists:
+                    return
+                existing = {
+                    row[1]
+                    for row in session.execute(
+                        text("PRAGMA table_info(stock_daily)")
+                    ).fetchall()
+                }
+                if "canonical_id" not in existing:
+                    session.execute(
+                        text("ALTER TABLE stock_daily ADD COLUMN canonical_id VARCHAR(32)")
+                    )
+                    logger.info("[storage] 迁移 stock_daily: 新增列 canonical_id")
+                session.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_canonical_id_date "
+                        "ON stock_daily (canonical_id, date)"
+                    )
+                )
+                session.commit()
+
+                # 回填存量行（只处理 canonical_id IS NULL 的 code）
+                rows = session.execute(
+                    text(
+                        "SELECT DISTINCT code FROM stock_daily "
+                        "WHERE canonical_id IS NULL"
+                    )
+                ).fetchall()
+                backfilled = 0
+                for row in rows:
+                    cid = generate_canonical_id(row[0])
+                    if cid:
+                        session.execute(
+                            text(
+                                "UPDATE stock_daily SET canonical_id = :cid "
+                                "WHERE code = :code AND canonical_id IS NULL"
+                            ),
+                            {"cid": cid, "code": row[0]},
+                        )
+                        backfilled += 1
+                if backfilled:
+                    session.commit()
+                    logger.info(
+                        "[storage] 回填 stock_daily.canonical_id：%d 个 code", backfilled
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[storage] stock_daily.canonical_id 迁移失败，降级运行: %s", exc
+            )
 
     def _migrate_catalyst_realizations(self) -> None:
         """幂等轻量迁移：为 catalyst_realizations 补齐 PEAD 多窗口新列。
@@ -2510,11 +2718,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return 0
 
         now = datetime.now()
+        # §9 canonical_id 双写：生成指数感知身份标识（只写不读）
+        canonical_id = generate_canonical_id(code)
         records_by_date: Dict[date, Dict[str, Any]] = {}
         for row in df.to_dict(orient='records'):
             row_date = self._normalize_daily_date(row.get('date'))
             records_by_date[row_date] = {
                 'code': code,
+                'canonical_id': canonical_id,  # §9 双写
                 'date': row_date,
                 'open': self._normalize_sql_value(row.get('open')),
                 'high': self._normalize_sql_value(row.get('high')),
@@ -2573,6 +2784,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         stmt.on_conflict_do_update(
                             index_elements=['code', 'date'],
                             set_={
+                                'canonical_id': excluded.canonical_id,  # §9 双写更新
                                 'open': excluded.open,
                                 'high': excluded.high,
                                 'low': excluded.low,
@@ -2609,6 +2821,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         session.add(StockDaily(**record))
                         new_count += 1
                         continue
+                    existing.canonical_id = record.get('canonical_id')  # §9 双写更新
                     existing.open = record['open']
                     existing.high = record['high']
                     existing.low = record['low']

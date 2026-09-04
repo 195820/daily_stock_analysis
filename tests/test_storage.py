@@ -701,8 +701,10 @@ class TestStorage(unittest.TestCase):
 
             self.assertEqual(total, 1)
         finally:
-            temp_dir.cleanup()
+            # 先释放引擎句柄再删临时目录：SQLite 引擎持有文件句柄，Windows 无法
+            # 删除打开的文件（与本文件其它 file-based 测试一致：reset 先于 cleanup）。
             DatabaseManager.reset_instance()
+            temp_dir.cleanup()
 
 if __name__ == '__main__':
     unittest.main()

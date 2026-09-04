@@ -1667,7 +1667,10 @@ verdict 含义：
     ) -> List[ScreenerStock]:
         """T1: Agent 终审 — 对 Top N 候选股调用个股 Agent 做最终审查
 
-        设计原则：
+        设计原则（§15.3 改造后）：
+        - 使用轻量 review executor（3 工具 + max_steps=4），替代全量 Agent
+        - 解析改用 try_parse_json（四策略），替代脆弱的正则
+        - 影子模式：跑审查但不执行降级（AGENT_STOCK_REVIEW_SHADOW）
         - 只有否决权：reject → 降级展示（保留、标注、移末位），不删除
         - 默认关闭（AGENT_STOCK_REVIEW_ENABLED）
         - 最多审查 AGENT_STOCK_REVIEW_MAX 只（R7 成本预算）
@@ -1677,8 +1680,12 @@ verdict 含义：
         Returns:
             同输入列表，但 stock.agent_verdict/agent_notes/agent_decision_signal 已填充
         """
-        from src.got.catalyst_config import AGENT_STOCK_REVIEW_MAX
-        from src.agent.factory import build_agent_executor
+        from src.got.catalyst_config import (
+            AGENT_STOCK_REVIEW_MAX,
+            AGENT_STOCK_REVIEW_SHADOW,
+        )
+        from src.agent.factory import build_review_executor
+        from src.agent.runner import try_parse_json
 
         # 截断到预算上限
         review_targets = finalists[:AGENT_STOCK_REVIEW_MAX]
@@ -1692,10 +1699,12 @@ verdict 含义：
         regime = market_ctx.get("market_state", {}).get("regime", "unknown")
 
         try:
-            executor = build_agent_executor()
+            executor = build_review_executor(review_type="t1")
         except Exception as exc:
-            logger.warning(f"[T1终审] Agent 构建失败，降级跳过: {exc}")
+            logger.warning(f"[T1终审] Review Agent 构建失败，降级跳过: {exc}")
             return finalists
+
+        shadow_tag = "[SHADOW] " if AGENT_STOCK_REVIEW_SHADOW else ""
 
         for stock in review_targets:
             try:
@@ -1738,8 +1747,8 @@ verdict 含义：
                     stock.agent_notes = "Agent 调用失败，降级为 warn"
                     continue
 
-                # 解析 JSON 响应
-                verdict_data = self._parse_agent_verdict(response_text)
+                # 解析 JSON 响应（使用 try_parse_json 四策略解析，替代旧正则）
+                verdict_data = self._parse_agent_verdict_v2(response_text, try_parse_json)
                 stock.agent_verdict = verdict_data.get("verdict", "warn")
                 stock.agent_notes = verdict_data.get("reasoning", "")
 
@@ -1747,13 +1756,21 @@ verdict 含义：
                 if stock.agent_verdict == "reject":
                     stock.agent_decision_signal = "demoted"
                     logger.info(
-                        f"[T1终审] {stock.code} {stock.name}: REJECT — {stock.agent_notes}"
+                        f"{shadow_tag}[T1终审] {stock.code} {stock.name}: REJECT — {stock.agent_notes}"
                     )
 
             except Exception as exc:
                 logger.warning(f"[T1终审] {stock.code} 审查异常: {exc}")
                 stock.agent_verdict = "warn"
                 stock.agent_notes = f"审查异常: {str(exc)[:30]}"
+
+        # 影子模式：跑审查但不执行降级（reject 不移到末位）
+        if AGENT_STOCK_REVIEW_SHADOW:
+            logger.info(
+                f"[SHADOW][T1终审] 影子模式: 审查完成但不执行降级，"
+                f"reject 数量={sum(1 for s in review_targets if s.agent_verdict == 'reject')}"
+            )
+            return finalists
 
         # reject 的候选移到末位（不删除）
         confirmed = [s for s in review_targets if s.agent_verdict != "reject"]
@@ -1768,24 +1785,25 @@ verdict 含义：
         return finalists
 
     @staticmethod
-    def _parse_agent_verdict(response_text: str) -> Dict:
-        """解析 Agent 终审 JSON 响应"""
-        import re
-        # 提取 JSON（兼容 markdown code block）
-        match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
-        if not match:
+    def _parse_agent_verdict_v2(response_text: str, try_parse_json) -> Dict:
+        """解析 Agent 终审 JSON 响应（v2: 使用 try_parse_json 四策略解析）
+
+        §15.3 改造：替代旧版正则 \\{[^}]+\\}（不支持嵌套 JSON）
+        """
+        data = try_parse_json(response_text)
+        if not data or not isinstance(data, dict):
             return {"verdict": "warn", "reasoning": "JSON 解析失败"}
-        try:
-            data = json.loads(match.group())
-            verdict = data.get("verdict", "warn")
-            if verdict not in ("confirm", "warn", "reject"):
-                verdict = "warn"
-            return {
-                "verdict": verdict,
-                "reasoning": data.get("reasoning", "")[:60],
-            }
-        except json.JSONDecodeError:
-            return {"verdict": "warn", "reasoning": "JSON 解析失败"}
+
+        verdict = data.get("verdict", "warn")
+        if verdict not in ("confirm", "warn", "reject"):
+            verdict = "warn"
+
+        return {
+            "verdict": verdict,
+            "reasoning": str(data.get("reasoning", ""))[:60],
+            "confidence": data.get("confidence"),
+            "risk_flags": data.get("risk_flags", []),
+        }
 
     def _score_capital(
         self, candidates: List[Dict], capital_ctx: dict
@@ -2797,6 +2815,10 @@ verdict 含义：
                     "risk_score_safe": stock.risk_score_safe,
                     "reasoning": stock.ai_reasoning,
                     "backtest_snapshot": stock.backtest_snapshot,
+                    # §15.3 影子期 verdict 落库：供 2 周后兑现数据对比 reject 命中率（A2 记忆回填数据源）
+                    "agent_verdict": getattr(stock, "agent_verdict", ""),
+                    "agent_notes": getattr(stock, "agent_notes", ""),
+                    "agent_decision_signal": getattr(stock, "agent_decision_signal", ""),
                 }
                 data["top_stocks"].append(stock_data)
 

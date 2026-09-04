@@ -160,6 +160,7 @@ import os
 SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "false").lower() == "true"   # T5: 事件→板块对齐层（2026-09-01 转正；影子观察已验证无异常，回滚设 SECTOR_ALIGN_SHADOW=true）
 NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
 AGENT_STOCK_REVIEW_ENABLED = os.environ.get("AGENT_STOCK_REVIEW_ENABLED", "false").lower() == "true"  # T1: Agent 终审
+AGENT_STOCK_REVIEW_SHADOW = os.environ.get("AGENT_STOCK_REVIEW_SHADOW", "true").lower() == "true"  # T1: 影子模式（跑审查但不执行降级）
 AGENT_STOCK_REVIEW_MAX = 2           # T1: Agent 终审最大调用数（R7 成本预算）
 
 # =============================================================================
@@ -168,6 +169,30 @@ AGENT_STOCK_REVIEW_MAX = 2           # T1: Agent 终审最大调用数（R7 成�
 
 REFINE_TOP_N = 10                    # 基础片：composite 降序前 N（原硬编码上提）
 REFINE_MAX_SECTORS = 20              # 总量上限（基础片 + 埋伏候选追加片）
+
+# =============================================================================
+# LLM 调用可观测性（agent_glue_plan_0903 §6.3 R3/R5 + §7.3 C3）
+# =============================================================================
+
+LLM_CALL_TIMEOUT_S = 60              # 单次 LLM 调用超时（秒）；glue 单次 max_tokens≈5000 需留足
+AGENT_SEMANTIC_GLUE_ENABLED = os.environ.get("AGENT_SEMANTIC_GLUE_ENABLED", "false").lower() == "true"
+AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "true").lower() == "true"
+
+# =============================================================================
+# §15 审查层配置（T1 候选股终审 + T1-H 持仓审查）
+# =============================================================================
+
+# Review profile 参数
+AGENT_REVIEW_MAX_STEPS = 4             # 审查专用步数上限（全量 Agent 默认 10）
+AGENT_REVIEW_TEMPERATURE = 0.2         # 审查专用温度（确定性输出）
+AGENT_REVIEW_TIMEOUT_S = 30            # 审查专用超时（秒）
+AGENT_REVIEW_TOOLS = ("get_realtime_quote", "get_daily_history", "search_stock_news")
+
+# T1-H 持仓审查（§15.4，Phase 2 新增）
+AGENT_HOLDING_REVIEW_ENABLED = os.environ.get("AGENT_HOLDING_REVIEW_ENABLED", "false").lower() == "true"
+AGENT_HOLDING_REVIEW_SHADOW = os.environ.get("AGENT_HOLDING_REVIEW_SHADOW", "true").lower() == "true"
+AGENT_HOLDING_REVIEW_MAX = 3           # 持仓审查最大只数（优先级：埋伏持仓 > P4 退出信号 > 浮亏）
+AGENT_HOLDING_REVIEW_MIN_CONFIDENCE = 0.6  # 低于此阈值忽略 Agent 输出（与 T3 仲裁一致）
 
 # =============================================================================
 # Agent 催化剂先行提名（0831 短剧案例修复，决策 21）

@@ -148,6 +148,13 @@ class NewsAnalysisNode:
 
         logger.info("[Node 4] 开始真实数据消息面分析")
 
+        # §6 Intelligence 源初始化（幂等，重复调用跳过已存在的源）
+        try:
+            from src.got.intelligence_service import initialize_builtin_sources
+            initialize_builtin_sources()
+        except Exception as e:
+            logger.warning("[Node 4] Intelligence 初始化失败（降级跳过）: %s", e)
+
         # Step 1: 并发采集新闻
         raw_news, data_quality = await self._fetch_news()
 
@@ -229,8 +236,15 @@ class NewsAnalysisNode:
     # =================================================================
 
     async def _fetch_news(self) -> Tuple[List[Dict[str, Any]], DataQuality]:
-        """4 源并发采集新闻（新浪/CLS/华尔街见闻/东财），返回合并结果 + DataQuality。"""
+        """5+1 源并发采集新闻（新浪/CLS/华尔街见闻/东财/NewsNow + Intelligence），返回合并结果 + DataQuality。"""
         merged, stats = await asyncio.to_thread(fetch_all_news)
+
+        # §6 Intelligence 通道：与 5 源并行，合并去重后送 LLM
+        intelligence_items = await self._fetch_intelligence()
+        if intelligence_items:
+            # 去重合并（基于标题相似度）
+            merged = self._merge_with_intelligence(merged, intelligence_items)
+            stats["intelligence"] = len(intelligence_items)
 
         # 构建 DataQuality
         available = [name for name, count in stats.items() if count > 0]
@@ -243,6 +257,7 @@ class NewsAnalysisNode:
             "eastmoney": "eastmoney_kuaixun",
             "newsnow": "newsnow_hot",
             "nga_forum": "nga_forum",
+            "intelligence": "intelligence_service",
         }
         available = [source_map.get(s, s) for s in available]
         missing = [source_map.get(s, s) for s in missing]
@@ -254,12 +269,56 @@ class NewsAnalysisNode:
 
         total = sum(stats.values())
         logger.info(
-            "[Node 4] 5 源采集完成: sina=%d cls=%d wallstreetcn=%d eastmoney=%d newsnow=%d → 合并 %d 条",
+            "[Node 4] 5+1 源采集完成: sina=%d cls=%d wallstreetcn=%d eastmoney=%d newsnow=%d intelligence=%d → 合并 %d 条",
             stats.get("sina", 0), stats.get("cls", 0),
             stats.get("wallstreetcn", 0), stats.get("eastmoney", 0),
-            stats.get("newsnow", 0), len(merged),
+            stats.get("newsnow", 0), stats.get("intelligence", 0),
+            len(merged),
         )
         return merged, data_quality
+
+    async def _fetch_intelligence(self) -> List[Dict[str, Any]]:
+        """§6 Intelligence 情报采集（独立通道）"""
+        try:
+            from src.got.intelligence_service import fetch_intelligence_items
+            return await asyncio.to_thread(fetch_intelligence_items, 1)  # 最近 1 天
+        except Exception as e:
+            logger.warning("[Node 4] Intelligence 采集失败（降级跳过）: %s", e)
+            return []
+
+    def _merge_with_intelligence(
+        self,
+        existing_news: List[Dict[str, Any]],
+        intelligence_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """合并 Intelligence 情报到现有新闻列表（基于标题相似度去重）"""
+        from difflib import SequenceMatcher
+
+        merged = list(existing_news)
+        existing_titles = {item.get("title", "") for item in existing_news}
+
+        for intel_item in intelligence_items:
+            intel_title = intel_item.get("title", "").strip()
+            if not intel_title:
+                continue
+
+            # 精确匹配去重
+            if intel_title in existing_titles:
+                continue
+
+            # 相似度去重（阈值 0.6，比 news_feeds 的 0.45 更严格）
+            is_duplicate = False
+            for existing_title in existing_titles:
+                ratio = SequenceMatcher(None, intel_title, existing_title).ratio()
+                if ratio >= 0.6:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                merged.append(intel_item)
+                existing_titles.add(intel_title)
+
+        return merged
 
     # =================================================================
     # Step 2: 3 并发 LLM 分析
@@ -320,28 +379,41 @@ class NewsAnalysisNode:
 
         return events, concepts, risks
 
-    # NGA 保底：确保至少 5 条论坛帖子进入 LLM 输入（散户视角不应被专业媒体完全淹没）
+    # 保底配额：确保论坛帖（NGA）与情报（Intelligence）进入 LLM 输入，不被权重更高的
+    # 专业媒体完全淹没。§6 Intelligence 条目追加在合并列表尾部，若不保底会被 top-N
+    # 截断而永远进不了 prompt（C4：防截断）。
     _NGA_MIN_FOR_LLM = 5
+    _INTEL_MIN_FOR_LLM = 5
+    # 保底保护的来源类型：替换末尾条目时跳过这些，避免保底类型互相挤占
+    _RESERVED_SOURCE_TYPES = ("nga_forum", "intelligence")
 
     @staticmethod
     def _format_news_for_prompt(news_items: List[Dict], max_items: int = 50) -> str:
-        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA 保底）。"""
+        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA/Intelligence 保底）。"""
         top_items = list(news_items[:max_items])
 
-        # NGA 保底：如果 top N 里没有论坛帖子，从后续条目中补入
-        nga_in_top = sum(1 for item in top_items if item.get("source_type") == "nga_forum")
-        if nga_in_top < NewsAnalysisNode._NGA_MIN_FOR_LLM:
-            nga_remaining = [
-                item for item in news_items[max_items:]
-                if item.get("source_type") == "nga_forum"
+        def _ensure_min(source_type: str, min_count: int) -> None:
+            """保底：确保 top_items 中至少有 min_count 条 source_type 条目。
+
+            不足时从 max_items 之后的尾部补入，替换末尾优先级最低的**非保底**条目
+            （跳过 nga_forum / intelligence，避免两类保底互相挤占）。
+            """
+            in_top = sum(1 for it in top_items if it.get("source_type") == source_type)
+            if in_top >= min_count:
+                return
+            remaining = [
+                it for it in news_items[max_items:]
+                if it.get("source_type") == source_type
             ]
-            needed = NewsAnalysisNode._NGA_MIN_FOR_LLM - nga_in_top
-            for nga_item in nga_remaining[:needed]:
-                # 替换 top_items 末尾最低权重的非 NGA 条目
+            needed = min_count - in_top
+            for cand in remaining[:needed]:
                 for j in range(len(top_items) - 1, -1, -1):
-                    if top_items[j].get("source_type") != "nga_forum":
-                        top_items[j] = nga_item
+                    if top_items[j].get("source_type") not in NewsAnalysisNode._RESERVED_SOURCE_TYPES:
+                        top_items[j] = cand
                         break
+
+        _ensure_min("nga_forum", NewsAnalysisNode._NGA_MIN_FOR_LLM)
+        _ensure_min("intelligence", NewsAnalysisNode._INTEL_MIN_FOR_LLM)
 
         lines = []
         for i, item in enumerate(top_items, 1):

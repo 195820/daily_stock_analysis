@@ -779,3 +779,62 @@ def load_phase2_decision(run_date: date) -> Optional["PortfolioDecision"]:
         logger.error(f"[Archive] Phase 2 决策加载失败: {e}")
         return None
 
+
+# =============================================================================
+# 回放 harness（agent_glue_plan_0903 §8.3 A1）
+# =============================================================================
+
+_CONTEXT_MODEL_MAP = {
+    "market": MarketContext,
+    "sector": SectorContext,
+    "capital": CapitalContext,
+    "news": NewsContext,
+    "sentiment": SentimentContext,
+    "unified": UnifiedContext,
+}
+
+
+def load_daily_contexts(
+    run_date: date,
+    *,
+    base_dir: Optional[Path] = None,
+) -> dict[str, object]:
+    """从 data/got_daily/YYYYMMDD/ 加载 6 个 Context JSON 并反序列化为 pydantic 对象。
+
+    用于回放 harness：把归档数据还原为 AggregatorNode.run() 的输入。
+
+    Args:
+        run_date: 回放日期
+        base_dir: 归档根目录（默认 data/got_daily/）
+
+    Returns:
+        dict: {"market": MarketContext, "sector": SectorContext, ...}
+              缺失的文件会记 warning 并跳过（不 raise）
+
+    Raises:
+        FileNotFoundError: 日期目录不存在
+    """
+    base_dir = base_dir or _default_base_dir()
+    date_str = run_date.strftime("%Y%m%d")
+    archive_dir = base_dir / date_str
+
+    if not archive_dir.exists():
+        raise FileNotFoundError(f"[Archive] 回放目录不存在: {archive_dir}")
+
+    result = {}
+    for key, filename in CONTEXT_FILES.items():
+        filepath = archive_dir / filename
+        if not filepath.exists():
+            logger.warning("[Archive] 回放文件缺失（跳过）: %s", filepath)
+            continue
+        try:
+            data = json.loads(filepath.read_text(encoding="utf-8"))
+            model_cls = _CONTEXT_MODEL_MAP[key]
+            result[key] = model_cls(**data)
+        except Exception as e:
+            logger.error("[Archive] 回放文件加载失败 %s: %s", filepath, e)
+
+    logger.info("[Archive] 回放数据已加载: %s — %d/%d 个 Context",
+                date_str, len(result), len(CONTEXT_FILES))
+    return result
+

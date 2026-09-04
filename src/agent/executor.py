@@ -490,6 +490,9 @@ class AgentExecutor:
         use_legacy_default_prompt: bool = False,
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
+        system_prompt_override: Optional[str] = None,
+        temperature: Optional[float] = None,
+        call_type: str = "agent",
     ):
         self.tool_registry = tool_registry
         self.llm_adapter = llm_adapter
@@ -498,6 +501,9 @@ class AgentExecutor:
         self.use_legacy_default_prompt = use_legacy_default_prompt
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.system_prompt_override = system_prompt_override
+        self.temperature = temperature
+        self.call_type = call_type
 
     def run(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for a given task.
@@ -510,28 +516,32 @@ class AgentExecutor:
             AgentResult with parsed dashboard or error.
         """
         # Build system prompt with skills
-        skills_section = ""
-        if self.skill_instructions:
-            skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
-        default_skill_policy_section = ""
-        if self.default_skill_policy:
-            default_skill_policy_section = f"\n{self.default_skill_policy}\n"
-        report_language = normalize_report_language((context or {}).get("report_language", "zh"))
-        stock_code = (context or {}).get("stock_code", "")
-        market_role = get_market_role(stock_code, report_language)
-        market_guidelines = get_market_guidelines(stock_code, report_language)
-        prompt_template = (
-            LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
-            if self.use_legacy_default_prompt
-            else AGENT_SYSTEM_PROMPT
-        )
-        system_prompt = prompt_template.format(
-            market_role=market_role,
-            market_guidelines=market_guidelines,
-            default_skill_policy_section=default_skill_policy_section,
-            skills_section=skills_section,
-            language_section=_build_language_section(report_language),
-        )
+        # 若设置了 system_prompt_override（如审查专用 profile），直接使用它
+        if self.system_prompt_override:
+            system_prompt = self.system_prompt_override
+        else:
+            skills_section = ""
+            if self.skill_instructions:
+                skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
+            default_skill_policy_section = ""
+            if self.default_skill_policy:
+                default_skill_policy_section = f"\n{self.default_skill_policy}\n"
+            report_language = normalize_report_language((context or {}).get("report_language", "zh"))
+            stock_code = (context or {}).get("stock_code", "")
+            market_role = get_market_role(stock_code, report_language)
+            market_guidelines = get_market_guidelines(stock_code, report_language)
+            prompt_template = (
+                LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
+                if self.use_legacy_default_prompt
+                else AGENT_SYSTEM_PROMPT
+            )
+            system_prompt = prompt_template.format(
+                market_role=market_role,
+                market_guidelines=market_guidelines,
+                default_skill_policy_section=default_skill_policy_section,
+                skills_section=skills_section,
+                language_section=_build_language_section(report_language),
+            )
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
@@ -757,6 +767,8 @@ class AgentExecutor:
             progress_callback=progress_callback,
             max_wall_clock_seconds=self.timeout_seconds,
             stock_scope=stock_scope,
+            temperature=self.temperature,
+            call_type=self.call_type,
         )
 
         model_str = loop_result.model

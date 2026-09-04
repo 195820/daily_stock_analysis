@@ -469,6 +469,7 @@ class LLMToolAdapter:
         tools: List[dict],
         provider: Optional[str] = None,
         timeout: Optional[float] = None,
+        temperature: Optional[float] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -477,11 +478,15 @@ class LLMToolAdapter:
                       [{"role": "system"/"user"/"assistant"/"tool", "content": ...}, ...]
             tools: OpenAI-format tool declarations; litellm converts to each provider's format.
             provider: Ignored (kept for backward compatibility).
+            temperature: Optional sampling temperature override (None → 配置默认值).
 
         Returns:
             LLMResponse with either content (final answer) or tool_calls.
         """
-        return self.call_completion(messages, tools=tools, provider=provider, timeout=timeout)
+        return self.call_completion(
+            messages, tools=tools, provider=provider, timeout=timeout,
+            temperature=temperature,
+        )
 
     def call_text(
         self,

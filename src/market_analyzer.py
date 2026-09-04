@@ -1308,14 +1308,31 @@ Output the report content directly, no extra commentary.
         """使用模板生成复盘报告（无大模型时的备选方案）"""
         template_language = self._get_template_review_language()
         mood_code = self.profile.mood_index_code
-        # 根据 mood_index_code 查找对应指数
-        # cn: mood_code="000001"，idx.code 可能为 "sh000001"（以 mood_code 结尾）
-        # us: mood_code="SPX"，idx.code 直接为 "SPX"
+        # §4.3-3 消歧：经 parse_analysis_target 解析 mood_index_code，断言其为指数
+        # 并取 canonical_id（注册表归一形式）。若配置误用裸码（asset_type=stock），
+        # 告警提示改用带交易所后缀格式——这正是 problem#3（market_mood 恒为震荡）的根因防御。
+        from src.got.index_registry import matches_index_code, parse_analysis_target
+        mood_target = parse_analysis_target(mood_code)
+        # 仅对 CN 裸数字码误配告警（problem#3 根因：000001 双身份歧义）；
+        # US 符号（SPX/.DJI 等非纯数字）注册表不识别为指数，属正常配置，跳过告警。
+        if mood_target.asset_type != "index" and str(mood_code).isdigit():
+            logger.warning(
+                "[MarketAnalyzer] mood_index_code=%r 是裸数字码但解析为 %s；"
+                "§4 消歧要求使用带交易所后缀格式（如 000001.SH）",
+                mood_code, mood_target.asset_type,
+            )
+        # 匹配基准：优先用注册表 canonical_id，退回原始配置字面量
+        mood_match_code = mood_target.canonical_id or mood_code
+        # idx.code 可能为 "sh000001" / "000001"（TickFlow 裸码）/ "000001.SH"，
+        # 用 matches_index_code 跨格式统一比较；US 符号（SPX 等）注册表不识别，
+        # 保留原始精确/后缀匹配作为兜底，避免非 CN 格式误判为无 mood_index。
         mood_index = next(
             (
                 idx
                 for idx in overview.indices
-                if idx.code == mood_code or idx.code.endswith(mood_code)
+                if matches_index_code(idx.code, mood_match_code)
+                or idx.code == mood_code
+                or idx.code.endswith(mood_code)
             ),
             None,
         )

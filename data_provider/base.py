@@ -971,6 +971,24 @@ class DataFetcherManager:
             )
         return kept
 
+    # W8: 仅服务于 A 股指数的补充源（个股 daily_data 不参与 fallback）
+    # TencentFetcher 的 pct_chg 为 close.pct_change() 计算值、amount 缺失填 0，
+    # 与交易所权威口径不一致，仅允许作为指数 K 线 fallback。
+    _INDEX_ONLY_FETCHERS = {"TencentFetcher"}
+
+    @classmethod
+    def _filter_fetchers_index_only(
+        cls, fetchers: List[BaseFetcher],
+    ) -> List[BaseFetcher]:
+        """非指数请求剔除仅供指数的补充源（W8：TencentFetcher 个股口径漂移）。"""
+        kept = [f for f in fetchers if f.name not in cls._INDEX_ONLY_FETCHERS]
+        skipped = [f.name for f in fetchers if f.name in cls._INDEX_ONLY_FETCHERS]
+        if skipped:
+            logger.debug(
+                "[数据源路由] 非指数请求跳过指数专用源: %s", ", ".join(skipped),
+            )
+        return kept
+
     def _get_cached_stock_name(self, stock_code: str) -> Optional[str]:
         self._ensure_concurrency_guards()
         with self._stock_name_cache_lock:
@@ -1291,11 +1309,13 @@ class DataFetcherManager:
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
+        from .tencent_fetcher import TencentFetcher
         config = get_config()
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         mootdx = MootdxFetcher()        # 通达信 TCP（P0，不封 IP）
         efinance = EfinanceFetcher()
         akshare = AkshareFetcher()
+        tencent = TencentFetcher()       # 腾讯免费接口（P1，指数 fallback）
         pytdx = PytdxFetcher()      # 通达信数据源（可配 PYTDX_HOST/PYTDX_PORT）
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
@@ -1332,6 +1352,7 @@ class DataFetcherManager:
             self._fetchers = [
                 mootdx,
                 efinance,
+                tencent,
                 akshare,
                 pytdx,
                 baostock,
@@ -1425,6 +1446,9 @@ class DataFetcherManager:
             fetchers = self._filter_daily_fetchers_for_market(fetchers, "hk")
         if is_a_index:
             fetchers = self._filter_fetchers_for_a_index(fetchers)
+        else:
+            # W8①: TencentFetcher 仅作 A 股指数 fallback，个股路径不参与
+            fetchers = self._filter_fetchers_index_only(fetchers)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
         total_fetchers = len(fetchers)
 

@@ -15,7 +15,9 @@ class MarketProfile:
     """大盘复盘市场区域配置"""
 
     region: str  # "cn" | "us"
-    # 用于判断整体走势的指数代码，cn 用上证 000001，us 用标普 SPX
+    # 用于判断整体走势的指数代码。
+    # §4 消歧：统一使用带交易所后缀格式（如 000001.SH），消除裸码双身份歧义。
+    # 消费方应通过 `parse_analysis_target()` 或 `IndexRegistry` 解析。
     mood_index_code: str
     # 新闻搜索关键词
     news_queries: List[str]
@@ -29,7 +31,8 @@ class MarketProfile:
 
 CN_PROFILE = MarketProfile(
     region="cn",
-    mood_index_code="000001",
+    # §4 消歧：原裸码 "000001" 与平安银行冲突，改为显式后缀 "000001.SH"
+    mood_index_code="000001.SH",
     news_queries=[
         "A股 大盘 复盘",
         "股市 行情 分析",

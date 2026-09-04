@@ -416,6 +416,8 @@ def run_agent_loop(
     max_wall_clock_seconds: Optional[float] = None,
     tool_call_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
+    temperature: Optional[float] = None,
+    call_type: str = "agent",
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -433,6 +435,8 @@ def run_agent_loop(
         thinking_labels: Override map of tool_name → friendly label.
         max_wall_clock_seconds: Optional overall timeout budget for the loop.
         tool_call_timeout_seconds: Optional timeout for one parallel tool batch.
+        temperature: Optional sampling temperature override (None → 配置默认值).
+        call_type: LLM 用量归因类型（落库 persist_llm_usage），审查层传 agent_review_t1/t1h。
 
     Returns:
         A :class:`RunLoopResult` with the final content, stats, and the
@@ -514,6 +518,7 @@ def run_agent_loop(
             messages,
             tool_decls,
             timeout=remaining_timeout,
+            temperature=temperature,
         )
         provider_used = response.provider
         total_tokens += (response.usage or {}).get("total_tokens", 0)
@@ -522,7 +527,7 @@ def run_agent_loop(
             models_used.append(m)
         model_for_usage = m or response.provider
         if model_for_usage and model_for_usage != "error" and response.usage:
-            _persist_usage(response.usage, model_for_usage, call_type="agent")
+            _persist_usage(response.usage, model_for_usage, call_type=call_type)
 
         remaining_timeout = _remaining_timeout_seconds(start_time, max_wall_clock_seconds)
         if remaining_timeout is not None and remaining_timeout <= 0:

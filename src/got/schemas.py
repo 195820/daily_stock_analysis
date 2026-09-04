@@ -953,6 +953,19 @@ class UnifiedScoringResult(BaseModel):
         default=None,
         description="退出理由（人可读）",
     )
+    # ── §15 T1-H 持仓审查字段（仅持仓股有效）──
+    agent_review_verdict: Optional[str] = Field(
+        default=None,
+        description="T1-H Agent 审查结果: hold / add / reduce / exit",
+    )
+    agent_review_reasoning: Optional[str] = Field(
+        default=None,
+        description="T1-H Agent 审查理由",
+    )
+    agent_review_penalty: Optional[float] = Field(
+        default=None,
+        description="T1-H 降档惩罚系数（0.0-1.0，已乘入 composite_score）",
+    )
 
 
 class TradeAllocation(BaseModel):
@@ -1006,3 +1019,56 @@ class PortfolioDecision(BaseModel):
         default_factory=list,
         description="主线家族续航评估（信号展示+降权提示，不触发强制卖出）",
     )
+
+
+# =============================================================================
+# Agent 语义粘合层输出（agent_glue_plan_0903 §5.3）
+# =============================================================================
+
+# 受控家族词表（§5.3.3）— Agent 只能从中选择，不得自创
+CONTROLLED_FAMILIES = [
+    "AI软件", "AI硬件", "周期资源", "新能源", "农业", "医药",
+    "军工", "消费", "智能驾驶", "金融", "机器人", "生态环保",
+]
+
+
+class GlueRelation(BaseModel):
+    """Agent 语义粘合层 — 事件→板块关系（替代 T5 映射）"""
+    event_id: str
+    board_code: str
+    strength: float = Field(ge=0.0, le=1.0)
+    direction: str = Field(default="positive")
+    propagation_path: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class GlueStrength(BaseModel):
+    """Agent 语义粘合层 — 板块强度（替代 Segment C/D/E）"""
+    board_code: str
+    strength: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence: str = Field(default="")
+    capital_read: str = Field(default="unknown")
+    news_read: str = Field(default="unknown")
+    sentiment_read: str = Field(default="unknown")
+
+
+class GlueFamily(BaseModel):
+    """Agent 语义粘合层 — 家族归属（只判落「其他」的板块）"""
+    board_code: str
+    family: str
+
+
+class SemanticGlueResult(BaseModel):
+    """Agent 语义粘合层输出（agent_glue_plan_0903 §5.3 / §7.2）
+
+    包含三类结构化输出：关系图 + 板块强度 + 家族归属。
+    `degraded=True` 时表示 F1 降级（全量或逐板块）。
+    """
+    relations: list[GlueRelation] = Field(default_factory=list)
+    strengths: list[GlueStrength] = Field(default_factory=list)
+    families: list[GlueFamily] = Field(default_factory=list)
+    degraded: bool = Field(default=False)
+    degraded_sectors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    raw_response: str = Field(default="", exclude=True)

@@ -108,6 +108,7 @@ class AgentMemory:
             db = get_db()
             records = db.get_analysis_history(code=stock_code, limit=limit)
             entries = []
+            pending = []  # (entry, signal, created_at)
             for r in records:
                 raw_result: Dict[str, Any] = {}
                 if isinstance(getattr(r, "raw_result", None), str) and r.raw_result:
@@ -125,18 +126,146 @@ class AgentMemory:
                 if price_at_analysis is None:
                     price_at_analysis = 0.0
 
-                entries.append(AnalysisMemoryEntry(
+                # 构建基础 entry
+                entry = AnalysisMemoryEntry(
                     stock_code=stock_code,
                     date=(r.created_at.date().isoformat() if getattr(r, "created_at", None) else ""),
                     signal=signal,
                     sentiment_score=getattr(r, "sentiment_score", 50) or 50,
                     price_at_analysis=float(price_at_analysis or 0.0),
-                    was_correct=None,
-                ))
+                )
+                entries.append(entry)
+                pending.append((entry, signal, r.created_at))
+
+            # §14.1 A2: 同一标的仅取一次 K 线，逐条复用计算 outcomes（避免逐条网络请求）
+            if any(e.price_at_analysis > 0 for e, _, _ in pending):
+                klines = self._fetch_outcome_klines(stock_code, [c for _, _, c in pending])
+                for entry, signal, created_at in pending:
+                    self._compute_entry_outcomes(entry, signal, created_at, klines=klines)
             return entries
         except Exception as exc:
             logger.debug("[AgentMemory] get_stock_history failed: %s", exc)
             return []
+
+    def _fetch_outcome_klines(self, stock_code: str, created_ats) -> List[Dict[str, Any]]:
+        """一次性获取覆盖分析日 +20 交易日窗口的日 K 线（§14.1 A2）。
+
+        返回按日期升序的 ``[{"date": ..., "close": float}]``；失败或无有效分析日返回 ``[]``。
+        同一标的的多条历史记录共享本次取数结果，避免逐条网络请求。
+        """
+        from datetime import datetime
+
+        valid_dates = [c.date() for c in created_ats if isinstance(c, datetime)]
+        if not valid_dates:
+            return []
+        try:
+            from data_provider.base import DataFetcherManager
+
+            if getattr(self, "_outcome_fetcher", None) is None:
+                self._outcome_fetcher = DataFetcherManager()
+            earliest = min(valid_dates)
+            span_days = (datetime.now().date() - earliest).days + 30  # 覆盖最早分析日的 20 交易日窗口
+            days = max(30, min(span_days, 250))
+            df, _src = self._outcome_fetcher.get_daily_data(stock_code, days=days)
+            if df is None or getattr(df, "empty", True):
+                return []
+            klines: List[Dict[str, Any]] = []
+            for _, row in df.iterrows():
+                d = row.get("date")
+                c = row.get("close")
+                if d is None or c is None:
+                    continue
+                klines.append({"date": d, "close": float(c)})
+            return klines
+        except Exception as exc:
+            logger.warning("[AgentMemory] outcome K线获取失败 %s: %s", stock_code, exc)
+            return []
+
+    def _compute_entry_outcomes(
+        self,
+        entry: AnalysisMemoryEntry,
+        signal: str,
+        created_at,
+        klines: Optional[List[Dict[str, Any]]] = None,
+    ) -> AnalysisMemoryEntry:
+        """计算历史分析的结果指标（§14.1 A2 回填链路）。
+
+        - outcome_5d: 分析后 5 日收益率（%）
+        - outcome_20d: 分析后 20 日收益率（%）
+        - was_correct: 信号方向是否与实际走势一致
+
+        ``klines`` 由 :meth:`get_stock_history` 一次性取数后传入；直接调用且未传时按需获取。
+        若无法获取价格数据则保持 None（降级）。
+        """
+        if entry.price_at_analysis <= 0 or not created_at:
+            return entry
+
+        try:
+            from datetime import datetime, date as _date
+
+            # 解析分析日期
+            if isinstance(created_at, datetime):
+                analysis_date = created_at.date()
+            else:
+                return entry
+
+            if klines is None:
+                klines = self._fetch_outcome_klines(entry.stock_code, [created_at])
+            if not klines or len(klines) < 2:
+                return entry
+
+            # 找到分析日后的价格（klines 按日期升序）
+            entry_price = entry.price_at_analysis
+            price_5d = None
+            price_20d = None
+
+            for bar in klines:
+                bar_date = bar.get("date")
+                if isinstance(bar_date, str):
+                    try:
+                        bar_date = datetime.fromisoformat(bar_date[:10]).date()
+                    except ValueError:
+                        continue
+                elif isinstance(bar_date, datetime):
+                    bar_date = bar_date.date()
+                elif not isinstance(bar_date, _date):
+                    continue
+
+                days_diff = (bar_date - analysis_date).days
+
+                # 找 5 日后的价格
+                if price_5d is None and 4 <= days_diff <= 7:
+                    price_5d = bar.get("close") or bar.get("price")
+
+                # 找 20 日后的价格
+                if price_20d is None and 18 <= days_diff <= 22:
+                    price_20d = bar.get("close") or bar.get("price")
+
+            # 计算收益率
+            if price_5d is not None and entry_price > 0:
+                entry.outcome_5d = round((price_5d - entry_price) / entry_price * 100, 2)
+
+            if price_20d is not None and entry_price > 0:
+                entry.outcome_20d = round((price_20d - entry_price) / entry_price * 100, 2)
+
+            # 判断方向正确性（使用 5 日收益率）
+            if entry.outcome_5d is not None:
+                signal_is_bullish = signal in ("buy", "buy_trend", "buy_dip", "long", "strong_buy")
+                signal_is_bearish = signal in ("sell", "short", "avoid")
+                actual_went_up = entry.outcome_5d > 0
+
+                if signal_is_bullish:
+                    entry.was_correct = actual_went_up
+                elif signal_is_bearish:
+                    entry.was_correct = not actual_went_up
+                else:
+                    # hold 等中性信号：若波动 < 3% 视为正确
+                    entry.was_correct = abs(entry.outcome_5d) < 3.0
+
+        except Exception as exc:
+            logger.warning("[AgentMemory] _compute_entry_outcomes failed for %s: %s", entry.stock_code, exc)
+
+        return entry
 
     # -----------------------------------------------------------------
     # Confidence calibration
@@ -287,7 +416,11 @@ class AgentMemory:
         stock_code: Optional[str],
         skill_id: Optional[str],
     ) -> Dict[str, Any]:
-        """Aggregate accuracy statistics from backtest history."""
+        """Aggregate accuracy statistics from backtest history.
+
+        §14.1 A1 修复：avg_confidence 不再硬编码 0.6，改为从历史数据计算真实均值。
+        若无法获取则使用中性值 0.5（使 calibration_factor = accuracy / 0.5 = 2*accuracy）。
+        """
         try:
             from src.services.backtest_service import BacktestService
             service = BacktestService()
@@ -301,12 +434,54 @@ class AgentMemory:
                 summary = service.get_global_summary() if hasattr(service, "get_global_summary") else None
 
             if summary:
+                # §14.1 A1: 尝试获取真实 avg_confidence，否则从历史分析记录计算
+                avg_confidence = self._compute_avg_confidence(stock_code)
                 return {
                     "total": summary.get("total_evaluations", 0),
                     "accuracy": summary.get("win_rate", 0.5),
                     "direction_accuracy": summary.get("direction_accuracy", 0.5),
-                    "avg_confidence": 0.6,  # approximate from historical data
+                    "avg_confidence": avg_confidence,
                 }
         except Exception:
             pass
         return {"total": 0, "accuracy": 0.5, "direction_accuracy": 0.5, "avg_confidence": 0.5}
+
+    def _compute_avg_confidence(self, stock_code: Optional[str] = None, limit: int = 100) -> float:
+        """从历史分析记录计算平均置信度（§14.1 A1 修复）。
+
+        查询 AnalysisHistory.raw_result JSON 中的 confidence 字段。
+        若无数据则返回中性值 0.5。
+        """
+        try:
+            from src.storage import get_db, AnalysisHistory
+            import json
+
+            db = get_db()
+            session = db.get_session()
+            query = session.query(AnalysisHistory.raw_result).filter(
+                AnalysisHistory.raw_result.isnot(None)
+            )
+            if stock_code:
+                query = query.filter(AnalysisHistory.code == stock_code)
+
+            records = query.order_by(AnalysisHistory.created_at.desc()).limit(limit).all()
+            session.close()
+
+            confidences = []
+            for (raw_result,) in records:
+                try:
+                    data = json.loads(raw_result)
+                    if isinstance(data, dict):
+                        conf = data.get("confidence") or data.get("overall_confidence")
+                        if conf is not None:
+                            confidences.append(float(conf))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+
+            if confidences:
+                return sum(confidences) / len(confidences)
+        except Exception:
+            pass
+
+        # 无数据或查询失败，返回中性值
+        return 0.5

@@ -101,6 +101,14 @@ class PortfolioDecisionNode:
             f"{len(holdings_scores)} 只持仓 + {len(candidates_scores)} 只候选"
         )
 
+        # Step 2.5: T1-H 持仓审查（§15.4，Agent 降档权）
+        holdings_scores = await self._agent_holding_review(
+            holdings_scores, unified_context, news_context, portfolio,
+        )
+        # 重新组装（持仓评分可能因降档而变化）
+        unified_scoring = holdings_scores + candidates_scores
+        unified_scoring.sort(key=lambda x: x.composite_score, reverse=True)
+
         # Step 3: 组合优化（规则 + LLM 混合）
         logger.info("[Phase 2] Step 3: 组合优化")
         allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio)
@@ -401,6 +409,8 @@ class PortfolioDecisionNode:
 
         # ── P4：加载埋伏持仓快照（用于退出信号检测）──
         ambush_snapshot_map = self._load_ambush_snaphots(positions)
+        # 供 Step 2.5 T1-H 持仓审查复用完整催化剂快照（§15.4 P4 快照输入契约）
+        self._ambush_snapshot_map = ambush_snapshot_map
 
         # 批量计算资金面/消息面评分（复用 screener 的方法，避免重复实现）
         holding_candidates = []
@@ -1984,6 +1994,329 @@ class PortfolioDecisionNode:
             logger.info(f"[P4] 关闭 {len(exit_signals)} 条埋伏快照")
         except Exception as e:
             logger.warning(f"[P4] 关闭埋伏快照失败: {e}")
+
+    # =================================================================
+    # §15.4 T1-H: 持仓 Agent 审查层
+    # =================================================================
+
+    async def _agent_holding_review(
+        self,
+        holdings: List[UnifiedScoringResult],
+        unified_context: UnifiedContext,
+        news_context: NewsContext,
+        portfolio: Dict[str, Any],
+    ) -> List[UnifiedScoringResult]:
+        """T1-H: 持仓逐股 Agent 审查（§15.4）
+
+        设计原则：
+        - Agent 只有降档权：reduce/exit 标注 + 打分惩罚系数
+        - 仓位计算与最终分配仍由规则层完成
+        - confidence < AGENT_HOLDING_REVIEW_MIN_CONFIDENCE 忽略（与 T3 仲裁一致）
+        - 调用失败/解析失败 → hold（等同现状，R4 原则）
+        - 影子模式：跑审查但不应用惩罚
+
+        审查优先级（最多 AGENT_HOLDING_REVIEW_MAX 只）：
+        1. 埋伏持仓（ambush_position_type 非空）
+        2. 有 P4 退出信号
+        3. 浮亏超阈值（composite_score < 40）
+
+        Args:
+            holdings: _score_holdings 输出的持仓评分列表
+            unified_context: 聚合上下文（含 market_regime 等）
+            news_context: 消息面上下文（含催化剂信息）
+            portfolio: 持仓快照 dict
+
+        Returns:
+            修改后的持仓列表（composite_score 可能因降档惩罚而降低）
+        """
+        from src.got.catalyst_config import (
+            AGENT_HOLDING_REVIEW_ENABLED,
+            AGENT_HOLDING_REVIEW_SHADOW,
+            AGENT_HOLDING_REVIEW_MAX,
+            AGENT_HOLDING_REVIEW_MIN_CONFIDENCE,
+        )
+
+        if not AGENT_HOLDING_REVIEW_ENABLED or not holdings:
+            return holdings
+
+        # 按优先级筛选审查目标
+        review_targets = self._select_holding_review_targets(
+            holdings, AGENT_HOLDING_REVIEW_MAX
+        )
+        if not review_targets:
+            logger.debug("[T1-H] 无需审查的持仓")
+            return holdings
+
+        shadow_tag = "[SHADOW] " if AGENT_HOLDING_REVIEW_SHADOW else ""
+        logger.info(
+            f"[T1-H] 审查 {len(review_targets)} 只持仓"
+            f"（预算上限 {AGENT_HOLDING_REVIEW_MAX}）"
+        )
+
+        # 构建 review executor（T1-H 持仓审查：verdict 词表 hold/add/reduce/exit）
+        try:
+            from src.agent.factory import build_review_executor
+            executor = build_review_executor(review_type="t1h")
+        except Exception as exc:
+            logger.warning(f"[T1-H] Review Agent 构建失败，降级跳过: {exc}")
+            return holdings
+
+        # 提取市场环境
+        regime = "unknown"
+        if hasattr(unified_context, 'market_regime'):
+            regime = unified_context.market_regime or "unknown"
+
+        # W10: 缓存降档前原分，影子回滚时精确还原（避免双重 rounding 漂移）
+        orig_score_by_symbol: Dict[str, float] = {}
+
+        for holding in review_targets:
+            try:
+                # 构建 prompt
+                prompt = self._build_holding_review_prompt(
+                    holding, regime, news_context, portfolio,
+                )
+
+                # 调用 Agent（空响应重试 3 次）
+                response_text = None
+                for attempt in range(3):
+                    try:
+                        result = executor.run(prompt)
+                        response_text = (
+                            result.content if result and result.success else ""
+                        )
+                        if response_text:
+                            break
+                    except Exception as exc:
+                        logger.debug(f"[T1-H] {holding.symbol} 第{attempt+1}次调用失败: {exc}")
+
+                if not response_text:
+                    logger.debug(f"[T1-H] {holding.symbol} 调用失败，降级为 hold")
+                    continue
+
+                # 解析 JSON（使用 try_parse_json 四策略）
+                from src.agent.runner import try_parse_json
+                verdict_data = try_parse_json(response_text)
+                if not verdict_data or not isinstance(verdict_data, dict):
+                    logger.warning(f"[T1-H] {holding.symbol} JSON 解析失败")
+                    continue
+
+                verdict = verdict_data.get("verdict", "hold")
+                try:
+                    confidence = float(verdict_data.get("confidence", 0.0))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                # W10: clamp 到 [0,1]，防 LLM 以百分制返回（如 85）被误读为极高置信
+                confidence = min(1.0, max(0.0, confidence))
+                reasoning = str(verdict_data.get("reasoning", ""))[:60]
+
+                # 记录 Agent 审查结果
+                holding.agent_review_verdict = verdict
+                holding.agent_review_reasoning = reasoning
+
+                # confidence 不足阈值 → 忽略（等同 hold）
+                if confidence < AGENT_HOLDING_REVIEW_MIN_CONFIDENCE:
+                    logger.debug(
+                        f"[T1-H] {holding.symbol} confidence={confidence:.2f} "
+                        f"< {AGENT_HOLDING_REVIEW_MIN_CONFIDENCE}，忽略"
+                    )
+                    continue
+
+                # 降档惩罚（仅 reduce/exit 生效）
+                if verdict in ("reduce", "exit"):
+                    penalty = self._compute_holding_penalty(verdict, confidence)
+                    holding.agent_review_penalty = penalty
+                    old_score = holding.composite_score
+                    orig_score_by_symbol[holding.symbol] = old_score
+                    holding.composite_score = round(old_score * penalty, 2)
+                    logger.info(
+                        f"{shadow_tag}[T1-H] {holding.symbol} {holding.name}: "
+                        f"{verdict.upper()} (conf={confidence:.2f}) "
+                        f"→ 评分 {old_score:.1f} → {holding.composite_score:.1f} "
+                        f"(惩罚×{penalty:.2f}) — {reasoning}"
+                    )
+                elif verdict == "add":
+                    logger.info(
+                        f"{shadow_tag}[T1-H] {holding.symbol}: ADD "
+                        f"(conf={confidence:.2f}) — {reasoning}"
+                    )
+
+            except Exception as exc:
+                logger.warning(f"[T1-H] {holding.symbol} 审查异常: {exc}")
+
+        # 影子模式：不应用惩罚（回滚 composite_score）
+        if AGENT_HOLDING_REVIEW_SHADOW:
+            for holding in review_targets:
+                if holding.agent_review_penalty is not None:
+                    # W10: 直接还原缓存原值，不做 round(score/penalty) 逆运算（双重舍入会漂移）
+                    orig = orig_score_by_symbol.get(holding.symbol)
+                    if orig is not None:
+                        holding.composite_score = orig
+                    holding.agent_review_penalty = None
+            logger.info(
+                f"[SHADOW][T1-H] 影子模式: 审查完成但不应用惩罚，"
+                f"降档数量={sum(1 for h in review_targets if h.agent_review_verdict in ('reduce', 'exit'))}"
+            )
+
+        return holdings
+
+    def _select_holding_review_targets(
+        self,
+        holdings: List[UnifiedScoringResult],
+        max_count: int,
+    ) -> List[UnifiedScoringResult]:
+        """按优先级选择持仓审查目标（最多 max_count 只）。
+
+        优先级：
+        1. 埋伏持仓（ambush_position_type 非空）
+        2. 有 P4 退出信号（ambush_exit_signal 非空）
+        3. 浮亏/低分持仓（composite_score < 40）
+        """
+        ambush = [h for h in holdings if h.ambush_position_type]
+        exit_signal = [h for h in holdings if h.ambush_exit_signal]
+        low_score = [h for h in holdings if h.composite_score < 40]
+
+        # 去重合并（保持优先级顺序）
+        seen = set()
+        targets = []
+        for h in ambush + exit_signal + low_score:
+            if h.symbol not in seen:
+                seen.add(h.symbol)
+                targets.append(h)
+            if len(targets) >= max_count:
+                break
+
+        return targets
+
+    def _build_holding_review_prompt(
+        self,
+        holding: UnifiedScoringResult,
+        regime: str,
+        news_context: NewsContext,
+        portfolio: Dict[str, Any],
+    ) -> str:
+        """构建 T1-H 持仓审查 prompt。"""
+        # 提取持仓成本/盈亏/数量信息
+        portfolio_positions = portfolio.get("positions", [])
+        position_info = ""
+        for pos in portfolio_positions:
+            if pos.get("symbol") == holding.symbol or pos.get("code") == holding.symbol:
+                cost = pos.get("cost_price", 0)
+                current = pos.get("current_price", 0)
+                quantity = (
+                    pos.get("quantity") or pos.get("shares")
+                    or pos.get("volume") or pos.get("amount") or 0
+                )
+                pnl_pct = ((current - cost) / cost * 100) if cost > 0 else 0
+                position_info = (
+                    f"持仓数量={quantity}, 成本价={cost:.2f}, "
+                    f"现价={current:.2f}, 盈亏={pnl_pct:+.1f}%"
+                )
+                break
+
+        # W11: §15.4 输入契约「买入以来新闻」— 按持仓标的过滤 news_context.major_events
+        news_lines = []
+        for ev in (getattr(news_context, "major_events", None) or []):
+            affected = set(getattr(ev, "affected_stocks", None) or [])
+            if holding.symbol in affected or holding.name in affected:
+                ts = getattr(ev, "timestamp", None) or getattr(ev, "first_seen", None) or ""
+                news_lines.append(
+                    f"- [{ts}] {getattr(ev, 'title', '')}"
+                    f"（{getattr(ev, 'sentiment', '')}/{getattr(ev, 'impact_level', '')}）"
+                )
+        news_section = "\n".join(news_lines[:10]) if news_lines else "无"
+
+        # §15.4 P4 催化剂快照：优先注入完整快照（事件标题/共识预期/影响等级/事件日期/
+        # 建仓信息），使 LLM 能判断「埋伏的是什么催化剂、共识预期、事件进度、影响量级」；
+        # 快照 map 不可用时回退 holding 上的 P4 代号字段（position_type/exit_signal/exit_reason）。
+        catalyst_info = "无"
+        snapshot = getattr(self, "_ambush_snapshot_map", {}).get(holding.symbol)
+        if snapshot is not None:
+            parts = [
+                f"埋伏类型={getattr(snapshot, 'category_tag', '') or holding.ambush_position_type or '未知'}"
+            ]
+            event_title = getattr(snapshot, "catalyst_event_title", "") or ""
+            if event_title:
+                parts.append(f"催化剂事件={event_title}")
+            event_date = getattr(snapshot, "catalyst_event_date", None)
+            if event_date:
+                parts.append(f"事件日期={event_date}")
+            impact_level = getattr(snapshot, "impact_level", 0) or 0
+            if impact_level:
+                parts.append(f"影响等级={'★' * impact_level}")
+            consensus = getattr(snapshot, "consensus_expectation", "") or ""
+            if consensus:
+                parts.append(f"共识预期={consensus}")
+            entry_date = getattr(snapshot, "entry_date", None)
+            entry_price = getattr(snapshot, "entry_price", None)
+            if entry_date and entry_price:
+                parts.append(f"建仓={entry_date}@{entry_price:.2f}")
+            if holding.ambush_exit_signal:
+                parts.append(f"退出信号={holding.ambush_exit_signal}")
+            if holding.ambush_exit_reason:
+                parts.append(f"退出理由={holding.ambush_exit_reason}")
+            catalyst_info = ", ".join(parts)
+        elif holding.ambush_position_type:
+            # 回退：快照 map 不可用（表缺失/查询失败），用 holding 上的 P4 代号字段
+            catalyst_info = f"埋伏类型={holding.ambush_position_type}"
+            if holding.ambush_exit_signal:
+                catalyst_info += f", 退出信号={holding.ambush_exit_signal}"
+            if holding.ambush_exit_reason:
+                catalyst_info += f", 退出理由={holding.ambush_exit_reason}"
+
+        return f"""请审查以下持仓股票，给出你的意见。
+
+## 市场环境
+- 大盘 regime: {regime}
+
+## 持仓股票
+- 代码: {holding.symbol}
+- 名称: {holding.name}
+- 板块: {holding.sector_name or "未知"}
+- 综合评分: {holding.composite_score:.1f}/100
+- 持仓信息: {position_info or "无"}
+- 催化剂: {catalyst_info}
+- 生命周期: {holding.lifecycle_phase or "未知"} (第{holding.lifecycle_day or "?"}天)
+
+## 买入以来相关新闻
+{news_section}
+
+## 输出要求
+以 JSON 格式输出你的审查意见：
+```json
+{{
+    "verdict": "hold/add/reduce/exit",
+    "confidence": 0.0-1.0,
+    "reasoning": "一句话理由（30字内）",
+    "risk_flags": ["风险点1", ...]
+}}
+```
+
+verdict 含义：
+- hold: 继续持有，维持现状
+- add: 看好，建议加仓
+- reduce: 存在风险，建议减仓
+- exit: 严重风险信号，建议清仓
+
+只输出 JSON，不要其他文字。"""
+
+    @staticmethod
+    def _compute_holding_penalty(verdict: str, confidence: float) -> float:
+        """计算降档惩罚系数。
+
+        惩罚公式：penalty = 1.0 - (severity * confidence)
+        - exit: severity=0.4（最大惩罚）
+        - reduce: severity=0.2
+        - hold/add: severity=0（无惩罚，返回 1.0）
+
+        Returns:
+            惩罚系数（0.6-1.0 区间，越低惩罚越重）
+        """
+        if verdict not in ("reduce", "exit"):
+            return 1.0  # hold/add 不应用惩罚
+
+        severity = 0.4 if verdict == "exit" else 0.2
+        penalty = 1.0 - (severity * confidence)
+        return max(0.6, min(1.0, penalty))
 
     def _detect_rotation_opportunity(
         self,

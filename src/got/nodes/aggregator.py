@@ -38,6 +38,11 @@ from src.got.schemas import (
     CatalystEvent,
     CrossNodeTemporalSignal,
     MainlineEndurance,
+    SemanticGlueResult,
+    GlueRelation,
+    GlueStrength,
+    GlueFamily,
+    CONTROLLED_FAMILIES,
 )
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
@@ -56,6 +61,9 @@ from src.got.catalyst_config import (
     AMBUSH_NOMINATION_MIN_CONSECUTIVE,
     AMBUSH_NOMINATION_DISABLED,
     ACCUMULATION_TOLERANCE,
+    AGENT_SEMANTIC_GLUE_ENABLED,
+    AGENT_SEMANTIC_GLUE_SHADOW,
+    LLM_CALL_TIMEOUT_S,
 )
 from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
@@ -159,13 +167,22 @@ class AggregatorNode:
         capital: CapitalContext,
         news: NewsContext,
         sentiment: SentimentContext,
+        *,
+        replay_mode: bool = False,
     ) -> UnifiedContext:
-        """执行分层 GOT 聚合"""
+        """执行分层 GOT 聚合
+
+        Args:
+            replay_mode: 回放模式（agent_glue_plan_0903 §8.3 A1）。
+                         跳过 _save_context / _update_monitoring / EMA 回写 / 状态机，
+                         不产生任何持久化副作用。
+        """
         if self.use_mock:
             logger.info("[Node 6] 使用 mock 数据")
             return self._mock_output()
 
-        logger.info("[Node 6] 开始 v3 分层 GOT 聚合")
+        self._replay_mode = replay_mode
+        logger.info("[Node 6] 开始 v3 分层 GOT 聚合" + ("（replay_mode）" if replay_mode else ""))
         today = date.today()
         self._run_cache = {}  # 单次 run() 内归档回读缓存
 
@@ -173,7 +190,9 @@ class AggregatorNode:
         regime = self._compute_market_regime(market, sector, capital, news, sentiment)
         # 状态机：跨日记忆 + 转换确认 + dwell 追踪（DISABLE_REGIME_STATE_MACHINE=true 回滚）
         import os as _os
-        if _os.environ.get("DISABLE_REGIME_STATE_MACHINE", "").lower() == "true":
+        if replay_mode:
+            logger.info("[Node 6] replay_mode=true，跳过状态机（避免污染跨日状态）")
+        elif _os.environ.get("DISABLE_REGIME_STATE_MACHINE", "").lower() == "true":
             logger.info("[Node 6] DISABLE_REGIME_STATE_MACHINE=true，跳过状态机")
         else:
             regime = self._apply_regime_state_machine(regime)
@@ -189,10 +208,20 @@ class AggregatorNode:
             sector, capital, news, sentiment, regime=regime,
         )
 
+        # ── Agent 语义粘合层（agent_glue_plan_0903 §5.4 时序修订）──
+        # 在 _build_sector_intel 之前调用，结果作为参数传入
+        # A4 阶段：调用 + 归档，glue 结果暂不影响 _build_sector_intel 行为
+        candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, ambush_pool)
+        glue = await self._agent_semantic_glue(
+            candidates_for_glue, news, capital, sentiment, regime,
+        )
+
         # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
         sector_intels = self._build_sector_intel(
             sector, capital, news, sentiment,
             ambush_pool=ambush_pool, ambush_reservoir=ambush_reservoir,
+            glue=glue,
+            candidates=candidates_for_glue, member_to_group=member_to_group_glue,
         )
         # 将埋伏通道结果回写到 SectorIntel（供 reasoning.md 和 Phase 2 消费）
         self._enrich_ambush_sector_intel(sector_intels, ambush_pool, ambush_reservoir)
@@ -239,7 +268,7 @@ class AggregatorNode:
         # ── 辅助信息 ──
         contradictions = self._detect_contradictions(regime, sector_intels, sector, capital)
         temporal = self._adaptive_temporal_check(regime)
-        override = await self._simplified_news_override(news, market)
+        override = await self._simplified_news_override(news, market) if not replay_mode else None
 
         # ── 跨节点时间线共振（v2.1 Phase 6）──
         # Rollback 开关：DISABLE_CROSS_NODE_SIGNALS=true 跳过共振检测；
@@ -263,9 +292,12 @@ class AggregatorNode:
             )
 
         # T3: 矛盾仲裁者（仅 medium/high 严重度，串行 LLM，影子模式）
-        contradictions = await self._arbitrate_contradictions(
-            contradictions, regime, sector, capital, news, sentiment, cross_node_signals,
-        )
+        if replay_mode:
+            logger.info("[Node 6] replay_mode: 跳过 _arbitrate_contradictions")
+        else:
+            contradictions = await self._arbitrate_contradictions(
+                contradictions, regime, sector, capital, news, sentiment, cross_node_signals,
+            )
 
         key_risks = self._collect_key_risks(news, sentiment, temporal)
         key_opportunities = self._collect_key_opportunities(sector_intels)
@@ -281,6 +313,13 @@ class AggregatorNode:
             )
 
         # ── 构建输出 ──
+        data_quality = self._build_data_quality(market, sector, capital, news, sentiment, glue=glue)
+        # P0-B B2: 护栏空转日志（lifecycle/crowded_families 等关键字段缺失时显式告警）
+        if data_quality.missing_fields:
+            logger.warning(
+                f"[Node 6] 数据质量告警: missing_fields={data_quality.missing_fields} "
+                f"（护栏可能空转，详见 agent_glue_plan_0903 §9）"
+            )
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
             unified_signal=unified_signal,
@@ -294,9 +333,9 @@ class AggregatorNode:
             key_opportunities=key_opportunities,
             concept_suggestions=news.concept_suggestions,
             reasoning=self._build_reasoning(regime, sector_intels, contradictions),
-            data_quality=self._build_data_quality(market, sector, capital, news, sentiment),
+            data_quality=data_quality,
             market_regime=regime,
-            llm_refinement_used=True,
+            llm_refinement_used=getattr(self, '_llm_refine_succeeded', False),
             ema_baseline=None,
             confirmed_sectors=sector_intels,
             ambush_pool=ambush_pool,
@@ -307,16 +346,20 @@ class AggregatorNode:
             cross_node_signals=cross_node_signals,
         )
 
-        # 持久化
-        self._save_context(unified, regime, sector_intels, today)
+        # 持久化（回放模式跳过）
+        if replay_mode:
+            logger.info("[Node 6] replay_mode: 跳过 _save_context / EMA 回写 / _update_monitoring")
+        else:
+            self._save_context(unified, regime, sector_intels, today)
 
-        # 回写 EMA 基线
-        updated_ema = load_ema_baseline()
-        if updated_ema:
-            unified.ema_baseline = updated_ema.get("regime_score")
+            # 回写 EMA 基线
+            updated_ema = load_ema_baseline()
+            if updated_ema:
+                unified.ema_baseline = updated_ema.get("regime_score")
 
-        # ── 生产监控更新（Phase 6）──
-        self._update_monitoring(regime, capital, sentiment, cross_node_signals)
+        # ── 生产监控更新（Phase 6，回放模式跳过）──
+        if not replay_mode:
+            self._update_monitoring(regime, capital, sentiment, cross_node_signals)
 
         logger.info(
             f"[Node 6] 聚合完成 — regime: {regime.regime}, "
@@ -530,26 +573,27 @@ class AggregatorNode:
     # Level 1: 板块 mini GOT
     # =========================================================================
 
-    def _build_sector_intel(
+    def _collect_sector_candidates(
         self,
         sector: SectorContext,
-        capital: CapitalContext,
-        news: NewsContext,
-        sentiment: SentimentContext,
         ambush_pool: Optional[list[AmbushCandidate]] = None,
-        ambush_reservoir: Optional[list[AmbushReservoirEntry]] = None,
-    ) -> list[SectorIntel]:
-        """对每个候选板块做 4 维 mini GOT，标记主线/埋伏来源
+    ) -> tuple[list[tuple[str, Optional[SectorDetail], dict]], dict[str, str]]:
+        """Segment A: 候选板块收集（纯规则，供 _build_sector_intel 与 glue 复用）
 
-        分类拆分消费：主线/降温板块走 composite TOP-N（Node 2 尺子），
-        埋伏板块的 classification 由埋伏通道准入结果直接映射
-        （入正式池 → actionable，否则 caution），不再与主线争抢 TOP-N 名额。
+        4 路来源，按优先级去重：
+        1. 主线板块 — 组名 + 成员展开（组粒度分类用 member_to_group）
+        2. 埋伏板块 — Node 2 状态机 ambush 列表
+        3. 高位降温 — 前主线回调未破位
+        4. 池外补入 — 埋伏正式池中不在 Node 2 名单的板块（蓄水池升格/近失来源）
+
+        Returns:
+            (candidates, member_to_group)
+            candidates: [(name, detail, role_info), ...]
+            member_to_group: {成员名: 组名}
         """
-
-        # 收集候选板块：(name, detail, role_info)
-        candidates = []
-        seen_names = set()
-        member_to_group: dict[str, str] = {}  # 主线组成员→组名（组粒度分类用）
+        candidates: list[tuple[str, Optional[SectorDetail], dict]] = []
+        seen_names: set[str] = set()
+        member_to_group: dict[str, str] = {}
 
         # 主线板块（组名 + 成员展开，确保反向查询能匹配到任意成员）
         for group in sector.active_mainline:
@@ -614,6 +658,471 @@ class AggregatorNode:
                     f"({'命中 Node 2 detail' if detail else '无 Node 2 detail，技术分取 strength_lookup'})"
                 )
 
+        return candidates, member_to_group
+
+    # =========================================================================
+    # Agent 语义粘合层（agent_glue_plan_0903 §5.2-5.3 / §7.2）
+    # =========================================================================
+
+    @staticmethod
+    def _glue_f1_degraded(
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+        reason: str = "",
+    ) -> SemanticGlueResult:
+        """F1 降级态：三件套全 unknown，composite 退回 tech_score（§7.2 F1-1~F1-6）"""
+        strengths = []
+        degraded_sectors = []
+        for name, detail, role_info in candidates:
+            code = getattr(detail, "code", "") or ""
+            tech = (detail.strength_score / 100.0) if detail else 0.0
+            strengths.append(GlueStrength(
+                board_code=code, strength=clip(tech, 0.0, 1.0),
+                confidence=0.3, evidence=f"F1 降级{':' + reason if reason else ''}",
+            ))
+            degraded_sectors.append(name)
+        return SemanticGlueResult(
+            degraded=True, degraded_sectors=degraded_sectors,
+            strengths=strengths,
+            warnings=[f"F1 降级: {reason}"] if reason else [],
+        )
+
+    @staticmethod
+    def _glue_strip_event(ev: CatalystEvent) -> dict:
+        """事件去冗余（§5.2）：剥除 4 个可由其他字段派生的字段。"""
+        return {
+            "event_id": ev.event_id,
+            "event_date": str(ev.event_date),
+            "event_type": ev.event_type,
+            "title": ev.title,
+            "sector": ev.sector,
+            "impact_level": ev.impact_level,
+            "direction": ev.direction,
+            "confidence": ev.confidence,
+            "source": ev.source,
+            "affected_sectors": ev.affected_sectors,
+            "source_news": ev.source_news,
+        }
+
+    @staticmethod
+    def _build_glue_prompt(
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+        news: NewsContext,
+        capital: CapitalContext,
+        sentiment: SentimentContext,
+    ) -> str:
+        """组装 Agent 输入 prompt（§5.2：只喂候选 + 去冗余事件 + 3d 资金流 + 瘦身情绪）"""
+        # ── 候选板块（受控词表）──
+        sector_lines = []
+        for name, detail, role_info in candidates:
+            code = getattr(detail, "code", "") or ""
+            tier = role_info.get("tier") or "-"
+            score = f"{detail.strength_score:.1f}" if detail else "-"
+            sector_lines.append(f"- {code} | {name} | {role_info.get('role', '?')} | tier={tier} | strength={score}")
+        sectors_text = "\n".join(sector_lines)
+
+        # ── 事件（去 4 个冗余字段）──
+        events = []
+        cal = getattr(news, "catalyst_calendar", None)
+        if cal and cal.events:
+            events = [AggregatorNode._glue_strip_event(ev) for ev in cal.events]
+
+        # ── 重大事件（§5.2 必喂：news.major_events）──
+        major_events = []
+        for me in (getattr(news, "major_events", None) or []):
+            major_events.append({
+                "event_type": getattr(me, "event_type", ""),
+                "title": getattr(me, "title", ""),
+                "impact_level": getattr(me, "impact_level", ""),
+                "sentiment": getattr(me, "sentiment", ""),
+                "affected_sectors": list(getattr(me, "affected_sectors", None) or []),
+                "lifecycle_state": getattr(me, "lifecycle_state", None),
+            })
+
+        # ── 资金流 3d（§5.2：全量嗂，不按位置截断）──
+        flow_3d = {}
+        sf = capital.evidence.sector_flow if capital and capital.evidence else None
+        if sf:
+            flow_3d = sf.get("sector_flow_all_3d") or {}
+
+        # ── 情绪热榜（瘦身：去 stock_code 和 associated_sectors）──
+        hot_list = []
+        for hs in (sentiment.hot_stocks if sentiment else []):
+            hot_list.append({
+                "stock_name": hs.stock_name,
+                "mention_count": hs.mention_count,
+                "sentiment": hs.sentiment,
+            })
+
+        # ── 情绪全局基调（§5.2 全喂，极小；供 Agent 判 sentiment_read）──
+        sentiment_global = {
+            "overall_sentiment": getattr(sentiment, "overall_sentiment", ""),
+            "sentiment_score": getattr(sentiment, "sentiment_score", 0.0),
+            "sentiment_stage": getattr(sentiment, "sentiment_stage", ""),
+            "forum_mood": getattr(sentiment, "forum_mood", ""),
+            "market_temperature": getattr(sentiment, "market_temperature", 0.5),
+            "fear_greed_index": getattr(sentiment, "fear_greed_index", 0.5),
+            "news_drift": getattr(sentiment, "news_drift", "neutral"),
+            "hot_topics": list(getattr(sentiment, "hot_topics", None) or [])[:20],
+        } if sentiment else {}
+
+        prompt = f"""你是一个 A 股板块语义分析引擎。请根据以下输入数据完成三个任务。
+
+## 候选板块（受控词表 — 你只能使用这些板块代码）
+{sectors_text}
+
+## 催化事件（{len(events)} 条）
+{json.dumps(events, ensure_ascii=False, default=str)}
+
+## 重大事件（{len(major_events)} 条）
+{json.dumps(major_events, ensure_ascii=False, default=str)}
+
+## 资金流 3d 日均（单位：亿元，全量 {len(flow_3d)} 板块）
+{json.dumps(flow_3d, ensure_ascii=False, default=str)}
+
+## 情绪全局基调
+{json.dumps(sentiment_global, ensure_ascii=False, default=str)}
+
+## 情绪热榜（{len(hot_list)} 只）
+{json.dumps(hot_list[:50], ensure_ascii=False)}
+
+## 任务
+
+### 任务1: relations — 事件→板块归属
+对每条有把握的事件，判断它影响哪个**候选板块**。要求：
+- board_code 必须从上方候选列表中选择
+- propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
+- strength: 事件对该板块的影响强度 (0-1)
+- confidence: 你对这个归属判断的置信度 (0-1)
+- 没把握的事件不要输出（不要编造）
+
+### 任务2: strengths — 板块强度评估
+对每个候选板块给出综合强度评估。要求：
+- strength: 综合强度 (0-1)，综合考虑技术面/资金面/消息面/情绪面
+- capital_read: 资金面判据 ("high"/"medium"/"low"/"unknown")
+- news_read: 消息面判据 ("high"/"medium"/"low"/"unknown")
+- sentiment_read: 情绪面判据 ("high"/"medium"/"low"/"unknown")
+- confidence: 你对这个评估的置信度 (0-1)
+- evidence: 一句话说明判断依据
+- 没有判据的维度必须写 "unknown"（不要写 "neutral"）
+
+### 任务3: families — 家族归属（仅对落「其他」的板块）
+以下家族名称是受控词表，你只能从中选择：
+AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消费 / 智能驾驶 / 金融 / 机器人 / 生态环保
+如果某板块不属于任何家族，family 写 "无归属"。
+
+## 输出格式（严格 JSON）
+```json
+{{
+  "relations": [
+    {{"event_id": "...", "board_code": "...", "strength": 0.8, "direction": "positive", "propagation_path": ["实体A", "实体B"], "confidence": 0.9}}
+  ],
+  "strengths": [
+    {{"board_code": "...", "strength": 0.7, "confidence": 0.8, "evidence": "...", "capital_read": "medium", "news_read": "high", "sentiment_read": "low"}}
+  ],
+  "families": [
+    {{"board_code": "...", "family": "AI软件"}}
+  ]
+}}
+```
+只输出 JSON，不要其他内容。"""
+        return prompt
+
+    @staticmethod
+    def _parse_glue_response(raw: str) -> dict:
+        """解析 Agent 输出的 JSON（复用 _parse_json 的 re+loads 策略）。"""
+        import re
+        m = re.search(r'\{[\s\S]*\}', raw)
+        if not m:
+            raise ValueError("无 JSON 对象")
+        return json.loads(m.group())
+
+    def _validate_glue(
+        self,
+        parsed: dict,
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+    ) -> SemanticGlueResult:
+        """校验 Agent 输出并构造 SemanticGlueResult（§7.2 S3-S5）。"""
+        code_to_name = {}
+        for name, detail, role_info in candidates:
+            code = getattr(detail, "code", "") or ""
+            code_to_name[code] = name
+        # 注：§5.3.3「仅对落『其他』的板块要家族」的范围约束由 prompt 任务3 交给 Agent
+        # 自行判定（非家族则返回「无归属」），此处不再预计算 unknown_family_sectors。
+
+        warnings: list[str] = []
+        controlled_set = set(CONTROLLED_FAMILIES) | {"无归属"}
+
+        # 容错转换：LLM 可能返回 null / 字符串 / 百分制，裸 float() 会抛异常击穿 F1 降级
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return d
+
+        def _path(v):
+            if isinstance(v, list):
+                return [str(x) for x in v]
+            if v is None:
+                return []
+            return [str(v)]
+
+        # ── relations ──
+        relations = []
+        for r in parsed.get("relations", []):
+            if not isinstance(r, dict):
+                continue
+            relations.append(GlueRelation(
+                event_id=str(r.get("event_id", "")),
+                board_code=str(r.get("board_code", "")),
+                strength=clip(_f(r.get("strength"), 0.0), 0, 1),
+                direction=str(r.get("direction", "positive")),
+                propagation_path=_path(r.get("propagation_path")),
+                confidence=clip(_f(r.get("confidence"), 0.5), 0, 1),
+            ))
+
+        # ── strengths ──
+        strengths = []
+        seen_codes = set()
+        for s in parsed.get("strengths", []):
+            if not isinstance(s, dict):
+                continue
+            code = str(s.get("board_code", ""))
+            raw_strength = _f(s.get("strength"), 0.0)
+            clipped = clip(raw_strength, 0, 1)
+            if abs(raw_strength - clipped) > 1e-6:
+                warnings.append(f"S5 strength 越界: {code}={raw_strength:.2f} → clip → {clipped:.2f}")
+            seen_codes.add(code)
+            strengths.append(GlueStrength(
+                board_code=code,
+                strength=clipped,
+                confidence=clip(_f(s.get("confidence"), 0.5), 0, 1),
+                evidence=str(s.get("evidence", "")),
+                capital_read=str(s.get("capital_read", "unknown")),
+                news_read=str(s.get("news_read", "unknown")),
+                sentiment_read=str(s.get("sentiment_read", "unknown")),
+            ))
+
+        # S3: 覆盖不全检测
+        all_codes = {getattr(d, "code", "") for _, d, _ in candidates if d}
+        missing_codes = all_codes - seen_codes - {""}
+        degraded_sectors = [code_to_name.get(c, c) for c in missing_codes]
+        if missing_codes:
+            warnings.append(f"S3 覆盖不全: {len(missing_codes)} 板块缺失 → 逐板块 F1")
+            # 补充缺失板块的 F1 降级条目
+            for name, detail, _ in candidates:
+                code = getattr(detail, "code", "") or ""
+                if code in missing_codes:
+                    tech = (detail.strength_score / 100.0) if detail else 0.0
+                    strengths.append(GlueStrength(
+                        board_code=code, strength=clip(tech, 0, 1),
+                        confidence=0.3, evidence="F1 降级: Agent 未覆盖",
+                        capital_read="unknown", news_read="unknown", sentiment_read="unknown",
+                    ))
+
+        # ── families ──
+        families = []
+        for f in parsed.get("families", []):
+            if not isinstance(f, dict):
+                continue
+            family_name = str(f.get("family", ""))
+            code = str(f.get("board_code", ""))
+            # S4: 家族名越界检测
+            if family_name not in controlled_set:
+                warnings.append(f"S4 家族名越界: {code_to_name.get(code, code)} → '{family_name}' 走兜底链")
+                continue
+            families.append(GlueFamily(board_code=code, family=family_name))
+
+        return SemanticGlueResult(
+            relations=relations, strengths=strengths, families=families,
+            degraded=bool(missing_codes),
+            degraded_sectors=degraded_sectors,
+            warnings=warnings,
+        )
+
+    async def _agent_semantic_glue(
+        self,
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+        news: NewsContext,
+        capital: CapitalContext,
+        sentiment: SentimentContext,
+        regime: MarketRegime,
+    ) -> SemanticGlueResult:
+        """Agent 语义粘合层（agent_glue_plan_0903 §5.2-5.3 / §7.2）
+
+        单次全量 LLM 调用，输出三类结构化结果：
+        - relations: 事件→板块关系图（替代 T5 映射）
+        - strengths: 板块强度/confidence/evidence（替代 Segment C/D/E）
+        - families: 「其他」板块的家族归属（受控词表）
+
+        F1 降级触发场景：S1-S7（§7.2）。降级态不影响现有行为（A4 阶段）。
+        """
+        # S6: 开关关闭 → 全量 F1
+        if not AGENT_SEMANTIC_GLUE_ENABLED:
+            logger.info("[Node 6] AGENT_SEMANTIC_GLUE_ENABLED=false，glue 全量 F1 降级")
+            return self._glue_f1_degraded(candidates, reason="开关关闭")
+
+        # replay_mode 跳过 LLM
+        if getattr(self, '_replay_mode', False):
+            logger.info("[Node 6] replay_mode: 跳过 _agent_semantic_glue")
+            return self._glue_f1_degraded(candidates, reason="replay_mode")
+
+        if not candidates:
+            return SemanticGlueResult(degraded=True)
+
+        # ── 组装 prompt ──
+        prompt = self._build_glue_prompt(candidates, news, capital, sentiment)
+
+        # ── LLM 调用（C1: temperature=0，D9 甲: 单次全量）──
+        try:
+            raw = await self._call_llm_async(
+                prompt,
+                temperature=0.0,
+                max_tokens=5000,
+                max_retries=3,
+                call_type="got_node6_semantic_glue",
+                timeout=float(LLM_CALL_TIMEOUT_S),
+            )
+        except Exception as e:
+            # S1: 调用失败
+            logger.warning(f"[Node 6] glue LLM 调用失败，F1 降级: {e}")
+            return self._glue_f1_degraded(candidates, reason=f"S1 调用失败: {e}")
+
+        if not raw or not raw.strip():
+            # S1: 空响应
+            logger.warning("[Node 6] glue LLM 返回空，F1 降级")
+            return self._glue_f1_degraded(candidates, reason="S1 空响应")
+
+        # ── 解析 JSON ──
+        try:
+            parsed = self._parse_glue_response(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            # S2: 解析失败
+            logger.warning(f"[Node 6] glue JSON 解析失败，F1 降级: {e}")
+            result = self._glue_f1_degraded(candidates, reason=f"S2 解析失败")
+            result.raw_response = raw
+            return result
+
+        # ── 校验 + 构造结果 ──
+        # Critical#2: _validate_glue 内部若因畸形结构抛异常，须走 F1 降级而非击穿整个 Node 6
+        try:
+            result = self._validate_glue(parsed, candidates)
+        except Exception as e:
+            logger.warning(f"[Node 6] glue 校验异常，F1 降级: {e}")
+            result = self._glue_f1_degraded(candidates, reason=f"S2 校验失败: {e}")
+            result.raw_response = raw
+            self._save_glue_result(result, prompt_bytes=len(prompt.encode("utf-8")))
+            return result
+        result.raw_response = raw
+
+        for w in result.warnings:
+            logger.warning(f"[Node 6] glue 校验: {w}")
+
+        # ── C2: 结果落盘 ──
+        self._save_glue_result(result, prompt_bytes=len(prompt.encode("utf-8")))
+
+        # ── 影子模式日志（A5：glue 照跑、结果只归档不生效）──
+        if AGENT_SEMANTIC_GLUE_SHADOW:
+            logger.info(
+                "[Node 6] 影子模式: glue 结果已归档但不影响 _build_sector_intel 行为"
+            )
+            # 影子对照：记录 glue strengths vs 规则 tech_score 的 diff（供 M4 指标）
+            self._log_shadow_comparison(result, candidates)
+
+        logger.info(
+            f"[Node 6] glue 完成: {len(result.relations)} 关系, "
+            f"{len(result.strengths)} 强度, {len(result.families)} 家族"
+            f"{', degraded=' + str(len(result.degraded_sectors)) if result.degraded else ''}"
+            f"{' [SHADOW]' if AGENT_SEMANTIC_GLUE_SHADOW else ''}"
+        )
+
+        return result
+
+    def _log_shadow_comparison(
+        self,
+        glue: SemanticGlueResult,
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+    ) -> None:
+        """影子对照：glue strength vs 规则 tech_score 的 diff（M4-b/M4-c 度量源）。
+
+        输出格式：[Node 6][SHADOW] 板块=glue_strength vs tech_score (delta=±0.XX)
+        """
+        if glue.degraded or not glue.strengths:
+            return
+        code_to_name = {}
+        code_to_tech = {}
+        for name, detail, _ in candidates:
+            code = getattr(detail, "code", "") or ""
+            code_to_name[code] = name
+            if detail:
+                code_to_tech[code] = detail.strength_score
+
+        diffs = []
+        for s in glue.strengths:
+            tech = code_to_tech.get(s.board_code)
+            if tech is None:
+                continue
+            glue_pct = s.strength * 100
+            delta = glue_pct - tech
+            if abs(delta) > 1.0:  # 只记录差异 > 1 分的
+                name = code_to_name.get(s.board_code, s.board_code)
+                diffs.append(f"{name}={glue_pct:.0f}vs{tech:.0f}(Δ{delta:+.0f})")
+
+        if diffs:
+            logger.info(f"[Node 6][SHADOW] 强度对照: {', '.join(diffs[:8])}")
+
+    def _save_glue_result(
+        self,
+        result: SemanticGlueResult,
+        prompt_bytes: Optional[int] = None,
+    ) -> None:
+        """C2: glue 结果落盘 → data/got_daily/{date}/agent_glue.json
+
+        replay_mode 下写入 _replay/ 子目录，避免污染真实归档（A1「不写归档」契约）。
+        """
+        import os
+        from pathlib import Path
+        replay = getattr(self, '_replay_mode', False)
+        today_str = date.today().strftime("%Y%m%d")
+        base = Path("data/got_daily") / today_str / ("_replay" if replay else "")
+        os.makedirs(base, exist_ok=True)
+        path = base / "agent_glue.json"
+        data = result.model_dump()
+        data.pop("raw_response", None)
+        if prompt_bytes is not None:
+            data["prompt_bytes"] = prompt_bytes
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        size = path.stat().st_size
+        if size > 90 * 1024:
+            logger.warning(f"[Node 6] glue 结果偏大: {path} ({size:,} B > 90KB)")
+        else:
+            logger.info(f"[Node 6] glue 结果已写入: {path} ({size:,} B)")
+
+    def _build_sector_intel(
+        self,
+        sector: SectorContext,
+        capital: CapitalContext,
+        news: NewsContext,
+        sentiment: SentimentContext,
+        ambush_pool: Optional[list[AmbushCandidate]] = None,
+        ambush_reservoir: Optional[list[AmbushReservoirEntry]] = None,
+        glue: Optional[SemanticGlueResult] = None,
+        candidates: Optional[list[tuple[str, Optional[SectorDetail], dict]]] = None,
+        member_to_group: Optional[dict] = None,
+    ) -> list[SectorIntel]:
+        """对每个候选板块做 4 维 mini GOT，标记主线/埋伏来源
+
+        分类拆分消费：主线/降温板块走 composite TOP-N（Node 2 尺子），
+        埋伏板块的 classification 由埋伏通道准入结果直接映射
+        （入正式池 → actionable，否则 caution），不再与主线争抢 TOP-N 名额。
+
+        glue: Agent 语义粘合层输出（A4 阶段接受但暂不使用，A6 正式消费）。
+        """
+
+        # Segment A: 候选收集（纯规则，抽出为独立方法供 glue 复用）
+        # Suggestion#18: run() 已为 glue 收集过候选，此处直接复用避免二次扫描
+        if candidates is None:
+            candidates, member_to_group = self._collect_sector_candidates(sector, ambush_pool)
         if not candidates:
             return []
 
@@ -1280,6 +1789,12 @@ class AggregatorNode:
         if not sectors:
             return sectors
 
+        # 回放模式跳过 LLM（纯规则回放，保证可复现性）
+        if getattr(self, '_replay_mode', False):
+            logger.info("[Node 6] replay_mode: 跳过 _llm_refine_sectors")
+            self._llm_refine_succeeded = False
+            return sectors
+
         # ── 切片：基础片（前 REFINE_TOP_N）+ 埋伏候选追加片 ──
         base = sectors[:REFINE_TOP_N]
         extra = [
@@ -1332,7 +1847,7 @@ class AggregatorNode:
   ]
 }}"""
 
-        raw_text = await self._call_llm_async(prompt, temperature=0.3, max_tokens=500)
+        raw_text = await self._call_llm_async(prompt, temperature=0.3, max_tokens=500, call_type="got_node6_refine")
 
         # 分类层级（数值越大越"好"），用于判断上调/下调
         CLASS_RANK = {
@@ -1381,9 +1896,11 @@ class AggregatorNode:
             if narrative and sectors:
                 sectors[0].reasoning = f"[全局] {narrative} | {sectors[0].reasoning}"
 
+            self._llm_refine_succeeded = True
             return sectors
         except Exception as e:
             logger.warning(f"[Node 6] LLM 精炼板块情报失败: {e}")
+            self._llm_refine_succeeded = False
             return sectors
 
     def _deterministic_catalyst_promotion(
@@ -1922,8 +2439,11 @@ class AggregatorNode:
                 ))
 
         # ── 决策 21: Agent 催化剂先行提名（单次批量调用，仅候选非空时触发）──
-        if nomination_queue:
+        if nomination_queue and not getattr(self, '_replay_mode', False):
             adopted = await self._llm_nominate_ambush(nomination_queue, regime, today)
+        elif nomination_queue:
+            logger.info("[Node 6] replay_mode: 跳过 _llm_nominate_ambush（%d 候选）", len(nomination_queue))
+            adopted = []
             for item in nomination_queue:
                 name = item["name"]
                 if name not in adopted:
@@ -2069,7 +2589,7 @@ class AggregatorNode:
         )
 
         try:
-            raw_text = await self._call_llm_async(prompt, temperature=0.2, max_tokens=400)
+            raw_text = await self._call_llm_async(prompt, temperature=0.2, max_tokens=400, call_type="got_node6_nominate")
             parsed = self._parse_json(raw_text)
             items = parsed if isinstance(parsed, list) else parsed.get("nominations", [])
             queue_names = {q["name"] for q in queue}
@@ -3262,10 +3782,12 @@ class AggregatorNode:
         capital: CapitalContext,
         news: NewsContext,
         sentiment: SentimentContext,
+        glue: Optional[SemanticGlueResult] = None,
     ) -> DataQuality:
         """汇总数据质量"""
         available = ["market", "sector", "capital", "news", "sentiment"]
         failed = []
+        missing = []
 
         if capital.status == "failed":
             failed.append("capital")
@@ -3277,9 +3799,55 @@ class AggregatorNode:
             failed.append("sentiment")
             available.remove("sentiment")
 
+        # ── 字段级完整性自检（agent_glue_plan_0903 §9 OPEN-5）──
+        # lifecycle 全部为 null → _is_hard_exclude 的 late_stage 分支空转
+        all_members = []
+        for group in (sector.active_mainline or []):
+            all_members.extend(group.members or [])
+        for detail in (sector.cooling_down or []):
+            all_members.append(detail)
+        if all_members:
+            lifecycle_null_count = sum(
+                1 for m in all_members
+                if getattr(m, "lifecycle", None) is None
+            )
+            if lifecycle_null_count == len(all_members):
+                missing.append("lifecycle_unavailable")
+
+        # catalyst_calendar 事件为空 → 消息面维度实质缺失
+        cal = getattr(news, "catalyst_calendar", None)
+        events = getattr(cal, "events", None) if cal else None
+        if events is not None and len(events) == 0:
+            missing.append("catalyst_events_empty")
+
+        # crowded_families 为空 → 组拥挤拦截无输入（P0-B B1/B3）
+        crowded = getattr(sector, "crowded_families", None)
+        if crowded is not None and len(crowded) == 0:
+            missing.append("crowded_families_empty")
+
+        # 资金流覆盖率（P0-B B1）：sector_flow_all 为空 → 规则侧资金维度全盲
+        sf = capital.evidence.sector_flow if capital and capital.evidence else None
+        sector_flow_all = sf.get("sector_flow_all") if sf else None
+        if not sector_flow_all:
+            missing.append("capital_sector_flow_empty")
+
+        # 情绪热榜关联（P0-B B1）：associated_sectors 全空 → 情绪→板块归属空转
+        hot_stocks = getattr(sentiment, "hot_stocks", None) or []
+        if hot_stocks:
+            all_empty = all(
+                not getattr(hs, "associated_sectors", None)
+                for hs in hot_stocks
+            )
+            if all_empty:
+                missing.append("hot_stocks_sectors_empty")
+
+        # F1-8: agent 语义粘合层降级 → glue 维度实质缺失（agent_glue_plan_0903 §7.2）
+        if glue is not None and glue.degraded:
+            missing.append("agent_semantic_glue")
+
         return DataQuality(
             available_fields=available,
-            missing_fields=[],
+            missing_fields=missing,
             fetch_failed_fields=failed,
         )
 
@@ -3417,7 +3985,18 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                             ],
                             temperature=0.3,
                             max_tokens=300,
+                            timeout=60.0,
                         )
+                        # 落库（成功/失败均记录 token 消耗）
+                        try:
+                            from src.storage import persist_llm_usage
+                            persist_llm_usage(
+                                usage=response.usage or {},
+                                model=response.model or "unknown",
+                                call_type="got_node6_arbitrate",
+                            )
+                        except Exception:
+                            pass
                         response_text = response.content if response else ""
                         if response_text:
                             break
@@ -3742,7 +4321,18 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                 [{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=300,
+                timeout=60.0,
             )
+            # 落库
+            try:
+                from src.storage import persist_llm_usage
+                persist_llm_usage(
+                    usage=response.usage or {},
+                    model=response.model or "unknown",
+                    call_type="got_node6_override",
+                )
+            except Exception:
+                pass
             result = AggregatorNode._parse_json(response.content or "")
             proposed = result.get("overridden_position_limit", market.position_limit)
             clamped = clip(proposed, market.position_limit - POSITION_LIMIT_DELTA, market.position_limit + POSITION_LIMIT_DELTA)
@@ -3829,20 +4419,37 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         temperature: float,
         max_tokens: int,
         max_retries: int = 3,
+        call_type: str = "got_node6_unknown",
+        timeout: float = 60.0,
     ) -> str:
-        """异步 LLM 调用"""
+        """异步 LLM 调用（统一 timeout + call_type 落库）"""
         from src.agent.llm_adapter import LLMToolAdapter
+        from src.got.catalyst_config import LLM_CALL_TIMEOUT_S
 
         adapter = LLMToolAdapter()
         messages = [{"role": "user", "content": prompt}]
+        effective_timeout = timeout if timeout > 0 else LLM_CALL_TIMEOUT_S
 
         for attempt in range(max_retries + 1):
             try:
                 response = await asyncio.to_thread(
                     adapter.call_text, messages,
                     temperature=temperature, max_tokens=max_tokens,
+                    timeout=effective_timeout,
                 )
                 content = response.content or ""
+                # 逐 attempt 落库：每次重试都是一次真实计费调用（含空响应也消耗 token），
+                # 故每个 attempt 各写一行以准确反映 token 花费；下游看板按 call_type 分组过滤
+                # （storage.get_llm_usage_summary 的 by_call_type），不会与既有口径混淆。
+                try:
+                    from src.storage import persist_llm_usage
+                    persist_llm_usage(
+                        usage=response.usage or {},
+                        model=response.model or "unknown",
+                        call_type=call_type,
+                    )
+                except Exception as persist_exc:
+                    logger.debug("[Node 6] persist_llm_usage 失败（已忽略）: %s", persist_exc)
                 if content.strip():
                     return content.strip()
                 logger.warning(f"[Node 6] LLM 空响应 (attempt {attempt + 1})")

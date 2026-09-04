@@ -357,6 +357,14 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--got-replay',
+        metavar='YYYYMMDD',
+        type=str,
+        default=None,
+        help='回放指定日期的 GOT Node 6 聚合（从归档加载 5 个 Context，不跑 Node 1-5，不写归档）'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -1305,6 +1313,104 @@ def main() -> int:
 
             except Exception as e:
                 logger.exception(f"[选股] 执行失败: {e}")
+                return 1
+
+        # 模式1.5b: GOT 回放（只跑 Node 6，从归档加载数据）
+        if args.got_replay:
+            logger.info("模式: GOT 回放 — 日期: %s", args.got_replay)
+            try:
+                import asyncio
+                from datetime import datetime as _dt
+                from src.got.archive import load_daily_contexts
+                from src.got.nodes.aggregator import AggregatorNode
+
+                replay_date = _dt.strptime(args.got_replay, "%Y%m%d").date()
+                contexts = load_daily_contexts(replay_date)
+
+                required_keys = {"market", "sector", "capital", "news", "sentiment"}
+                missing = required_keys - set(contexts.keys())
+                if missing:
+                    logger.error("[GOT Replay] 归档缺少必要 Context: %s", missing)
+                    return 1
+
+                aggregator = AggregatorNode(use_mock=False)
+                unified = asyncio.run(aggregator.run(
+                    market=contexts["market"],
+                    sector=contexts["sector"],
+                    capital=contexts["capital"],
+                    news=contexts["news"],
+                    sentiment=contexts["sentiment"],
+                    replay_mode=True,
+                ))
+
+                # 输出摘要
+                actionable = [s for s in unified.confirmed_sectors if s.classification == "actionable"]
+                logger.info(
+                    "[GOT Replay] 完成 — regime: %s, 信号: %s, "
+                    "仓位: %.0f%%, actionable: %d/%d",
+                    unified.market_regime.regime if unified.market_regime else "?",
+                    unified.unified_signal,
+                    unified.final_position_limit * 100,
+                    len(actionable), len(unified.confirmed_sectors),
+                )
+
+                # 回放结果写入 _replay/ 子目录
+                replay_dir = Path("data/got_daily") / args.got_replay / "_replay"
+                replay_dir.mkdir(parents=True, exist_ok=True)
+                replay_path = replay_dir / "unified.json"
+                replay_path.write_text(
+                    unified.model_dump_json(indent=2), encoding="utf-8"
+                )
+                logger.info("[GOT Replay] 结果已写入: %s", replay_path)
+
+                # 与归档对比
+                if "unified" in contexts:
+                    orig = contexts["unified"]
+                    print(f"\n{'='*60}")
+                    print(f"回放对比（{args.got_replay}）")
+                    print(f"{'='*60}")
+                    print(f"  原 confirmed_sectors: {len(orig.confirmed_sectors)} 条")
+                    print(f"  回放 confirmed_sectors: {len(unified.confirmed_sectors)} 条")
+                    orig_actionable = len([s for s in orig.confirmed_sectors if s.classification == "actionable"])
+                    print(f"  原 actionable: {orig_actionable}")
+                    print(f"  回放 actionable: {len(actionable)}")
+                    # 逐板块对比
+                    orig_map = {s.sector_name: s for s in orig.confirmed_sectors}
+                    replay_map = {s.sector_name: s for s in unified.confirmed_sectors}
+                    all_names = sorted(set(orig_map) | set(replay_map))
+                    diffs = 0
+                    for name in all_names:
+                        o = orig_map.get(name)
+                        r = replay_map.get(name)
+                        if o and r:
+                            # S19: §10.4 A1 要求 composite/classification/frame_group 全等
+                            if (
+                                o.composite_score != r.composite_score
+                                or o.classification != r.classification
+                                or o.frame_group != r.frame_group
+                            ):
+                                print(f"  ⚠ {name}: composite {o.composite_score:.1f}→{r.composite_score:.1f}, "
+                                      f"class {o.classification}→{r.classification}, "
+                                      f"frame_group {o.frame_group}→{r.frame_group}")
+                                diffs += 1
+                        elif o and not r:
+                            print(f"  ❌ {name}: 回放缺失")
+                            diffs += 1
+                        elif r and not o:
+                            print(f"  ➕ {name}: 回放多出")
+                            diffs += 1
+                    if diffs == 0:
+                        print("  ✅ 逐字段一致")
+                    else:
+                        print(f"  差异: {diffs} 个板块")
+
+                return 0
+
+            except FileNotFoundError as e:
+                logger.error("[GOT Replay] %s", e)
+                return 1
+            except Exception as e:
+                logger.exception("[GOT Replay] 执行失败: %s", e)
                 return 1
 
         # 模式1.6: GOT Phase 1 市场分析
