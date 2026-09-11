@@ -75,6 +75,14 @@ run.sh
 
 verify_*.py
 
+# 例外：0911 验收手具是四份修复方案（docs/got_layer_*_plan_0911.md §6）指定的红线载体，
+# 必须随仓库分发 —— 否则「可计数的验收红线」对任何 clone 本仓库的人都不存在。
+# 见 docs/got_impl_review_0911.md §R2.12
+!scripts/verify_common.py
+!scripts/verify_glue_metrics.py
+!scripts/verify_layer_b_consistency.py
+!scripts/verify_same_day_idempotency.py
+
 # ignore Claude workspace artifacts, but keep shared repo skills versioned
 .claude/*
 !.claude/skills/
