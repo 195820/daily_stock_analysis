@@ -45,6 +45,7 @@ from src.got.schemas import (
     SectorContext,
     SectorDetail,
 )
+from src.got.family_keywords import FAMILY_KEYWORDS, FAMILY_NAMES
 from src.storage import DatabaseManager, Node2SectorTrendRecord
 
 logger = logging.getLogger(__name__)
@@ -161,113 +162,9 @@ def decide_wave_days(
 
 
 # =============================================================================
-# 主线家族关键词（Node 2 v2：替代旧的 CONCEPT_UNIVERSE + _FRAME_GROUP_KEYWORDS）
-# ~10 个家族，每个板块名命中首个匹配的家族，未命中 → "其他"
+# 主线家族关键词已迁移至 src.got.family_keywords（B2 词表同源修复）
+# FAMILY_KEYWORDS / FAMILY_NAMES 从该模块 import（见文件顶部）
 # =============================================================================
-
-FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("AI硬件", [
-        "芯片", "半导体", "光刻", "EDA", "封装", "HBM", "高带宽内存", "存储芯片", "GPU",
-        "寒武纪", "RISC-V", "国产芯片", "算力", "光模块", "CPO",
-        "液冷", "PCB", "铜缆", "数据中心", "AIDC", "东数西算",
-        "华为算力", "华为海思",
-        # 新增：半导体上游
-        "元件", "电子化学品", "被动元件", "IGBT", "碳化硅", "氮化镓", "玻璃基板",
-    ]),
-    ("AI软件", [
-        "大模型", "AIGC", "多模态", "人工智能", "AI应用",
-        "智能体", "智算", "AI语料", "AI手机", "AI PC", "AI眼镜", "AIPC",
-        "消费电子", "混合现实", "OLED", "MiniLED", "折叠屏",
-        "苹果概念", "数据要素",
-        "鸿蒙", "信息安全",
-        # 新增：数字经济 + 新内容
-        "数字经济", "数字孪生", "国资云", "短剧游戏", "谷子经济",
-    ]),
-    ("机器人", [
-        "人形机器人", "人形机器", "具身智能", "机器人", "减速器", "丝杠", "伺服",
-        # 新增：核心部件
-        "机器人执行器", "执行器", "机器视觉",
-    ]),
-    ("智能驾驶", [
-        "自动驾驶", "智能驾驶", "智能座舱", "车路云", "激光雷达",
-        "无人驾驶", "车联网", "华为汽车",
-        # 新增：新能源充电
-        "高压快充", "换电",
-    ]),
-    ("新能源", [
-        "储能", "光伏", "锂电池", "氢能", "风电",
-        "电力", "特高压", "智能电网", "虚拟电厂",
-        "核电", "绿色电力",
-        # 新增：电池技术
-        "BC电池", "钙钛矿电", "TOPCon电", "钠电池", "固态电池",
-        "麒麟电池", "刀片电池", "动力电池回收", "换电",
-    ]),
-    # 2026-09-02 P2-4 新增：终结"其他"家族垃圾箱
-    # 复盘：0902 全部 96 板块中 64 个 frame_group="其他"，农业/环保链板块与
-    # 军贸概念被聚合成同一 MainlineGroup（组名取最强成员名，产生"军贸概念
-    # 包含风沙治理"的视觉错觉）。新增农业/生态环保族拆散该组；
-    # "军贸"归军工族。
-    #
-    # 位置要求：农业族必须早于医药族。_build_frame_group 按声明顺序短路匹配
-    # （首个命中的家族胜出），医药族含关键词"基因"，若农业在后则"转基因"
-    # 被误归医药（登海种业/苏垦农发实测）。已做夺占检测：农业词与前 5 族
-    # （AI硬件/AI软件/机器人/智能驾驶/新能源）无子串交集，前置安全。
-    ("农业", [
-        "粮食", "种业", "种子", "种植", "农林牧渔", "渔业", "水产品",
-        "养殖", "畜牧", "饲料", "土地流转", "乡村振兴", "供销社",
-        "草甘膦", "氮肥", "农药", "化肥", "虫害防治", "人造肉",
-        "生态农业", "农产品", "农业概念",
-        # 林业属农林牧渔一级行业（成分反查：永安林业/福建金森/平潭发展
-        # 均挂 林业Ⅲ + 农林牧渔）
-        "林业", "转基因", "水产养殖", "粮食种植", "农业种植",
-    ]),
-    ("医药", [
-        "创新药", "生物医药", "生物制药", "CXO", "医疗器械", "医药",
-        # 新增
-        "减肥药", "医美概念", "合成生物",
-        # 2026-08-20 补充：避免医药链共振时被拆散到"其他"组
-        "生物疫苗", "疫苗", "免疫治疗", "肝炎", "基因", "辅助生殖",
-        "幽门螺杆", "仿制药", "制药", "生物医药概念",
-    ]),
-    ("金融", [
-        "券商", "保险", "银行", "信托", "多元金融",
-        # 2026-09-02 补：工行/招行/宁波银行成分反查均有"金融地产风格"，
-        # 城商行Ⅲ 等三级行业名也需覆盖
-        "金融地产", "互联网金融", "城商行", "股份制银行", "国有大型银行",
-    ]),
-    ("周期资源", [
-        "黄金", "有色", "铜", "铝", "稀土", "锂矿",
-        "钢铁", "化工", "化纤",
-        # 新增：新材料
-        "PEEK", "碳纤维概", "石墨烯", "超导", "有机硅概",
-    ]),
-    ("军工", [
-        "军工", "航空", "船舶", "航运", "航天", "国防", "军民融合", "商业航天",
-        "军贸",  # 2026-09-02 P2-4：军贸概念归属军工，避免滞留"其他"组
-    ]),
-    ("消费", [
-        "白酒", "白酒概念", "食品", "家电", "旅游", "酒店", "零售",
-        # 新增
-        "养老概念", "养老金持", "宠物经济",
-    ]),
-    ("华为生态", [
-        "华为概念", "华为欧拉", "欧拉",
-    ]),
-    ("前沿科技", [
-        "可控核聚变", "量子科技",
-    ]),
-    ("生态环保", [
-        "环保", "风沙", "生态园林", "生态治理", "园林", "污水处理", "水务",
-        "水利建设", "土壤修复", "绿色生态", "碳交易", "碳中和", "节能",
-        "固废", "垃圾处理",
-        # 2026-09-02 补：成分反查（蒙草生态/铁汉生态/碧水源）所得真实板块名
-        "环境治理", "海绵城市", "垃圾分类", "新型城镇化", "水务及水治理",
-        "园林工程",
-    ]),
-]
-
-# 家族名快速查找集
-_FAMILY_NAMES = {name for name, _ in FAMILY_KEYWORDS}
 
 CONCEPT_UNIVERSE: dict[str, dict[str, list[str]]] = {
     # === AI 上游：芯片/半导体 ===
@@ -4348,8 +4245,10 @@ class SectorAnalysisNode:
 
     def _calc_strength_trend(self, session, sector_code: str, current_strength: float) -> dict:
         """计算强度趋势（最近 7 天）。"""
+        # A-P0-5: 排除当天记录，避免同日重跑重复追加 trajectory
         history = session.query(Node2SectorTrendRecord).filter(
-            Node2SectorTrendRecord.sector_code == sector_code
+            Node2SectorTrendRecord.sector_code == sector_code,
+            Node2SectorTrendRecord.tracking_date < date.today(),
         ).order_by(Node2SectorTrendRecord.tracking_date.desc()).limit(7).all()
 
         trajectory = [h.strength_score for h in reversed(history)] + [current_strength]
@@ -4373,8 +4272,10 @@ class SectorAnalysisNode:
         if not is_currently_mainline:
             return 0
 
+        # A-P0-5: 排除当天记录，避免同日重跑多计天数
         history = session.query(Node2SectorTrendRecord).filter(
-            Node2SectorTrendRecord.sector_code == sector_code
+            Node2SectorTrendRecord.sector_code == sector_code,
+            Node2SectorTrendRecord.tracking_date < date.today(),
         ).order_by(Node2SectorTrendRecord.tracking_date.desc()).all()
 
         days = 0
@@ -4390,8 +4291,10 @@ class SectorAnalysisNode:
         if not is_currently_ambush:
             return 0
 
+        # A-P0-5: 排除当天记录，避免同日重跑多计天数
         history = session.query(Node2SectorTrendRecord).filter(
-            Node2SectorTrendRecord.sector_code == sector_code
+            Node2SectorTrendRecord.sector_code == sector_code,
+            Node2SectorTrendRecord.tracking_date < date.today(),
         ).order_by(Node2SectorTrendRecord.tracking_date.desc()).all()
 
         days = 0

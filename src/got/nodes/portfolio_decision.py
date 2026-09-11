@@ -34,6 +34,14 @@ from src.got.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# ── 板块角色参数（模块级：_assess_risk 与 _allocate 共用，避免两处各写一份魔法值）──
+# 角色 → 仓位乘数（参与 sector_exposure_limits 公式；cooling 取最低档）
+ROLE_MULTIPLIER: dict[str, float] = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3}
+# 角色 → 单笔止损比例（埋伏 / 降温用更紧的止损）
+ROLE_STOP_LOSS: dict[str, float] = {"mainline": 0.07, "ambush": 0.05, "cooling": 0.05}
+# 角色未命中映射时的兜底（保持现状取主线；是否改为保守档属策略决策，见审核报告 R2.5）
+DEFAULT_SECTOR_ROLE = "mainline"
+
 
 class PortfolioDecisionNode:
     """Phase 2 统一决策节点"""
@@ -111,7 +119,7 @@ class PortfolioDecisionNode:
 
         # Step 3: 组合优化（规则 + LLM 混合）
         logger.info("[Phase 2] Step 3: 组合优化")
-        allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio)
+        allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio, unified_context)
 
         # Step 4: 轮动时机检测 + 家族拥挤检查（吃鱼身+高切低策略）
         logger.info("[Phase 2] Step 4: 轮动检测 + 拥挤检查")
@@ -134,11 +142,13 @@ class PortfolioDecisionNode:
             self._close_ambush_snapshots(ambush_exit_signals, portfolio)
 
         # P4：埋伏仓买入快照写入（买入催化剂快照）
-        ambush_buys = self._write_ambush_buy_snapshots(
+        ambush_buys, ambush_failed = self._write_ambush_buy_snapshots(
             allocation, unified_scoring, unified_context,
         )
         if ambush_buys:
             logger.info(f"[Phase 2] P4 埋伏买入快照: {len(ambush_buys)} 条")
+        if ambush_failed:
+            logger.warning(f"[Phase 2] P4 埋伏快照写入失败: {ambush_failed}")
 
         # LLM 精炼（生成可追溯的推理总结）
         reasoning = await self._llm_refinement(
@@ -152,6 +162,17 @@ class PortfolioDecisionNode:
         # 生成风险提示
         warnings = self._generate_warnings(allocation, risk_assessment, unified_context)
 
+        # D-P12: 落盘板块暴露绑定信息（口径声明 + 绑定次数）
+        sector_limits = risk_assessment.sector_exposure_limits
+        sum_limits = sum(sector_limits.values()) if sector_limits else 0.0
+        position_limit = risk_assessment.position_limit
+        sector_exposure_binding = {
+            "sum_limits": round(sum_limits, 4),
+            "position_limit": round(position_limit, 4),
+            "ratio": round(sum_limits / position_limit, 2) if position_limit > 0 else 0.0,
+            "note": "确信度乘数非敞口上限，只乘不除，与板块数无关",
+        }
+
         decision = PortfolioDecision(
             status="normal",
             risk_assessment=risk_assessment,
@@ -164,6 +185,7 @@ class PortfolioDecisionNode:
             crowding_warnings=crowding_warnings,
             ambush_exit_signals=ambush_exit_signals,
             mainline_endurance=getattr(unified_context, "mainline_endurance", []),
+            sector_exposure_binding=sector_exposure_binding,
         )
 
         logger.info(
@@ -208,13 +230,16 @@ class PortfolioDecisionNode:
         # 上限 = base × regime乘数 × role乘数 × confidence × 催化剂类型系数（P4）
         # 效果：bull+主线+高确信 ≈ 36%，bear+埋伏+binary ≈ 2%
         #
+        # D-P12: 本字段是「确信度乘数」非「敞口上限」。
+        # 公式 base × regime × role × conf × catalyst 只乘不除，与板块数无关。
+        # 实测 sum(limits) / position_limit 比值区间 1.92-7.81 倍。
+        #
         # 新版分类（TOP-N + conviction sizing）：
         # - actionable: 排名靠前，可选股（主线 100% 仓位，埋伏 50% 仓位）
         # - caution: 排名靠后但有潜力，缩小仓位（主线 30%，埋伏 15%）
         # - exclude: 不选股
         REGIME_MULTIPLIER = {"bull": 1.0, "transition": 0.65, "bear": 0.35}
-        # cooling（高位降温）最低档：防新买入（2026-08-17 状态机校准新增）
-        ROLE_MULTIPLIER = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3}
+        # ROLE_MULTIPLIER 已提为模块级常量（_allocate 同样需要，避免两处各写一份）
         # P4 催化剂类型系数（文献：Yee 2025, 二元事件限仓）
         # drift: 持有吃事件后漂移，给得大
         # fade: 事件日即退，持有期短
@@ -273,7 +298,7 @@ class PortfolioDecisionNode:
         constraint_reasoning += (
             f", 当前仓位 {current_position:.0%}, "
             f"止损线 {stop_loss:.0%}, "
-            f"风险预算 {risk_budget:.1%}"
+            f"单笔风险预算 {risk_budget:.1%}（派生展示值，当前未接线）"
         )
 
         return PortfolioRiskAssessment(
@@ -801,10 +826,11 @@ class PortfolioDecisionNode:
             adjustment -= 10.0
 
         # sentiment_check 调整
+        # D-P4 后缺失态为 'missing'：为保持「D-P4 零分数变更」，缺失仍按 low 同档扣分
         sentiment_check = intel.get('sentiment_check', 'medium')
         if sentiment_check == 'high':
             adjustment += 3.0
-        elif sentiment_check == 'low':
+        elif sentiment_check in ('low', 'missing'):
             adjustment -= 5.0
 
         # 应用调整，限制在 [0, 100]
@@ -1424,10 +1450,16 @@ class PortfolioDecisionNode:
 
         # 一级：匹配 confirmed_sectors
         matched = []
+        seen_canons = set()  # D-P7: 板块去重（同一板块不再占用多个名额）
         for board in boards:
             board_name = board.get("name", "") or board.get("board_name", "")
             canon = normalize_sector_name(board_name)
+            # D-P7 (P1-2): 对 canon 做 set 去重
+            # ⚠️ 注意：本项会改变 Top-3 的构成——去重后同一板块不再占用三个名额
+            if canon in seen_canons:
+                continue
             if canon in confirmed_map:
+                seen_canons.add(canon)
                 intel = confirmed_map[canon]
                 # 板块强度统一用综合口径（composite），不再用纯技术分（2026-08-18）
                 strength = intel.composite_score
@@ -1872,19 +1904,19 @@ class PortfolioDecisionNode:
         allocation: List[TradeAllocation],
         unified_scoring: List[UnifiedScoringResult],
         unified_context: UnifiedContext,
-    ) -> List[Dict[str, Any]]:
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
         """P4 埋伏仓买入快照写入
 
         对每个 buy 类型的 allocation：
         1. 从 unified_scoring 找到该 symbol 的板块
         2. 若板块在 ambush_pool 中 → 写入催化剂快照到 SQLite
-        3. 返回成功写入的快照列表（用于日志）
+        3. 返回 (成功写入的快照列表, 失败的 symbol 列表)
 
         降级：表不存在/写入失败 → 记录日志但不阻塞主流程。
         """
         buy_allocations = [a for a in allocation if a.action == "buy" and a.quantity_delta > 0]
         if not buy_allocations:
-            return []
+            return [], []
 
         # 构建 symbol → scoring 映射（获取板块名）
         symbol_to_scoring = {s.symbol: s for s in unified_scoring}
@@ -1895,6 +1927,7 @@ class PortfolioDecisionNode:
         }
 
         written = []
+        failed_symbols = []
         try:
             from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
             db = DatabaseManager()
@@ -1904,8 +1937,9 @@ class PortfolioDecisionNode:
                     if not scoring:
                         continue
 
-                    # 从 reasoning 中解析板块名（格式: "板块[XXX]强度XX..."）
-                    sector_name = self._extract_sector_from_reasoning(alloc.reasoning)
+                    # P2-4 修复：scoring.sector_name 替代 reasoning 反解析
+                    # （候选侧 reasoning 无 "板块[XXX]" 格式，无法从中提取板块名）
+                    sector_name = scoring.sector_name if scoring else ""
                     if not sector_name or sector_name not in ambush_pool_map:
                         continue
 
@@ -1913,20 +1947,39 @@ class PortfolioDecisionNode:
                     today = date.today()
                     entry_price = alloc.price_range[0] if alloc.price_range else 0.0
 
-                    record = AmbushPositionSnapshotRecord(
-                        symbol=alloc.symbol,
-                        sector_name=sector_name,
-                        category_tag=candidate.category_tag,
-                        catalyst_event_id=candidate.events[0] if candidate.events else "",
-                        catalyst_event_title=candidate.events[0] if candidate.events else "",
-                        catalyst_event_date=candidate.top_event_date,
-                        impact_level=candidate.top_event_level,
-                        consensus_expectation="",
-                        entry_date=today,
-                        entry_price=entry_price,
-                        is_open=True,
-                    )
-                    session.merge(record)
+                    # A-P0-6: 按自然键 (symbol, entry_date) 查询，命中则更新，未命中才插入
+                    existing = session.query(AmbushPositionSnapshotRecord).filter(
+                        AmbushPositionSnapshotRecord.symbol == alloc.symbol,
+                        AmbushPositionSnapshotRecord.entry_date == today,
+                    ).first()
+
+                    if existing:
+                        # 同日重跑：更新快照字段（末版为准）
+                        existing.sector_name = sector_name
+                        existing.category_tag = candidate.category_tag
+                        existing.catalyst_event_id = candidate.events[0] if candidate.events else ""
+                        existing.catalyst_event_title = candidate.events[0] if candidate.events else ""
+                        existing.catalyst_event_date = candidate.top_event_date
+                        existing.impact_level = candidate.top_event_level
+                        existing.entry_price = entry_price
+                        existing.is_open = True
+                        logger.info(f"[P4] 埋伏快照已更新（同日重跑）: {alloc.symbol} @ {today}")
+                    else:
+                        record = AmbushPositionSnapshotRecord(
+                            symbol=alloc.symbol,
+                            sector_name=sector_name,
+                            category_tag=candidate.category_tag,
+                            catalyst_event_id=candidate.events[0] if candidate.events else "",
+                            catalyst_event_title=candidate.events[0] if candidate.events else "",
+                            catalyst_event_date=candidate.top_event_date,
+                            impact_level=candidate.top_event_level,
+                            consensus_expectation="",
+                            entry_date=today,
+                            entry_price=entry_price,
+                            is_open=True,
+                        )
+                        session.add(record)
+
                     written.append({
                         "symbol": alloc.symbol,
                         "sector": sector_name,
@@ -1937,16 +1990,13 @@ class PortfolioDecisionNode:
                 session.commit()
 
         except Exception as e:
-            logger.warning(f"[P4] 埋伏买入快照写入失败（降级跳过）: {e}")
+            # 快照写入是非关键记录，降级运行：记录失败 symbol，不中断 Phase 2
+            logger.warning(f"[P4] 埋伏买入快照写入失败（降级，不阻塞 Phase 2）: {e}")
+            for alloc in buy_allocations:
+                if not any(w["symbol"] == alloc.symbol for w in written):
+                    failed_symbols.append(alloc.symbol)
 
-        return written
-
-    @staticmethod
-    def _extract_sector_from_reasoning(reasoning: str) -> str:
-        """从 reasoning 字符串中提取板块名（格式: 板块[XXX]强度...）"""
-        import re
-        match = re.search(r'板块\[([^\]]+)\]', reasoning)
-        return match.group(1) if match else ""
+        return written, failed_symbols
 
     def _close_ambush_snapshots(
         self,
@@ -2652,6 +2702,7 @@ verdict 含义：
         unified_scoring: List[UnifiedScoringResult],
         risk: PortfolioRiskAssessment,
         portfolio: Dict[str, Any],
+        unified_context: UnifiedContext = None,
     ) -> tuple[list[TradeAllocation], list[UnifiedScoringResult]]:
         """规则驱动的仓位分配（支持高切低轮动策略）。
 
@@ -2780,10 +2831,19 @@ verdict 含义：
             candidates = buy_candidates
 
             # 差异化仓位分配（参考 Garrone 2026 Structural Optionality Budget）
-            # 通过 sector_exposure_limits 推断角色：上限高=主线，上限低=埋伏
+            # D-P13: 用 sector_role（来自 unified_context.confirmed_sectors）判定分支。
+            # 未命中映射时 fallback 为 "mainline"（反推逻辑已在 D-P13 移除，
+            # sector_exposure_limits 仅作参考值落盘，不再参与分支判定）
             sector_limits = risk.sector_exposure_limits
-            max_limit = max(sector_limits.values()) if sector_limits else 0.40
-            role_threshold = max_limit * 0.5  # 低于主线上限50%的视为埋伏
+
+            # 构建 sector_name → sector_role 映射（D-P13 完整实现）
+            sector_role_map = {}
+            if unified_context and unified_context.confirmed_sectors:
+                sector_role_map = {
+                    s.sector_name: s.sector_role
+                    for s in unified_context.confirmed_sectors
+                    if s.sector_name
+                }
 
             # 每只候选股的基础预算
             actual_buy_count = min(len(candidates), 3)
@@ -2796,18 +2856,35 @@ verdict 含义：
                     logger.warning(f"[Phase 2] 无法获取 {score.symbol} 价格，跳过")
                     continue
 
-                # 根据板块暴露上限推断角色，调整预算（参考 Conviction-Tier: 埋伏=中确信→¼ Kelly）
-                stock_limit = sector_limits.get(score.reasoning.split('[')[0].strip() if '[' in score.reasoning else "", 0.20)
-                if stock_limit < role_threshold and stock_limit > 0:
-                    per_stock_budget = base_budget * 0.55  # 埋伏仓缩小 45%
-                    stop_loss_pct = 0.05  # 埋伏仓更紧止损（-5%）
-                else:
-                    per_stock_budget = base_budget
-                    stop_loss_pct = 0.07  # 主线仓标准止损（-7%）
+                # D-P11 + D-P13: 使用 sector_role 判定分支（不再用 limit 反推）。
+                # 角色未命中映射时取 DEFAULT_SECTOR_ROLE（主线）。
+                sector_role = (
+                    sector_role_map.get(score.sector_name, DEFAULT_SECTOR_ROLE)
+                    if score.sector_name else DEFAULT_SECTOR_ROLE
+                )
+                sector_limit = sector_limits.get(score.sector_name, 0.20) if score.sector_name else 0.20
+
+                # 修正（2026-09-11）：cooling 此前落入 else 拿到主线仓位与止损，与本项目
+                # 「cooling 最低档」的设计意图相反 —— ROLE_MULTIPLIER["cooling"] 从未对任何
+                # 仓位生效（sector_exposure_limits 全仓无执行消费者，仅用于落盘记录）。
+                role_budget_m = ROLE_MULTIPLIER.get(sector_role, ROLE_MULTIPLIER[DEFAULT_SECTOR_ROLE])
+                stop_loss_pct = ROLE_STOP_LOSS.get(sector_role, ROLE_STOP_LOSS[DEFAULT_SECTOR_ROLE])
+                per_stock_budget = base_budget * role_budget_m
+                branch = sector_role
 
                 quantity = int(per_stock_budget / estimated_price / 100) * 100
 
                 if quantity > 0:
+                    # D-P11: 落盘分支走向，使行为变更可见。
+                    # 判据是 sector_role（D-P13），不再由 limit 反推；
+                    # stock_limit 仅作参考值（未命中 sector_limits 时为 0.20）
+                    sector_limit_detail = {
+                        "sector_name": score.sector_name,
+                        "sector_role": sector_role,
+                        "stock_limit": sector_limit,
+                        "branch": branch,
+                    }
+
                     allocations.append(
                         TradeAllocation(
                             symbol=score.symbol,
@@ -2826,6 +2903,7 @@ verdict 含义：
                             risk_reward_ratio=round(0.10 / stop_loss_pct, 2),
                             confidence=score.confidence,
                             reasoning=score.reasoning,
+                            sector_limit_detail=sector_limit_detail,
                         )
                     )
 

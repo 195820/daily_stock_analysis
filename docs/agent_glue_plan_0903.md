@@ -974,14 +974,25 @@ glue 是 Node 6 内部改造（`aggregator.py` + 一次 `call_text`），**不�
 
 ### 8.1 六条可计数指标
 
+> **⚠️ 口径修正（2026-09-11 C 层修复）**：M1/M6 原表基线取自规则侧字段，但影子期 glue「接受但不使用」
+> （`aggregator.py` 的 `status` 字段标记），规则侧字段不因 glue 而变 ⇒ M1 恒 3.1%、M6 恒 65.6%，
+> 红线永不达成（死锁）。C 层修正：M1/M6 改为 **glue 侧**度量。详见 `got_layer_c_plan_0911.md` §1。
+>
+> **⚠️ 二次修正（2026-09-11 复审）**：上一版修正**把字段路径与数值都写错了** ——
+> ① `agent_glue.json` 的 `relations[]` 实际键为 `[event_id, board_code, strength, direction, propagation_path, confidence]`，
+> **既无 `news_check` 也无 `family`**；glue 侧的正确路径是 **`strengths[].news_read`** 与 **`families[].family`**。
+> ② 上一版填的 `3.1%` / `65.6%` 是**规则侧恒值**，却标成「glue 侧」，**同一行内自相矛盾**；
+> glue 侧实测为 **34.4%** / **96.9%**。
+> ③ 「M1'/M6' 的命名与 C-P6/C-P7 的最终定义（M1 改 glue 侧、M6 改「其他」回收率 = 90.9%）如何对齐」**尚待落地**。
+
 | # | 指标 | 0903 基线 | 转正红线 | 数据源 | 当前可度量 |
 |---|---|---|---|---|---|
-| M1 | **消息面非中性率**：`news_check != "neutral"` 的候选占比 | **0/24 = 0%** | **≥ 60%** | `unified.json` `confirmed_sectors[].news_check` | ✅ |
+| M1' | **glue 消息面非中性率**：glue `strengths[]` 中 `news_read` 非 `low`/`unknown` 的候选占比 | **11/32 = 34.4%**（0910 实测，glue 侧）<br>规则侧对照 = 1/32 = 3.1% | **≥ 60%** | `agent_glue.json` **`strengths[].news_read`**；规则侧对照取 `unified.json` `confirmed_sectors[].news_check` | ✅ |
 | M2 | **事件归属命中率**：至少关联到 1 条 catalyst event 的候选占比 | **3/24 = 12.5%**（精确同名：AIGC概念/汽车整车/短剧游戏） | **≥ 70%** | `agent_glue.json` `relations` × `news.json` `events` | ⚠️ 需 ground truth |
 | M3 | **误配率**：人工抽查 glue 归属中「该事件与该板块无实质传导关系」的占比 | 旧机制 **11/15 = 73%**（L931 自述） | **≤ 15%** | 人工抽查（每日 24 候选全量，≤10 分钟） | ⚠️ 人工 |
-| M4 | **排序差异度**：见下方三条相关系数 | — | 见下表 | 同日产出新旧两份 composite | ✅（影子期双跑） |
+| M4 | **排序差异度**：见下方三条相关系数（⚠️ 前提：规则侧 tech/composite 未退化，否则 ρ 无诊断力） | — | 见下表 | 同日产出新旧两份 composite | ✅（影子期双跑） |
 | M5 | **F1 降级率**：触发 §7.2 S1-S5 任一场景的交易日占比 | —（无 glue） | **≤ 10%**（10 日中至多 1 日） | 依赖 C3 `call_type` 落库 | 🔴 **当前不可** |
-| M6 | **家族覆盖率**：候选中 `frame_group != "其他"` 的占比 | **13/24 = 54.2%**（落「其他」11 个） | **≥ 80%** | `unified.json` `confirmed_sectors[].frame_group` | ✅ |
+| M6' | **glue 家族覆盖率**：glue `families[]` 中 `family` 非「无归属」的占比 | **31/32 = 96.9%**（0910 实测，glue 侧）<br>规则侧对照 = 21/32 = 65.6%<br>（C-P7 另有「其他」回收率 = 10/11 = 90.9%） | **≥ 80%** | `agent_glue.json` **`families[].family`**；规则侧对照取 `unified.json` `confirmed_sectors[].frame_group` | ✅ |
 
 #### M4 拆成三条相关系数（单一 Spearman 无诊断力）
 

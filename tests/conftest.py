@@ -16,6 +16,7 @@ from warnings import warn
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
@@ -234,3 +235,15 @@ class _ThreadlessTestClient:
 
 fastapi.testclient.TestClient = _ThreadlessTestClient
 starlette.testclient.TestClient = _ThreadlessTestClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_glue_archive_root(tmp_path, monkeypatch):
+    """把 GOT glue 落盘根目录重定向到 tmp_path。
+
+    _agent_semantic_glue 的 8 条 return 路径全部调用 _save_glue_result，
+    若仍指向生产 data/got_daily/ 会用夹具数据覆盖当天真实影子样本（末版为准）。
+    """
+    from src.got.nodes import aggregator
+
+    monkeypatch.setattr(aggregator, "GLUE_ARCHIVE_ROOT", tmp_path / "got_daily")

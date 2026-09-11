@@ -102,8 +102,8 @@ class TestControlledFamilies(unittest.TestCase):
     """测试受控词表定义。"""
 
     def test_twelve_plus_one(self):
-        """12 个真实家族 + '无归属' = 13 个合法值。"""
-        self.assertEqual(len(CONTROLLED_FAMILIES), 12)
+        """14 个真实家族 + '无归属' = 15 个合法值（B2 修复：华为生态/前沿科技加入）。"""
+        self.assertEqual(len(CONTROLLED_FAMILIES), 14)
         self.assertIn("AI软件", CONTROLLED_FAMILIES)
         self.assertIn("金融", CONTROLLED_FAMILIES)
         self.assertIn("消费", CONTROLLED_FAMILIES)
@@ -320,7 +320,7 @@ class TestAgentSemanticGlueDispatch(unittest.TestCase):
         import asyncio
         result = asyncio.run(
             self.node._agent_semantic_glue(
-                self.candidates, self.news, self.capital, self.sentiment, self.regime,
+                self.candidates, self.news, self.capital, self.sentiment,
             )
         )
         self.assertTrue(result.degraded)
@@ -337,7 +337,7 @@ class TestAgentSemanticGlueDispatch(unittest.TestCase):
         try:
             result = asyncio.run(
                 self.node._agent_semantic_glue(
-                    self.candidates, self.news, self.capital, self.sentiment, self.regime,
+                    self.candidates, self.news, self.capital, self.sentiment,
                 )
             )
             self.assertTrue(result.degraded)
@@ -356,7 +356,7 @@ class TestAgentSemanticGlueDispatch(unittest.TestCase):
         try:
             result = asyncio.run(
                 self.node._agent_semantic_glue(
-                    [], self.news, self.capital, self.sentiment, self.regime,
+                    [], self.news, self.capital, self.sentiment,
                 )
             )
             self.assertTrue(result.degraded)
@@ -392,8 +392,7 @@ class TestGlueReplay0903(unittest.TestCase):
 
         import asyncio
         glue = asyncio.run(
-            node._agent_semantic_glue(candidates, news, capital, sentiment,
-                                       contexts.get("market"))
+            node._agent_semantic_glue(candidates, news, capital, sentiment)
         )
 
         # glue 降级（replay_mode）

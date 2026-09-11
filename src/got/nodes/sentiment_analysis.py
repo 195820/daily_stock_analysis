@@ -18,6 +18,7 @@ Node 5: 情绪面分析节点
 import asyncio
 import logging
 import pathlib
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from data_provider.base import DataFetcherManager
@@ -40,6 +41,14 @@ logger = logging.getLogger(__name__)
 
 XUEQIU_TOP_N = 50  # 过滤后取前 50 只热门股（覆盖全行业主要板块）
 XUEQIU_TIMEOUT = 90  # 雪球 API 较慢，单次超时 90 秒
+
+# 东财关注指数存储缩放（历史遗留：原值约 0~100，存储时 ×1000）
+EM_ATTENTION_SCALE = 1000
+
+# 热点股热度口径（D-P8 mention_source）：东财为「关注指数×1000」，雪球为 total_attention 原值。
+# 渲染时必须按来源分支，否则雪球降级日会把原值当成东财口径并错误缩小 1000 倍。
+MENTION_SOURCE_EASTMONEY = "eastmoney_attention_index"
+MENTION_SOURCE_XUEQIU = "xueqiu_attention"
 
 # 行业关键词（覆盖 A 股主要板块，宽松过滤以反映散户真实关注分布）
 TECH_GROWTH_KEYWORDS = frozenset({
@@ -131,7 +140,7 @@ class SentimentAnalysisNode:
 
         # Step 2: 计算情绪评分
         sentiment_score = self._calculate_sentiment_score(
-            em_data, breadth_data, nga_data, search_data, xueqiu_data, detail_data,
+            em_data, breadth_data, nga_data, search_data, detail_data,
         )
         sentiment_score = max(-1.0, min(1.0, sentiment_score))
 
@@ -555,17 +564,17 @@ class SentimentAnalysisNode:
         }
 
     # =================================================================
-    # Step 2: 情绪评分（6 维置信度加权）
+    # Step 2: 情绪评分（5 维置信度加权）
     # =================================================================
 
     # 各维度基础权重 + 置信度（参考 fffinstill Fear & Greed Index）
+    # D-P14: 删除死配置 momentum（唯一没被读的维度）
     _DIMENSION_CONFIG = {
         "eastmoney":  {"weight": 0.25, "confidence": 0.90},
         "breadth":    {"weight": 0.15, "confidence": 0.85},
         "nga":        {"weight": 0.20, "confidence": 0.80},
         "news":       {"weight": 0.15, "confidence": 0.70},
         "detail":     {"weight": 0.10, "confidence": 0.60},
-        "momentum":   {"weight": 0.15, "confidence": 0.80},
     }
 
     @classmethod
@@ -575,11 +584,11 @@ class SentimentAnalysisNode:
         breadth: Dict,
         nga: Dict,
         search: Dict,
-        xueqiu: Dict,
         detail_data: Dict,
     ) -> float:
-        """6 维置信度加权情绪评分（-1 ~ 1）。
+        """5 维置信度加权情绪评分（-1 ~ 1）。
 
+        D-P14: 删除死参数 xueqiu（在 70 行函数体里只出现在签名，从未被读取）。
         缺失维度时有效权重自动重分配（乘以置信度后归一化）。
         """
         scores: list[float] = []
@@ -787,9 +796,13 @@ class SentimentAnalysisNode:
                     hot_stocks.append(HotStock(
                         stock_code=str(row.get("代码", "")),
                         stock_name=str(row.get("名称", "")),
-                        mention_count=int(float(row.get("关注指数", 0) or 0) * 1000),
+                    # ⚠️ B6: 关注指数原值约 0~100，×1000 为历史遗留缩放。
+                    # 存储值不改，展示由 _format_mention_display 按 mention_source 分支渲染。
+                    # 后续考虑改为 attention_index 存原值（OPEN-B4）。
+                    mention_count=int(float(row.get("关注指数", 0) or 0) * EM_ATTENTION_SCALE),
                         sentiment=sentiment,
                         associated_sectors=[],
+                        mention_source=MENTION_SOURCE_EASTMONEY,  # D-P8: 口径声明
                     ))
                 if hot_stocks:
                     return hot_stocks
@@ -820,9 +833,21 @@ class SentimentAnalysisNode:
                 mention_count=s["total_attention"],
                 sentiment="neutral",  # 雪球无情绪数据，不再硬编码 positive
                 associated_sectors=[],
+                mention_source=MENTION_SOURCE_XUEQIU,  # D-P8: 口径声明
             )
             for s in sorted_stocks
         ]
+
+    @staticmethod
+    def _format_mention_display(stock: HotStock) -> str:
+        """按 mention_source 渲染热度文本，保证口径与单位同实际数据源一致。"""
+        if stock.mention_source == MENTION_SOURCE_EASTMONEY:
+            # 东财存储值已 ×1000，展示时还原为关注指数原值
+            return f"东财关注指数{stock.mention_count / EM_ATTENTION_SCALE:.1f}"
+        if stock.mention_source == MENTION_SOURCE_XUEQIU:
+            # 雪球为 total_attention 原值，禁止缩放
+            return f"雪球热度{stock.mention_count}"
+        return f"热度{stock.mention_count}"
 
     @staticmethod
     def _calculate_market_temperature(breadth: Dict) -> float:
@@ -933,11 +958,10 @@ class SentimentAnalysisNode:
         if not daily_dir.exists():
             return 0.0
 
-        # 按日期倒序加载最近 10 天的 sentiment_score
+        # 按日期倒序加载最近 10 天的 sentiment_score（A-P0-1 统一入口，排除当天）
+        from src.got.archive import list_archive_dirs
         scores = []
-        for date_dir in sorted(daily_dir.iterdir(), reverse=True)[:10]:
-            if not date_dir.is_dir():
-                continue
+        for date_dir in list_archive_dirs(reverse=True, before=date.today(), base_dir=daily_dir)[:10]:
             sent_file = date_dir / "sentiment.json"
             if not sent_file.exists():
                 continue
@@ -1181,7 +1205,7 @@ class SentimentAnalysisNode:
         """LLM 生成 reasoning + hot_topics，失败时规则降级。"""
         # 构建摘要
         top_stocks_text = "、".join(
-            f"{s.stock_name}({s.sentiment[0].upper()},{s.mention_count})"
+            f"{s.stock_name}({s.sentiment[0].upper()},{self._format_mention_display(s)})"
             for s in hot_stocks[:8]
         ) or "无"
 
@@ -1204,7 +1228,7 @@ class SentimentAnalysisNode:
             nga_stocks = nga.get("hot_stocks", [])
             if nga_stocks:
                 nga_text = "、".join(
-                    f"{s['name']}({s['mention_count']}提)" for s in nga_stocks[:8]
+                    f"{s['name']}(NGA提及{s['mention_count']})" for s in nga_stocks[:8]
                 )
             nga_sentiment = nga.get("market_sentiment", 0)
             nga_topic_list = nga.get("hot_topics", [])
@@ -1230,7 +1254,7 @@ class SentimentAnalysisNode:
             f"反身性阶段：{stage}\n"
             f"论坛情绪：{mood}\n"
             f"{dispersion_text}\n\n"
-            f"热门股（P=正面/N=负面/N=中性）：{top_stocks_text}\n"
+            f"热门股（P=正面/N=负面/中=中性）：{top_stocks_text}\n"
             f"市场宽度：{breadth_text or '无数据'}\n"
             f"舆情搜索：{search_text or '无数据'}\n"
             f"NGA论坛：{nga_text or '无数据'}\n\n"

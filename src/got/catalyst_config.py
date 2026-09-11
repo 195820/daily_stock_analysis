@@ -152,6 +152,9 @@ RESERVOIR_EXPIRY_DAYS = 10           # 蓄水池驻留 ≥N 交易日 → 自动
 RESERVOIR_PROMOTION_MIN_DAYS = 2     # TODO: 待校准 — 升格最低驻留天数（太短无意义）
 RESERVOIR_MAX_SIZE = 15              # 蓄水池容量上限（超出按优先级驱逐最老条目）
 
+# D-P3: 正式池水位目标（用于归档落盘，使偏差可见；不改任何阈值）
+AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 天 0–2，下界 2 为略高于现状的最小要求）
+
 # =============================================================================
 # 影子模式开关（Track B agent 增强）
 # =============================================================================
@@ -177,6 +180,8 @@ REFINE_MAX_SECTORS = 20              # 总量上限（基础片 + 埋伏候选�
 LLM_CALL_TIMEOUT_S = 60              # 单次 LLM 调用超时（秒）；glue 单次 max_tokens≈5000 需留足
 AGENT_SEMANTIC_GLUE_ENABLED = os.environ.get("AGENT_SEMANTIC_GLUE_ENABLED", "false").lower() == "true"
 AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "true").lower() == "true"
+# C-P3: replay_mode 下允许运行 glue（默认关闭，保持 0903 A1「不产生任何持久化副作用」契约）
+AGENT_SEMANTIC_GLUE_IN_REPLAY = os.environ.get("AGENT_SEMANTIC_GLUE_IN_REPLAY", "false").lower() == "true"
 
 # =============================================================================
 # §15 审查层配置（T1 候选股终审 + T1-H 持仓审查）

@@ -1054,12 +1054,9 @@ class CatalystCalendarBuilder:
         from pathlib import Path
         names: Set[str] = set()
         try:
-            archive_dir = Path("data/got_daily")
-            if not archive_dir.exists():
-                return names
-            date_dirs = sorted(
-                (d for d in archive_dir.iterdir() if d.is_dir()), reverse=True
-            )
+            # A-P0-1 统一入口，排除当天
+            from src.got.archive import list_archive_dirs
+            date_dirs = list_archive_dirs(reverse=True, before=date.today())
             for d in date_dirs:
                 unified_path = d / "unified.json"
                 if not unified_path.exists():

@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,7 @@ from src.got.schemas import (
     SentimentContext,
     UnifiedContext,
 )
+from src.got.persistence import list_archive_dirs, load_regime_raw_segment_days  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,9 @@ REASONING_NODE_TITLES = {
 
 # 节点遍历顺序
 NODE_ORDER = ("market", "sector", "capital", "news", "sentiment", "unified")
+
+# A-P0-1: 归档目录遍历的唯一权威实现位于 persistence（7 个 loader 共用），
+# 此处仅重导出供既有的 `from src.got.archive import list_archive_dirs` 调用方使用。
 
 
 def archive_daily_run(
@@ -88,21 +93,27 @@ def archive_daily_run(
     run_date = run_date or date.today()
     base_dir = base_dir or _default_base_dir()
     archive_dir = base_dir / run_date.strftime("%Y%m%d")
+    tmp_dir = archive_dir.with_suffix(".tmp")
+    old_dir = archive_dir.with_suffix(".old")
 
-    # 当天重跑：清理旧档，确保数据全部覆盖（不残留旧版 JSON/reasoning）
-    # 但保留 agent_glue.json（A6 影子模式输出）和 _replay/ 目录（回放模式）
+    # ① 写入旁路目录 .tmp（避免「整个写入期」窗口被并发读到半成品）
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # ② 替换前搬运：目标目录的 agent_glue.json 和 _replay/ 搬进 tmp
+    # agent_glue.json 是当日影子结论，按 D-1「末版为准」必须随本轮覆盖；
+    # 但 aggregator._save_glue_result 在归档前已直接写目标目录，故需搬运。
+    # _replay/ 是回放模式的旁路产物，保留语义不变。
     if archive_dir.exists():
-        import shutil
-        preserved_files = {"agent_glue.json"}
-        preserved_dirs = {"_replay"}
-        for item in archive_dir.iterdir():
-            if item.is_file() and item.name not in preserved_files:
-                item.unlink()
-            elif item.is_dir() and item.name not in preserved_dirs:
-                shutil.rmtree(item)
-        logger.info("[GOT Archive] 清理旧档: %s", archive_dir)
-
-    archive_dir.mkdir(parents=True, exist_ok=True)
+        glue_src = archive_dir / "agent_glue.json"
+        if glue_src.exists():
+            glue_dst = tmp_dir / "agent_glue.json"
+            shutil.move(str(glue_src), str(glue_dst))
+        replay_src = archive_dir / "_replay"
+        if replay_src.exists():
+            replay_dst = tmp_dir / "_replay"
+            shutil.move(str(replay_src), str(replay_dst))
 
     contexts = {
         "market": market_ctx,
@@ -113,27 +124,43 @@ def archive_daily_run(
         "unified": unified_ctx,
     }
 
-    # 1. 写入 6 个 Context JSON（全量 model_dump）
+    # ③ 写入 6 个 Context JSON 到 tmp 目录
     # 使用 mode="python" 避免 Pydantic v2 对 numpy 类型的序列化错误，再由 _sanitize_for_json 清洗
     for key, ctx in contexts.items():
         _write_json(
-            archive_dir / CONTEXT_FILES[key],
+            tmp_dir / CONTEXT_FILES[key],
             ctx.model_dump(mode="python"),
         )
 
-    # 2. 写入 reasoning.md（汇总 LLM 推理文本）
-    _write_reasoning_md(archive_dir / "reasoning.md", contexts, run_date)
+    # ④ 写入 reasoning.md 到 tmp 目录
+    _write_reasoning_md(tmp_dir / "reasoning.md", contexts, run_date)
 
-    # 3. 写入 meta.json（运行元数据）
+    # ⑤ 写入 meta.json 到 tmp 目录
     meta = _build_meta(
         run_date=run_date,
         use_mock=use_mock,
         start_time=start_time,
         contexts=contexts,
     )
-    _write_json(archive_dir / "meta.json", meta)
+    _write_json(tmp_dir / "meta.json", meta)
 
-    logger.info("[GOT Archive] 历史档已保存: %s", archive_dir)
+    # ⑥ 原子替换：目标→.old → .tmp→目标 → 删.old
+    # 窗口从「整个写入期」缩短到「两次 rename 之间」。
+    # Windows 兼容性：os.replace 对非空目录会失败，改用 os.rename 两步替换。
+    # 崩溃恢复：若上次在两次 rename 之间中断，日期目录缺席而 .old 幸存 —— .old 被
+    # persistence._SKIP_DIR_SUFFIXES 排除在 loader 之外，不恢复就会让该日归档彻底不可见。
+    if not archive_dir.exists() and old_dir.exists():
+        logger.warning("[GOT Archive] 检测到中断残留，先恢复归档目录: %s", old_dir)
+        os.rename(str(old_dir), str(archive_dir))
+    if archive_dir.exists():
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
+        os.rename(str(archive_dir), str(old_dir))
+    os.rename(str(tmp_dir), str(archive_dir))
+    if old_dir.exists():
+        shutil.rmtree(old_dir)
+
+    logger.info("[GOT Archive] 历史档已保存（原子替换）: %s", archive_dir)
     return archive_dir
 
 
@@ -198,7 +225,7 @@ def _write_reasoning_md(
                 lines.append(f"- **待确认信号:** {transition_pending}（首次出现，待次日确认）")
             if dwell_days < 2:
                 lines.append(f"- ⚠️ **低置信度:** regime 刚切换（dwell={dwell_days}），矛盾检测标记低置信")
-            lines.append(f"- **风险预算:** {regime.risk_budget:.0%}")
+            lines.append(f"- **仓位暴露上限:** {regime.risk_budget:.0%}")
             lines.append(f"- **恐贪指数:** {regime.fear_greed:.2f}（{regime.sentiment_stage}）")
             lines.append(f"- **板块方向:** {regime.market_direction}（{regime.mainline_count} 条主线）")
             lines.append(f"- **宏观摘要:** {regime.macro_overlay}")
@@ -400,6 +427,17 @@ def _write_reasoning_md(
         veto_n = sum(1 for v in ambush_veto if not v.split(": ", 1)[-1].startswith("吸筹观察"))
         observe_n = len(ambush_veto) - veto_n
         lines.append(f"## 🔍 埋伏通道（正式池 {len(ambush_pool)} / 蓄水池 {len(ambush_reservoir)} / 否决 {veto_n} / 观察 {observe_n}）")
+        # D-P3: 正式池水位目标（实际水位 / 目标区间 / 是否达标）
+        from src.got.catalyst_config import AMBUSH_POOL_TARGET_RANGE
+        actual_water_level = len(ambush_pool)
+        target_lo, target_hi = AMBUSH_POOL_TARGET_RANGE
+        if actual_water_level < target_lo:
+            level_status = "⚠️ 低于目标"
+        elif actual_water_level > target_hi:
+            level_status = "⚠️ 高于目标"
+        else:
+            level_status = "✅ 达标"
+        lines.append(f"**水位:** 实际 {actual_water_level} / 目标 [{target_lo}, {target_hi}] → {level_status}")
         lines.append("")
         if ambush_pool:
             lines.append("**正式池（催化剂排序）：**")
@@ -506,16 +544,20 @@ def _build_meta(
     contexts: dict,
 ) -> dict:
     """构建 meta.json 内容。"""
+    now = datetime.now()
     meta: dict = {
         "run_date": run_date.isoformat(),
-        "run_timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_timestamp": now.isoformat(timespec="seconds"),
         "use_mock": use_mock,
         "git_commit": _get_git_commit(),
+        # A-P0-9: 快照标签（只落归档侧，不进节点 JSON / SQLite）
+        "snapshot_time": now.isoformat(timespec="seconds"),
+        "bar_complete": _is_bar_complete(run_date, now),
     }
 
     if start_time:
         meta["duration_seconds"] = round(
-            (datetime.now() - start_time).total_seconds(), 1
+            (now - start_time).total_seconds(), 1
         )
 
     # 数据质量摘要
@@ -548,6 +590,15 @@ def _build_meta(
     if llm_model:
         meta["llm_model"] = llm_model
 
+    # C-P10: 震荡惩罚可观测化（零行为变更，只记录本次运行是否生效）
+    unified_ctx = contexts.get("unified")
+    if unified_ctx is not None:
+        market_regime = getattr(unified_ctx, "market_regime", None)
+        if market_regime is not None:
+            transition_count = getattr(market_regime, "transition_count", 0) or 0
+            meta["regime_choppiness_penalty_applied"] = transition_count >= 5
+            meta["transition_count_raw_segment_days"] = load_regime_raw_segment_days(20)
+
     return meta
 
 
@@ -566,6 +617,91 @@ def _get_git_commit() -> str:
     except (OSError, subprocess.SubprocessError):
         pass
     return "unknown"
+
+
+def _is_bar_complete(run_date: date, now: datetime) -> bool:
+    """判断当日日线是否已走完（15:00 后且为交易日）。
+
+    A-P0-9: 标记收盘后补跑版（如 0910 17:51），便于 P6 兑现追踪按 bar_complete 分组。
+    先用墙钟判断（简单、与 13:30 节奏配合），后续如需精确再改为 bar 时间戳。
+    """
+    # 时间条件：15:00 后
+    if now.time() < time(15, 0):
+        return False
+    # 交易日条件：尝试用交易日历判断
+    try:
+        from src.core.trading_calendar import is_market_open
+        return is_market_open("cn", run_date)
+    except Exception as exc:
+        # 交易日历不可用时降级为工作日判断 —— 该降级会影响 bar_complete 语义
+        # （法定节假日被误判为交易日），故用 warning 而非 debug，确保生产可见
+        logger.warning("[archive] 交易日历判断失败，降级为工作日: %s", exc)
+        return run_date.weekday() < 5
+
+
+def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
+    """覆盖写 Phase 2 reasoning 到 reasoning.md。
+
+    D-P6（A-P0-8 子任务）: Phase 2 同样遵守「末版为准」，同日重跑时
+    先清理旧的「Node 7 交易建议」段再写新内容，而非追加（避免 reasoning.md 出现多份）。
+    """
+    # 读取现有内容，截取 Node 7 段之前的部分
+    existing_content = ""
+    if reasoning_path.exists():
+        full_text = reasoning_path.read_text(encoding="utf-8")
+        # 找到 "## Node 7 交易建议" 段的位置
+        marker = "## Node 7 交易建议"
+        idx = full_text.find(marker)
+        if idx >= 0:
+            # 截取 Node 7 段之前的内容
+            existing_content = full_text[:idx].rstrip()
+        else:
+            existing_content = full_text.rstrip()
+
+    # 构建新的 Phase 2 内容
+    lines = []
+    if existing_content:
+        lines.append(existing_content)
+        lines.append("")
+    lines.append(f"## Node 7 交易建议")
+    lines.append("")
+    lines.append(decision.reasoning)
+    lines.append("")
+    if decision.allocation:
+        lines.append(f"**操作总结:** {decision.summary}")
+        lines.append("")
+        lines.append("**交易明细:**")
+        lines.append("")
+        for alloc in decision.allocation:
+            lines.append(
+                f"- **{alloc.action.upper()}** {alloc.name} "
+                f"({alloc.symbol}): {alloc.quantity_delta:+d} 股, "
+                f"¥{alloc.target_value:,.0f}"
+            )
+            lines.append(f"  - 理由: {alloc.reasoning}")
+            lines.append(f"  - 止损: ¥{alloc.stop_loss:.2f}, "
+                         f"风险收益比: {alloc.risk_reward_ratio:.2f}")
+        lines.append("")
+    if decision.warnings:
+        lines.append("**风险提示:**")
+        lines.append("")
+        for w in decision.warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+    # P4：埋伏退出信号
+    ambush_exits = getattr(decision, "ambush_exit_signals", [])
+    if ambush_exits:
+        lines.append(f"**🔍 埋伏退出信号（{len(ambush_exits)} 条）:**")
+        lines.append("")
+        for exit_info in ambush_exits:
+            lines.append(
+                f"- {exit_info.get('symbol', '')} "
+                f"({exit_info.get('sector', '')}/{exit_info.get('category_tag', '?')}): "
+                f"`{exit_info.get('exit_signal', '')}`"
+            )
+        lines.append("")
+
+    reasoning_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ── Phase 2: 统一决策节点存档 ──
@@ -716,41 +852,11 @@ def archive_phase2(
 
     logger.info(f"[Archive] Phase 2 交易建议已生成: {trading_md_path}")
 
-    # 3. 追加 Phase 2 reasoning 到 reasoning.md
+    # 3. 覆盖写 Phase 2 reasoning 到 reasoning.md
+    # D-P6（A-P0-8 子任务）: Phase 2 同样遵守「末版为准」，同日重跑时覆盖旧的 Node 7 段
     reasoning_path = output_dir / "reasoning.md"
-    with open(reasoning_path, "a", encoding="utf-8") as f:
-        f.write(f"\n## Node 7 交易建议\n\n")
-        f.write(f"{decision.reasoning}\n\n")
-        if decision.allocation:
-            f.write(f"**操作总结:** {decision.summary}\n\n")
-            f.write(f"**交易明细:**\n\n")
-            for alloc in decision.allocation:
-                f.write(
-                    f"- **{alloc.action.upper()}** {alloc.name} "
-                    f"({alloc.symbol}): {alloc.quantity_delta:+d} 股, "
-                    f"¥{alloc.target_value:,.0f}\n"
-                )
-                f.write(f"  - 理由: {alloc.reasoning}\n"
-                        f"  - 止损: ¥{alloc.stop_loss:.2f}, "
-                        f"风险收益比: {alloc.risk_reward_ratio:.2f}\n")
-            f.write("\n")
-        if decision.warnings:
-            f.write(f"**风险提示:**\n\n")
-            for w in decision.warnings:
-                f.write(f"- {w}\n")
-            f.write("\n")
-        # P4：埋伏退出信号
-        ambush_exits = getattr(decision, "ambush_exit_signals", [])
-        if ambush_exits:
-            f.write(f"**🔍 埋伏退出信号（{len(ambush_exits)} 条）:**\n\n")
-            for exit_info in ambush_exits:
-                f.write(
-                    f"- {exit_info.get('symbol', '')} "
-                    f"({exit_info.get('sector', '')}/{exit_info.get('category_tag', '?')}): "
-                    f"`{exit_info.get('exit_signal', '')}`\n"
-                )
-            f.write("\n")
-    logger.info(f"[Archive] Phase 2 reasoning 已追加到: {reasoning_path}")
+    _append_phase2_reasoning(reasoning_path, decision)
+    logger.info(f"[Archive] Phase 2 reasoning 已写入: {reasoning_path}")
 
     logger.info(f"[Archive] Phase 2 决策已存档: {output_path}")
 

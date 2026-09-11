@@ -1019,6 +1019,7 @@ class Node4EventRecord(Base):
     first_seen = Column(Date, nullable=False, index=True)
     last_seen = Column(Date, nullable=False, index=True)
     mention_count = Column(Integer, default=1)
+    mention_count_run_based = Column(Integer, default=0)  # A-P0-7: 旧口径（每次运行+1），与 mention_count（按日去重）双写对比
     sources_seen = Column(Text)  # JSON array: ["sina", "cls", "wallstcn"]
     lifecycle_state = Column(String(20), default='emerging')  # emerging/fermenting/peak/fading/archived
     sentiment_trajectory = Column(Text)  # JSON array: [0.3, 0.5, 0.7]（跨日情感变化）
@@ -1343,6 +1344,7 @@ class Node4RawNewsRecord(Base):
     first_seen_date = Column(Date, nullable=False)  # 首次出现日期
     last_seen_date = Column(Date, nullable=False)  # 最近出现日期
     appearance_count = Column(Integer, default=1)  # 跨日出现次数
+    appearance_count_run_based = Column(Integer, default=0)  # A-P0-7: 旧口径（每次运行+1），与 appearance_count（按日去重）双写对比
     lifecycle_state = Column(String(20), default='active')  # active/fermenting/archived
     # 时间戳
     created_at = Column(DateTime, default=utc_naive_now)
@@ -1520,6 +1522,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._migrate_catalyst_events()
             self._migrate_deactivate_ambush_frames()
             self._migrate_stock_daily_canonical_id()
+            self._migrate_node4_run_based_columns()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1775,6 +1778,61 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     )
         except Exception as exc:
             logger.warning("[storage] 框废除迁移失败，降级运行: %s", exc)
+
+    def _migrate_node4_run_based_columns(self) -> None:
+        """幂等轻量迁移：为 node4 表补齐 A-P0-7 双写对比列。
+
+        SQLAlchemy create_all 只建新表、不补旧表列。老库缺列会导致 INSERT/SELECT
+        抛 OperationalError，而 news_analysis.py 的 except 只记日志不阻塞主流程，
+        ⇒ 事件持久化、跨日去重、lifecycle_state 更新静默全废。
+
+        新增列：
+        - node4_events.mention_count_run_based (INTEGER DEFAULT 0)
+        - node4_raw_news.appearance_count_run_based (INTEGER DEFAULT 0)
+
+        幂等：已存在的列跳过；失败不阻塞启动。
+        """
+        if not self._is_sqlite_engine:
+            return
+        migrations = {
+            "node4_events": {
+                "mention_count_run_based": "INTEGER DEFAULT 0",
+            },
+            "node4_raw_news": {
+                "appearance_count_run_based": "INTEGER DEFAULT 0",
+            },
+        }
+        try:
+            with self._SessionLocal() as session:
+                for table_name, new_columns in migrations.items():
+                    table_exists = session.execute(
+                        text(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type='table' AND name=:table_name"
+                        ),
+                        {"table_name": table_name},
+                    ).scalar()
+                    if not table_exists:
+                        continue
+                    existing = {
+                        row[1]
+                        for row in session.execute(
+                            text(f"PRAGMA table_info({table_name})")
+                        ).fetchall()
+                    }
+                    for col, col_type in new_columns.items():
+                        if col not in existing:
+                            session.execute(
+                                text(
+                                    f"ALTER TABLE {table_name} ADD COLUMN {col} {col_type}"
+                                )
+                            )
+                            logger.info(
+                                "[storage] 迁移 %s: 新增列 %s", table_name, col
+                            )
+                session.commit()
+        except Exception as exc:
+            logger.warning("[storage] node4 列迁移失败，降级运行: %s", exc)
 
     def _ensure_schema_migration_record(self) -> None:
         session = self._SessionLocal()

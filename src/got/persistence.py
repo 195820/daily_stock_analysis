@@ -116,13 +116,17 @@ EMA_ALPHA = 0.3
 # 最小样本数：低于此值时使用宽松阈值（避免冷启动误报）
 EMA_WARMUP_SAMPLES = 5
 
+# EMA 计算与落盘保留的最大交易日数（超过则丢弃最旧样本，防止 daily_scores 无界增长）
+EMA_MAX_DAYS = 60
+
 
 def load_ema_baseline() -> Optional[dict[str, Any]]:
     """加载 EMA 基线（指数移动平均 + 滚动标准差）
 
     Returns:
         {"regime_score": float, "score_std": float,
-         "last_updated": str, "sample_count": int}
+         "last_updated": str, "sample_count": int,
+         "daily_scores": {"YYYY-MM-DD": score, ...}}
         不存在时返回 None
     """
     if not _EMA_BASELINE_FILE.exists():
@@ -140,6 +144,44 @@ def load_ema_baseline() -> Optional[dict[str, Any]]:
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"[persistence] EMA 基线读取失败: {e}")
         return None
+
+
+def compute_ema_stats_from_daily(
+    daily_scores: dict[str, float],
+    alpha: float = EMA_ALPHA,
+    max_days: int = EMA_MAX_DAYS,
+) -> tuple[float, float, int]:
+    """从 daily_scores 重算 regime_score / score_std / sample_count（纯函数）
+
+    Args:
+        daily_scores: {日期字符串: regime_score} 映射
+        alpha: EMA 平滑系数
+        max_days: 保留最近多少个交易日
+
+    Returns:
+        (regime_score, score_std, sample_count)
+    """
+    if not daily_scores:
+        return 0.0, 0.0, 0
+
+    # 按日期排序，保留最近 max_days 个
+    sorted_dates = sorted(daily_scores.keys())[-max_days:]
+    scores = [daily_scores[d] for d in sorted_dates]
+
+    # EMA 计算
+    ema = scores[0]
+    for score in scores[1:]:
+        ema = alpha * score + (1 - alpha) * ema
+
+    # 滚动标准差（样本标准差）
+    if len(scores) >= 2:
+        mean = sum(scores) / len(scores)
+        variance = sum((s - mean) ** 2 for s in scores) / (len(scores) - 1)
+        std = max(variance ** 0.5, 0.01)
+    else:
+        std = 0.1  # 单样本默认
+
+    return ema, std, len(scores)
 
 
 def save_ema_baseline(baseline: dict[str, Any]) -> Path:
@@ -169,19 +211,53 @@ _ARCHIVE_DIR = Path("data/got_daily")
 # 连续缺失天数阈值：超过此值则该板块序列降级为 None
 _MAX_CONSECUTIVE_MISSING = 5
 
-# 排除的目录后缀（备份/修复前缀目录）
-_SKIP_DIR_SUFFIXES = ("_backup", "_pre_fix")
+# 排除的目录后缀（备份/修复前缀目录/原子替换临时目录）
+_SKIP_DIR_SUFFIXES = ("_backup", "_pre_fix", ".tmp", ".old")
 
 
-def _list_archive_dirs(reverse: bool = True) -> list[Path]:
-    """列出归档日期目录，按日期排序。排除备份/修复目录。"""
-    if not _ARCHIVE_DIR.exists():
+def list_archive_dirs(
+    reverse: bool = True,
+    before: Optional[date] = None,
+    base_dir: Optional[Path] = None,
+) -> list[Path]:
+    """列出归档日期目录，按日期排序（A-P0-1 全仓唯一权威实现）。
+
+    所有需要遍历归档目录的代码必须调用此函数（或 persistence 内的
+    `_list_archive_dirs` 兼容别名），禁止自行 iterdir()。保证：
+    - 过滤 .tmp/.old/_backup/_pre_fix 目录
+    - before 参数排除当天及之后（same-day idempotency）
+    - 非日期格式目录名安全跳过
+
+    Args:
+        reverse: 是否按日期降序（默认 True）
+        before: 非空时只返回目录名日期 < before 的目录
+        base_dir: 归档根目录（默认 data/got_daily）
+    """
+    archive_dir = base_dir or _ARCHIVE_DIR
+    if not archive_dir.exists():
         return []
-    return sorted(
-        (d for d in _ARCHIVE_DIR.iterdir()
-         if d.is_dir() and not d.name.endswith(_SKIP_DIR_SUFFIXES)),
-        reverse=reverse,
-    )
+
+    result = []
+    for d in archive_dir.iterdir():
+        if not d.is_dir() or d.name.endswith(_SKIP_DIR_SUFFIXES):
+            continue
+        try:
+            dir_date = datetime.strptime(d.name, "%Y%m%d").date()
+        except ValueError:
+            # 非日期格式目录名（如残留的临时目录），跳过
+            continue
+        if before is not None and dir_date >= before:
+            continue
+        result.append(d)
+
+    return sorted(result, reverse=reverse)
+
+
+def _list_archive_dirs(
+    reverse: bool = True, before: Optional[date] = None
+) -> list[Path]:
+    """向后兼容别名：persistence 内 7 个 loader 与既有测试仍引用此名。"""
+    return list_archive_dirs(reverse=reverse, before=before)
 
 
 def _load_capital_json(date_dir: Path) -> Optional[dict]:
@@ -225,7 +301,7 @@ def load_capital_flow_series(
         - 净流入单位为亿元
         - 失败/状态为 failed 的归档日视为缺失
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     if not date_dirs:
         logger.info("[persistence] 无归档目录，返回空序列")
         return {}, []
@@ -332,7 +408,7 @@ def load_previous_regime_state() -> Optional[dict[str, Any]]:
 
     用于 Node 6 Level 0 状态机的跨日记忆。
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     for d in date_dirs:
         data = _load_unified_json(d)
         if data is None:
@@ -365,7 +441,7 @@ def load_regime_state_history(
 
     跳过缺失/失败的归档日。仅含 regime 字段的日才纳入。
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     entries: list[tuple[str, str]] = []
 
     for d in date_dirs:
@@ -387,6 +463,36 @@ def load_regime_state_history(
             f"从 {entries[0][0]} 到 {entries[-1][0]}"
         )
     return entries
+
+
+def load_regime_raw_segment_days(days: int = 20) -> int:
+    """C-P10: 20 日窗口中落在状态机生效日之前的天数。
+
+    状态机上线后 unified.json 的 market_regime 才含 dwell_days 字段；
+    统计窗口内**缺失 dwell_days** 的归档日数即为原始段天数。
+
+    0910 示例：0813–0826 共 10 日无 dwell_days → raw_segment_days = 10。
+    状态机全窗口生效后该值归零。
+    """
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
+    raw_days = 0
+    counted = 0
+
+    for d in date_dirs:
+        if counted >= days:
+            break
+        data = _load_unified_json(d)
+        if data is None:
+            continue
+        regime_data = data.get("market_regime") or {}
+        if regime_data.get("regime") is None:
+            continue
+        counted += 1
+        # dwell_days 不存在/为 None 表示该日状态机尚未处理
+        if regime_data.get("dwell_days") is None:
+            raw_days += 1
+
+    return raw_days
 
 
 # =============================================================================
@@ -418,7 +524,7 @@ def load_previous_stage_state() -> Optional[dict[str, Any]]:
 
     用于 Node 5 阶段状态机的跨日记忆。
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     for d in date_dirs:
         data = _load_sentiment_json(d)
         if data is None:
@@ -453,7 +559,7 @@ def load_sentiment_score_history(
 
     跳过缺失/失败的归档日。
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     entries: list[tuple[str, float]] = []
 
     for d in date_dirs:
@@ -487,7 +593,7 @@ def load_regime_history(days: int = 20) -> list[tuple[str, str]]:
     Returns:
         [(日期YYYYMMDD, regime_str), ...] 按日期升序
     """
-    date_dirs = _list_archive_dirs(reverse=True)
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
     entries: list[tuple[str, str]] = []
 
     for d in date_dirs:
@@ -592,10 +698,13 @@ def save_monitoring(
 
     # 合并 cross_node 信号计数（30 日窗口由日期驱动衰减）
     prev_signal_counts = prev.get("cross_node", {}).get("signal_count_30d", {})
-    # 清理超过 30 天的信号日期记录
+    # 清理超过 30 天的信号日期记录 + 剔除当天既有条目（防止重复）
     prev_signal_dates = prev.get("cross_node", {}).get("signal_dates", [])
     cutoff_30d = (today - timedelta(days=30)).isoformat()
-    prev_signal_dates = [d for d in prev_signal_dates if d.get("date", "") >= cutoff_30d]
+    prev_signal_dates = [
+        d for d in prev_signal_dates
+        if d.get("date", "") >= cutoff_30d and d.get("date") != today_str
+    ]
     # 追加今日信号
     for sig_type, count in cross_node_signal_counts.items():
         for _ in range(count):
@@ -608,7 +717,11 @@ def save_monitoring(
 
     # 反向信号：30 日窗口滚动（存储日期列表而非纯计数）
     prev_alert_dates = prev.get("node5", {}).get("contrarian_alert_dates", [])
-    prev_alert_dates = [d for d in prev_alert_dates if d >= cutoff_30d]
+    # 清理超过 30 天 + 剔除当天既有条目（防止重复）
+    prev_alert_dates = [
+        d for d in prev_alert_dates
+        if d >= cutoff_30d and d != today_str
+    ]
     if contrarian_alert_today:
         prev_alert_dates.append(today_str)
     contrarian_alert_count_30d = len(prev_alert_dates)

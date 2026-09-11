@@ -1341,6 +1341,7 @@ def main() -> int:
                     news=contexts["news"],
                     sentiment=contexts["sentiment"],
                     replay_mode=True,
+                    run_date=replay_date,
                 ))
 
                 # 输出摘要

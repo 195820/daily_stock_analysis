@@ -11,6 +11,9 @@ from datetime import date, datetime
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
+# B2 词表同源：CONTROLLED_FAMILIES 从单一权威源导入
+from src.got.family_keywords import CONTROLLED_FAMILIES  # noqa: E402
+
 
 # =============================================================================
 # 基础类型
@@ -151,11 +154,11 @@ class MarketContext(BaseModel):
     )
     vol_adjusted_position: Optional[float] = Field(
         default=None,
-        description="波动率调整后仓位（Layer 1 输出）",
+        description="波动率调整后仓位（Layer 1 输出）。**参考值，当前不参与 `final_position_limit`**",
     )
     regime_scale: Optional[float] = Field(
         default=None,
-        description="状态缩放因子（Layer 2 输出，0.2 ~ 1.0）",
+        description="状态缩放因子（Layer 2 输出，0.2 ~ 1.0）。**参考值，当前不参与 `final_position_limit`**",
     )
 
 
@@ -515,6 +518,7 @@ class HotStock(BaseModel):
     mention_count: int
     sentiment: str = Field(default="positive")
     associated_sectors: list[str] = Field(default_factory=list)
+    mention_source: str = "unknown"  # D-P8: 口径声明（eastmoney_attention_index / xueqiu_attention / nga_mention）
 
 
 class SentimentStageState(BaseModel):
@@ -912,6 +916,22 @@ class UnifiedContext(BaseModel):
         description="跨节点时间线共振信号（bull_confirmation / sentiment_top / catalyst_confirmation / range_reversal）",
     )
 
+    # ── D-P1: 资金背离阈值可观测性（2026-09-11）──
+    capital_divergence: Optional[dict] = Field(
+        default=None,
+        description="资金背离阈值诊断信息（样本数/5%分位/最终阈值/确认板块匹配详情），仅落盘不进评分",
+    )
+
+    # ── D-P2: 埋伏闸门漏斗 + 蓄水池溢出（2026-09-11）──
+    ambush_gate_funnel: Optional[dict] = Field(
+        default=None,
+        description="埋伏闸门逐层漏斗（G1利空→G2防买顶→G3拥挤→G4吸筹→入池的逐层计数）",
+    )
+    ambush_reservoir_overflow: Optional[list[dict]] = Field(
+        default=None,
+        description="蓄水池容量驱逐记录（被驱逐板块/驻留天数/驱逐原因）",
+    )
+
 
 # ── Phase 2: 统一决策节点 Schema ──
 
@@ -922,7 +942,7 @@ class PortfolioRiskAssessment(BaseModel):
     current_position_ratio: float = Field(..., ge=0.0, le=1.0, description="当前仓位比例")
     stop_loss_threshold: float = Field(default=-0.07, description="止损阈值（-7%）")
     sector_exposure_limits: dict[str, float] = Field(default_factory=dict, description="板块暴露上限")
-    risk_budget: float = Field(default=0.05, description="风险预算（单笔最大亏损占总资产比例）")
+    risk_budget: float = Field(default=0.05, description="风险预算（单笔最大亏损占总资产比例）。**派生自 `MarketRegime.risk_budget`，当前无消费者**")
     constraint_reasoning: str = Field(description="约束设定理由")
 
 
@@ -998,6 +1018,11 @@ class TradeAllocation(BaseModel):
     ambush_catalyst_event_date: Optional[date] = Field(
         default=None, description="催化剂事件日期",
     )
+    # ── D-P11: 板块限制明细（落盘分支走向，使行为变更可见）──
+    sector_limit_detail: Optional[dict] = Field(
+        default=None,
+        description="板块限制明细: {sector_name, sector_role, stock_limit, branch}（判据为 sector_role，limit 仅参考值）",
+    )
 
 
 class PortfolioDecision(BaseModel):
@@ -1023,17 +1048,19 @@ class PortfolioDecision(BaseModel):
         default_factory=list,
         description="主线家族续航评估（信号展示+降权提示，不触发强制卖出）",
     )
+    # ── D-P12: 板块暴露绑定信息（口径声明 + 落盘绑定次数）──
+    sector_exposure_binding: Optional[dict] = Field(
+        default=None,
+        description="板块暴露绑定信息: {sum_limits, position_limit, ratio, note}",
+    )
 
 
 # =============================================================================
 # Agent 语义粘合层输出（agent_glue_plan_0903 §5.3）
 # =============================================================================
 
-# 受控家族词表（§5.3.3）— Agent 只能从中选择，不得自创
-CONTROLLED_FAMILIES = [
-    "AI软件", "AI硬件", "周期资源", "新能源", "农业", "医药",
-    "军工", "消费", "智能驾驶", "金融", "机器人", "生态环保",
-]
+# 受控家族词表（§5.3.3）— 已迁移至 src.got.family_keywords（B2 词表同源修复）
+# CONTROLLED_FAMILIES 从该模块 import（见文件顶部）
 
 
 class GlueRelation(BaseModel):
@@ -1055,6 +1082,11 @@ class GlueStrength(BaseModel):
     capital_read: str = Field(default="unknown")
     news_read: str = Field(default="unknown")
     sentiment_read: str = Field(default="unknown")
+    # C-P9: 口径声明（strength 替代的是综合评分 composite_score，0-100 百分制）
+    basis: str = Field(
+        default="composite",
+        description="strength 所替代的口径（当前恒为 composite_score，0-100 百分制）",
+    )
 
 
 class GlueFamily(BaseModel):
@@ -1075,4 +1107,5 @@ class SemanticGlueResult(BaseModel):
     degraded: bool = Field(default=False)
     degraded_sectors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    status: str = Field(default="ok", description="状态标记：ok / no_candidates / S1_call_failed / S1_empty / S2_parse_failed / S2_validate_failed / S6_disabled / replay_mode")
     raw_response: str = Field(default="", exclude=True)

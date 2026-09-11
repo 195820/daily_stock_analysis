@@ -690,7 +690,19 @@ class NewsAnalysisNode:
                         # 更新已有事件
                         db_event = session.query(Node4EventRecord).filter_by(event_id=matched_event_id).first()
                         if db_event:
-                            db_event.mention_count += 1
+                            # A-P0-7: mention_count 改为跨日才增（按日去重）
+                            last_seen_date = db_event.last_seen
+                            if isinstance(last_seen_date, datetime):
+                                last_seen_date = last_seen_date.date()
+                            elif not isinstance(last_seen_date, date):
+                                last_seen_date = date.today()
+                            if last_seen_date < today:
+                                db_event.mention_count = (db_event.mention_count or 0) + 1
+                            # else: 同日重复只刷新 last_seen/来源/轨迹，不增 mention_count
+
+                            # 影子字段：每次运行+1（旧口径，用于对比）
+                            db_event.mention_count_run_based = (db_event.mention_count_run_based or 0) + 1
+
                             db_event.last_seen = today
                             # 追加新来源
                             existing_sources = db_event.get_sources_seen()
@@ -798,7 +810,19 @@ class NewsAnalysisNode:
                                 break
 
                     if existing:
-                        existing.appearance_count += 1
+                        # A-P0-7: appearance_count 改为跨日才增（按日去重）
+                        last_seen_date = existing.last_seen_date
+                        if isinstance(last_seen_date, datetime):
+                            last_seen_date = last_seen_date.date()
+                        elif not isinstance(last_seen_date, date):
+                            last_seen_date = date.today()
+                        if last_seen_date < today:
+                            existing.appearance_count = (existing.appearance_count or 0) + 1
+                        # else: 同日重复只刷新 last_seen_date，不增 appearance_count
+
+                        # 影子字段：每次运行+1（旧口径，用于对比）
+                        existing.appearance_count_run_based = (existing.appearance_count_run_based or 0) + 1
+
                         existing.last_seen_date = today
                         updated += 1
                     else:

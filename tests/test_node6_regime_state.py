@@ -234,8 +234,8 @@ class TestComputePositionDwellAware(unittest.TestCase):
         regime_established = self._make_regime("bull", dwell_days=10, risk_budget=0.8)
         sectors = self._make_sector_intels(3)
 
-        pos_fresh = AggregatorNode._compute_position_from_regime(regime_fresh, sectors, 0.6)
-        pos_established = AggregatorNode._compute_position_from_regime(regime_established, sectors, 0.6)
+        pos_fresh = AggregatorNode._compute_position_from_regime(regime_fresh, sectors)
+        pos_established = AggregatorNode._compute_position_from_regime(regime_established, sectors)
 
         # fresh 应该比 established 低（0.9 vs 1.0 系数）
         self.assertLess(pos_fresh, pos_established)
@@ -247,8 +247,8 @@ class TestComputePositionDwellAware(unittest.TestCase):
         regime_established = self._make_regime("bear", dwell_days=10, risk_budget=0.8)
         sectors = self._make_sector_intels(3)
 
-        pos_fresh = AggregatorNode._compute_position_from_regime(regime_fresh, sectors, 0.6)
-        pos_established = AggregatorNode._compute_position_from_regime(regime_established, sectors, 0.6)
+        pos_fresh = AggregatorNode._compute_position_from_regime(regime_fresh, sectors)
+        pos_established = AggregatorNode._compute_position_from_regime(regime_established, sectors)
 
         self.assertGreater(pos_fresh, pos_established)
 
@@ -260,8 +260,8 @@ class TestComputePositionDwellAware(unittest.TestCase):
         regime_high = self._make_regime("bull", dwell_days=10, transition_count=6, risk_budget=0.8)
         sectors = self._make_sector_intels(5)  # 更多 sectors
 
-        pos_low = AggregatorNode._compute_position_from_regime(regime_low, sectors, 0.6)
-        pos_high = AggregatorNode._compute_position_from_regime(regime_high, sectors, 0.6)
+        pos_low = AggregatorNode._compute_position_from_regime(regime_low, sectors)
+        pos_high = AggregatorNode._compute_position_from_regime(regime_high, sectors)
 
         # high 应该比 low 低（因为有 0.8 惩罚）
         self.assertLess(pos_high, pos_low)
