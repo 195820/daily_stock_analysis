@@ -150,6 +150,87 @@ def _lookup_sector_events(name, events_by_sector):   # A2：精确 → 别名变
 | 🔴 **写作阶段错误：OPEN-5 Y3「`_is_hard_exclude` 的 lifecycle 分支全量空转」** | 复核：sector 侧 `lifecycle` 在走 `_classify_all_sectors` 的 **16 个候选上 16/16 非空**（`active_mainline` 11/11 + `cooling_down` 5/5）；ambush 8 个为 null 但 L640-644 **已将其排除**，根本不进 `_is_hard_exclude`。原方案说的「13/13 null」是 **`news.json` `major_events[].lifecycle_state`**，唯一消费者是 `_cross_check_news` L1076 的 fading ×0.5 | **Y3 作废重写**（见 OPEN-5）。护栌 P5-1 **正常运作**，不存在「实际不存在」的问题 |
 | 🔴 **写作阶段遗漏：§5.2 输入契约与 §5.3.2 输出契约断裂** | §5.1 Segment C 把 `_cross_check_capital` / `_cross_check_sentiment` 交给了 Agent，§5.3.2 又要求输出 `capital_read` / `sentiment_read`，但 §5.2 **只喂了 `sector.json` + `news.json`** —— 无输入却要输出 | 已补齐资金侧与情绪侧（§5.2），并经负责人确认：喂 **`sector_flow_all_3d`（477 条）+ 瘦身 `hot_stocks`（50 条）** |
 
+### 2.3 事实核查修正块（2026-09-10）：mootdx 已修复，§2.1 第 1 项技术前提部分失效
+
+> 沿用 §2.2 约定。**§2.1 第 1 项与 §3.1 的部分技术前提已失效，但两者的结论均不变** ——
+> 变化的是"有没有别的路"，不是"该不该建表"。
+
+#### 变更 1：mootdx 从「全废」变为「可用」
+
+§2.1 第 1 项与 §3.1 均以 mootdx 不可用为前提写成。2026-09-10 实测：
+
+| 项 | 实测结果 |
+|---|---|
+| 根因 | **不是通达信协议更新**，是 mootdx 内置 `HQ_HOSTS` 38 台名单（末次更新 2024-07）整批失效 |
+| 网络环境 | 裸 TCP 出口 `36.28.211.141`（浙江电信），**无代理、无 TUN** —— 排除网络环境因素 |
+| 38 台内置 | **0 台能取 K 线**（14 台 TCP 通但回空表，24 台连不上） |
+| 73 台外部候选 | **9 台可取数**：国泰君安 `117.34.114.13/14/15/16/17/18/20/27` + 安信 `59.36.5.11` |
+| 修复 | `data_provider/mootdx_fetcher.py` 弃用 BESTIP（它只在陈旧名单内选优），改 **pin 验活主站池 + 真实取数验活 + 顺序故障转移** |
+
+**副产品**：`index_bars('880xxx')` 板块指数 K 线恢复（含 `up_count` / `down_count`）；
+`stock_all()` 返回 51,989 行含 1,120 个 `88` 开头板块指数。
+Node 2 板块 K 线 **`0/112` → `217/217`**，GOT 全流程由 `exit 1` 恢复为 `exit 0`。
+
+#### 变更 2：TDX 板块成分股解析器**存在**（§2.1「0 命中」是搜索范围局限）
+
+§2.1 第 1 项的判据是「全仓库 0 命中 `get_and_parse_block_file` / `blockname` / `BlockData`」——
+搜索范围是**本仓库**，而实现在 **site-packages**：
+
+| 层 | 位置 |
+|---|---|
+| 入口 | `mootdx.quotes.StdQuotes.block(tofile=...)` |
+| 协议 | `tdxpy.hq.TdxHq_API.get_and_parse_block_info` |
+| 解析 | `tdxpy/reader/block_reader.py` → 产出带 **`blockname`** 字段的 DataFrame（即 §2.1 判为「0 命中」的那个字段） |
+
+#### 变更 3：但该通路**当前不通**，卡在 tdxpy 一处 `or` 写法
+
+```python
+# tdxpy/reader/block_reader.py:41
+data = (type(name) is bytearray) and name or Path(name).read_bytes()
+```
+
+服务器返回空块时 `file_content` 是**空 `bytearray`**（falsy）→ `... or Path(name)` 被求值
+→ `TypeError: expected str, bytes or os.PathLike object, not bytearray`。
+**空响应被掩盖成类型错误**；非空时该链可用。属 §3.3 同型的「静默失败伪装成别的问题」。
+
+#### 变更 4：东财 push2delay **部分可用**（§3.1「数据源已被实测封禁」需限定主机）
+
+| 主机 / 端点 | 结果 |
+|---|---|
+| `push2.eastmoney.com` | 连接被拒（`RemoteDisconnected`） |
+| `push2delay.eastmoney.com` 板块排行 | **可用**：`fs=m:90+t:3` → 300 条 |
+| `push2delay.eastmoney.com` 板块成分 | **可用**：`fs=b:BK0729+f:!50` → `total=15` |
+| `push2delay.eastmoney.com` + `kline/get` | **不可用**：板块与个股均返回 `dktotal=0` / `klines=[]`（该主机是延迟**行情**主机，不供历史 K 线） |
+
+代理（US 出口）与直连均实测，结论一致。
+
+#### 变更 5：`_prefetch_constituent_stats` 实测映射覆盖率（补 §3.1「手写映射不可行」证据）
+
+| 项 | 实测 |
+|---|---|
+| TDX registry | 112 个板块 |
+| 东财板块表 | 300 条 |
+| `sector_name_variants` 命中 | **36 / 112 = 32.1%** |
+| 未命中样例 | `芯片` `玻璃基板` `EDA概念` `第三代半` `液冷服务` `铜缆高速` `人形机器` `机器人概` … |
+
+未命中项**全部落在 §3.1 已记录的「TDX 8 字节 GBK 定长 → 4 汉字硬截断」规律内**。
+
+**结论不变：不修映射**（撞 §2.2「不做任何形式的 `code↔name` 表」）。
+且 `_prefetch_constituent_stats` 的失效是**设计内降级**——`sector_analysis.py:1234` 明写
+「D7 回退 `today_change` 代理、D9 回退宽度代理，**方向安全：0 = 无过热**」，
+故 `0/25` 的后果是**过热维度退回代理口径**，非故障。
+
+**唯一确认待修项**：`sector_analysis.py:1316` 把失败原因吞在 `logger.debug` —— 降级可以，原因应可见。
+
+#### 由此重新变得可行的选项
+
+变更 1 + 2 使「**用 TDX 自身取板块成分股**」从「不可行」变为「可能」（前置：先过变更 3 的 tdxpy 缺陷）。
+该路线**不需要任何 `code↔name` 表**——TDX 的 `blockname` 与 TDX 板块代码同源，**不违反 §2.2 的禁令**。
+
+> ⚠️ 这是本修正块唯一需要裁决的项：**启动该路线，还是按 §2.1 等问财路线接线**
+> （`data/ths_concept_boards.json` 已在每日刷新，实测 2026-09-10 17:59 写入 7,604 B，
+> 但全仓库仅 `src/services/board_name_resolver.py:41` 在读，**Node 2 尚未接**）。
+
 ---
 
 ## 3. 根因：三层护栏修补同一个映射失败

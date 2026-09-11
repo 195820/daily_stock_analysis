@@ -2439,11 +2439,15 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 ))
 
         # ── 决策 21: Agent 催化剂先行提名（单次批量调用，仅候选非空时触发）──
-        if nomination_queue and not getattr(self, '_replay_mode', False):
-            adopted = await self._llm_nominate_ambush(nomination_queue, regime, today)
-        elif nomination_queue:
-            logger.info("[Node 6] replay_mode: 跳过 _llm_nominate_ambush（%d 候选）", len(nomination_queue))
-            adopted = []
+        if nomination_queue:
+            if getattr(self, '_replay_mode', False):
+                logger.info("[Node 6] replay_mode: 跳过 _llm_nominate_ambush（%d 候选）", len(nomination_queue))
+                adopted: dict[str, str] = {}
+            else:
+                adopted = await self._llm_nominate_ambush(nomination_queue, regime, today)
+
+            # 消费提名结果对两种模式共用：此前该循环被误置于 replay 分支内，
+            # 且该分支的 adopted 恒为空 list，导致 LLM 提名结果被静默丢弃
             for item in nomination_queue:
                 name = item["name"]
                 if name not in adopted:
@@ -4463,11 +4467,19 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
 
     @staticmethod
     def _parse_json(text: str) -> dict:
-        """从 LLM 输出中提取 JSON"""
-        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        """从 LLM 输出中提取 JSON。
+
+        空内容单独报错：否则 json.loads 抛的 "Expecting value: line 1 column 1"
+        会把"LLM 没返回内容"误报成"JSON 格式不对"，掩盖真实故障点
+        （_call_llm_async 重试耗尽后返回空串）。
+        """
+        content = (text or "").strip()
+        if not content:
+            raise ValueError("LLM 返回空内容（重试已耗尽），无可解析的 JSON")
+        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, re.DOTALL)
         if match:
-            text = match.group(1)
-        return json.loads(text)
+            content = match.group(1)
+        return json.loads(content)
 
     def _update_monitoring(
         self,

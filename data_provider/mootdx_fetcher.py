@@ -8,17 +8,17 @@ MootdxFetcher - 通达信数据源 (Priority 0)
 特点：TCP 协议不受 HTTP 反爬影响，免费、无需 Token
 
 关键策略：
-1. mootdx BESTIP 自动探测最优服务器（带数据验证）
+1. pin 验活行情主站池 + 真实取数验活 + 顺序故障转移（不用 BESTIP）
 2. TCP 连接失败后指数退避重试
 3. 不支持的市场（美/港/北交所）直接抛异常触发降级
 
 与 PytdxFetcher 的区别：
-- mootdx 内置 BESTIP 服务器探测（pytdx 需手动遍历）
-- 旧 TDX 服务器 IP 频繁过期，mootdx 探测更可靠
+- mootdx 内置主站池 + 真实取数验活（pytdx 需手动遍历且只做 TCP 探测）
 - 优先级 P0（高于 PytdxFetcher P2）
 """
 
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from typing import Optional, Generator, List, Tuple, Dict, Any
@@ -49,6 +49,54 @@ logger = logging.getLogger(__name__)
 # 连接冷却时间：连接失败后暂时跳过，避免反复探测
 _MOOTDX_CONNECTION_COOLDOWN_SECONDS = 15.0
 
+# 全池失败冷却：网络中断时逐台扫描本身要花 池大小×超时，若只冷却 15s 会陷入
+# "扫 45s → 歇 15s" 的忙等，把上层拖成分钟级挂起。此时改用长冷却。
+_MOOTDX_ALL_SERVERS_DOWN_COOLDOWN_SECONDS = 120.0
+
+# ── 通达信行情主站池（TCP 7709）──
+# 2026-09-10 全量验活结论（73 台候选 → 9 台能取到 K 线）：
+# mootdx 内置的 38 台名单最后更新于 2024-07，现已整批失效——TCP 握手与
+# get_security_count 均正常，唯独 K 线接口回空表，属"握手通过 ≠ 能取数"的
+# 静默失败。BESTIP 只在该陈旧名单内选优，因此换服务器必须绕开它。
+# 可用环境变量 MOOTDX_SERVERS="ip:port,ip:port" 覆盖本池。
+_DEFAULT_HQ_SERVERS: Tuple[Tuple[str, int], ...] = (
+    ("117.34.114.15", 7709),  # 国泰君安9
+    ("117.34.114.13", 7709),  # 国泰君安7
+    ("117.34.114.14", 7709),  # 国泰君安8
+    ("117.34.114.16", 7709),  # 国泰君安10
+    ("117.34.114.17", 7709),  # 国泰君安11
+    ("117.34.114.18", 7709),  # 国泰君安12
+    ("117.34.114.20", 7709),  # 国泰君安13
+    ("117.34.114.27", 7709),  # 国泰君安14
+    ("59.36.5.11", 7709),     # 安信15
+)
+
+# 验活探针：TCP 握手/连接数查询成功不等于能取数，必须真取一根 K 线
+_TDX_PROBE_MARKET = 1        # 1 = 上海
+_TDX_PROBE_SYMBOL = "600519"
+_TDX_PROBE_FREQUENCY = 9     # 日线
+_TDX_PROBE_COUNT = 1
+_TDX_CONNECT_TIMEOUT = 5
+
+# 单次会话内的选路尝试次数：第一次复用已选节点，失败后再作废重选一次
+_TDX_SELECT_ATTEMPTS = 2
+
+
+def _resolve_hq_servers() -> Tuple[Tuple[str, int], ...]:
+    """解析行情主站池：环境变量 MOOTDX_SERVERS 优先，格式 "ip:port,ip:port"。"""
+    raw = os.getenv("MOOTDX_SERVERS", "").strip()
+    if not raw:
+        return _DEFAULT_HQ_SERVERS
+
+    servers: List[Tuple[str, int]] = []
+    for item in raw.split(","):
+        host, _, port = item.strip().partition(":")
+        if host and port.isdigit():
+            servers.append((host, int(port)))
+        else:
+            logger.warning("忽略非法的 MOOTDX_SERVERS 条目: %r", item)
+    return tuple(servers) or _DEFAULT_HQ_SERVERS
+
 
 def _is_us_code(stock_code: str) -> bool:
     """判断是否为美股代码（1-5个大写字母，可含'.'）"""
@@ -74,18 +122,20 @@ class MootdxFetcher(BaseFetcher):
         self._unavailable_until = 0.0
         self._last_unavailable_reason = ""
         self._stock_name_cache: Dict[str, str] = {}
+        # 上次验活通过的行情主站，后续会话优先复用（失效后由选路逻辑换台）
+        self._active_server: Optional[Tuple[str, int]] = None
+        # 选路锁：Node 2 会并发发起上百个会话，无锁时冷启动期各线程
+        # 都看到 _active_server 为空而各自扫全池（惊群）
+        self._server_lock = threading.Lock()
 
     def _is_in_cooldown(self) -> bool:
         return time.time() < self._unavailable_until
 
-    def _mark_cooldown(self, reason: str) -> None:
-        self._unavailable_until = time.time() + _MOOTDX_CONNECTION_COOLDOWN_SECONDS
+    def _mark_cooldown(self, reason: str, seconds: Optional[float] = None) -> None:
+        cooldown = _MOOTDX_CONNECTION_COOLDOWN_SECONDS if seconds is None else seconds
+        self._unavailable_until = time.time() + cooldown
         self._last_unavailable_reason = str(reason or "").strip()
-        logger.info(
-            "Mootdx 连接冷却 %.0fs: %s",
-            _MOOTDX_CONNECTION_COOLDOWN_SECONDS,
-            self._last_unavailable_reason,
-        )
+        logger.info("Mootdx 连接冷却 %.0fs: %s", cooldown, self._last_unavailable_reason)
 
     def is_available_for_request(self, capability: str = "") -> bool:
         return not self._is_in_cooldown()
@@ -99,13 +149,79 @@ class MootdxFetcher(BaseFetcher):
             logger.warning("mootdx 未安装，请运行: pip install mootdx")
             return None
 
+    def _open_client(self, Quotes, server: Tuple[str, int]):
+        """按指定节点建连；失败返回 None（不抛，交由选路逻辑继续下一台）。"""
+        try:
+            return Quotes.factory(
+                market="std", server=server, timeout=_TDX_CONNECT_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("mootdx 连接 %s:%s 失败: %s", server[0], server[1], exc)
+            return None
+
+    @staticmethod
+    def _probe_client(client) -> bool:
+        """真实取数验活——故障节点会静默回空表，只测 TCP 通不通会误判。"""
+        try:
+            bars = client.bars(
+                symbol=_TDX_PROBE_SYMBOL,
+                frequency=_TDX_PROBE_FREQUENCY,
+                offset=_TDX_PROBE_COUNT,
+            )
+        except Exception as exc:
+            logger.warning("mootdx 验活异常: %s", exc)
+            return False
+        return bars is not None and not bars.empty
+
+    def _scan_servers(self, Quotes) -> Optional[Tuple[str, int]]:
+        """按池序扫描，返回第一台能真取到 K 线的节点；全败返回 None。"""
+        for server in _resolve_hq_servers():
+            client = self._open_client(Quotes, server)
+            if client is None:
+                continue
+            if not self._probe_client(client):
+                logger.warning("mootdx 节点 %s:%s 验活失败（回空表），换下一台", *server)
+                continue
+            logger.info("mootdx 选定行情主站 %s:%s", *server)
+            return server
+        return None
+
+    def _select_server(self, Quotes) -> Optional[Tuple[str, int]]:
+        """返回当前选定的主站；未选定（或已失效）时加锁扫描一次。"""
+        if self._active_server is not None:
+            return self._active_server
+        with self._server_lock:
+            # 双检：等锁期间可能已有线程扫完并写回结果
+            if self._active_server is None:
+                self._active_server = self._scan_servers(Quotes)
+            return self._active_server
+
+    def _invalidate_active_server(self) -> None:
+        """作废当前节点，使下一次会话重新选路。"""
+        with self._server_lock:
+            self._active_server = None
+
+    def _connect_healthy(self, Quotes):
+        """取得一个已验活的 client；节点失效时作废重选，仍失败返回 None。"""
+        for _ in range(_TDX_SELECT_ATTEMPTS):
+            server = self._select_server(Quotes)
+            if server is None:
+                return None
+            client = self._open_client(Quotes, server)
+            if client is not None and self._probe_client(client):
+                return client
+            logger.warning("mootdx 节点 %s:%s 已失效，作废重选", *server)
+            self._invalidate_active_server()
+        return None
+
     @contextmanager
     def _mootdx_session(self) -> Generator:
         """
         mootdx 连接上下文管理器
 
-        使用 BESTIP 自动探测最优服务器（带数据验证），
-        连接失败自动冷却避免反复探测。
+        复用上次验活通过的节点，每台都必须真取到一根 K 线才采用。全部失败则
+        进入冷却并抛 DataSourceUnavailableError，让 Manager 立即降级，而不是
+        把空表当成"这个板块没数据"往上抛。
         """
         if self._is_in_cooldown():
             raise DataSourceUnavailableError(
@@ -116,14 +232,13 @@ class MootdxFetcher(BaseFetcher):
         if Quotes is None:
             raise DataFetchError("mootdx 库未安装")
 
-        try:
-            # BESTIP 自动探测（timeout=10s，含数据验证）
-            client = Quotes.factory(market='std', timeout=10)
-            logger.debug("mootdx BESTIP 连接成功")
-            yield client
-        except Exception as e:
-            self._mark_cooldown(f"mootdx 连接失败: {e}")
-            raise DataFetchError(f"mootdx 连接失败: {e}") from e
+        client = self._connect_healthy(Quotes)
+        if client is None:
+            reason = f"全部 {len(_resolve_hq_servers())} 个通达信节点验活失败（协议或网络）"
+            self._mark_cooldown(reason, _MOOTDX_ALL_SERVERS_DOWN_COOLDOWN_SECONDS)
+            raise DataSourceUnavailableError(f"Mootdx 不可用: {reason}")
+
+        yield client
 
     def _get_market_prefix(self, stock_code: str) -> str:
         """

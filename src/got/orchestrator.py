@@ -176,6 +176,11 @@ class GOTOrchestrator:
         logger.info(f"[GOT]   Node 1 完成 — 科技成长: {market_ctx.tech_growth.trend}")
 
         sector_ctx = await self.sector_node.run(market_context=market_ctx)
+        if sector_ctx.status in ("degraded", "failed"):
+            raise RuntimeError(
+                f"[GOT] Node 2 板块分析失败（status={sector_ctx.status}），"
+                "无法进行后续聚合与决策，中止执行"
+            )
         logger.info(f"[GOT]   Node 2 完成 — 活跃主线: {len(sector_ctx.active_mainline)}")
 
         capital_ctx = await self.capital_node.run(

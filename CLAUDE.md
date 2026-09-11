@@ -6,6 +6,14 @@
 
 **→ 参见 [`AGENTS.md`](AGENTS.md)（CLAUDE.md 为其镜像）**
 
+### GOT 运行规范
+
+- **影子模式输出总结**：当 GOT 运行包含影子模式内容（如 A6 glue 影子模式）时，运行完成后必须在终端输出总结，包括：
+  - Phase 1 各节点核心结论（大盘/板块/资金/消息/情绪/聚合）
+  - 影子模式输出内容（如 `agent_glue.json` 的关系/强度/家族统计）
+  - Phase 2 交易建议（持仓分析/候选股/操作建议）
+  - 关键风险提示和主线续航评估
+
 ---
 
 ## 项目架构
@@ -104,7 +112,7 @@ daily_stock_analysis/
 │   │
 │   ├── data_provider/           # 数据获取层（策略模式）
 │   │   ├── manager.py                # DataFetcherManager（故障切换+熔断器）
-│   │   ├── mootdx_fetcher.py         # 通达信 TCP P0（不封 IP，mootdx BESTIP 自动探测）
+│   │   ├── mootdx_fetcher.py         # 通达信 TCP P0（不封 IP，验活主站池+故障转移）
 │   │   ├── em_rate_limiter.py        # 东财 HTTP 统一限流（1s间隔+抖动+重试+连接池）
 │   │   ├── efinance_fetcher.py       # 东财 HTTP P0
 │   │   ├── akshare_fetcher.py        # akshare P1（多源降级）

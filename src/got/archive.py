@@ -90,11 +90,16 @@ def archive_daily_run(
     archive_dir = base_dir / run_date.strftime("%Y%m%d")
 
     # 当天重跑：清理旧档，确保数据全部覆盖（不残留旧版 JSON/reasoning）
+    # 但保留 agent_glue.json（A6 影子模式输出）和 _replay/ 目录（回放模式）
     if archive_dir.exists():
         import shutil
+        preserved_files = {"agent_glue.json"}
+        preserved_dirs = {"_replay"}
         for item in archive_dir.iterdir():
-            if item.is_file():
+            if item.is_file() and item.name not in preserved_files:
                 item.unlink()
+            elif item.is_dir() and item.name not in preserved_dirs:
+                shutil.rmtree(item)
         logger.info("[GOT Archive] 清理旧档: %s", archive_dir)
 
     archive_dir.mkdir(parents=True, exist_ok=True)

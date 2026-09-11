@@ -390,6 +390,10 @@ class SectorContext(BaseModel):
         default="high",
         description="评分可信度：high / medium / low（>30% 板块获取失败时降级为 low）",
     )
+    status: str = Field(
+        default="normal",
+        description="节点健康度：normal / degraded / failed（degraded 时下游走降级路径）",
+    )
 
     # ── P0-1: 全量板块→强度映射（供 Node 6 升格消费）──
     strength_lookup: dict[str, float] = Field(
