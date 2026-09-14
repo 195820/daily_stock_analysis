@@ -41,44 +41,131 @@
 
 ## 1. 影子期总览：三条影子线的可数性差异
 
-| 影子线 | 开关 | 归档产物 | 当前可数性 |
-|---|---|---|---|
-| **A5 glue 语义粘合层** | `AGENT_SEMANTIC_GLUE_ENABLED`（默认 `false`）+ `..._SHADOW`（默认 `true`） | `data/got_daily/{date}/agent_glue.json` | ✅ **可数**（逐日产物，见 §2） |
-| **T1 候选股终审** | `AGENT_STOCK_REVIEW_ENABLED`（默认 `false`）+ `..._SHADOW`（默认 `true`） | `data/got_screener/{date}.json`（`_save_got_result`，`src/services/stock_screener.py:2784`） | 🔴 **无归档证据**——`data/got_screener/` 最新一份是 **2026-08-25**，早于 T1 落地（0904） |
-| **T1-H 持仓审查** | `AGENT_HOLDING_REVIEW_ENABLED`（默认 `false`）+ `..._SHADOW`（默认 `true`） | 无独立产物；结论写回 `portfolio_decision` 流程 | 🔴 **无归档证据**——`portfolio_decision.json` 中无 `agent_decision_signal` / `holding_review` / `shadow` 标记 |
+> **机制澄清（2026-09-14 实测）**：三条线都是 `*_ENABLED`（默认 `false`）+ `*_SHADOW`（默认 `true`）的双开关形状，
+> 但 **`*_SHADOW` 在 `*_ENABLED=false` 时是失效的**——它的语义是「跑了之后不生效」，不负责让功能跑起来。
+> 因此三条线的差异只由一个变量决定：**`*_ENABLED` 的实际取值**。
 
-**这三条线的差异本身是事实**：A5 有逐日归档产物可复算，T1/T1-H 目前只有运行期日志行（`[SHADOW][T1终审]` / `[SHADOW][T1-H]`），**没有可离线复核的产物**。
+| 影子线 | 门（代码位置） | 实跑 `ENABLED` | 归档产物 | 当前可数性 |
+|---|---|---|---|---|
+| **A5 glue 语义粘合层** | `src/got/nodes/aggregator.py:985`<br>`if not AGENT_SEMANTIC_GLUE_ENABLED: → S6_disabled; return` | **true**<br>（0910/0914 产物 `relations=25/26`、`degraded=False`、`status=ok`，不可能是开关关闭的形状） | `data/got_daily/{date}/agent_glue.json` | ✅ **可数，但只有 5 天**（7 份文件中 2 份是测试污染，见 §2.2） |
+| **T1 候选股终审** | `src/services/stock_screener.py:1622`<br>`if AGENT_STOCK_REVIEW_ENABLED and finalists:` | false | `data/got_screener/{date}.json`（`_save_got_result`，`src/services/stock_screener.py:2784`） | 🔴 **无归档证据**——`data/got_screener/` 最新一份是 **2026-08-25**，早于 T1 落地（0904） |
+| **T1-H 持仓审查** | `src/got/nodes/portfolio_decision.py:2162`<br>`if not AGENT_HOLDING_REVIEW_ENABLED or not holdings: return holdings` | false | 结论写回 `portfolio_decision.json` 的 `unified_scoring[]` | 🔴 **字段在位、值恒 `None`**——见下 |
+
+**这三条线的差异本身是事实**：A5 有逐日归档产物可复算，T1 目前只有运行期日志行（`[SHADOW][T1终审]`），**没有可离线复核的产物**。
+
+### 1.1 T1-H 的可数性高于此前判断
+
+原判断写「`portfolio_decision.json` 中无 `agent_decision_signal` / `holding_review` / `shadow` 标记」——
+**这三个字段名在代码里都不存在**。真实字段是 `schemas.py:981-992` 的三个：
+
+| 字段 | 类型 | 取值 |
+|---|---|---|
+| `agent_review_verdict` | `Optional[str]` | `hold` / `add` / `reduce` / `exit` |
+| `agent_review_reasoning` | `Optional[str]` | T1-H 审查理由 |
+| `agent_review_penalty` | `Optional[float]` | 降档惩罚系数 |
+
+它们**已经落进归档**（位于 `unified_scoring[]` 下），实测 **29 个归档日全部为 `None`**（20260803 → 20260914；仅 20260819 无 `unified_scoring`）。
+
+⇒ **T1-H 的验收成本远低于原判断**：不需要新产物、不需要改 schema，
+只要 `AGENT_HOLDING_REVIEW_ENABLED=true` 跑一天，结论即落进现有归档。
+（归档值确为 JSON `null`，非字符串 `"None"`。）
 
 ---
 
 ## 2. A5 glue 影子期：逐日产物盘点
 
-`data/got_daily/*/agent_glue.json` 全量清点（2026-09-14 实测）：
+`data/got_daily/*/agent_glue.json` 全量清点（2026-09-14 实测，字段为归档原文）：
 
-| 归档日 | 星期 | 大小 | 性质 |
-|---|---|---|---|
-| 20260904 | 五 | 8,299 B | 真实 LLM 输出（`relations` 6 / `strengths` 19） |
-| 20260907 | 一 | 9,501 B | 真实 |
-| **20260908** | **二** | **无文件** | **缺口**：交易日，6 节点归档齐全，但无 glue 产物 |
-| 20260909 | 三 | 17,099 B | 真实（`relations` 22 / `strengths` 32） |
-| 20260910 | 四 | 18,976 B | 真实 |
-| 20260911 | 五 | 1,106 B | **F1 降级占位**：`evidence="F1 降级:纯技术分"`、`news_read/capital_read/sentiment_read = unknown`、`confidence=0.3`、`relations=[]` |
-| 20260912 | **六** | 1,106 B | **F1 降级 + 非交易日**（周六） |
-| 20260914 | 一 | 16,702 B | 真实（`relations` 26 / `strengths` 23），新增 `status` 字段 = `ok` |
+| 归档日 | 星期 | 大小 | `status` | `relations` | `strengths` | `families` | `degraded` | 性质 |
+|---|---|---|---|---|---|---|---|---|
+| 20260904 | 五 | 8,299 B | （无该字段） | 6 | 19 | 19 | false | 真实 LLM 输出 |
+| 20260907 | 一 | 9,501 B | （无该字段） | 6 | 22 | 22 | false | 真实 |
+| **20260908** | **二** | **无文件** | — | — | — | — | — | **缺口**：交易日，6 节点归档齐全，但无 glue 产物 |
+| 20260909 | 三 | 17,099 B | （无该字段） | 22 | 32 | 32 | false | 真实 |
+| 20260910 | 四 | 18,976 B | （无该字段） | 25 | 32 | 32 | false | 真实 |
+| 20260911 | 五 | 1,106 B | **`S6_disabled`** | 0 | **3** | 0 | true | **测试污染**（非影子期样本，见 §2.2） |
+| 20260912 | **六** | 1,106 B | **`S6_disabled`** | 0 | **3** | 0 | true | **测试污染 + 非交易日**（周六，见 §2.2） |
+| 20260914 | 一 | 16,702 B | `ok` | 26 | 23 | 23 | false | 真实 |
+
+> `status` 键只在 **0914** 的真实产物里出现；**0904–0910 的产物没有这个键**。
+> 0911/0912 虽带该键，但产物是测试污染（§2.2），**不能用来推断该键的引入时点**。
 
 ### 有效样本计数
 
 **真实 LLM 样本 = 5 天**：`20260904` / `20260907` / `20260909` / `20260910` / `20260914`。
 
-（0911、0912 为 F1 降级占位，不计入；0908 无产物。）
+（0911、0912 的产物是测试污染，不是影子期样本，见 §2.2；0908 无产物。）
 
 转正条件（`archive/got/agent_glue_plan_0903.md` §8.2）要求影子期 **≥10 个交易日**且双达标。
 **是否达标由负责人判定**，本清单只登记上述计数。
 
-### 已知的两处干扰
+### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）
 
-1. **0912 是周六**——归档存在本身是 0914 commit `dc5bbde` 修掉的"非交易日照跑"bug 的现场证据（`_check_trading_day` 的 `import TradingCalendar` 恒抛 `ImportError` 且被 `except ImportError` 静默吞掉）。修复后非交易日不再运行。
-2. **0911 / 0912 的 glue 是降级态**——`[SHADOW]` 日志行与归档产物不一致时，**以产物为准**：1106 B 是 F1 降级的形状。
+原记载写 `evidence="F1 降级:纯技术分"`。**归档原文不是这个**：
+
+```
+0911 / 0912（两天产物字段完全相同）
+  status           = "S6_disabled"
+  evidence         = "F1 降级:开关关闭"
+  warnings         = ["F1 降级: 开关关闭"]
+  degraded_sectors = ["旅游", "半导体", "量子计算"]
+  strengths        = 3        ← 原记载只记了 relations=[]，漏了这 3 条
+  confidence       = 0.3
+  capital_read = news_read = sentiment_read = "unknown"
+```
+
+`S6_disabled` 在 `aggregator.py:984-990` 的定义即 **`AGENT_SEMANTIC_GLUE_ENABLED=false` 走的 F1 全量降级**，
+reason 为「开关关闭」。「纯技术分」是另一条 reason，两者含义相反：一个是**配置选择**，一个是**失败**。
+
+**这个区别不是措辞问题**：`S6_disabled` 由开关取值直接决定，而 `F1 降级:纯技术分` 是 LLM 路径的降级。
+前者是**配置选择**，后者是**失败**——「以产物为准：1106 B 是 F1 降级的形状」形状判断对，但归因错，
+且方向正好相反：**这两天不是 glue 坏了，是 glue 没被允许跑。**
+
+> ✅ **「为何关闭开关」已查明**：开关关着不是生产运行的选择，而是**测试的既定前提**——
+> 见 §2.2。原「未查证」结论已撤销。
+
+### 2.2 0911 / 0912 的产物不是影子期样本，是**测试污染**（2026-09-14 查明）
+
+上表 0911 / 0912 两天共 4 份产物（`agent_glue.json` × 2、`_replay/agent_glue.json` × 2），
+**没有一份来自生产运行**。证据是 `strengths` 条数与 mtime：
+
+| 产物 | 大小 | `strengths` | mtime | 生成者 |
+|---|---|---|---|---|
+| `20260911/agent_glue.json` | 1,106 B | **3** | 09-11 23:35:19 | `test_s6_switch_off` |
+| `20260911/_replay/agent_glue.json` | 7,331 B | **24** | 09-11 23:35:19 | `test_0903_replay_unchanged` |
+| `20260912/agent_glue.json` | 1,106 B | **3** | 09-12 00:07:13 | 同上（隔夜的第二轮测试） |
+| `20260912/_replay/agent_glue.json` | 7,331 B | **24** | 09-12 00:07:13 | 同上 |
+
+两条判据，各自独立成立：
+
+1. **`strengths=3` / `24` 是测试夹具的数，不是当日候选的数。** `tests/test_node6_glue.py`
+   的 `_make_candidates()` 恰好返回 3 个（旅游 / 半导体 / 量子计算）；`test_0903_replay_unchanged`
+   从 0903 归档收集候选并**断言 `len(candidates) == 24`**。两个数字与两个夹具一一对应，
+   且两天的 3 条全部是 `["旅游", "半导体", "量子计算"]`。
+2. **mtime 精确到秒相同。** 同一天的两份产物在同一秒写出 ⇒ 同一次测试调用的两个用例。
+   0912 的 00:07:13 与 0911 的 23:35:19 相差 32 分钟，是同一套测试跨零点跑了第二轮。
+
+**机制**：这 4 个用例真实调用 `_agent_semantic_glue`，而该函数第 5 行起就会调
+`_save_glue_result`；落盘根目录取 `GLUE_ARCHIVE_ROOT / date.today()`，回放态再加 `_replay/`。
+**测试没有重定向该根目录，于是写入生产归档。**
+
+**这与 A5 影子期直接相关，不是无关的洁净度问题**：任一交易日跑一次测试套件，就会在
+`data/got_daily/{当天}/` 落一份 3 候选的 `agent_glue.json`——它会被 §2 的盘点当成当日样品计入。
+§2「有效样本 = 5 天」之所以仍成立，只是因为 0914 的真实运行（23 条 strengths）盖过了它。
+
+**处置（2026-09-14 已实施）**：`tests/test_node6_glue.py` 新增 `_redirect_glue_archive()`，
+把 `GLUE_ARCHIVE_ROOT` 指向临时目录并把运行日固定为 `TEST_RUN_DATE`；4 个会落盘的用例全部接入。
+存量的 4 份污染产物**未删除**——它们是本节结论的现场证据；是否清理请负责人决定。
+
+> ⚠️ **对 §4.1 的连带影响**：`_replay/` 那两份此前被当作「回放产物」，据此推出的路径约定
+> 与「回放在开关处短路」都建立在**测试产物**上。§4.1 已按此更正。
+
+### 已知的另一处干扰
+
+**0912 是周六**——归档存在本身是 0914 commit `dc5bbde` 修掉的"非交易日照跑"bug 的现场证据（`_check_trading_day` 的 `import TradingCalendar` 恒抛 `ImportError` 且被 `except ImportError` 静默吞掉）。修复后非交易日不再运行。
+
+> 📌 该解释与 §2.2 不冲突：`test_0903_replay_unchanged` 在 0912 00:07 写出产物，
+> 与「0912 非交易日本不应有生产运行」两件事各自独立成立。
 
 ---
 
@@ -86,6 +173,9 @@
 
 > 出处：`archive/got/agent_glue_plan_0903.md` §8.1 / §8.2；实测值与口径修正见 `archive/got/got_layer_c_plan_0911.md` §0 / §1。
 > **本节只抄录，不判定。**
+>
+> **2026-09-14 复跑确认**：`python scripts/verify_glue_metrics.py --date 20260910` → R-C3 **PASS 10/10**，
+> 下表全部数值与文档锚点逐位一致（M1 3.1% / M1′ 34.4% / M2 28.1% / M4-a 0.591P·0.419S / M4-bc 0.646P·0.500S / M6 65.6% / M6′ 96.9% / 回收率 90.9%）。
 
 | # | 指标定义 | 转正红线 | 实测值（0910 + 四日） | 文档给出的状态描述 |
 |---|---|---|---|---|
@@ -120,15 +210,42 @@ C 层给出的修正方向是 **C-P6（M1 改 glue 侧）、C-P7（M6 改为「�
 
 | # | 判据 | 达标线 | 当前状态（材料） |
 |---|---|---|---|
-| **R-C1** | 制造 S1 / S2 各一次后 `agent_glue.json` **仍存在**且 `status` 正确 | 2/2 存在 | 待复测 |
-| **R-C2** | `--got-replay 20260901` 的 glue 产物落在 `20260901/_replay/` | 路径精确匹配 | 已有 `_replay/` 产物（0911 / 0912），未逐日核对 |
+| **R-C1** | 制造 S1 / S2 各一次后 `agent_glue.json` **仍存在**且 `status` 正确 | 2/2 存在 | ✅ **本次补测通过（4/4）**——`tests/test_node6_glue.py::TestGlueFailureSamplePersistence`，覆盖 `S1_call_failed` / `S1_empty` / `S2_parse_failed` / `S2_validate_failed`，逐个断言落盘文件存在 + `status` 相符 |
+| **R-C2** | `--got-replay 20260901` 的 glue 产物落在 `20260901/_replay/` | 路径精确匹配 | **部分**——路径约定 `{date}/_replay/` 在 **1 份**真实产物上成立（`20260903/_replay/unified.json`）；其余 2 份为**测试污染**（§2.2 / §4.1），不计为证据。`20260901` 本身无产物 |
 | **R-C3** | `verify_glue_metrics.py --date 20260910` 十锚点逐位一致 | 全部相等 | ✅ **本次实跑 PASS 10/10** |
 | **R-C4** | `status=ok` 的交易日 ≥ 7 且连续，**须分列实盘 / 回填来源** | 7 天 | 实盘仅 **5 天**且缺 0908、不连续（见 §2） |
-| **R-C5** | `_log_shadow_comparison` 在 `src/` 与 `tests/` 零引用 | 0 处 | 已按 C-P4 删除，待复验 |
-| **R-C6** | M2 × M3 在 8 天回填样本上的 A/B 对照表 | 2×8 = 16 点 | 🔴 **SKIP**——回填样本仅 **2 天**（`data/got_daily/*/_replay/agent_glue.json`），两版 prompt 未跑 |
+| **R-C5** | `_log_shadow_comparison` 在 `src/` 与 `tests/` 零引用 | 0 处 | ✅ **本次实跑复验通过**——`src/got/nodes/aggregator.py:1072` 仅剩墓志铭注释（`# C-P4: … 已删除`），`tests/` 零命中 |
+| **R-C6** | M2 × M3 在 8 天回填样本上的 A/B 对照表 | 2×8 = 16 点 | 🔴 **SKIP**——回填产物文件 2 份但**去重后仅 1 份**，且为禁用态占位 ⇒ **有效样本 0 天**，见 §4.1。脚本已改为分列「文件数 / 去重数 / 有效数」 |
 | **R-C7** | C 层零行为变更项落地后同期归档逐字段不变 | 100% 一致 | 待回放 |
 
 > R-C3 的实跑命令见 §8。R-C6 是 `verify_glue_metrics.py` 内**唯一被判为 SKIP** 的一条（该脚本只含 R-C3 / R-C6 两条），前置为 C-P11（回填跑批）+ C-P12（prompt A/B），两项均未实施。
+
+### 4.1 `_replay/` 产物全量盘点（2026-09-14 实测，含污染溯源）
+
+仓库存量 `_replay/` 产物共 **3 份**，无一构成 R-B8/R-B9 或 R-C6 需要的「对」或「多日样本」：
+
+| 路径 | 大小 | md5(前12) | `status` | 性质 |
+|---|---|---|---|---|
+| `20260903/_replay/unified.json` | 46,868 B | `ccd62f7d642f` | — | **单日**产物（09-03 21:40，mtime 与当日归档同步）。是 B 层 diff 的一半，**不是一对**；且早于 0911 修复，与 A/B/C 三层红线均无关。**此前未登记。本目录唯一非测试产物** |
+| `20260911/_replay/agent_glue.json` | 7,331 B | `bea358d36270` | `S6_disabled` | **测试污染**（`test_0903_replay_unchanged`，见 §2.2） |
+| `20260912/_replay/agent_glue.json` | 7,331 B | `bea358d36270` | `S6_disabled` | **同一测试跨零点第二次运行**，故与上份字节完全相同 |
+
+**两份 glue 产物是同一份，且都不是回放运行。** 二者 `relations=0` / `strengths=24` / `families=0`，
+`status=S6_disabled`。此前把它读作「`--got-replay` 在开关处短路、从未调用 LLM」是**误判**：
+`strengths=24` 正是 `test_0903_replay_unchanged` 对 0903 归档收集到的候选数（该用例自己断言
+`len(candidates) == 24`），mtime 与该测试的另一个用例精确到秒相同（§2.2）。
+它们既非 `--got-replay` 的产物，也就**不能作为「回放路径约定成立」的证据**。
+
+⇒ 对 R-C6 而言，不是「8 天里只有 2 天有数据」，而是**文件 2 份 / 去重后 1 份 / 有效样本 0 天**；
+C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据随之收敛到 0903 那 1 份。
+
+> ⚠️ 这 3 份都不是 `--replay-before/--replay-after` 或 `--archive-before/--archive-after` 可用的输入。
+> §8 的 ① 组红线（R-B3 / R-B8 / R-B9 / R-C7）仍为 3 SKIP。
+>
+> ✅ **`verify_glue_metrics.py` 的 R-C6 样本计数已修**（2026-09-14）：原 `_count_replay_samples()`
+> 只数文件数（输出「当前回填样本天数 = 2」）；现改为 `_replay_sample_inventory()`，
+> 分列**文件数 / md5 去重数 / 有效数**，并把 `S6_disabled`、`replay_mode` 判为占位态不计入。
+> 实跑输出已变为「有效样本 = 0 天（文件 2 份，去重后 1 份）」并逐条列出重复组与占位态日期。
 
 ---
 
@@ -145,6 +262,21 @@ C 层给出的修正方向是 **C-P6（M1 改 glue 侧）、C-P7（M6 改为「�
 | **R-C7** | `got_layer_c_plan_0911.md` §6 | C 层零行为变更项落地后归档逐字段不变 | 修复前后两组归档 | 待回放 |
 | **R1 / R3 / R4** | `got_run_model_plan_0911.md` §6 | 同日两跑状态一致性 / 事件计数不翻倍 / EMA 计数按日 | 两个同日快照目录 | 无参时 **SKIP** |
 | **R6** | 同上 | 15 个状态源（W1–W6 + D1–D9）逐项幂等复测 | 每源两跑前后各一次观测点 | **SKIP** |
+
+**2026-09-14 实跑复算**（两条脚本本次输出）：
+
+     verify_layer_b_consistency.py    → 0/3 PASS | 0 FAIL | 3 SKIP | exit 2
+     verify_same_day_idempotency.py   → 0/6 PASS | 2 FAIL | 4 SKIP | exit 1
+
+其中 R2 / R5 的 FAIL **不是代码缺陷**，实测值与性质：
+
+| 红线 | 实测 | 性质 |
+|---|---|---|
+| **R2** | 36 个含 `unified.json` 的归档日中，**0 天** `previous_regime != regime`（8 天无 `market_regime` 字段、16 天 `previous_regime` 为 null、12 天相等） | 按状态机设计（`aggregator.py:527-531`），该条件**只在情形 2（确认切换）成立**，其余两情形按设计就相等。旁证：`transition_pending` 在 0904 / 0909 / 0910 均被正确写入 ⇒ 字段接线是通的，是市场未触发切换。<br>✅ **已收口（2026-09-14）**：`tests/test_node6_regime_state.py::test_confirmed_switch` 补断言 `result.previous_regime == "bull"`（情形 2 是唯一会让两者不等的路径）⇒ 该项**不再依赖等市场切换**，每次跑测试即验 |
+| **R5** | 7 组 `(type, date)` 重复，**全部落在 08-28～09-10** | **预计 2026-10-11 起自动归零**——`persistence.py:704` 的去重只剔 `date == today_str`，历史条目靠 30 日窗口裁剪，最晚重复日为 09-10 |
+
+其余 4 条（R1 / R3 / R4 / R6）与 ① 组的 3 条均为纯 SKIP。**`data/_run*` 快照目录不存在**（本轮实测 Glob 零命中）；
+快照产出步骤见 `verify_same_day_idempotency.py` SKIP 提示内的 ①②③。
 
 > ⚠️ **R1/R3/R4 的历史记录不可复现**：`archive/got/got_impl_review_0911.md` §505 记「`--runs` 冒烟 **PASS**（比对 474 字段、差异 0）」，
 > 但该次比对所用的 `data/_run1` / `data/_run2` 快照**已不存在**，本次无法复算。按「不能算就不落判定」原则，此处状态记为 **SKIP**，不沿用该历史结论。
@@ -203,10 +335,10 @@ C 层给出的修正方向是 **C-P6（M1 改 glue 侧）、C-P7（M6 改为「�
 
 | 项 | 类型 | 说明 |
 |---|---|---|
-| **M3** 误配率人工抽查 | 人工 | 判据 ≤15%，样本为每日候选全量（≤10 分钟/日）。工具已备：`scripts/export_glue_family_audit.py`（**未纳入版本控制**），自述"只搬运事实，不做判定，判定列留空给审核者" |
+| **M3** 误配率人工抽查 | 人工 | 判据 ≤15%，样本为每日候选全量（≤10 分钟/日）。工具已备：`scripts/export_glue_family_audit.py`（**已纳入版本控制**，commit `0ac5252`），自述"只搬运事实，不做判定，判定列留空给审核者"。<br>📌 **材料已生成（2026-09-14 实跑）**：5 个有效归档日（0904 / 0907 / 0909 / 0910 / 0914，与 §2 的样本数独立互证）、**128 行候选**，类别分布 `same=78` / `recovered=42` / `overridden=6` / `both_none=2`；**待判**的那一类是 `overridden`（6 行）。输出 `data/glue_family_audit/family_audit.html`。判定归负责人 |
 | **OPEN-C2** M3 人工流程未定义 | 人工 | 抽查怎么抽 / 判据 / 谁判，文档建议分层抽 10 个、三档判据 |
-| **OPEN-C1** `transition_count` 时间炸弹 | 时间窗 | 约 **2026-09-25** 前后，0813–0826 的 10 个原始日将滚出 20 日窗口，`transition_count` 落到 ≈4–6，横躺阈值 5。**A 层落地后须重算倒计时** |
-| **A5 影子期** | 时间窗 | 需 ≥10 个交易日（当前有效样本 5 天，见 §2） |
+| **OPEN-C1** `transition_count` 时间炸弹 | 时间窗 | 🔴 **首次跌破阈值 = 2026-09-24**（已按窗口实算，替代原「约 09-25」估计）。窗口口径 = `load_regime_state_history(days=20)`，取**最近 20 个带 `market_regime` 字段的归档日**（无该字段的日不占窗格）。<br>📌 **实测 20260914 = 11**，窗口为 `0817…0914` —— 原文记的「0813–0826 十天」已过期：**0813 / 0814 早已滚出**，剩余 8 天（`0817–0826`）在 `0915–0924` 逐个滚出。<br>滚动预测（假设期间无新切换）：`0915:10 → 0918:8 → 0921:7 → 0923:5 → **0924:4**`。<br>两个消费者都在 `aggregator.py`：`:3192` 仓位震荡惩罚 ×0.8、`:3335` `range_reversal` 信号生成（需 `>=5` **且** `persistence_regime == "low"`）——**0924 起两者同时失去触发条件** |
+| **A5 影子期** | 时间窗 | 需 ≥10 个交易日（当前有效样本 **5 天**，见 §2；缺口 0908，0911/0912 的产物是测试污染见 §2.2）。距达标差 **5 个交易日** |
 | **Phase 5b 显著性校准** | 时间窗 | 需归档 ≥60 交易日（`custom/got_timeseries_calibration.md` 记为预计 2026-11 下旬） |
 
 ---
@@ -220,8 +352,19 @@ for d in $(ls data/got_daily/ | grep -E '^2026' | grep -v pre_fix); do
   [ -f "$f" ] && echo "$d $(stat -c%s "$f")" || echo "$d ---"
 done
 
+# _replay 产物盘点 + 去重（§4.1）—— 两份 glue 回放产物 md5 相同即同一份
+python -c "
+import hashlib,glob
+for p in sorted(glob.glob('data/got_daily/*/_replay/*.json')):
+    b=open(p,'rb').read()
+    print('%-52s %7d B  md5=%s' % (p, len(b), hashlib.md5(b).hexdigest()[:12]))
+"
+
 # M1–M6 与 R-C3 十锚点复算（§3 / §4）
 python scripts/verify_glue_metrics.py --date 20260910
+
+# B 层 R-B3 / R-B8 / R-B9（§4 / §5）—— 无参时 3 SKIP（缺回放对）
+python scripts/verify_layer_b_consistency.py
 
 # R1/R3/R4/R5/R6 同日两跑 diff（§5）—— --runs 需要【两个】快照目录
 # 快照怎么产出见脚本 SKIP 提示里的 ①②③；只传字面量 --runs 会直接 argparse 报错
@@ -229,6 +372,18 @@ python scripts/verify_same_day_idempotency.py --runs data/_run1 data/_run2
 
 # 无快照时跑全量（R2/R5 可离线真算，其余 SKIP）
 python scripts/verify_same_day_idempotency.py
+
+# R-C1 复测（§4）—— 4 个 S1/S2 失败样本落盘用例（无需 LLM / 网络）
+python -m pytest tests/test_node6_glue.py::TestGlueFailureSamplePersistence -q
+
+# R2 收口（§5）—— 情形 2 的 previous_regime 断言
+python -m pytest tests/test_node6_regime_state.py::TestApplyRegimeStateMachine -q
+
+# M3 人工抽查材料（§7）—— 输出 data/glue_family_audit/family_audit.html
+python scripts/export_glue_family_audit.py
+
+# R-C5 复验（§4）—— src/ + tests/ 零真实引用（仅 aggregator.py 墓志铭注释）
+rg -n '_log_shadow_comparison' src/ tests/
 
 # A-P0-4 沙箱幂等实测（§6.2）—— 复制 monitoring.json 到临时目录后连调 save_monitoring
 # （不触碰 data/got_timeseries/monitoring.json；完整片段见 §6.2 说明）
@@ -241,3 +396,6 @@ ls -la data/got_screener/ | tail
 
 *生成日期：2026-09-14*
 *修订：2026-09-14 —— 明确收录范围（§0）；移出 R-D1 / R-D2 / R2 / R5；A-P0-4 由「待验证」改为「已实测有效」（§6）；补 R6 与归档输入禁区（§5）；修正 `--runs` 复现命令（§8）。*
+*修订：2026-09-14（第二轮）—— R-C5 复验通过并改判（§4）；R-C6 样本描述更正为「2 份 = 同一份 `S6_disabled` 占位」，有效样本 0 天（§4 / §4.1）；新增 §4.1 `_replay/` 产物全量盘点，登记此前未记载的 0903 单日产物；§5 补两条脚本的实跑复算值与 R2 / R5 的性质说明；§7 补 `transition_count` 实测值（0914 = 11）；§8 增 B 层脚本与 `_replay` 盘点命令。*
+*修订：2026-09-14（第三轮，影子期）—— §1 增「`*_SHADOW` 在 `*_ENABLED=false` 时失效」的机制澄清，三条线改按各自门与实跑取值列；新增 §1.1 T1-H 真实字段名与 29 天全 `None` 实测（原记载的三个字段名在代码中不存在）；§2 改为含 `status`/`relations`/`strengths`/`families`/`degraded` 的逐日表；新增 §2.1 更正 0911/0912 的降级归因（`S6_disabled`「开关关闭」≠「F1 降级:纯技术分」）；§3 补 R-C3 复跑 PASS 10/10；§4.1 补脚本 R-C6 样本数高估的提示；§7 更新 A5 样本数与 M3 工具入库状态。*
+*修订：2026-09-14（第四轮，修正轮）—— 新增 §2.2：**查明 0911/0912 的 4 份产物全部是测试污染**（`strengths=3/24` 与测试夹具一一对应、mtime 精确到秒相同；测试未重定向 `GLUE_ARCHIVE_ROOT`），§1/§2/§7 随之改口径，§2.1 的「未查证」撤销；§4.1 据此更正——`_replay/` 那两份不是回放产物，R-C2 的有效证据收敛到 0903 一份；**§4 R-C1 由「待复测」改判 PASS（补 4 个失败样本落盘用例）**；§4 R-C6 与脚本改判为「文件 2 / 去重 1 / 有效 0」（`_replay_sample_inventory()`）；§5 R2 标注已由测试收口；§7 OPEN-C1 由「约 09-25」改为实算的 **09-24 破阈值**（并用窗口实算更正「0813–0826 十天」→「0817–0826 八天」）；§7 M3 补材料实跑结果（5 天 / 128 行）；§8 增 R-C1、R2、M3 三条复现命令。*

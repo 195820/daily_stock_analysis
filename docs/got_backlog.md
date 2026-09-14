@@ -45,8 +45,23 @@
 | **A-P0-5** | Node 2 三处派生计数器补 `tracking_date < today` 过滤 | 首轮记为"部分"；第二轮未单列 |
 | **A-P0-6** | `ambush_position_snapshots` 改自然键 upsert + 收窄静默 `except` | 首轮解包 bug（P0-1）已修；DB 实测该表仍 **0 行**（见下条） |
 | **A-P0-9** | 归档侧快照标签 `snapshot_time` / `bar_complete`，只落 `meta.json` | 首轮 ⚠️（伴随 P1-6）；P1-6 已在 R2.1 修，是否收口待确认 |
-| **P4 快照路径解析** | `:1933` 仍用 `_extract_sector_from_reasoning` 解析候选 reasoning ⇒ 恒 `""` ⇒ `continue`；**DB 实测 `ambush_position_snapshots` 0 行** | R2.7(A) §8-4 记为"已修"（改 `scoring.sector_name`），副产物 `_extract_sector_from_reasoning` 成死代码 |
+| **P4 快照路径解析** | `:1933` 仍用 `_extract_sector_from_reasoning` 解析候选 reasoning ⇒ 恒 `""` ⇒ `continue`；**DB 实测 `ambush_position_snapshots` 0 行** | R2.7(A) §8-4 记为"已修"（改 `scoring.sector_name`），副产物 `_extract_sector_from_reasoning` 成死代码。**0 行 ≠ 修复失效，见下注** |
 | **OPEN-1…4** | 见 §3 | — |
+
+> 📌 **`ambush_position_snapshots` 0 行的复核结论（2026-09-14）**
+>
+> 该表 0 行曾被与 P4「已修」并列，读起来像修复未验证。实测**不是**：
+>
+> | 环节 | 实测（20260914） |
+> |---|---|
+> | 写路径可达性 | ✅ `buy_allocations` 非空——当日有 2 笔买入（`002040` 1200 股 / `000070` 700 股） |
+> | 板块名判据 | ✅ `unified_scoring[].sector_name` 有值（P2-4 生效），仅 `688127` 为 `null` |
+> | 交集判定 | ❌ 埋伏池 = `{先进封装, 光刻机}`；买入的 `002040`(港口) / `000070`(CPO概念) 均不在其中 ⇒ `continue` |
+>
+> **唯一命中的 `002106`(先进封装) 当日未被买入。** 故 0 行是**正确行为**：路径可达、判据正确，只是从未被触发。
+> 与 P2-3（`buy_budget` 截断，OPEN-D9）叠加后，这张表的空置可能长期持续——它是**下游症状**，不是 P4 的证据缺口。
+>
+> 代码位置已漂移：文档记的 `:1933` 现为 `portfolio_decision.py:2016`。
 
 ### 1.B 概念一致性层（B 层）
 
@@ -68,8 +83,8 @@
 | **C-P6** | M1 数据源改 glue 侧（`strengths[].news_read ∉ {low, unknown}`），规则侧并列对照列 | ✗ 未落地（决定 R-C4 / M1 能否成立的关键项） |
 | **C-P7** | M6 改为「其他」回收率（「无归属」计为未回收；覆盖率降为观察项） | ✗ 未落地 |
 | **C-P8** | 明确 M4 系数 = Spearman，增注"M4-a 的独立性以 B1 修复为条件"，M4-a 红线数值标记「待标定」 | ✗ 未落地 |
-| **C-P9** | `GlueStrength` 新增 `basis` 字段 + prompt 写明替代综合评分 | ✗ 未落地；`GlueStrength.basis` **无生产者**（R2.13 #2） |
-| **C-P11** | 回填跑批（`--got-replay 20260901`…`20260908`），影子样本 4→8 天 | ✗ 未实施（当前 `_replay` 样本仅 **2 天**） |
+| **C-P9** | `GlueStrength` 新增 `basis` 字段 + prompt 写明替代综合评分 | ✅ **两半均已落地**（2026-09-14 复核）——字段见 `schemas.py:1086-1089`（`default="composite"`，commit `8ad119b`，09-12）；prompt 见 `aggregator.py:824`「**此字段替代的是综合评分（技术面+资金面+消息面+情绪面）**，不是只替代技术面」。原记「无生产者」字面成立但**会误导**：`basis` 是恒真的口径声明，语义在 prompt 里，**不需要赋值语句**；归档侧 0911 起可见 `basis="composite"` |
+| **C-P11** | 回填跑批（`--got-replay 20260901`…`20260908`），影子样本 4→8 天 | ✗ 未实施（`_replay` 产物文件 **2 份**，去重后 **1 份**，且均为占位态 ⇒ **有效样本 0 天**，见 [`got_shadow_verification.md`](got_shadow_verification.md) §4.1） |
 | **C-P12** | prompt A/B（保守版 vs 全量归属版），输出 M2×M3 对照曲线 | ✗ 未实施 —— **R-C6 因此 SKIP** |
 | **C-P13** | 红线标定 | 依赖 C-P11/C-P12，文档明示**本轮不执行** |
 | **C-P3** | `replay_mode` 下允许 glue（受新开关控制，默认 `false`） | 首轮 ⚠️（replay 分支新增落盘副作用，违约） |
@@ -248,8 +263,9 @@ A6 本体的动作（`archive/got/agent_glue_plan_0903.md` §11.3）：
 | # | 项 | 性质 |
 |---|---|---|
 | 1 | `sector_role_map` 的 fallback 是 `"mainline"`（**放大风险**而非保守侧） | 策略决策：改它会改变"角色未知"时的仓位方向 |
-| 2 | `GlueStrength.basis` 无生产者；`HotStock.mention_source` 的 `nga_mention` 值无生产者 | 口径声明类，接线需先定语义 |
+| 2 | ~~`GlueStrength.basis` 无生产者~~ ✅ **已结**（`basis` 是常量口径声明，语义落在 prompt `aggregator.py:824`，见 §1.C C-P9）；**仅剩** `HotStock.mention_source` 的 `nga_mention` 值无生产者（实测只有 `sentiment_analysis.py:805` eastmoney / `:836` xueqiu 两个生产者） | 口径声明类，接线需先定语义 |
 | 3 | `signal_dates` 的口径：「**按次**」还是「**按日**」 | R5 要求同 `(type, date)` 至多 1 条，而实现**有意**按当日信号出现次数逐条落盘，`signal_count_30d` 依赖该计数。二者必居其一（详见 §9 #5） |
+| 4 | 存量的 **4 份测试污染归档产物**是否清理（`data/got_daily/20260911/agent_glue.json`、`20260912/agent_glue.json` 及各自 `_replay/` 一份） | 污染源已修（测试已隔离 `GLUE_ARCHIVE_ROOT`），存量文件**未删**——它们是该结论的现场证据。清理会失去现场，不清理则 `data/got_daily/` 里始终有 4 份非生产产物。取舍见 [`got_shadow_verification.md`](got_shadow_verification.md) §2.2 |
 | — | ~~`A-P0-4`（monitoring 按日去重）效果未验证~~ | ✅ **已结**（2026-09-14）：沙箱实测 + 09-14 归档旁证确认有效，见 [`got_shadow_verification.md`](got_shadow_verification.md) §6 |
 
 > 另有一条**曾被公开撤销的错误断言**记录在 `archive/got/agent_glue_plan_0903.md` §9：原断言"`base_position` 是死参数"曾在写作阶段被错误撤销（查错了文件），**撤销作废**——`aggregator.py` 的 `base_position` 确是死参数。
@@ -266,7 +282,7 @@ A6 本体的动作（`archive/got/agent_glue_plan_0903.md` §11.3）：
 | 4 | **`CHANGELOG.md` 混段** | `[Unreleased]`（第 10–61 行，47 条）中 **19 条本地 GOT 工作 + 28 条上游开源项目条目**混排；另有 `## GOT 架构实施记录（从 CLAUDE.md 归档）` 一节位于 1.0.0 之后 |
 | 5 | **文档状态字段过期** | `custom/plan_got_timeseries_enhancement.md` 头部写"状态：待评审"，但其内容与实现**同批落库**（commit `03bb3d1`，2026-08-28） |
 | 6 | **未纳入版本控制的验收脚本** | `.gitignore:76` 的 `verify_*.py` 规则下仍有 6 个：`verify_flow_archive.py`、`verify_position_sizing.py`、`verify_remote_data_sources.py`、`verify_risk_fix.py`、`verify_t5_alignment.py`、`verify_ths_*.py`（4 个 0911 手具已有负向例外） |
-| 7 | **未跟踪工具** | `scripts/export_glue_family_audit.py`（M3 人工抽查工具）尚未入库 |
+| 7 | ~~**未跟踪工具**~~ | ✅ **已结**（2026-09-14）：`scripts/export_glue_family_audit.py`（M3 人工抽查工具，702 行）已入库，commit `0ac5252` |
 | 8 | **附录 A 基线不可复现（R-D2 FAIL）** | `archive/got/got_layer_d_plan_0911.md` §附录 A 的四个子计数中 **2 项与实算不一致**：① `ambush_pool_saturation_days` 文档记 **≥10**，实算 **5**（顶格日共 8 天、最长连续 5 天）——文档自注"缺口见 D-P2 落盘"，即**该基线的数据源未落盘、无法复核**；② `dead_signal_count` 文档记 **4**，实算 **3**——文档基线早于 D-P14 删 E10 落地。R-D2 由「验收红线」降级为**文档缺陷**：它的输入是一份过期基线，不是代码状态。 |
 
 ---
@@ -279,15 +295,17 @@ A6 本体的动作（`archive/got/agent_glue_plan_0903.md` §11.3）：
 |---|---|---|
 | 1 | **R-D1 口径自相矛盾** | `archive/got/got_layer_d_plan_0911.md` §6 的**定义**是「报告中每个**已修复/已解决**声明都附一条可复算证据」= **窄口径**；但同节**基线明细**把 9 条「待修」全算进去了 = **宽口径**。15 项里只有 P0-1 是「已修复」声明 ⇒ 窄口径 `unverified = 1`，宽口径 `= 8`（脚本输出 9，多算 1，见 #4）。**宽口径下「如实标注待修」反而被罚**，与「可复算率」这个名称的语义相反 |
 | 2 | **R-D1 是 burndown 而非验收红线** | 它的 9 项读数**全部由未实施工作决定**（见 §2 处置表：待退役 4 / 延后 1 / 挂起 2 / 降级 1 / 改归属 1）。A6 退役一落地，4 项随 §6.1 删除自动消解 ⇒ **R-D1 → 0 是 A6 的副产品，不是 A6 的前置任务** |
-| 3 | **R2 把市场事件当验收条件** | 「出现 `previous_regime != regime` 的归档日 ≥ 1 天」。按状态机设计（`aggregator.py:583-590`），`prev != cur` **只在情形 2（确认切换）**发生，其余两情形**按设计就相等**；自 08-27 接线以来 0 次触发。**零切换无法区分「市场没切换」与「情形不可达」**，两种解释都不可由该红线区分。低成本收口见 §9.1 |
-| 4 | **`check_audit_claims.py` 把修复前归档当失效证据** | P1-5 被判 `INEFFECTIVE`，理由「修复代码尚未产生修复后归档，20260904 仍可复现重复」——**该理由不成立**：修复于 commit `8ad119b`（**09-12**）落地，`20260914` 即修复后归档且当日 ≥ 2 跑，其 `reasoning.md` 中「Node 7」仅出现 1 次（逐日实测见 §2 注）。**根因：脚本不区分 pre-fix / post-fix 归档，只扫全量找复发。** ⇒ **R-D1 正确读数 = 8，不是脚本输出的 9** |
+| 3 | **R2 把市场事件当验收条件** | 「出现 `previous_regime != regime` 的归档日 ≥ 1 天」。按状态机设计（`aggregator.py:583-590`），`prev != cur` **只在情形 2（确认切换）**发生，其余两情形**按设计就相等**；自 08-27 接线以来 0 次触发。**零切换无法区分「市场没切换」与「情形不可达」**，两种解释都不可由该红线区分。✅ **已收口（2026-09-14）**，见 §9.1 |
+| 4 | ~~**`check_audit_claims.py` 把修复前归档当失效证据**~~ ✅ **已修（2026-09-14）** | P1-5 被判 `INEFFECTIVE`，理由「修复代码尚未产生修复后归档，20260904 仍可复现重复」——**该理由不成立**：修复于 commit `8ad119b`（**09-12**）落地，`20260914` 即修复后归档且当日 ≥ 2 跑，其 `reasoning.md` 中「Node 7」仅出现 1 次（逐日实测见 §2 注）。<br>⚠️ **原记「根因：脚本不区分 pre-fix / post-fix 归档，只扫全量找复发」有误**：实测 `check_p1_5` **本来就有**分流 `recent = [d for d in duplicates if d.split("×")[0] > "20260901"]`，只是**阈值写的是 0901**，而修复落地在 0912 ⇒ 修复前的 0904 被判进了「之后」。真正的修法是改一个日期字面量，不是加分流。<br>**已修**：阈值提取为常量 `P1_5_FIX_DATE = "20260912"`（注明 commit `8ad119b`）⇒ **R-D1 实跑读数 = 8**，与本节预期一致 |
 | 5 | **R5 与 `signal_dates` 的设计语义冲突** | R5 要求同 `(type, date)` 至多 1 条；但 `persistence.py:709-711` **有意**按当日信号出现次数逐条落盘（`for _ in range(count)`），`persistence.py:713-716` 的 `signal_count_30d` 正依赖该计数。当前 7 组重复全部是**修复前**的历史条目（去重只剔 `date == today_str`，历史条目靠 30 日窗口裁剪）⇒ **预计 2026-10-11 起自动归零**（最晚重复日 09-10 滚出窗口）。⚠️ 若某天单次运行就产生 ≥2 条同类信号，R5 会**再次** FAIL —— 那时是定义与实现语义打架，**需裁决「按次」还是「按日」** |
 
-### 9.1 R2 的低成本收口（建议）
+### 9.1 R2 的低成本收口 ✅ 已实施（2026-09-14）
 
-`tests/test_node6_regime_state.py:127 test_confirmed_switch` **已经**用合成 `prev_state` 构造了情形 2，
-但只断言了 `regime` / `dwell_days` / `transition_pending` —— **恰好漏掉 `previous_regime`**，而它正是 R2 唯一的观测量。
-补一行 `self.assertEqual(result.previous_regime, "bull")`，即可把 R2 从"等市场切换"变成"每次跑测试都验"。
+`tests/test_node6_regime_state.py` 的 `test_confirmed_switch` **已经**用合成 `prev_state` 构造了情形 2，
+但原先只断言了 `regime` / `dwell_days` / `transition_pending` —— **恰好漏掉 `previous_regime`**，而它正是 R2 唯一的观测量。
+
+**已补** `self.assertEqual(result.previous_regime, "bull")`（情形 2 是唯一会让两者不等的路径），
+R2 遂从「等市场切换」变为「每次跑测试都验」。
 
 ---
 
@@ -298,7 +316,7 @@ A6 本体的动作（`archive/got/agent_glue_plan_0903.md` §11.3）：
 # ⚠️ --runs 需要【两个】快照目录；只传字面量 --runs 会 argparse 报错
 python scripts/verify_same_day_idempotency.py --runs data/_run1 data/_run2
 python scripts/verify_layer_b_consistency.py
-python scripts/verify_glue_metrics.py --all
+python scripts/verify_glue_metrics.py --date 20260910   # ⚠️ 无 --all；R-C3 十锚点由 --date 触发，只接受 --date/--json/--spearman-method
 python scripts/check_audit_claims.py
 
 # 0902 对账基线中的 P2-3（买入预算归零）
@@ -311,9 +329,17 @@ for p in sorted(glob.glob('data/got_daily/2026*/portfolio_decision.json'))[-26:]
 
 # 未纳入版本控制的脚本
 git check-ignore -v --no-index scripts/verify_*.py
+
+# 本轮收口的三项（R-C1 / R2 / M3）
+python -m pytest tests/test_node6_glue.py::TestGlueFailureSamplePersistence -q   # R-C1：S1/S2 落盘
+python -m pytest tests/test_node6_regime_state.py::TestApplyRegimeStateMachine -q  # R2：情形 2 断言
+python scripts/export_glue_family_audit.py                                       # M3 材料 → data/glue_family_audit/family_audit.html
 ```
 
 ---
 
 *生成日期：2026-09-14*
 *修订：2026-09-14 —— §0 明确「未实施」的六类处置与验收红线判定标准；§2 由「10 项未修」改为 **15 项处置表**（真·未排期 = 0）；§8 增 R-D2；新增 §9 红线与验收脚本自身的缺陷（含 R-D1 正确读数 = 8）；§7 结掉 A-P0-4 并换入 `signal_dates` 口径裁决项；修正 §10 的 `--runs` 命令。*
+*修订：2026-09-14（第二轮）—— §1.A 补 `ambush_position_snapshots` 0 行的复核结论（是下游症状，不是 P4 证据缺口）；P4 行补代码位置漂移提示（`:1933` → `:2016`）。*
+*修订：2026-09-14（第三轮，影子期）—— §1.C C-P9 由「✗ 未落地」改判为 **两半均已落地**（字段 `schemas.py:1086` + prompt `aggregator.py:824`）；§7 裁决 #2 结掉 `GlueStrength.basis` 一半、仅留 `mention_source`；§8 #7 M3 工具已入库并结项；§10 修正 `verify_glue_metrics.py --all`（脚本无该参数）。*
+*修订：2026-09-14（第四轮，修正轮）—— §9 #3 与 §9.1 标注 R2 **已收口**（测试补断言）；§9 #4 **改判已修**并**更正根因**（脚本本有 pre/post 分流，错的是阈值 0901 → 实为修复落地日 0912，已提为常量 `P1_5_FIX_DATE`；R-D1 实跑读数 = 8）；§1.C C-P11 样本描述更正为「文件 2 / 去重 1 / 有效 0」；§7 新增裁决 #4（存量 4 份测试污染产物是否清理）；§10 增 R-C1 / R2 / M3 三条复现命令。*

@@ -92,6 +92,8 @@ R_D1_BASELINE = 10
 CONFIDENCE_BASE = 0.7          # P0-2：板块置信度隐式基础分
 BASE_COLLAPSE_SHARE = 0.5      # 基础分占比 ≥ 50% 即判定「仍坍缩在基础分上」
 MENTION_SPREAD_MIN = 0.10      # P1-3：mention_count 极差 > 10% 视为已恢复区分度
+P1_5_FIX_DATE = "20260912"     # P1-5（Node 7 段重复）修复落地日，commit 8ad119b；
+                               # 归档日早于此值的属**修复前归档**，不构成修复失效的证据
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -366,16 +368,16 @@ def check_p1_5() -> tuple[str, list[str]]:
         count = text.count("## Node 7 交易建议") or text.count("Node 7 交易建议")
         if count > 1:
             duplicates.append(f"{day.name}×{count}")
-    recent = [d for d in duplicates if d.split("×")[0] > "20260901"]
+    recent = [d for d in duplicates if d.split("×")[0] > P1_5_FIX_DATE]
     effective = cleanup and not recent
     return (
         EFFECTIVE if effective else INEFFECTIVE,
         [
             f"archive.py `_append_phase2_reasoning` 覆盖写并清理旧段：{cleanup}"
             f" [{_landing(ARCHIVE, '先清理旧的')}]",
-            f"归档中 Node 7 段重复日：{duplicates or '无'}；其中 20260901 之后：{recent or '无'}"
-            f"（历史重复日属于修复前归档，不随代码修复重写）",
-            f"判定：{'修复已落地且归档无重复' if effective else '修复代码尚未产生修复后归档，20260904 仍可复现重复 ⇒ 可复算性未成立，按 unverified 计'}",
+            f"归档中 Node 7 段重复日：{duplicates or '无'}；其中修复落地（{P1_5_FIX_DATE}）之后的：{recent or '无'}"
+            f"（早于该日的重复属修复前归档，不随代码修复重写）",
+            f"判定：{'修复已落地且修复后归档无重复' if effective else f'修复后归档仍可复现重复 {recent} ⇒ 可复算性未成立，按 unverified 计'}",
         ],
     )
 

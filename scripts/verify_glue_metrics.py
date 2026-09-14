@@ -40,6 +40,7 @@ Spearman 口径声明（不得静默取数）
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -65,6 +66,7 @@ ANCHOR_DATE = "20260910"
 
 NON_NEUTRAL_READS = {"low", "unknown"}
 NO_FAMILY = {"无归属"}
+REPLAY_PLACEHOLDER_STATUSES = {"S6_disabled", "replay_mode"}
 
 
 def _load_pair(date: str) -> tuple[dict, dict] | None:
@@ -192,18 +194,45 @@ def compare_anchor(metrics: dict) -> list[tuple[str, str, str, bool]]:
     return [(name, actual, expected, actual == expected) for name, actual, expected in comparisons]
 
 
-def _count_replay_samples() -> int:
-    """统计 `{date}/_replay/agent_glue.json` 回填样本天数（R-C6 前置）。"""
-    return sum(
-        1 for day in iter_archive_days() if (day / "_replay" / "agent_glue.json").exists()
-    )
+def _replay_sample_inventory() -> dict:
+    """盘点 `{date}/_replay/agent_glue.json` 回填样本（R-C6 前置）。
+
+    ⚠️ 必须分开数「文件数」与「有效样本数」：
+      - 同一份产物在不同日期重复落盘会被文件数数成多天（实测 0911 / 0912 两份 md5 相同）；
+      - `S6_disabled` / `replay_mode` 是开关短路产生的**占位**，回放在此处即返回，
+        从未调用 LLM，不构成 A/B 对照的有效样本。
+    """
+    file_paths = [
+        day / "_replay" / "agent_glue.json"
+        for day in iter_archive_days()
+        if (day / "_replay" / "agent_glue.json").exists()
+    ]
+    by_digest: dict[str, list[str]] = {}
+    placeholders: list[str] = []
+    valid_days: list[str] = []
+    for path in file_paths:
+        day = path.parent.parent.name
+        by_digest.setdefault(hashlib.md5(path.read_bytes()).hexdigest(), []).append(day)
+        status = (read_json(path) or {}).get("status")
+        if status in REPLAY_PLACEHOLDER_STATUSES:
+            placeholders.append(f"{day}({status})")
+        else:
+            valid_days.append(day)
+    return {
+        "files": len(file_paths),
+        "distinct": len(by_digest),
+        "valid_days": valid_days,
+        "placeholders": placeholders,
+        "duplicate_groups": [days for days in by_digest.values() if len(days) > 1],
+    }
 
 
 def _latest_complete_day() -> str | None:
     """最近一个同时含 agent_glue.json 与 unified.json 的归档日。
 
-    0911/0912 只有 agent_glue.json（测试直调 _agent_semantic_glue 的污染产物），
-    不能作为指标复算样本，必须成对存在。
+    0911/0912 只有 `agent_glue.json`（且 `_replay/` 那份也无对应 unified），
+    是测试直调 `_agent_semantic_glue` 产生的污染产物（污染源已在
+    tests/test_node6_glue.py 中隔离），不能作为指标复算样本，必须成对存在。
     """
     for day in reversed(iter_archive_days()):
         if (day / "agent_glue.json").exists() and (day / "unified.json").exists():
@@ -283,17 +312,35 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
         )
 
     # ── R-C6：A/B 曲线（需回填 + 两版 prompt，不能算则 SKIP） ──
-    replay_samples = _count_replay_samples()
+    replay = _replay_sample_inventory()
+    replay_samples = len(replay["valid_days"])
+    sample_evidence = [
+        f"文件数 = {replay['files']} / 去重后 = {replay['distinct']}；"
+        f"有效样本 = {replay_samples} 天"
+        + (f"（{', '.join(replay['valid_days'])}）" if replay["valid_days"] else ""),
+    ]
+    if replay["duplicate_groups"]:
+        sample_evidence.append(
+            "⚠️ 同内容重复落盘（文件数因此高估）："
+            + "、".join("/".join(group) for group in replay["duplicate_groups"])
+        )
+    if replay["placeholders"]:
+        sample_evidence.append(
+            "⚠️ 占位态（开关短路，未调用 LLM，不计入有效样本）："
+            + ", ".join(replay["placeholders"])
+        )
+    sample_evidence += [
+        "前置条件：① C-P11 回填跑批产出 ≥8 天 _replay/agent_glue.json；"
+        "② C-P12 prompt A/B 两版各跑这 8 天；③ 回填期 M3 需人工抽查样本（OPEN-C2 流程未定义）",
+        "本脚本不把 R-C6 替换成任何静态检查 —— 无样本即 SKIP",
+    ]
     verifier.add(
         "R-C6 A/B 曲线（M2 × M3，8 天回填 × 2 版 prompt）",
         STATUS_SKIP,
-        f"当前回填样本天数 = {replay_samples}（data/got_daily/*/_replay/agent_glue.json），"
+        f"当前回填**有效**样本 = {replay_samples} 天"
+        f"（文件 {replay['files']} 份，去重后 {replay['distinct']} 份），"
         "两版 prompt 的 A/B 对照表尚未产出",
-        [
-            "前置条件：① C-P11 回填跑批产出 ≥8 天 _replay/agent_glue.json；"
-            "② C-P12 prompt A/B 两版各跑这 8 天；③ 回填期 M3 需人工抽查样本（OPEN-C2 流程未定义）",
-            "本脚本不把 R-C6 替换成任何静态检查 —— 无样本即 SKIP",
-        ],
+        sample_evidence,
     )
 
     if as_json:
@@ -303,7 +350,14 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
                 {"name": name, "actual": actual, "expected": expected, "match": ok}
                 for name, actual, expected, ok in comparisons
             ],
-            "rc6": {"status": STATUS_SKIP, "replay_samples": replay_samples},
+            "rc6": {
+                "status": STATUS_SKIP,
+                "replay_samples": replay_samples,
+                "replay_files": replay["files"],
+                "replay_distinct": replay["distinct"],
+                "replay_valid_days": replay["valid_days"],
+                "replay_placeholders": replay["placeholders"],
+            },
         }
         print("\n── --json ──")
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
