@@ -15,8 +15,8 @@
 
 ## 0. 结论摘要
 
-GOT 是**日频**系统：[`orchestrator.run()`](../src/got/orchestrator.py) 每日跑一次，盘前产出
-`regime` + `confirmed_sectors` + 选股候选（[`_filter_got_finalists`](../src/services/stock_screener.py) 5 轮漏斗）。
+GOT 是**日频**系统：[`orchestrator.run()`](../../../src/got/orchestrator.py) 每日跑一次，盘前产出
+`regime` + `confirmed_sectors` + 选股候选（[`_filter_got_finalists`](../../../src/services/stock_screener.py) 5 轮漏斗）。
 它回答了「**今天该关注哪些板块、哪些票**」，但**没有回答「这只票今天走完 0→1 了吗、现在是不是真共识、该不该 now 介入」**——
 这一步目前**完全交给人在盘中判断**。
 
@@ -29,9 +29,9 @@ GOT 是**日频**系统：[`orchestrator.run()`](../src/got/orchestrator.py) 每
 
 **但有一条决定性的前置事实（§2）**：
 
-> 盘中确认的瓶颈**不在算法，在数据地基**。`UnifiedRealtimeQuote`（[`realtime_types.py` L109-189](../data_provider/realtime_types.py)）
+> 盘中确认的瓶颈**不在算法，在数据地基**。`UnifiedRealtimeQuote`（[`realtime_types.py` L109-189](../../../data_provider/realtime_types.py)）
 > **不承载五档 / 封单 / 委比 / 分时**；底层 `mootdx` / `pytdx` 的 `get_realtime_quote` 虽返回五档买卖**价**
-> （[`mootdx_fetcher.py` L337-338](../data_provider/mootdx_fetcher.py)），但**未上浮**到统一结构，且五档买卖**量**（封单/委比的原料）
+> （[`mootdx_fetcher.py` L337-338](../../../data_provider/mootdx_fetcher.py)），但**未上浮**到统一结构，且五档买卖**量**（封单/委比的原料）
 > 当前**取都未取**；分时序列、集合竞价**无任何接口**。
 >
 > → 故本方案的 **Phase 6-0（盘中数据地基）是硬前置**，与 `agent_glue_plan` 把「回放 harness」列为 P0-A 第一项同理。
@@ -58,13 +58,13 @@ GOT 是**日频**系统：[`orchestrator.run()`](../src/got/orchestrator.py) 每
 
 | # | 能力项 | 代码 / 数据事实 | 判定 |
 |---|---|---|---|
-| F1 | 统一实时结构承载字段 | `UnifiedRealtimeQuote`（[`realtime_types.py` L109-189](../data_provider/realtime_types.py)）含 price/change_pct/volume/amount/**volume_ratio(量比)**/**turnover_rate(换手)**/amplitude/open/high/low/pre_close。**无 bid/ask 五档、无封单量、无委比、无分时序列** | ✅ 现状明确 |
-| F2 | 五档买卖**价** | `mootdx_fetcher.get_realtime_quote`（[L306-339](../data_provider/mootdx_fetcher.py)）返回 `bid_prices[5]`/`ask_prices[5]`；`pytdx_fetcher`（[L455-488](../data_provider/pytdx_fetcher.py)）同。**但这两字段无处安放于 F1 的统一结构 → 归一时被丢弃** | ⚠️ 底层有、统一层丢 |
+| F1 | 统一实时结构承载字段 | `UnifiedRealtimeQuote`（[`realtime_types.py` L109-189](../../../data_provider/realtime_types.py)）含 price/change_pct/volume/amount/**volume_ratio(量比)**/**turnover_rate(换手)**/amplitude/open/high/low/pre_close。**无 bid/ask 五档、无封单量、无委比、无分时序列** | ✅ 现状明确 |
+| F2 | 五档买卖**价** | `mootdx_fetcher.get_realtime_quote`（[L306-339](../../../data_provider/mootdx_fetcher.py)）返回 `bid_prices[5]`/`ask_prices[5]`；`pytdx_fetcher`（[L455-488](../../../data_provider/pytdx_fetcher.py)）同。**但这两字段无处安放于 F1 的统一结构 → 归一时被丢弃** | ⚠️ 底层有、统一层丢 |
 | F3 | 五档买卖**量**（封单/委比原料） | 当前 `get_realtime_quote` **只取了价（L337-338 `bid{i}`/`ask{i}`），未取量**。通达信 quotes() 协议标准含五档量列，但**列名/可得性未核实** | 🔴 待核实（OPEN-I2） |
 | F4 | 分时序列 / 分钟 K 线 | `data_provider/*.py` 全量检索**无** `get_minute`/分时/fenshi 接口（仅 `base.py` 一句"分时量比"口径注释、`tushare_fetcher` 的限流计时器 `_minute_start`） | 🔴 缺失，需新增 |
 | F5 | 集合竞价（auction） | **无接口**。竞价量价需从分时首段或通达信竞价数据推导 | 🔴 缺失，需新增 |
-| F6 | 盘中轮询可行性 | mootdx 走**通达信 TCP 7709，不封 IP**（[`mootdx_fetcher.py` L348 注释](../data_provider/mootdx_fetcher.py)）；已有 `CircuitBreaker` 熔断（[`realtime_types.py` L280-425](../data_provider/realtime_types.py)）+ `em_rate_limiter` 限流 | ✅ 适合盘中高频 |
-| F7 | 盘中调度入口 | `main.py --got` 为**日频一次性**运行（`orchestrator.run` 每日一次）；`--got-replay`（[`main.py` L1254+](../main.py)）为**日频归档回放**。**无盘中定时（9:26/11:25/14:45）调度** | 🔴 缺失，需新增 |
+| F6 | 盘中轮询可行性 | mootdx 走**通达信 TCP 7709，不封 IP**（[`mootdx_fetcher.py` L348 注释](../../../data_provider/mootdx_fetcher.py)）；已有 `CircuitBreaker` 熔断（[`realtime_types.py` L280-425](../../../data_provider/realtime_types.py)）+ `em_rate_limiter` 限流 | ✅ 适合盘中高频 |
+| F7 | 盘中调度入口 | `main.py --got` 为**日频一次性**运行（`orchestrator.run` 每日一次）；`--got-replay`（[`main.py` L1254+](../../../main.py)）为**日频归档回放**。**无盘中定时（9:26/11:25/14:45）调度** | 🔴 缺失，需新增 |
 | F8 | 盘中数据归档 / 回放 | `archive.py` 为**日频**归档（`got_daily/YYYYMMDD/`）。Phase 0-A1 已完成**日频**回放 harness（`load_daily_contexts` + `--got-replay`）。**盘中分时/五档快照无归档结构** | 🔴 缺失，需新增 |
 | F9 | 可复用资产：审查 Agent | Phase 3a 已实现 `build_review_executor`（轻量 Agent，3 工具 + max_steps=4 + 审查专用提示词，见 `agent_glue_plan` §11.1） | ✅ 可复用于 §4.3 语义仲裁 |
 | F10 | 可复用资产：T+1 结果回填 | Phase 3c 已实现 `get_stock_history` **惰性回填** `outcome_5d/20d/was_correct`（读取时用 DataFetcherManager 拉 K 线算，见 `agent_glue_plan` §11.1） | ✅ 可复用于 §6 的 I4/I5 有效性验证 |
@@ -77,7 +77,7 @@ GOT 是**日频**系统：[`orchestrator.run()`](../src/got/orchestrator.py) 每
 
 > 这一节防止方案被误读为"追涨停确认"，与 GOT 既有定位冲突。
 
-- GOT 选股**轮次 0 主动剔除涨停股**（[`_filter_got_finalists` L1448-1460](../src/services/stock_screener.py)："当日无法买入"），
+- GOT 选股**轮次 0 主动剔除涨停股**（[`_filter_got_finalists` L1448-1460](../../../src/services/stock_screener.py)："当日无法买入"），
   轮次 0b 软过滤涨 ≥8% 过热票。这是**波段低吸 + 埋伏**路线，与"打板/追龙头一字板/连板梯队"方向**相反**。
 - 故本闸门的目标**不是**"确认能不能封住板"，而是：对 GOT 已选出的候选股，判断**当日是不是合适的低吸/半路介入时点**——
   即心法第 ① 条的"走完 0→1"、第 ⑦ 条的"午后真共识 vs 早盘诱多"。
@@ -239,7 +239,7 @@ I3 防"零价值重述"，I4 防"改了但改错方向"。**I4 是本方案区�
 ## 10. 关联项（改进 2-5，本方案不含，一句带过）
 
 - **改进 2（龙头辨识度接入选股排序）**：与本方案**协同**——盘中闸门的"龙头竞价/领涨地位"判据可复用
-  [`market_theme.py`](../src/got/market_theme.py) 已算出的龙头角色（warming/accelerating/cooling）。留独立方案。
+  [`market_theme.py`](../../../src/got/market_theme.py) 已算出的龙头角色（warming/accelerating/cooling）。留独立方案。
 - **改进 3（空仓/无行情信号档）**、**改进 4（换手率 regime 自适应）**、**改进 5（情绪顶出货证据链）**：
   见比对分析，均为日频侧增量，**不在本盘中方案射程**。其中改进 5 的"封单衰减出货证据"与本方案 §5 封单监控**同源**，可共享 Phase 6-0 数据地基。
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GOT 指数注册表 + 身份解析（agent_glue_plan_0903 §10 对应 remote §4）
+GOT 指数注册表 + 身份解析（docs/archive/got/agent_glue_plan_0903.md §10 对应 remote_integration_plan.md §4（同目录））
 
 解决 `000001` 等裸码的指数/股票双身份歧义：
   - `mood_index_code="000001"` → 语义为上证指数

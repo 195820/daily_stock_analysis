@@ -2,7 +2,7 @@
 """B 层验收红线：R-B3 / R-B8 / R-B9（归档回放 / 归档 diff，真算数据）。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-红线原文（`docs/got_layer_b_plan_0911.md` §6.1）
+红线原文（`docs/archive/got/got_layer_b_plan_0911.md` §6.1）
 
 | **R-B3** | 家族降权影响面：同一期归档回放，`crowded_families` 非空天数与 `家族拥挤降权`
 触发次数变化 | **有界**（给出前后对比表，无单日增幅 > 100%） | 归档回放 | ✅ |
@@ -47,7 +47,7 @@ from verify_common import (  # noqa: E402
     repo_root,
 )
 
-REDLINE_DOC = "docs/got_layer_b_plan_0911.md §6.1"
+REDLINE_DOC = "docs/archive/got/got_layer_b_plan_0911.md §6.1"
 CROWDING_TRIGGER_TEXT = "家族拥挤降权"
 
 FAMILY_KW_FILE = repo_root() / "src" / "got" / "family_keywords.py"

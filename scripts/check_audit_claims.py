@@ -2,7 +2,7 @@
 """D 层验收红线：R-D1 / R-D2（对 0902 审核报告 15 项逐条**真算**复算）。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-红线原文（`docs/got_layer_d_plan_0911.md` §6「验收红线（可计数）」）
+红线原文（`docs/archive/got/got_layer_d_plan_0911.md` §6「验收红线（可计数）」）
 
 | # | 指标 | 达标线 | 数据源 | 可度量 |
 |---|---|---|---|---|
@@ -68,9 +68,9 @@ from verify_common import (  # noqa: E402
     repo_root,
 )
 
-REDLINE_DOC = "docs/got_layer_d_plan_0911.md §6"
-AUDIT_REPORT = repo_root() / "docs" / "GOT_0902_audit_report.md"
-D_PLAN = repo_root() / "docs" / "got_layer_d_plan_0911.md"
+REDLINE_DOC = "docs/archive/got/got_layer_d_plan_0911.md §6"
+AUDIT_REPORT = repo_root() / "docs" / "archive" / "got" / "GOT_0902_audit_report.md"
+D_PLAN = repo_root() / "docs" / "archive" / "got" / "got_layer_d_plan_0911.md"
 
 AGGREGATOR = repo_root() / "src" / "got" / "nodes" / "aggregator.py"
 SENTIMENT = repo_root() / "src" / "got" / "nodes" / "sentiment_analysis.py"

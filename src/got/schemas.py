@@ -1056,7 +1056,7 @@ class PortfolioDecision(BaseModel):
 
 
 # =============================================================================
-# Agent 语义粘合层输出（agent_glue_plan_0903 §5.3）
+# Agent 语义粘合层输出（docs/archive/got/agent_glue_plan_0903.md §5.3）
 # =============================================================================
 
 # 受控家族词表（§5.3.3）— 已迁移至 src.got.family_keywords（B2 词表同源修复）
@@ -1096,7 +1096,7 @@ class GlueFamily(BaseModel):
 
 
 class SemanticGlueResult(BaseModel):
-    """Agent 语义粘合层输出（agent_glue_plan_0903 §5.3 / §7.2）
+    """Agent 语义粘合层输出（docs/archive/got/agent_glue_plan_0903.md §5.3 / §7.2）
 
     包含三类结构化输出：关系图 + 板块强度 + 家族归属。
     `degraded=True` 时表示 F1 降级（全量或逐板块）。

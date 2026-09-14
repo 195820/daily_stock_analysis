@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """红线验收脚本公共设施。
 
-设计约束（来自 `docs/got_impl_review_0911.md` §R2.3）：
+设计约束（来自 `docs/archive/got/got_impl_review_0911.md` §R2.3）：
 - 红线定义以文档为准，脚本不得自行改写；每个脚本 docstring 顶部须**原文引用**。
 - 退出码语义分明：全 PASS 无 SKIP = 0；有 FAIL = 1；有 SKIP 且无 FAIL = 2。
 - 「能算的必须真算；不能算的显式 SKIP 并给出前置条件」，禁止用静态 grep 冒充回放/实跑。

@@ -180,7 +180,7 @@ class AggregatorNode:
         """执行分层 GOT 聚合
 
         Args:
-            replay_mode: 回放模式（agent_glue_plan_0903 §8.3 A1）。
+            replay_mode: 回放模式（docs/archive/got/agent_glue_plan_0903.md §8.3 A1）。
                          跳过 _save_context / _update_monitoring / EMA 回写 / 状态机，
                          不产生任何持久化副作用。
             run_date: 运行日期（用于 glue 落盘目录）。默认为 date.today()。
@@ -225,7 +225,7 @@ class AggregatorNode:
             sector, capital, news, sentiment, regime=regime,
         )
 
-        # ── Agent 语义粘合层（agent_glue_plan_0903 §5.4 时序修订）──
+        # ── Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.4 时序修订）──
         # 在 _build_sector_intel 之前调用，结果作为参数传入
         # A4 阶段：调用 + 归档，glue 结果暂不影响 _build_sector_intel 行为
         candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, ambush_pool)
@@ -336,7 +336,7 @@ class AggregatorNode:
         if data_quality.missing_fields:
             logger.warning(
                 f"[Node 6] 数据质量告警: missing_fields={data_quality.missing_fields} "
-                f"（护栏可能空转，详见 agent_glue_plan_0903 §9）"
+                f"（护栏可能空转，详见 docs/archive/got/agent_glue_plan_0903.md §9）"
             )
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
@@ -684,7 +684,7 @@ class AggregatorNode:
         return candidates, member_to_group
 
     # =========================================================================
-    # Agent 语义粘合层（agent_glue_plan_0903 §5.2-5.3 / §7.2）
+    # Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
     # =========================================================================
 
     @staticmethod
@@ -970,7 +970,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         capital: CapitalContext,
         sentiment: SentimentContext,
     ) -> SemanticGlueResult:
-        """Agent 语义粘合层（agent_glue_plan_0903 §5.2-5.3 / §7.2）
+        """Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
 
         单次全量 LLM 调用，输出三类结构化结果：
         - relations: 事件→板块关系图（替代 T5 映射）
@@ -3967,7 +3967,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             failed.append("sentiment")
             available.remove("sentiment")
 
-        # ── 字段级完整性自检（agent_glue_plan_0903 §9 OPEN-5）──
+        # ── 字段级完整性自检（docs/archive/got/agent_glue_plan_0903.md §9 OPEN-5）──
         # lifecycle 全部为 null → _is_hard_exclude 的 late_stage 分支空转
         all_members = []
         for group in (sector.active_mainline or []):
@@ -4009,7 +4009,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             if all_empty:
                 missing.append("hot_stocks_sectors_empty")
 
-        # F1-8: agent 语义粘合层降级 → glue 维度实质缺失（agent_glue_plan_0903 §7.2）
+        # F1-8: agent 语义粘合层降级 → glue 维度实质缺失（docs/archive/got/agent_glue_plan_0903.md §7.2）
         if glue is not None and glue.degraded:
             missing.append("agent_semantic_glue")
 

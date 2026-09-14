@@ -2,7 +2,7 @@
 """C 层验收红线：R-C3 / R-C6（复算脚本，真算归档数据）。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-红线原文（`docs/got_layer_c_plan_0911.md` §6.1）
+红线原文（`docs/archive/got/got_layer_c_plan_0911.md` §6.1）
 
 | **R-C3** | **复算脚本可复现**：`verify_glue_metrics.py --date 20260910` 输出与本文**对应章节**逐位一致。
 必需锚点（**每项标注口径 —— 禁止跨口径比对**）：`M1=3.1%`（规则侧，§1）/ `M1′=34.4%`（glue 侧，§1）/
@@ -60,7 +60,7 @@ from verify_common import (  # noqa: E402
     spearman,
 )
 
-REDLINE_DOC = "docs/got_layer_c_plan_0911.md §6.1"
+REDLINE_DOC = "docs/archive/got/got_layer_c_plan_0911.md §6.1"
 ANCHOR_DATE = "20260910"
 
 NON_NEUTRAL_READS = {"low", "unknown"}
@@ -276,7 +276,7 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
         verifier.check(
             "R-C3 锚点逐位一致",
             anchor_ok,
-            "与 docs/got_layer_c_plan_0911.md §6.1 / §1 锚点全部一致"
+            "与 docs/archive/got/got_layer_c_plan_0911.md §6.1 / §1 锚点全部一致"
             if anchor_ok
             else "存在与文档锚点不一致的项",
             evidence,
