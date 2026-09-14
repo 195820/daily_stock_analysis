@@ -2947,38 +2947,46 @@ verdict 含义：
 
                 quantity = int(per_stock_budget / estimated_price / 100) * 100
 
-                if quantity > 0:
-                    # D-P11: 落盘分支走向，使行为变更可见。
-                    # 判据是 sector_role（D-P13），不再由 limit 反推；
-                    # stock_limit 仅作参考值（未命中 sector_limits 时为 0.20）
-                    sector_limit_detail = {
-                        "sector_name": score.sector_name,
-                        "sector_role": sector_role,
-                        "stock_limit": sector_limit,
-                        "branch": branch,
-                    }
-
-                    allocations.append(
-                        TradeAllocation(
-                            symbol=score.symbol,
-                            name=score.name,
-                            action="buy",
-                            target_quantity=quantity,
-                            target_value=quantity * estimated_price,
-                            current_quantity=0,
-                            quantity_delta=quantity,
-                            price_range=(
-                                estimated_price * 0.98,
-                                estimated_price * 1.02,
-                            ),
-                            expected_return=0.10,  # 目标 +10%
-                            stop_loss=round(estimated_price * (1 - stop_loss_pct), 2),
-                            risk_reward_ratio=round(0.10 / stop_loss_pct, 2),
-                            confidence=score.confidence,
-                            reasoning=score.reasoning,
-                            sector_limit_detail=sector_limit_detail,
-                        )
+                if quantity == 0:
+                    # A 股最小可买单位为 100 股：高价股的整手金额可能超出单只预算，
+                    # 取整后归零。此前该路径无任何日志，候选被静默淘汰（审核 F-3）
+                    logger.warning(
+                        f"[Phase 2] {score.name} ({score.symbol}) 跳过：买入 100 股需 "
+                        f"¥{estimated_price * 100:,.0f}，超出单只预算 ¥{per_stock_budget:,.0f}"
                     )
+                    continue
+
+                # D-P11: 落盘分支走向，使行为变更可见。
+                # 判据是 sector_role（D-P13），不再由 limit 反推；
+                # stock_limit 仅作参考值（未命中 sector_limits 时为 0.20）
+                sector_limit_detail = {
+                    "sector_name": score.sector_name,
+                    "sector_role": sector_role,
+                    "stock_limit": sector_limit,
+                    "branch": branch,
+                }
+
+                allocations.append(
+                    TradeAllocation(
+                        symbol=score.symbol,
+                        name=score.name,
+                        action="buy",
+                        target_quantity=quantity,
+                        target_value=quantity * estimated_price,
+                        current_quantity=0,
+                        quantity_delta=quantity,
+                        price_range=(
+                            estimated_price * 0.98,
+                            estimated_price * 1.02,
+                        ),
+                        expected_return=0.10,  # 目标 +10%
+                        stop_loss=round(estimated_price * (1 - stop_loss_pct), 2),
+                        risk_reward_ratio=round(0.10 / stop_loss_pct, 2),
+                        confidence=score.confidence,
+                        reasoning=score.reasoning,
+                        sector_limit_detail=sector_limit_detail,
+                    )
+                )
 
         # 预算不足时，全部 BUY 候选被约束否决 → 显式透出（消除"高分候选 vs 0 交易"静默矛盾）
         vetoed_candidates = buy_candidates if buy_budget <= 0 else []

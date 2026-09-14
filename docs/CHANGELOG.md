@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 `docs/alphasift-integration.md`：明确 AlphaSift 锁定 commit 来源、Hotspot 契约边界、LLM/LiteLLM 兼容语义与关闭开关下回退路径。
 - [修复] 为 THS 发酵路线补充列名兜底：当 `stock_board_concept_summary_ths` 返回缺列时仅跳过该来源富化，不影响 `/api/v1/alphasift/hotspots/{topic}` 返回。
 - [测试] 新增/更新后端回归：`python -m pytest tests/test_alphasift_api.py -q`、`python -m pytest tests/test_docker_entrypoint.py -q`、`python -m pytest tests/test_main_schedule_mode.py -q -k "start_api_server_fails_before_thread_when_port_is_busy"`.
+- [修复] GOT 编排器交易日检查恢复生效：`_check_trading_day` 原 `import TradingCalendar` 引用的类在 `src/core/trading_calendar.py` 中不存在，恒抛 `ImportError` 且被 `except ImportError` 静默吞掉，周末/节假日照跑；改用模块级 `is_market_open()`（与 `src/core/pipeline.py` 同口径），并把 `try` 收窄到只包 import；`main.py --got` 新增 `except NonTradingDayError` 显式按「正常跳过」处理（`logger.info` + 退出码 0），不再被兜底 `logger.exception` 报成执行失败。注意：修复后非交易日不再运行 GOT。
+- [修复] GOT Phase 2 买入分配整手取整归零不再静默：`quantity = int(per_stock_budget / price / 100) * 100` 对高价股取整后为 0 时，原实现 `if quantity > 0:` 无 else 分支，候选被无声淘汰且其预算不回填（0914 实测方邦股份 ¥145.36 买 100 股需 ¥14,536 > 单只预算约 ¥11.7k）；现改为守卫子句提前 `continue` 并输出 WARNING，明确「100 股需 X，超出单只预算 Y」。
+- [测试] 新增 `tests/test_got_orchestrator_trading_day.py`（4 测试：交易日放行/非交易日抛错/不再触发导入降级告警）与 `tests/test_portfolio_decision_lot_rejection.py`（2 测试：整手归零留痕且不产生买单/预算充裕时高价股正常买入），前者同时填补 `_allocate` 此前零测试覆盖的盲区。
 
 ## [3.21.0] - 2026-06-07
 

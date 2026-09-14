@@ -206,11 +206,18 @@ class GOTOrchestrator:
         return news_ctx, sentiment_ctx
 
     def _check_trading_day(self, check_date: date):
-        """检查是否交易日"""
+        """检查是否交易日（非交易日抛 NonTradingDayError）
+
+        修复（2026-09-14）：原实现 `import TradingCalendar` 引用的类不存在，
+        恒抛 ImportError 并被 `except ImportError` 吞掉 ⇒ 检查从未生效。
+        改用模块级 `is_market_open()`（与 src/core/pipeline.py 同口径）。
+        """
         try:
-            from src.core.trading_calendar import TradingCalendar
-            calendar = TradingCalendar()
-            if not calendar.is_market_open("cn", check_date):
-                raise NonTradingDayError(f"{check_date} 非交易日，跳过分析")
+            from src.core.trading_calendar import is_market_open
         except ImportError:
+            # 日历不可用时降级为「不阻断」，避免整条 GOT 链路不可用
             logger.warning("[GOT] 无法导入交易日历，跳过交易日检查")
+            return
+
+        if not is_market_open("cn", check_date):
+            raise NonTradingDayError(f"{check_date} 非交易日，跳过分析")

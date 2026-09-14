@@ -1424,7 +1424,7 @@ def main() -> int:
 
                 import asyncio
                 from datetime import date
-                from src.got.orchestrator import GOTOrchestrator
+                from src.got.orchestrator import GOTOrchestrator, NonTradingDayError
 
                 orchestrator = GOTOrchestrator(use_mock=False)
                 unified = asyncio.run(orchestrator.run())
@@ -1516,6 +1516,11 @@ def main() -> int:
                 else:
                     logger.info("[GOT] Phase 2 决策不存在（可能 Phase 2 未启用或失败）")
 
+                return 0
+
+            except NonTradingDayError as e:
+                # 非交易日属正常跳过（非失败）：不打印堆栈，也不计入失败退出码
+                logger.info("[GOT] %s", e)
                 return 0
 
             except Exception as e:
