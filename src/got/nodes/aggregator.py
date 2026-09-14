@@ -1011,7 +1011,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             raw = await self._call_llm_async(
                 prompt,
                 temperature=0.0,
-                max_tokens=5000,
+                max_tokens=8000,
                 max_retries=3,
                 call_type="got_node6_semantic_glue",
                 timeout=float(LLM_CALL_TIMEOUT_S),

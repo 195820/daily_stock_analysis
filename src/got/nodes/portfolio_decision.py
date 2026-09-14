@@ -423,6 +423,10 @@ class PortfolioDecisionNode:
         # 构建板块情报映射（从 Node 6 v3 的 confirmed_sectors）
         sector_intel_map = self._build_sector_intel_map(unified)
 
+        # 构建扩展生命周期映射（覆盖 exhausted_mainline/cooling_down 等持仓板块）
+        # 确保持仓板块即使不在 confirmed_sectors 中，也能获取生命周期用于止损判定
+        extended_lifecycle_map = self._build_extended_lifecycle_map(sector_context)
+
         # 资金面全局评分（从 capital_context）
         capital_overall = self._extract_capital_overall(capital_context)
 
@@ -548,6 +552,17 @@ class PortfolioDecisionNode:
                 lifecycle_day = intel.get('lifecycle_day')
                 overheat_severity = intel.get('overheat_severity')
                 family_name = intel.get('frame_group')
+            elif sector_name:
+                # 板块不在 confirmed_sectors 中，尝试从 Node 2 全量列表获取生命周期
+                # 使用 normalize_sector_name 做板块名归一化（同花顺→东财口径）
+                from src.got.board_aliases import normalize_sector_name
+                canon_name = normalize_sector_name(sector_name)
+                ext_intel = extended_lifecycle_map.get(canon_name) or extended_lifecycle_map.get(sector_name)
+                if ext_intel:
+                    lifecycle_phase = ext_intel.get('lifecycle_phase')
+                    lifecycle_day = ext_intel.get('lifecycle_day')
+                    overheat_severity = ext_intel.get('overheat_severity')
+                    family_name = ext_intel.get('frame_group')
 
             # 动作建议：生命周期驱动 + 板块踢出检测
             sector_strength = stock_sector_info.get("strength", 50.0)
@@ -777,6 +792,64 @@ class PortfolioDecisionNode:
             }
 
         return sector_intel_map
+
+    def _build_extended_lifecycle_map(
+        self, sector_context: SectorContext
+    ) -> Dict[str, Dict[str, Any]]:
+        """从 Node 2 全量板块列表构建扩展生命周期映射
+
+        覆盖 confirmed_sectors 之外的板块（如 exhausted_mainline, cooling_down），
+        确保持仓板块即使不在主线/埋伏列表中，也能获取生命周期信息用于止损判定。
+
+        Returns:
+            {sector_name: {
+                'lifecycle_phase': 'mature'/'acceleration'/...,
+                'lifecycle_day': 9,
+                'overheat_severity': 0.03,
+                'state': 'exhausted_mainline'/'high_position_cooling'/...,
+                'strength_score': 61.4,
+                'recommended_action': 'exit'/'hold'/...,
+            }}
+        """
+        lifecycle_map = {}
+
+        # 遍历所有板块列表，提取生命周期信息
+        # 优先级：active_mainline > cooling_down > exhausted_mainline > ambush > defensive_rotation
+        for group in (sector_context.active_mainline or []):
+            for member in (group.members or []):
+                if member.name and member.name not in lifecycle_map:
+                    lifecycle_map[member.name] = self._extract_lifecycle_from_detail(member)
+            # 组名也记录（最强成员代表）
+            if group.group_name and group.group_name not in lifecycle_map:
+                best = max(group.members, key=lambda m: m.strength_score) if group.members else None
+                if best:
+                    lifecycle_map[group.group_name] = self._extract_lifecycle_from_detail(best)
+
+        for detail_list_attr in ('cooling_down', 'exhausted_mainline', 'ambush', 'defensive_rotation', 'top_by_score'):
+            for detail in (getattr(sector_context, detail_list_attr, None) or []):
+                if detail.name and detail.name not in lifecycle_map:
+                    lifecycle_map[detail.name] = self._extract_lifecycle_from_detail(detail)
+
+        return lifecycle_map
+
+    @staticmethod
+    def _extract_lifecycle_from_detail(detail) -> Dict[str, Any]:
+        """从 SectorDetail 提取生命周期信息"""
+        lifecycle_phase = None
+        lifecycle_day = None
+        if detail.lifecycle:
+            lifecycle_phase = detail.lifecycle.phase
+            lifecycle_day = detail.lifecycle.days_since_launch
+
+        return {
+            'lifecycle_phase': lifecycle_phase,
+            'lifecycle_day': lifecycle_day,
+            'overheat_severity': getattr(detail, 'overheat_severity', None),
+            'state': getattr(detail, 'state', None),
+            'strength_score': getattr(detail, 'strength_score', None),
+            'recommended_action': getattr(detail, 'recommended_action', None),
+            'frame_group': getattr(detail, 'frame_group', None),
+        }
 
     def _adjust_score_by_sector_intel(
         self, base_score: float, sector_name: str, sector_intel_map: Dict[str, Dict[str, Any]]
