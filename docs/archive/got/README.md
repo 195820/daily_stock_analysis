@@ -79,6 +79,19 @@
 | `custom/0827_got_diagnostic.md` | P0-1 `attack_power` 分档连续化（`sector_analysis.py:3227-3236`）、P0-2 Phase 2 sector 分用实际强度、P0-3 选股当日涨幅软过滤（`stock_screener.py:1462-1480`） |
 | `custom/plan_got_timeseries_enhancement.md` v2.1 | 跨日记忆系统 + 跨节点时间线共振（commit `03bb3d1`，2026-08-28） |
 
+### 2.5 2026-09-14 新增：C-P6/C-P7 落地 + 首跑实测
+
+| 项 | 状态 |
+|---|---|
+| **C-P6** M1 主口径改 glue 侧（`strengths[].news_read`） | ✅ 落地——`scripts/verify_glue_metrics.py` 主口径切换，规则侧降为对照列 |
+| **C-P7** M6 主口径改「其他」回收率 | ✅ 落地——M6′ 覆盖率降为观察项 |
+| **R-C3 回归** | ✅ 十锚点仍逐位一致，退出码不变（`1/2 PASS \| 0 FAIL \| 1 SKIP \| exit 2`） |
+| **同日两跑首验**（R1/R3/R4） | ✅ 快照已产出（`data/_run1` / `_run2`，在 `.gitignore` 的 `/data/` 内）；**R4 PASS**，R1/R3 的 FAIL 经 **DB 级逐事件比对**归因为**数据差异、非幂等缺陷** |
+| **三条影子线首跑** | A5 ✅ `status=ok`；T1 ✅ 跑通（`reject=1`）但产物被 Phase 2 路径丢弃；T1-H 开关生效但持仓未命中筛选条件 |
+
+> ⚠️ 判定归负责人：M1 / M6 是否达标、A5 影子期样本是否计入，均不由本次实施代判。
+> 实测细节与三障碍见 [`got_shadow_verification.md`](../../got_shadow_verification.md) §1、§5；工器缺口见 [`got_backlog.md`](../../got_backlog.md) §1.F。
+
 ---
 
 ## 三、归档时的注意事项

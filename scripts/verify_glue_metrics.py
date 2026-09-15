@@ -68,6 +68,17 @@ NON_NEUTRAL_READS = {"low", "unknown"}
 NO_FAMILY = {"无归属"}
 REPLAY_PLACEHOLDER_STATUSES = {"S6_disabled", "replay_mode"}
 
+# ── C-P6 / C-P7 主口径（2026-09-14 落地） ──
+# C-P6：M1 改量 glue 侧 `strengths[].news_read`，规则侧 `news_check` 降为并列对照列。
+# C-P7：M6 改量「其他」回收率，「无归属」计为未回收；规则侧覆盖率降为观察项。
+# 依据 `docs/archive/got/got_layer_c_plan_0911.md` §5.2 P2（该项自述「零行为变更」）。
+#
+# ⚠️ 两者原本只能量规则侧字段 ⇒ M1 恒 3.1% / M6 恒 65.6%，构成「门禁自锁」。
+#    C-P6 改数据源只**解除死锁**，不解除「红线不可达」（glue 侧 34.4% 仍 < 60%）。
+# ⚠️ 下方仅为 0903 §8.1 的**参考线**，用于并列展示；M1 / M6 的达标判定归项目负责人
+#    （C-P8 已把 M1 标为「待标定」，C-P13 明示本轮不标定）⇒ 本脚本不对两者产生 PASS/FAIL。
+REDLINE_REFERENCE = {"M1": 60.0, "M6": 80.0}
+
 
 def _load_pair(date: str) -> tuple[dict, dict] | None:
     """加载 agent_glue.json + unified.json。"""
@@ -164,6 +175,13 @@ def compute_metrics(date: str, spearman_method: str) -> dict:
         "m6p_glue_display": format_pct(m6p),
         "recovery_display": format_pct(recovery),
         "recovery_detail": f"{len(recovered)}/{len(other_codes)}",
+        # C-P6 / C-P7 主口径（与旧键同值但语义为主；旧键保留供 R-C3 锚点与历史对照）
+        "m1_primary_pct": m1p,
+        "m1_primary_display": format_pct(m1p),
+        "m6_primary_pct": recovery,
+        "m6_primary_display": format_pct(recovery),
+        "m6_other_total": len(other_codes),
+        "m6_other_recovered": len(recovered),
         "m4a_pearson": m4_a_pearson,
         "m4a_spearman": m4_a_spearman,
         "m4a_spearman_average": m4_a_spearman_average,
@@ -263,16 +281,34 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
         verifier.check("R-C3 归档加载", False, str(exc), [])
         return verifier.finish()
 
-    # ── 输出实算指标（每项标注口径） ──
-    print("\n── 实算指标（口径逐项标注） ──")
+    # ── 归档样本概况 ──
+    print("\n── 归档样本 ──")
     print(
         f"  归档日 = {metrics['date']}  "
         f"confirmed_sectors={metrics['n_confirmed_sectors']} "
         f"strengths={metrics['n_strengths']} families={metrics['n_families']} "
         f"relations={metrics['n_relations']} join={metrics['n_joined']}"
     )
-    print(f"  M1  (规则侧 unified.confirmed_sectors[].news_check != neutral) = {metrics['m1_rule_display']}")
-    print(f"  M1′ (glue 侧 strengths[].news_read 非 low/unknown)             = {metrics['m1p_glue_display']}")
+    # ── 主口径（C-P6 / C-P7 落地后，M1 / M6 从此侧读取） ──
+    print("\n── 主口径（C-P6 / C-P7，M1 / M6 从此侧读取） ──")
+    print(
+        f"  M1  glue 侧 strengths[].news_read 非 low/unknown  = {metrics['m1_primary_display']}"
+        f"   [参考线 ≥{REDLINE_REFERENCE['M1']:.0f}%]"
+    )
+    print(
+        f"  M6  「其他」回收率 ({metrics['recovery_detail']})"
+        f"{' ' * 20}= {metrics['m6_primary_display']}"
+        f"   [参考线 ≥{REDLINE_REFERENCE['M6']:.0f}%]"
+    )
+
+    # ── 对照列 / 观察项（C-P6 要求规则侧并列保留；C-P7 要求覆盖率降为观察项） ──
+    print("\n── 对照列 / 观察项（均不参与判定） ──")
+    print(f"  M1 对照  规则侧 news_check != neutral             = {metrics['m1_rule_display']}")
+    print(f"  M6 观察  规则侧 frame_group != \"其他\"（修复前口径） = {metrics['m6_rule_before_fix_display']}")
+    print(f"  M6 观察  glue 侧 family 非「无归属」               = {metrics['m6p_glue_display']}")
+
+    # ── 其余指标 ──
+    print("\n── 其余指标 ──")
     print(f"  M2  (confirmed_sectors 中至少 1 条 relations[] 的占比)          = {metrics['m2_display']}")
     print(f"  M4-a Pearson  ρ(glue.strength, tech_score)                     = {_fmt_corr(metrics['m4a_pearson'])}")
     print(f"  M4-a Spearman ρ [method={spearman_method}]                     = {_fmt_corr(metrics['m4a_spearman'])}")
@@ -280,9 +316,7 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
     print(f"  M4-b/c Pearson  ρ(glue.strength, composite_score)              = {_fmt_corr(metrics['m4bc_pearson'])}")
     print(f"  M4-b/c Spearman ρ [method={spearman_method}]                    = {_fmt_corr(metrics['m4bc_spearman'])}")
     print(f"  M4-b/c Spearman ρ [method=average]                             = {_fmt_corr(metrics['m4bc_spearman_average'])}")
-    print(f"  M6  (规则侧修复前口径 frame_group != \"其他\")                   = {metrics['m6_rule_before_fix_display']}")
-    print(f"  M6′ (glue 侧 families[].family 非「无归属」)                    = {metrics['m6p_glue_display']}")
-    print(f"  「其他」回收率 (C-P7 修复后定义)                                = {metrics['recovery_display']} ({metrics['recovery_detail']})")
+    print("\n  ⚠️ M1 / M6 的达标判定归项目负责人，本脚本只列数值与参考线，不产生 PASS/FAIL。")
     print("\n  ⚠️ Spearman 口径声明：文档锚点 0.419S / 0.500S 只在 rank(method=\"first\") 下复现；")
     print("     标准平均秩（等价 scipy.stats.spearmanr；本环境未安装 scipy，用 pandas")
     print("     rank(method=\"average\") 的等价实现）会得到上面 average 行的值。两值均列出，未静默取舍。")
@@ -346,6 +380,23 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
     if as_json:
         payload = {
             "metrics": metrics,
+            "primary": {
+                "m1": {
+                    "definition": "glue 侧 strengths[].news_read 非 low/unknown（C-P6）",
+                    "value": metrics["m1_primary_display"],
+                    "reference_line": REDLINE_REFERENCE["M1"],
+                    "rule_side_comparison": metrics["m1_rule_display"],
+                    "judged_by": "项目负责人",
+                },
+                "m6": {
+                    "definition": "「其他」回收率（C-P7，无归属计为未回收）",
+                    "value": metrics["m6_primary_display"],
+                    "detail": metrics["recovery_detail"],
+                    "reference_line": REDLINE_REFERENCE["M6"],
+                    "coverage_observation": metrics["m6_rule_before_fix_display"],
+                    "judged_by": "项目负责人",
+                },
+            },
             "anchor_comparisons": [
                 {"name": name, "actual": actual, "expected": expected, "match": ok}
                 for name, actual, expected, ok in comparisons
