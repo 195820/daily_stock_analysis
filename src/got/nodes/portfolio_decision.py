@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.got.schemas import (
@@ -48,6 +49,10 @@ class PortfolioDecisionNode:
 
     def __init__(self, use_mock: bool = False):
         self.use_mock = use_mock
+        # 影子模式观测留痕（reasoning.md 末尾段落的数据源）：
+        # 两条线的「跑没跑 / 为什么没跑 / 跑了得到什么」都记在这里，run() 末尾落盘。
+        self._shadow_t1: Dict[str, Any] = {}
+        self._shadow_t1h: Dict[str, Any] = {}
 
     async def run(
         self,
@@ -187,6 +192,9 @@ class PortfolioDecisionNode:
             mainline_endurance=getattr(unified_context, "mainline_endurance", []),
             sector_exposure_binding=sector_exposure_binding,
         )
+
+        # 影子观测落盘（A5 的 agent_glue.json 由 Node 6 自行落盘，此处补 T1 / T1-H 两条线）
+        self._save_shadow_records()
 
         logger.info(
             f"[Phase 2] 完成 — 交易建议: {len(allocation)} 条, "
@@ -2159,7 +2167,18 @@ class PortfolioDecisionNode:
             AGENT_HOLDING_REVIEW_MIN_CONFIDENCE,
         )
 
-        if not AGENT_HOLDING_REVIEW_ENABLED or not holdings:
+        if not AGENT_HOLDING_REVIEW_ENABLED:
+            self._shadow_t1h = {
+                "line": "t1h", "executed": False,
+                "reason": "AGENT_HOLDING_REVIEW_ENABLED 处于关闭状态",
+            }
+            return holdings
+
+        if not holdings:
+            self._shadow_t1h = {
+                "line": "t1h", "executed": False,
+                "reason": "当前无持仓，该影子线无审查对象",
+            }
             return holdings
 
         # 按优先级筛选审查目标
@@ -2168,6 +2187,21 @@ class PortfolioDecisionNode:
         )
         if not review_targets:
             logger.debug("[T1-H] 无需审查的持仓")
+            self._shadow_t1h = {
+                "line": "t1h", "executed": False,
+                "reason": (
+                    f"{len(holdings)} 只持仓均不满足三类审查条件"
+                    "（埋伏持仓 / P4 退出信号 / 综合评分 < 40）"
+                ),
+                "skipped": [
+                    {
+                        "symbol": h.symbol,
+                        "name": getattr(h, "name", "") or h.symbol,
+                        "composite_score": round(float(h.composite_score or 0), 1),
+                    }
+                    for h in holdings
+                ],
+            }
             return holdings
 
         shadow_tag = "[SHADOW] " if AGENT_HOLDING_REVIEW_SHADOW else ""
@@ -2175,6 +2209,11 @@ class PortfolioDecisionNode:
             f"[T1-H] 审查 {len(review_targets)} 只持仓"
             f"（预算上限 {AGENT_HOLDING_REVIEW_MAX}）"
         )
+        self._shadow_t1h = {
+            "line": "t1h", "executed": True, "shadow": AGENT_HOLDING_REVIEW_SHADOW,
+            "reviewed": len(review_targets), "budget": AGENT_HOLDING_REVIEW_MAX,
+            "verdicts": [],
+        }
 
         # 构建 review executor（T1-H 持仓审查：verdict 词表 hold/add/reduce/exit）
         try:
@@ -2182,6 +2221,8 @@ class PortfolioDecisionNode:
             executor = build_review_executor(review_type="t1h")
         except Exception as exc:
             logger.warning(f"[T1-H] Review Agent 构建失败，降级跳过: {exc}")
+            self._shadow_t1h["executed"] = False
+            self._shadow_t1h["reason"] = f"Review Agent 构建失败: {exc}"
             return holdings
 
         # 提取市场环境
@@ -2235,6 +2276,14 @@ class PortfolioDecisionNode:
                 # 记录 Agent 审查结果
                 holding.agent_review_verdict = verdict
                 holding.agent_review_reasoning = reasoning
+                self._shadow_t1h.setdefault("verdicts", []).append({
+                    "symbol": holding.symbol,
+                    "name": getattr(holding, "name", "") or holding.symbol,
+                    "verdict": verdict,
+                    "confidence": round(confidence, 2),
+                    "reasoning": reasoning,
+                    "below_threshold": confidence < AGENT_HOLDING_REVIEW_MIN_CONFIDENCE,
+                })
 
                 # confidence 不足阈值 → 忽略（等同 hold）
                 if confidence < AGENT_HOLDING_REVIEW_MIN_CONFIDENCE:
@@ -2281,6 +2330,69 @@ class PortfolioDecisionNode:
             )
 
         return holdings
+
+    def _save_shadow_records(self) -> None:
+        """把 T1 / T1-H 的影子观测记录落到当日归档目录，供 archive.py 渲染进 reasoning.md。
+
+        目录基准取「运行日期」，与 aggregator._save_glue_result 一致；
+        Phase 2 只在生产运行（--got-replay 不经过 Phase 2），故 today() 可靠。
+        """
+        if not (self._shadow_t1 or self._shadow_t1h):
+            return
+        day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+        try:
+            day_dir.mkdir(parents=True, exist_ok=True)
+            for filename, record in (
+                ("shadow_t1.json", self._shadow_t1),
+                ("shadow_t1h.json", self._shadow_t1h),
+            ):
+                if record:
+                    (day_dir / filename).write_text(
+                        json.dumps(record, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+        except OSError as exc:
+            logger.warning("[Phase 2] 影子观测落盘失败（已忽略）: %s", exc)
+
+    def _collect_shadow_t1(self, finalists: List[Any]) -> None:
+        """收集 T1 候选股终审的影子观测记录。
+
+        T1 的 verdict 由 stock_screener 写在 ScreenerStock 上、随 finalists 返回；
+        Phase 2 路径此前直接丢弃（只有 run_got_mode 才落盘），此处留痕供 reasoning.md 使用。
+        """
+        from src.got.catalyst_config import (
+            AGENT_STOCK_REVIEW_ENABLED,
+            AGENT_STOCK_REVIEW_SHADOW,
+            AGENT_STOCK_REVIEW_MAX,
+        )
+
+        if not AGENT_STOCK_REVIEW_ENABLED:
+            self._shadow_t1 = {
+                "line": "t1", "executed": False,
+                "reason": "AGENT_STOCK_REVIEW_ENABLED 处于关闭状态",
+            }
+            return
+
+        reviewed = [s for s in finalists if getattr(s, "agent_verdict", "")]
+        if not reviewed:
+            self._shadow_t1 = {
+                "line": "t1", "executed": False,
+                "reason": "无候选进入终审（候选池为空，或漏斗未产出 finalists）",
+            }
+            return
+
+        self._shadow_t1 = {
+            "line": "t1", "executed": True, "shadow": AGENT_STOCK_REVIEW_SHADOW,
+            "reviewed": len(reviewed), "budget": AGENT_STOCK_REVIEW_MAX,
+            "rejects": [
+                {
+                    "symbol": getattr(s, "code", ""),
+                    "name": getattr(s, "name", ""),
+                    "reason": getattr(s, "agent_notes", ""),
+                }
+                for s in reviewed if getattr(s, "agent_verdict", "") == "reject"
+            ],
+        }
 
     def _select_holding_review_targets(
         self,
@@ -2634,6 +2746,9 @@ verdict 含义：
         finalists = await asyncio.to_thread(
             screener._filter_got_finalists, universe, got_context, 10
         )
+
+        # 影子观测：T1 终审结果随 finalists 返回（ScreenerStock.agent_verdict），此前无人消费
+        self._collect_shadow_t1(finalists)
 
         # ── 2026-08-18 新增：候选股板块交叉验证 ──
         # 用 efinance.get_belong_board() 验证问财返回的板块标签是否真实

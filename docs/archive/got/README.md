@@ -102,6 +102,7 @@
    - `got_impl_review_0911.md` §0–§10 的**红线达标总表已过期**（作者原话："记录的是修复轮之前的状态……勿单独引用"）；
    - `E3_fixes_summary.md` 的声明**与真实改动不符**（改 2 个文件 vs 实际 13 个 tracked + 1 个新模块）。
 4. **本目录不再更新**。当前有效的待验证项与待实施项分别见根目录两份新文档。
+5. **2026-09-15 新增**：T1/T1-H 影子产物文件（`shadow_t1.json` / `shadow_t1h.json`），与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘到 `data/got_daily/{date}/`，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾。详见 [`got_shadow_verification.md`](../../got_shadow_verification.md) §2 末尾。
 
 ---
 

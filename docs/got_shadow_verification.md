@@ -48,8 +48,8 @@
 | 影子线 | 门（代码位置） | 实跑 `ENABLED` | 归档产物 | 当前可数性 |
 |---|---|---|---|---|
 | **A5 glue 语义粘合层** | `src/got/nodes/aggregator.py:985`<br>`if not AGENT_SEMANTIC_GLUE_ENABLED: → S6_disabled; return` | **true**<br>（0910/0914 产物 `status=ok`，不可能是开关关闭的形状） | `data/got_daily/{date}/agent_glue.json` | ✅ **可数，但只有 5 天**（7 份文件中 2 份是测试污染，见 §2.2） |
-| **T1 候选股终审** | `src/services/stock_screener.py:1622`<br>`if AGENT_STOCK_REVIEW_ENABLED and finalists:` | **false（`.env`）→ 本次实验性置 `true`**（运行时环境变量，未改 `.env`） | `data/got_screener/{date}.json`（`_save_got_result`，`src/services/stock_screener.py:2784`） | 🟡 **跑通但无归档**——见 §1.2 |
-| **T1-H 持仓审查** | `src/got/nodes/portfolio_decision.py:2162`<br>`if not AGENT_HOLDING_REVIEW_ENABLED or not holdings: return holdings` | 同上 | 结论写回 `portfolio_decision.json` 的 `unified_scoring[]` | 🟡 **开关生效但审不到任何持仓**——见 §1.3 |
+| **T1 候选股终审** | `src/services/stock_screener.py:1622`<br>`if AGENT_STOCK_REVIEW_ENABLED and finalists:` | **true** | **`shadow_t1.json`**（2026-09-15 起）；之前产物被 Phase 2 路径丢弃，仅日志可查 | 🟡 **4 天日志（0908/0909/0910/0914）+ 1 天归档（0915 起）** |
+| **T1-H 持仓审查** | `src/got/nodes/portfolio_decision.py:2162`<br>`if not AGENT_HOLDING_REVIEW_ENABLED or not holdings: return holdings` | **true** | **`shadow_t1h.json`**（2026-09-15 起） | 🟡 **1 天归档（0915，未执行：持仓不满足三类筛选条件）** |
 
 **这三条线的差异本身是事实**：A5 有逐日归档产物可复算；T1 与 T1-H 即便跑通，**T1 落到日志、T1-H 落到持久化字段**，两者的离线可复核性都远低于 A5。
 
@@ -129,6 +129,22 @@
 
 转正条件（`archive/got/agent_glue_plan_0903.md` §8.2）要求影子期 **≥10 个交易日**且双达标。
 **是否达标由负责人判定**，本清单只登记上述计数。
+
+### T1/T1-H 影子产物（2026-09-15 起）
+
+T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A5 的 `agent_glue.json` 对称：
+
+- **`shadow_t1.json`**：T1 候选股终审的影子观测记录（审查了几只、否决了谁、理由是什么）
+- **`shadow_t1h.json`**：T1-H 持仓审查的影子观测记录（审了几只持仓、每条 verdict 是什么）
+
+两份产物由 `src/got/nodes/portfolio_decision.py` 的 `_save_shadow_records()` 落盘到 `data/got_daily/{date}/`，供 `src/got/archive.py` 的 `_render_shadow_section()` 读取并渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落。
+
+**设计要点**：
+- 零 schema 改动（不改 `schemas.py`，不影响 R-B8/R-C7 的逐字段 diff）
+- 重跑不堆积（`_append_phase2_reasoning()` 的覆盖写机制天然处理，影子段随 Node 7 段一并重建）
+- "未执行"必带原因（开关关闭 / 无可审目标 / 具体哪只持仓不满足哪条筛选条件）
+
+详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
 
 ### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）
 
@@ -524,3 +540,4 @@ ls -la data/got_screener/ | tail
 *修订：2026-09-14（第四轮，修正轮）—— 新增 §2.2：**查明 0911/0912 的 4 份产物全部是测试污染**（`strengths=3/24` 与测试夹具一一对应、mtime 精确到秒相同；测试未重定向 `GLUE_ARCHIVE_ROOT`），§1/§2/§7 随之改口径，§2.1 的「未查证」撤销；§4.1 据此更正——`_replay/` 那两份不是回放产物，R-C2 的有效证据收敛到 0903 一份；**§4 R-C1 由「待复测」改判 PASS（补 4 个失败样本落盘用例）**；§4 R-C6 与脚本改判为「文件 2 / 去重 1 / 有效 0」（`_replay_sample_inventory()`）；§5 R2 标注已由测试收口；§7 OPEN-C1 由「约 09-25」改为实算的 **09-24 破阈值**（并用窗口实算更正「0813–0826 十天」→「0817–0826 八天」）；§7 M3 补材料实跑结果（5 天 / 128 行）；§8 增 R-C1、R2、M3 三条复现命令。*
 *修订：2026-09-14（第五轮，C-P6/C-P7 落地）—— §3 表改主从：**M1 主口径 = glue 侧 `strengths[].news_read`（34.4%）、M6 主口径 = 「其他」回收率（90.9%）**，规则侧（3.1% / 65.6%）与 M6′ 覆盖率（96.9%）降为对照列 / 观察项，并注明「回收率与 M6′ 分母不同（11 vs 32），不是同一个量」；§3「门禁自锁」小节由「尚未落地」改为**已落地**，并保留 C-P6 原文的「只解除死锁、不解除红线不可达」。**R-C3 复跑仍 10/10、脚本退出码不变**（`1/2 PASS | 0 FAIL | 1 SKIP | exit 2`）——新口径只改主从命名。M1 / M6 达标判定仍归项目负责人，脚本与本节均不代判。*
 *修订：2026-09-14（第六轮，首跑实测）—— **首次产出同日两跑快照并开启三条影子线**：① §5 R1/R3/R4 **首次真算**（R4 PASS；R1/R3 FAIL 但经 DB 级逐事件比对**归因为数据差异而非幂等缺陷**——`node4_events` 零漂移、`peak` 两表不变、`node4_raw_news` 仅 3 条跨日重采且 `last_seen` 同步推进）；② 新增 §5.1（R-B8/R-B9 输入产不出的三障碍，含「`--got-replay` 不跑 Node 2 ⇒ 验不到 B 层改动」这一根本矛盾）、§5.2（R1/R3 归因证据）、§5.3（R6 为脚本硬编码 SKIP）；③ §1 三条影子线改为实测：**T1 跑通且 `reject=1` 但产物被 Phase 2 路径丢弃**（新 §1.2）、**T1-H 开关生效却因持仓 50.1 分未命中筛选条件而审不到任何目标**（新 §1.3），并据此**修正 §1.1 末尾「开关打开跑一天即有结论」的结论**；④ §2 的 0914 行更新为第 4 跑产物（当日共跑 4 次，前三跑被覆盖）；⑤ §8 增 DB 级差异归因命令。*
+*修订：2026-09-15（第七轮，T1/T1-H 影子产物落盘）—— **T1/T1-H 新增独立影子产物文件**：`shadow_t1.json` / `shadow_t1h.json`，与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落。**零 schema 改动**（不碰 `schemas.py`，不影响 R-B8/R-C7 逐字段 diff）。§1 表更新 T1/T1-H 的「实跑 ENABLED」与「归档产物」列：T1 现有 4 天日志 + 1 天归档，T1-H 现有 1 天归档（未执行：持仓不满足三类筛选条件）。新增 §2 末尾「T1/T1-H 影子产物」小节说明设计要点。11 个测试用例覆盖（含重跑不堆积、「未执行+原因」分支）。端到端验证通过（0915 归档，T1 否决广立微 301095，T1-H 未执行）。*

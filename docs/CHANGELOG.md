@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 修复历史报告运行流快照在混合时区事件时间戳下返回 500 的问题。
 - [改进] #1459 持仓管理页新增持仓账户删除入口，复用现有账户软删除接口，误建账户会从默认列表、快照、风险、录入入口和事件列表隐藏且不物理清理历史流水。
 - [修复] 修复运行流 live SSE 事件未复用快照层递归脱敏规则的问题，避免本地路径、prompt/raw response、代理头等敏感诊断字段在 refetch 前短暂暴露。
+- [新功能] GOT T1/T1-H 影子模式产物落盘（`shadow_t1.json` / `shadow_t1h.json`）：与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘到 `data/got_daily/{date}/`，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落；零 schema 改动（不碰 `schemas.py`，不影响 R-B8/R-C7 逐字段 diff）；重跑不堆积（`_append_phase2_reasoning()` 覆盖写机制天然处理）；「未执行」必带原因（开关关闭 / 无可审目标 / 具体哪只持仓不满足哪条筛选条件）；11 个测试用例覆盖（含重跑不堆积、「未执行+原因」分支）；端到端验证通过（0915 归档，T1 否决广立微 301095，T1-H 未执行）。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [新功能] GOT Node 6 Agent 语义粘合层（agent_glue_plan_0903 Phase 0+1）：`_agent_semantic_glue` 单次全量 LLM 调用输出事件→板块关系图 + 板块强度 + 家族归属（受控词表 12+1），F1 八行降级契约完整实现（S1-S7），影子模式对照日志，`--got-replay` 回放 harness，`_collect_sector_candidates` 候选收集独立抽取，P0-B 数据完整性字段级检查（lifecycle/catalyst/crowded_families/capital_flow/hot_stocks_sectors），护栏空转 WARNING 日志。

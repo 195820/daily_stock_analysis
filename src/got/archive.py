@@ -639,6 +639,179 @@ def _is_bar_complete(run_date: date, now: datetime) -> bool:
         return run_date.weekday() < 5
 
 
+SHADOW_SECTION_TITLE = "## 🧪 影子模式观测"
+
+# 影子产物文件名（与 A5 既有的 agent_glue.json 对称，均落在 data/got_daily/{date}/）
+GLUE_ARTIFACT = "agent_glue.json"
+SHADOW_T1_ARTIFACT = "shadow_t1.json"
+SHADOW_T1H_ARTIFACT = "shadow_t1h.json"
+
+
+def _shadow_display_name(name: str, symbol: str) -> str:
+    """影子段的股票显示名。
+
+    部分持仓的 `name` 字段等于代码（backlog §2 P1-1，已知未修），
+    此时只显示代码一次，避免出现「600250（600250）」。
+    """
+    text = (name or "").strip()
+    return f"{text}（{symbol}）" if text and text != symbol else (symbol or text)
+
+
+def _render_shadow_a5(glue: "dict | None", code_to_name: dict) -> list[str]:
+    """A5 语义粘合层：叙述一段 + 全量语义表（板块/家族/强度/三维读数/传导路径）。"""
+    if not glue:
+        return [f"**A5 语义粘合层**（影子，不影响决策）：本次无产物（`{GLUE_ARTIFACT}` 缺失）。", ""]
+
+    strengths = glue.get("strengths") or []
+    relations = glue.get("relations") or []
+    families = glue.get("families") or []
+    degraded = bool(glue.get("degraded"))
+    status = glue.get("status") or "unknown"
+
+    family_by_code = {f.get("board_code"): f.get("family") for f in families}
+    path_by_code = {r.get("board_code"): (r.get("propagation_path") or []) for r in relations}
+
+    state = f"**已降级（status={status}）**" if degraded else "状态正常、未降级"
+    lines = [
+        f"**A5 语义粘合层**（影子，不影响决策）：本次对 {len(strengths)} 个候选板块做语义粘合，"
+        f"产出 {len(relations)} 条事件→板块关系、{len(strengths)} 条强度判定、{len(families)} 个家族归属，"
+        f"{state}。下表是 Agent 粘合出的全部语义——「家族」列是 glue 的归属，"
+        f"消息/资金/情绪是它对三个维度的独立读数（`low` 表示该维度无支撑）。",
+        "",
+    ]
+    if strengths:
+        lines.append("| 板块 | 家族 | 强度 | 消息 | 资金 | 情绪 | 关联事件（传导路径） |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for item in strengths:
+            code = item.get("board_code")
+            path = path_by_code.get(code) or []
+            lines.append(
+                f"| {code_to_name.get(code) or code or '?'} "
+                f"| {family_by_code.get(code) or '无归属'} "
+                f"| {item.get('strength')} | {item.get('news_read')} "
+                f"| {item.get('capital_read')} | {item.get('sentiment_read')} "
+                f"| {' → '.join(path) if path else '—'} |"
+            )
+        lines.append("")
+
+    if degraded:
+        sectors = glue.get("degraded_sectors") or []
+        if sectors:
+            lines.append(f"受影响板块（{len(sectors)} 个）：{'、'.join(sectors)}")
+        lines += [f"- ⚠️ {w}" for w in (glue.get("warnings") or [])]
+        lines.append("")
+    return lines
+
+
+def _render_shadow_t1(t1: "dict | None") -> list[str]:
+    """T1 候选股终审：叙述 + 否决明细（无否决时明说）。"""
+    if not t1:
+        return [f"**T1 候选股终审**（影子，只有否决权）：本次无产物（`{SHADOW_T1_ARTIFACT}` 缺失）。", ""]
+
+    if not t1.get("executed"):
+        return [
+            f"**T1 候选股终审**（影子，只有否决权）：本次**未执行**。"
+            f"原因：{t1.get('reason') or '未说明'}。",
+            "",
+        ]
+
+    reviewed = t1.get("reviewed") or 0
+    budget = t1.get("budget")
+    rejects = t1.get("rejects") or []
+    lines = [
+        f"**T1 候选股终审**（影子，只有否决权）：本次提交审查 {reviewed} 只"
+        + (f"（预算上限 {budget}）" if budget else "")
+        + f"，Agent 否决 {len(rejects)} 只。"
+    ]
+    if not rejects:
+        return lines + ["", "本次无否决。", ""]
+
+    lines.append("")
+    lines += [
+        f"- **{_shadow_display_name(r.get('name'), r.get('symbol'))}**：{r.get('reason')}"
+        for r in rejects
+    ]
+    lines += ["", "影子模式下该否决仅影响展示顺序，未从候选池移除。", ""]
+    return lines
+
+
+def _render_shadow_t1h(t1h: "dict | None") -> list[str]:
+    """T1-H 持仓审查：叙述 + verdict 明细；未执行时须列出未命中的筛选条件。"""
+    if not t1h:
+        return [f"**T1-H 持仓审查**（影子，只有降档权）：本次无产物（`{SHADOW_T1H_ARTIFACT}` 缺失）。", ""]
+
+    if not t1h.get("executed"):
+        lines = [
+            f"**T1-H 持仓审查**（影子，只有降档权）：本次**未执行**。"
+            f"原因：{t1h.get('reason') or '未说明'}。"
+        ]
+        skipped = t1h.get("skipped") or []
+        if skipped:
+            lines += [""]
+            lines += [
+                f"- {_shadow_display_name(s.get('name'), s.get('symbol'))}："
+                f"综合评分 {s.get('composite_score')}，非埋伏持仓、无 P4 退出信号"
+                for s in skipped
+            ]
+        return lines + [""]
+
+    verdicts = t1h.get("verdicts") or []
+    reviewed = t1h.get("reviewed") or 0
+    budget = t1h.get("budget")
+    lines = [
+        f"**T1-H 持仓审查**（影子，只有降档权）：本次审查 {reviewed} 只持仓"
+        + (f"（预算上限 {budget}）" if budget else "")
+        + f"，Agent 给出 {len(verdicts)} 条裁决。"
+    ]
+    if not verdicts:
+        return lines + ["", "本次无裁决。", ""]
+
+    lines.append("")
+    lines += [
+        f"- **{_shadow_display_name(v.get('name'), v.get('symbol'))}**"
+        f"裁决 `{v.get('verdict')}`（置信度 {v.get('confidence')}）：{v.get('reasoning')}"
+        for v in verdicts
+    ]
+    lines += ["", "影子模式下裁决已归档但未施加降档惩罚，未影响持仓评分。", ""]
+    return lines
+
+
+def _render_shadow_section(
+    *,
+    glue: "dict | None",
+    t1: "dict | None",
+    t1h: "dict | None",
+    code_to_name: dict,
+) -> list[str]:
+    """渲染「影子模式观测」段（reasoning.md 末尾，三条影子线各一段）。"""
+    lines = [SHADOW_SECTION_TITLE, ""]
+    lines += _render_shadow_a5(glue, code_to_name)
+    lines += _render_shadow_t1(t1)
+    lines += _render_shadow_t1h(t1h)
+    return lines
+
+
+def _read_json_quiet(path: Path) -> "dict | None":
+    """读 JSON；文件缺失或损坏时返回 None（影子段降级为「无产物」而非中断归档）。"""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("[Archive] 影子产物读取失败 %s: %s", path.name, exc)
+        return None
+
+
+def _load_board_code_to_name(unified_path: Path) -> dict:
+    """从 unified.json 取 board_code → 板块名 映射（影子表用中文名，不用裸代码）。"""
+    unified = _read_json_quiet(unified_path) or {}
+    return {
+        s.get("sector_code"): s.get("sector_name")
+        for s in (unified.get("confirmed_sectors") or [])
+        if s.get("sector_code")
+    }
+
+
 def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
     """覆盖写 Phase 2 reasoning 到 reasoning.md。
 
@@ -700,6 +873,15 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
                 f"`{exit_info.get('exit_signal', '')}`"
             )
         lines.append("")
+
+    # 影子模式观测（三条影子线）——挂在 Node 7 之后，同日重跑时随 Node 7 段一并被丢弃重建
+    day_dir = reasoning_path.parent
+    lines += _render_shadow_section(
+        glue=_read_json_quiet(day_dir / GLUE_ARTIFACT),
+        t1=_read_json_quiet(day_dir / SHADOW_T1_ARTIFACT),
+        t1h=_read_json_quiet(day_dir / SHADOW_T1H_ARTIFACT),
+        code_to_name=_load_board_code_to_name(day_dir / "unified.json"),
+    )
 
     reasoning_path.write_text("\n".join(lines), encoding="utf-8")
 
