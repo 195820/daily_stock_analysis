@@ -66,7 +66,7 @@ def test_docker_guides_do_not_recommend_single_file_env_bind_mount() -> None:
         r"\.\./\.env:/app/\.env",
     ]
 
-    for doc_path in ("docs/full-guide.md", "docs/full-guide_EN.md"):
+    for doc_path in ("docs/guide/full-guide.md", "docs/guide/full-guide_EN.md"):
         doc = (REPO_ROOT / doc_path).read_text(encoding="utf-8")
 
         assert "--env-file .env" in doc
@@ -79,7 +79,7 @@ def test_documented_compose_exec_commands_run_as_dsa() -> None:
     safe_exec_prefix = "docker-compose -f ./docker/docker-compose.yml exec -u dsa"
     unsafe_exec_prefix = "docker-compose -f ./docker/docker-compose.yml exec"
 
-    for doc_path in ("docs/DEPLOY.md", "docs/DEPLOY_EN.md"):
+    for doc_path in ("docs/guide/DEPLOY.md", "docs/guide/DEPLOY_EN.md"):
         doc = (REPO_ROOT / doc_path).read_text(encoding="utf-8")
 
         assert f"{safe_exec_prefix} stock-analyzer bash" in doc

@@ -1074,7 +1074,7 @@ def load_phase2_decision(run_date: date) -> Optional["PortfolioDecision"]:
 
 
 # =============================================================================
-# 回放 harness（docs/archive/got/agent_glue_plan_0903.md §8.3 A1）
+# 回放 harness（docs/got/archive/agent_glue_plan_0903.md §8.3 A1）
 # =============================================================================
 
 _CONTEXT_MODEL_MAP = {

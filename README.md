@@ -15,9 +15,9 @@
 
 > 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/Slack/邮箱
 
-[**产品预览**](#-产品预览) · [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**文档中心**](docs/INDEX.md) · [**完整指南**](docs/full-guide.md)
+[**产品预览**](#-产品预览) · [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**文档中心**](docs/INDEX.md) · [**完整指南**](docs/guide/full-guide.md)
 
-简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md)
+简体中文 | [English](docs/guide/README_EN.md) | [繁體中文](docs/guide/README_CHT.md)
 
 </div>
 
@@ -47,7 +47,7 @@
 | 智能导入与补全 | 图片、CSV/Excel、剪贴板导入；股票代码/名称/拼音/别名补全 |
 | 自动化与推送 | GitHub Actions、Docker、本地定时任务、FastAPI 服务和企业微信/飞书/Telegram/Discord/Slack/邮件推送 |
 
-> 功能细节、字段契约、基本面 P0 超时语义、交易纪律、数据源优先级、Web/API 行为请看 [完整配置与部署指南](docs/full-guide.md)。
+> 功能细节、字段契约、基本面 P0 超时语义、交易纪律、数据源优先级、Web/API 行为请看 [完整配置与部署指南](docs/guide/full-guide.md)。
 
 ### 技术栈与数据来源
 
@@ -58,7 +58,7 @@
 | 新闻搜索 | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC)、[SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)、[Tavily](https://tavily.com/)、[Bocha](https://open.bocha.cn/)、[Brave](https://brave.com/search/api/)、[MiniMax](https://platform.minimaxi.com/)、SearXNG |
 | 社交舆情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，仅美股，可选） |
 
-> 完整规则见 [数据源配置](docs/full-guide.md#数据源配置)。
+> 完整规则见 [数据源配置](docs/guide/full-guide.md#数据源配置)。
 
 ## 🚀 快速开始
 
@@ -77,7 +77,7 @@
 
 **AI 模型配置（至少配置一个）**
 
-默认先选一个模型服务商并填写 API Key；需要多模型、图片识别、本地模型或高级路由时，再参考 [LLM 配置指南](docs/LLM_CONFIG_GUIDE.md)。
+默认先选一个模型服务商并填写 API Key；需要多模型、图片识别、本地模型或高级路由时，再参考 [LLM 配置指南](docs/guide/LLM_CONFIG_GUIDE.md)。
 
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
@@ -101,7 +101,7 @@
 | `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` | Slack Bot |
 | `EMAIL_SENDER` + `EMAIL_PASSWORD` | 邮件推送 |
 
-更多渠道、签名校验、分组邮件、Markdown 转图片等配置见 [通知渠道详细配置](docs/full-guide.md#通知渠道详细配置)。
+更多渠道、签名校验、分组邮件、Markdown 转图片等配置见 [通知渠道详细配置](docs/guide/full-guide.md#通知渠道详细配置)。
 
 **自选股配置（必填）**
 
@@ -123,7 +123,7 @@
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/)：结构化搜索结果 | 可选 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例：无配额兜底，适合私有部署 | 可选 |
 
-更多搜索源、社交舆情和降级规则见 [搜索服务配置](docs/full-guide.md#搜索服务配置)。
+更多搜索源、社交舆情和降级规则见 [搜索服务配置](docs/guide/full-guide.md#搜索服务配置)。
 
 #### 3. 启用 Actions
 
@@ -135,7 +135,7 @@
 
 #### 完成
 
-默认每个**工作日 18:00（北京时间）**自动执行，也可手动触发。默认非交易日（含 A/H/US 节假日）不执行；强制运行、交易日检查、断点续传等规则见 [完整指南](docs/full-guide.md#定时任务配置)。
+默认每个**工作日 18:00（北京时间）**自动执行，也可手动触发。默认非交易日（含 A/H/US 节假日）不执行；强制运行、交易日检查、断点续传等规则见 [完整指南](docs/guide/full-guide.md#定时任务配置)。
 
 ### 方式二：[客户端配置教程](https://www.bilibili.com/video/BV11FEb66Eyr/) / 本地运行 / Docker 部署
 
@@ -164,7 +164,7 @@ python main.py --schedule
 python main.py --serve-only
 ```
 
-> Docker 部署、定时任务、云服务器访问请参考 [完整指南](docs/full-guide.md)；桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)。
+> Docker 部署、定时任务、云服务器访问请参考 [完整指南](docs/guide/full-guide.md)；桌面客户端打包请参考 [桌面端打包说明](docs/guide/desktop-package.md)。
 
 ## 📱 推送效果
 
@@ -217,7 +217,7 @@ python main.py --serve-only
 
 ## ⚙️ 配置说明
 
-完整环境变量、模型渠道、通知渠道、数据源优先级、交易纪律、基本面 P0 语义和部署说明请参考 [完整配置指南](docs/full-guide.md)。
+完整环境变量、模型渠道、通知渠道、数据源优先级、交易纪律、基本面 P0 语义和部署说明请参考 [完整配置指南](docs/guide/full-guide.md)。
 
 ## 🖥️ Web 界面
 
@@ -228,7 +228,7 @@ python main.py --webui
 python main.py --webui-only
 ```
 
-访问 `http://127.0.0.1:8000` 即可使用。认证、智能导入、搜索补全、历史报告复制、云服务器访问等细节见 [本地 WebUI 管理界面](docs/full-guide.md#本地-webui-管理界面)。
+访问 `http://127.0.0.1:8000` 即可使用。认证、智能导入、搜索补全、历史报告复制、云服务器访问等细节见 [本地 WebUI 管理界面](docs/guide/full-guide.md#本地-webui-管理界面)。
 
 ## 🤖 Agent 策略问股
 
@@ -239,7 +239,7 @@ python main.py --webui-only
 - 支持多轮追问、会话导出、发送到通知渠道和后台执行
 - 支持自定义策略文件与多 Agent 编排（实验性）
 
-> Agent 具体参数、`skill` 命名兼容、多 Agent 模式和预算护栏见 [完整指南](docs/full-guide.md#本地-webui-管理界面) 与 [LLM 配置指南](docs/LLM_CONFIG_GUIDE.md)。
+> Agent 具体参数、`skill` 命名兼容、多 Agent 模式和预算护栏见 [完整指南](docs/guide/full-guide.md#本地-webui-管理界面) 与 [LLM 配置指南](docs/guide/LLM_CONFIG_GUIDE.md)。
 
 ## 🧩 相关项目 (Related Projects)
 

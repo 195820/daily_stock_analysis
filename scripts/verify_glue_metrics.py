@@ -2,7 +2,7 @@
 """C 层验收红线：R-C3 / R-C6（复算脚本，真算归档数据）。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-红线原文（`docs/archive/got/got_layer_c_plan_0911.md` §6.1）
+红线原文（`docs/got/archive/got_layer_c_plan_0911.md` §6.1）
 
 | **R-C3** | **复算脚本可复现**：`verify_glue_metrics.py --date 20260910` 输出与本文**对应章节**逐位一致。
 必需锚点（**每项标注口径 —— 禁止跨口径比对**）：`M1=3.1%`（规则侧，§1）/ `M1′=34.4%`（glue 侧，§1）/
@@ -61,7 +61,7 @@ from verify_common import (  # noqa: E402
     spearman,
 )
 
-REDLINE_DOC = "docs/archive/got/got_layer_c_plan_0911.md §6.1"
+REDLINE_DOC = "docs/got/archive/got_layer_c_plan_0911.md §6.1"
 ANCHOR_DATE = "20260910"
 
 NON_NEUTRAL_READS = {"low", "unknown"}
@@ -71,7 +71,7 @@ REPLAY_PLACEHOLDER_STATUSES = {"S6_disabled", "replay_mode"}
 # ── C-P6 / C-P7 主口径（2026-09-14 落地） ──
 # C-P6：M1 改量 glue 侧 `strengths[].news_read`，规则侧 `news_check` 降为并列对照列。
 # C-P7：M6 改量「其他」回收率，「无归属」计为未回收；规则侧覆盖率降为观察项。
-# 依据 `docs/archive/got/got_layer_c_plan_0911.md` §5.2 P2（该项自述「零行为变更」）。
+# 依据 `docs/got/archive/got_layer_c_plan_0911.md` §5.2 P2（该项自述「零行为变更」）。
 #
 # ⚠️ 两者原本只能量规则侧字段 ⇒ M1 恒 3.1% / M6 恒 65.6%，构成「门禁自锁」。
 #    C-P6 改数据源只**解除死锁**，不解除「红线不可达」（glue 侧 34.4% 仍 < 60%）。
@@ -339,7 +339,7 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
         verifier.check(
             "R-C3 锚点逐位一致",
             anchor_ok,
-            "与 docs/archive/got/got_layer_c_plan_0911.md §6.1 / §1 锚点全部一致"
+            "与 docs/got/archive/got_layer_c_plan_0911.md §6.1 / §1 锚点全部一致"
             if anchor_ok
             else "存在与文档锚点不一致的项",
             evidence,

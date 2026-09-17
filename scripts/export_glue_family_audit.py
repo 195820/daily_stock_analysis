@@ -2,7 +2,7 @@
 """M3 家族误配率人工抽查：导出逐日「板块 → 家族」对照表（自包含 HTML）。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-指标出处（`docs/archive/got/agent_glue_plan_0903.md` §8.1 / §8.2）
+指标出处（`docs/got/archive/agent_glue_plan_0903.md` §8.1 / §8.2）
 
 | M3 | **误配率**：人工抽查 glue 归属中「无实质归属关系」的占比 |
 | 红线 | **≤ 15%** |
@@ -539,7 +539,7 @@ textarea:focus-visible { outline: 2px solid var(--agent); outline-offset: 2px; }
   <p class="foot">
     数据源：<code>data/got_daily/{date}/agent_glue.json</code> × <code>unified.json</code> ·
     生成脚本 <code>scripts/export_glue_family_audit.py</code> ·
-    指标定义 <code>docs/archive/got/agent_glue_plan_0903.md</code> §8.1
+    指标定义 <code>docs/got/archive/agent_glue_plan_0903.md</code> §8.1
   </p>
 </main>
 

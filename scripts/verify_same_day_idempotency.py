@@ -2,7 +2,7 @@
 """A 层（运行模型）验收红线：R1–R6 —— 同日两跑状态一致性。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-红线原文（`docs/archive/got/got_run_model_plan_0911.md` §6.1「六条」）
+红线原文（`docs/got/archive/got_run_model_plan_0911.md` §6.1「六条」）
 
 | # | 指标 | 达标线 | 数据源 | 可度量 |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ from verify_common import (  # noqa: E402
     repo_root,
 )
 
-REDLINE_DOC = "docs/archive/got/got_run_model_plan_0911.md §6"
+REDLINE_DOC = "docs/got/archive/got_run_model_plan_0911.md §6"
 
 SRC_GOT = repo_root() / "src" / "got"
 EMA_BASELINE = repo_root() / "data" / "aggregator_contexts" / "ema_baseline.json"

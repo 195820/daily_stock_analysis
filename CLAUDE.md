@@ -4,7 +4,7 @@
 
 ## 开发规则
 
-**→ 参见 [`AGENTS.md`](AGENTS.md)（CLAUDE.md 为其镜像）**
+**→ 参见 [`docs/AGENTS.md`](docs/AGENTS.md)（CLAUDE.md 为其镜像）**
 
 ### GOT 运行规范
 
@@ -144,14 +144,14 @@ daily_stock_analysis/
 │   └── custom/
 │       └── screener_design.md        # 选股系统设计文档
 │
-└── agent_cot_design.md          # GOT 架构设计文档（v1.0，2026-08-11）
+└── docs/got/architecture.md          # GOT 架构设计文档（v1.0，2026-08-11）
 ```
 
 ---
 
 ## GOT 架构概览
 
-> **详细设计文档**：[`agent_cot_design.md`](agent_cot_design.md)（v1.0，2026-08-11）  
+> **详细设计文档**：[`docs/got/architecture.md`](docs/got/architecture.md)（v1.0，2026-08-11）  
 > 本文档保留高层架构速览 + 数据流转全图 + 编排流程 + 持久化层。节点级详细设计（评分维度、阈值、LLM 调用、Schema 字段）见设计文档。
 
 ### 核心理念

@@ -1,5 +1,7 @@
 # English Documentation Index
 
+> Docs were reorganized on 2026-09-17 into three zones: `guide/` (base project, non-GOT, all implemented), `got/` (GOT active plans/checklists), `archive/` + `got/archive/` (completed history). Chinese index: [docs/INDEX.md](INDEX.md).
+
 This is the entry point for project documentation. The README covers the project overview and quick start; detailed setup, configuration, deployment, feature usage, and troubleshooting docs are linked below.
 
 > For Chinese documentation, see [docs/INDEX.md](INDEX.md).
@@ -8,53 +10,53 @@ This is the entry point for project documentation. The README covers the project
 
 | I want to | Start with | Then read |
 | --- | --- | --- |
-| Understand what the project does | [README (EN)](README_EN.md) | [Full Guide (EN)](full-guide_EN.md) |
-| Run the project for the first time | [README (EN)](README_EN.md) | [Full Guide (EN)](full-guide_EN.md) |
-| Configure model providers | [LLM Config Guide (EN)](LLM_CONFIG_GUIDE_EN.md) | [Provider Configuration Guide](llm-providers.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
-| Configure notifications | [Notification Baseline](notifications.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | [Full Guide (EN)](full-guide_EN.md) |
-| Deploy to a server or cloud platform | [Deploy Guide (EN)](DEPLOY_EN.md) | [Cloud WebUI Deployment](deploy-webui-cloud.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only), [Zeabur Deployment](docker/zeabur-deployment.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
-| Use Bot / IM integrations | [Bot Commands (EN)](bot-command_EN.md) | [Bot Platform Docs](bot/) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
-| Troubleshoot runtime issues | [FAQ (EN)](FAQ_EN.md) | [Changelog](CHANGELOG.md) |
+| Understand what the project does | [README (EN)](guide/README_EN.md) | [Full Guide (EN)](guide/full-guide_EN.md) |
+| Run the project for the first time | [README (EN)](guide/README_EN.md) | [Full Guide (EN)](guide/full-guide_EN.md) |
+| Configure model providers | [LLM Config Guide (EN)](guide/LLM_CONFIG_GUIDE_EN.md) | [Provider Configuration Guide](guide/llm-providers.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
+| Configure notifications | [Notification Baseline](guide/notifications.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | [Full Guide (EN)](guide/full-guide_EN.md) |
+| Deploy to a server or cloud platform | [Deploy Guide (EN)](guide/DEPLOY_EN.md) | [Cloud WebUI Deployment](guide/deploy-webui-cloud.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only), [Zeabur Deployment](docker/zeabur-deployment.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
+| Use Bot / IM integrations | [Bot Commands (EN)](guide/bot-command_EN.md) | [Bot Platform Docs](bot/) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) |
+| Troubleshoot runtime issues | [FAQ (EN)](guide/FAQ_EN.md) | [Changelog](CHANGELOG.md) |
 | Contribute code or docs | [Contributing Guide (EN)](CONTRIBUTING_EN.md) | [API Spec](architecture/api_spec.json) |
 
 ## Getting Started
 
 | Document | Contents |
 | --- | --- |
-| [README (EN)](README_EN.md) | Project overview, key features, quick start, sample output |
-| [Full Guide (EN)](full-guide_EN.md) | Environment setup, run modes, configuration, deployment paths, and common issues |
-| [FAQ (EN)](FAQ_EN.md) | Common configuration, model, notification, deployment, and runtime issues |
+| [README (EN)](guide/README_EN.md) | Project overview, key features, quick start, sample output |
+| [Full Guide (EN)](guide/full-guide_EN.md) | Environment setup, run modes, configuration, deployment paths, and common issues |
+| [FAQ (EN)](guide/FAQ_EN.md) | Common configuration, model, notification, deployment, and runtime issues |
 | [Changelog](CHANGELOG.md) | Release notes, capability changes, and migration notes |
 
 ## Configuration
 
 | Document | Contents |
 | --- | --- |
-| [LLM Config Guide (EN)](LLM_CONFIG_GUIDE_EN.md) | Model providers, three-tier configuration, Web settings, and common model setup |
-| [Provider Configuration Guide](llm-providers.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Provider presets, GitHub Actions mapping, error categories, and diagnostics |
+| [LLM Config Guide (EN)](guide/LLM_CONFIG_GUIDE_EN.md) | Model providers, three-tier configuration, Web settings, and common model setup |
+| [Provider Configuration Guide](guide/llm-providers.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Provider presets, GitHub Actions mapping, error categories, and diagnostics |
 | [LiteLLM YAML Example](examples/litellm_config.example.yaml) | Example LiteLLM multi-provider configuration |
-| [Notification Baseline](notifications.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | WeChat Work, Feishu, Telegram, Discord, Slack, Email, and other notification channels |
-| [Tushare Stock List Guide](TUSHARE_STOCK_LIST_GUIDE.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Tushare stock-list configuration and usage notes |
+| [Notification Baseline](guide/notifications.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | WeChat Work, Feishu, Telegram, Discord, Slack, Email, and other notification channels |
+| [Tushare Stock List Guide](guide/TUSHARE_STOCK_LIST_GUIDE.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Tushare stock-list configuration and usage notes |
 
 ## Usage Topics
 
 | Document | Contents |
 | --- | --- |
-| [Bot Commands (EN)](bot-command_EN.md) | Bot commands, webhooks, platform integration, and callback behavior |
+| [Bot Commands (EN)](guide/bot-command_EN.md) | Bot commands, webhooks, platform integration, and callback behavior |
 | [Bot Platform Docs](bot/) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Feishu, DingTalk, Discord, and related Bot configuration screenshots and notes |
-| [Real-Time Alert Center](alerts.md) <sub><sub>![P4 Badge](https://img.shields.io/badge/P4-yellow?style=flat)</sub></sub> (Chinese-only) | EventMonitor baseline, Web rule management, notification attempts, cooldown state, and phase boundaries |
-| [Analysis Context Pack Contract, Runtime Consumption, And Visibility](analysis-context-pack.md) <sub><sub>![P6 Badge](https://img.shields.io/badge/P6-orange?style=flat)</sub></sub> (Chinese-only) | AnalysisContextPack first-scope boundaries, field quality states, P1/P2 internal contracts, P3 prompt-summary consumption, P4 history/API/Web low-sensitivity visibility, P5 data-quality scoring, and P6 migration/rollback notes, plus source anchors; the full guide adds #1386 market-phase analysis, migration, and rollback entry points |
-| [Image Extraction Prompt](image-extract-prompt.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Prompt and boundaries for extracting stock information from images |
-| [OpenClaw Skill Integration](openclaw-skill-integration.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | OpenClaw / Skill external integration notes |
+| [Real-Time Alert Center](guide/alerts.md) <sub><sub>![P4 Badge](https://img.shields.io/badge/P4-yellow?style=flat)</sub></sub> (Chinese-only) | EventMonitor baseline, Web rule management, notification attempts, cooldown state, and phase boundaries |
+| [Analysis Context Pack Contract, Runtime Consumption, And Visibility](guide/analysis-context-pack.md) <sub><sub>![P6 Badge](https://img.shields.io/badge/P6-orange?style=flat)</sub></sub> (Chinese-only) | AnalysisContextPack first-scope boundaries, field quality states, P1/P2 internal contracts, P3 prompt-summary consumption, P4 history/API/Web low-sensitivity visibility, P5 data-quality scoring, and P6 migration/rollback notes, plus source anchors; the full guide adds #1386 market-phase analysis, migration, and rollback entry points |
+| [Image Extraction Prompt](guide/image-extract-prompt.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Prompt and boundaries for extracting stock information from images |
+| [OpenClaw Skill Integration](guide/openclaw-skill-integration.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | OpenClaw / Skill external integration notes |
 
 ## Deployment And Packaging
 
 | Document | Contents |
 | --- | --- |
-| [Deploy Guide (EN)](DEPLOY_EN.md) | Server deployment, Docker, systemd, Supervisor, and related options |
-| [Cloud WebUI Deployment](deploy-webui-cloud.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Cloud server WebUI access and deployment notes |
+| [Deploy Guide (EN)](guide/DEPLOY_EN.md) | Server deployment, Docker, systemd, Supervisor, and related options |
+| [Cloud WebUI Deployment](guide/deploy-webui-cloud.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Cloud server WebUI access and deployment notes |
 | [Zeabur Deployment](docker/zeabur-deployment.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Zeabur platform deployment |
-| [Desktop Packaging](desktop-package.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Electron desktop app and Web artifact packaging |
+| [Desktop Packaging](guide/desktop-package.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Electron desktop app and Web artifact packaging |
 
 ## Reference And Development
 
@@ -63,12 +65,21 @@ This is the entry point for project documentation. The README covers the project
 | [API Spec](architecture/api_spec.json) | FastAPI OpenAPI artifact |
 | [Contributing Guide (EN)](CONTRIBUTING_EN.md) | Issues, pull requests, tests, documentation sync, and collaboration expectations |
 
+## GOT (China-market decision system, Chinese-only)
+
+| Document | Contents |
+| --- | --- |
+| [GOT docs navigation](got/README.md) | Zone map and ordering of GOT work items |
+| [GOT architecture](got/architecture.md) | Current architecture v2.0 (based on actual code) |
+| [GOT backlog](got/backlog.md) | Not-yet-implemented items, dispositions, and pending rulings |
+| [GOT verification](got/verification.md) | Shadow-period / to-be-verified redlines with measured values |
+
 ## Languages
 
 | Document | Contents |
 | --- | --- |
 | [Chinese Documentation Index](INDEX.md) | Chinese documentation entry point |
-| [Traditional Chinese README](README_CHT.md) | Traditional Chinese project overview and quick start |
+| [Traditional Chinese README](guide/README_CHT.md) | Traditional Chinese project overview and quick start |
 
 ## China-Market Glossary
 

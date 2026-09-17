@@ -174,14 +174,19 @@ REFINE_TOP_N = 10                    # 基础片：composite 降序前 N（原�
 REFINE_MAX_SECTORS = 20              # 总量上限（基础片 + 埋伏候选追加片）
 
 # =============================================================================
-# LLM 调用可观测性（docs/archive/got/agent_glue_plan_0903.md §6.3 R3/R5 + §7.3 C3）
+# LLM 调用可观测性（docs/got/archive/agent_glue_plan_0903.md §6.3 R3/R5 + §7.3 C3）
 # =============================================================================
 
 LLM_CALL_TIMEOUT_S = 60              # 单次 LLM 调用超时（秒）；glue 单次 max_tokens≈5000 需留足
 AGENT_SEMANTIC_GLUE_ENABLED = os.environ.get("AGENT_SEMANTIC_GLUE_ENABLED", "false").lower() == "true"
-AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "true").lower() == "true"
+# A6 阶段 1（2026-09-17）：SHADOW 默认翻为 false，glue 结果正式接入 _build_sector_intel 及下游消费路径。
+# 回滚：GOT_A6_ENABLED=false 或 AGENT_SEMANTIC_GLUE_SHADOW=true 均可回到影子期「归档不消费」行为。
+AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "false").lower() == "true"
 # C-P3: replay_mode 下允许运行 glue（默认关闭，保持 0903 A1「不产生任何持久化副作用」契约）
 AGENT_SEMANTIC_GLUE_IN_REPLAY = os.environ.get("AGENT_SEMANTIC_GLUE_IN_REPLAY", "false").lower() == "true"
+# A6 灰度总开关：控制 4 个消费点（_build_sector_intel / refine_events_map / _llm_refine_sectors.adjustments /
+# _synthesize_mainline_endurance）是否走 glue 分支。false = 完全回退到影子期行为。
+GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"
 
 # =============================================================================
 # §15 审查层配置（T1 候选股终审 + T1-H 持仓审查）

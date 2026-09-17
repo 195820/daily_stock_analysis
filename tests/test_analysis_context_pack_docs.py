@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DOC_PATH = PROJECT_ROOT / "docs" / "analysis-context-pack.md"
-FULL_GUIDE_PATH = PROJECT_ROOT / "docs" / "full-guide.md"
-FULL_GUIDE_EN_PATH = PROJECT_ROOT / "docs" / "full-guide_EN.md"
+DOC_PATH = PROJECT_ROOT / "docs" / "guide" / "analysis-context-pack.md"
+FULL_GUIDE_PATH = PROJECT_ROOT / "docs" / "guide" / "full-guide.md"
+FULL_GUIDE_EN_PATH = PROJECT_ROOT / "docs" / "guide" / "full-guide_EN.md"
 
 
 def _read_doc() -> str:
@@ -427,11 +427,11 @@ def test_analysis_context_pack_doc_updates_indexes_and_changelog() -> None:
     index_en = (PROJECT_ROOT / "docs" / "INDEX_EN.md").read_text(encoding="utf-8")
     changelog = (PROJECT_ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert "[分析上下文包契约、运行态消费与可见性](analysis-context-pack.md)" in index
-    assert "P1/P2 内部契约、P3 Prompt 摘要消费、P4 历史/API/Web 低敏可见性、P5 数据质量评分、P6 迁移回滚" in index
-    assert "#1386 阶段感知分析、迁移与回滚入口" in index
+    # 2026-09-17 文档重排：INDEX.md 重写为三区精简表格，断言随新结构更新
+    assert "[分析上下文包](guide/analysis-context-pack.md)" in index
+    assert "AnalysisContextPack 契约、运行态消费与可见性（P0–P6）" in index
     assert (
-        "[Analysis Context Pack Contract, Runtime Consumption, And Visibility](analysis-context-pack.md) "
+        "[Analysis Context Pack Contract, Runtime Consumption, And Visibility](guide/analysis-context-pack.md) "
         "<sub><sub>![P6 Badge](https://img.shields.io/badge/P6-orange?style=flat)</sub></sub> "
         "(Chinese-only)"
     ) in index_en
@@ -450,8 +450,8 @@ def test_analysis_context_pack_doc_updates_indexes_and_changelog() -> None:
 
 
 def test_full_guides_cover_issue_1386_p7_user_migration_closeout() -> None:
-    guide = (PROJECT_ROOT / "docs" / "full-guide.md").read_text(encoding="utf-8")
-    guide_en = (PROJECT_ROOT / "docs" / "full-guide_EN.md").read_text(encoding="utf-8")
+    guide = (PROJECT_ROOT / "docs" / "guide" / "full-guide.md").read_text(encoding="utf-8")
+    guide_en = (PROJECT_ROOT / "docs" / "guide" / "full-guide_EN.md").read_text(encoding="utf-8")
 
     for token in (
         "文档、配置与迁移说明（Issue #1386 P7）",
@@ -505,8 +505,8 @@ def test_full_guides_cover_issue_1386_p7_user_migration_closeout() -> None:
 
 
 def test_full_guides_clarify_pack_summary_does_not_replace_legacy_payload_channels() -> None:
-    guide = (PROJECT_ROOT / "docs" / "full-guide.md").read_text(encoding="utf-8")
-    guide_en = (PROJECT_ROOT / "docs" / "full-guide_EN.md").read_text(encoding="utf-8")
+    guide = (PROJECT_ROOT / "docs" / "guide" / "full-guide.md").read_text(encoding="utf-8")
+    guide_en = (PROJECT_ROOT / "docs" / "guide" / "full-guide_EN.md").read_text(encoding="utf-8")
 
     assert "在这个新增的 pack 摘要区块中" in guide
     assert "不会通过该区块看到完整 `news.content`" in guide

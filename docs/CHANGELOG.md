@@ -9,23 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- [文档] README 与繁中 README 快速开始入口补充视频教程链接，并将桌面客户端入口文案调整为客户端配置教程。
-- [修复] 问股从历史报告进入后的追问会持续携带当前标的，切回或重载已有会话时可从历史消息恢复基础当前标的，并由后端阻断未明确切换时的错误股票工具调用、交易所片段和指标缩写误路由。
-- [修复] 自选股加入和删除按等价股票代码匹配港股及大小写美股变体，避免 `00700`、`HK00700`、`00700.HK` 或 `aapl`、`AAPL` 被误判为不同标的。
-- [改进] #1390 P0 为个股分析与历史/回测展示新增可选八态 `action` / `action_label` 建议动作字段，保留 `operation_advice` 自由文本和 `decision_type=buy|hold|sell` 统计口径，不新增迁移或配置项。
-- [新功能] #1390 P1 新增独立 `DecisionSignal` 存储、Repository、Service 与 `/api/v1/decision-signals` API，支持按来源类型/市场/股票/动作/期限/阶段去重、按 `source_report_id` / `trace_id` 查询、同源过期信号续期且保留来源身份字段、禁止 expired 直接 PATCH 复活、价格计划校验、状态更新、懒过期、cache-only 持仓过滤、敏感信息脱敏、敏感 `trace_id` 拒绝和仅清理 `source_type=analysis` 历史绑定信号的历史删除联动。
-- [改进] #1390 P1 补充 Web decision-signals typed API wrapper 与契约隔离测试，暂不接入 UI。
-- [修复] #1390 收紧建议动作 legacy fallback：英文 `not to ...` 与 `avoid selling/reducing/trimming ...` 等否定/回避表达不再误判为买卖动作，Web 旧记录不再把中文金融上下文、`buy or sell`、多 guard 歧义文本或 `buyback` / `buy-back` / `buy back` / `selloff` / `sell-off` / `sell off` 等英文复合词渲染成 action badge，并在有结构化 `action` 时让回测/历史趋势等入口按界面语言显示 action 标签。
-- [改进] 完善运行时日志上下文，补充 logger name、触发来源、市场统计与实时行情预取链路状态，便于排查调度、API、Bot 和数据源降级路径。
-- [修复] #1662 股票新闻与多维情报搜索在相关度排序后新增域名无关的准入过滤，剔除下载/安装包/应用评分页及成人/招嫖服务垃圾页，并在同批已有有效标的/行业候选时移除 `score=0` 背景填充项，避免无关或低质量页面进入 Prompt、Agent 工具输出和历史情报缓存。
-- [新功能] 新增分析任务与历史报告运行流快照 API，提供 lanes、nodes、edges、events、summary 等统一契约，并从任务队列、运行诊断和 AnalysisContextPack overview 构建脱敏数据流/信息流。
-- [新功能] Web 端为活跃任务、历史报告和大盘复盘报告补充运行流视图入口，支持查看运行摘要、拓扑节点、事件流和基础排障详情。
-- [修复] 修复历史报告运行流快照在混合时区事件时间戳下返回 500 的问题。
-- [改进] #1459 持仓管理页新增持仓账户删除入口，复用现有账户软删除接口，误建账户会从默认列表、快照、风险、录入入口和事件列表隐藏且不物理清理历史流水。
-- [修复] 修复运行流 live SSE 事件未复用快照层递归脱敏规则的问题，避免本地路径、prompt/raw response、代理头等敏感诊断字段在 refetch 前短暂暴露。
+### 本地工作（GOT 及仓库自维护，非上游发布内容）
+
+- [chore] 移除 `.github/copilot-instructions.md` 和 `.github/instructions/` 目录，简化 AI 配置入口；同步更新 `scripts/check_ai_assets.py` 校验逻辑，去掉 copilot 和 symlink 相关检查。
 - [新功能] GOT T1/T1-H 影子模式产物落盘（`shadow_t1.json` / `shadow_t1h.json`）：与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘到 `data/got_daily/{date}/`，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落；零 schema 改动（不碰 `schemas.py`，不影响 R-B8/R-C7 逐字段 diff）；重跑不堆积（`_append_phase2_reasoning()` 覆盖写机制天然处理）；「未执行」必带原因（开关关闭 / 无可审目标 / 具体哪只持仓不满足哪条筛选条件）；11 个测试用例覆盖（含重跑不堆积、「未执行+原因」分支）；端到端验证通过（0915 归档，T1 否决广立微 301095，T1-H 未执行）。
-<!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
-<!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [新功能] GOT Node 6 Agent 语义粘合层（agent_glue_plan_0903 Phase 0+1）：`_agent_semantic_glue` 单次全量 LLM 调用输出事件→板块关系图 + 板块强度 + 家族归属（受控词表 12+1），F1 八行降级契约完整实现（S1-S7），影子模式对照日志，`--got-replay` 回放 harness，`_collect_sector_candidates` 候选收集独立抽取，P0-B 数据完整性字段级检查（lifecycle/catalyst/crowded_families/capital_flow/hot_stocks_sectors），护栏空转 WARNING 日志。
 - [新功能] Phase 2 §3 TencentFetcher（`data_provider/tencent_fetcher.py`）：腾讯免费指数 K 线 fallback 源，P1 优先级，接入 `DataFetcherManager` 并经 `_filter_fetchers_index_only` 门控为仅指数可用（个股 fallback 时排除，避免 pct_chg 口径漂移），注册顺序置于 akshare 之前，Node 1 大盘分析 5 指数 K 线实际第一可用源（mootdx/efinance 被 A 股指数路由跳过，akshare push2his 间歇失效）。
 - [新功能] Phase 2 §4 指数注册表 + 身份解析（`src/got/index_registry.py` + `data/got_index_registry.json`）：`parse_analysis_target()` 消除裸码 000001 双身份歧义（裸码→股票，带后缀→指数），`matches_index_code()` 跨格式匹配（`sh000001` / `000001.SH` / `000001.SS` 等价），`CN_PROFILE.mood_index_code` 由 `"000001"` 改为 `"000001.SH"`。
@@ -42,6 +29,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] Phase 3 新增 `tests/test_phase3_glue.py`（31 测试：§15.2 review profile 构建 / §15.3 T1 JSON 解析 + 影子 / §15.4 T1-H 降档惩罚系数 + 目标选择优先级 + P4 催化剂快照注入 / §14.1 A1 avg_confidence 无数据回退 + 真实均值正路径 / A2 outcome 回填 bullish/bearish/hold 正路径），31 个 Phase 3 测试全通过。本轮 agent_glue_plan_0903 三阶段总计 **107 个测试**全通过（Node 6 30 + Phase 2 46 + Phase 3 31）。
 - [改进] Phase 3 §15.4 T1-H P4 催化剂快照增强（`src/got/nodes/portfolio_decision.py`）：`_build_holding_review_prompt` 由仅注入 `ambush_position_type`/`ambush_exit_signal` 两个代号字段，升级为优先注入完整 `AmbushPositionSnapshotRecord` 快照（催化剂事件标题/事件日期/影响等级★/共识预期/建仓日期与价格），并补上此前遗漏的 `ambush_exit_reason`（人可读退出理由）；`_score_holdings` 将 `ambush_snapshot_map` 暴露为 `self._ambush_snapshot_map` 供 Step 2.5 审查复用，快照不可用时回退 holding 代号字段（getattr 防御，不新增异常路径）。新增 5 个 `TestT1HCatalystSnapshot` 测试覆盖完整注入/退出理由/回退/未初始化防御/非埋伏持仓。
 - [文档] Phase 3 §14.1 A2 后台回填任务排期（`docs/agent_glue_plan_0903.md` §11.2）：明确当前 outcome 回填为惰性触发（`get_stock_history` 读取时回填，闭环已补全），独立后台调度任务（覆盖「从不被查询的标的」）因需接入调度器、改动较大，列为单独排期项（非本轮）；同步修正 §11.5 测试覆盖汇总（补 `test_phase3_glue.py` 行，合计 92→123）。
+- [修复] GOT 编排器交易日检查恢复生效：`_check_trading_day` 原 `import TradingCalendar` 引用的类在 `src/core/trading_calendar.py` 中不存在，恒抛 `ImportError` 且被 `except ImportError` 静默吞掉，周末/节假日照跑；改用模块级 `is_market_open()`（与 `src/core/pipeline.py` 同口径），并把 `try` 收窄到只包 import；`main.py --got` 新增 `except NonTradingDayError` 显式按「正常跳过」处理（`logger.info` + 退出码 0），不再被兜底 `logger.exception` 报成执行失败。注意：修复后非交易日不再运行 GOT。
+- [修复] GOT Phase 2 买入分配整手取整归零不再静默：`quantity = int(per_stock_budget / price / 100) * 100` 对高价股取整后为 0 时，原实现 `if quantity > 0:` 无 else 分支，候选被无声淘汰且其预算不回填（0914 实测方邦股份 ¥145.36 买 100 股需 ¥14,536 > 单只预算约 ¥11.7k）；现改为守卫子句提前 `continue` 并输出 WARNING，明确「100 股需 X，超出单只预算 Y」。
+- [文档] GOT 文档整合：13 份 GOT 文档整体归档至 `docs/archive/got/`（文件内容与节号一字未改，代码/脚本中的 `§X` 引用仍可解析），`docs/` 根目录只保留两份现行清单——`got_shadow_verification.md`（待验证 / 影子期：三条影子线可数性、M1–M6 定义与实测值、R-B/R-C/R1–R6 待回放红线、A-P0-4 已实测有效）与 `got_backlog.md`（待实施：四层未落地项、0902 报告 15 项处置表、OPEN 汇总、A6 转正与 17 项退役、后续 Phase、需裁决事项）。新增 `docs/archive/got/README.md` 归档索引与「已实施并完成验收」清单，防止归档后失联。
+- [chore] 同步 GOT 文档下沉后的路径引用：`src/got/`（archive/catalyst_config/index_registry/intelligence_service/schemas/nodes/aggregator 共 13 处，含 `aggregator.py` 一处运行时 f-string 提示文案）与 `scripts/`（`check_audit_claims.py` 的两处硬读盘路径 + 5 个验收脚本的出处常量）全部指向 `docs/archive/got/`；`intraday_gate_plan_0907.md` 的 12 条相对链接由 `../` 补为 `../../../`（下沉两级后到达仓库根的深度变化）。新增 `scripts/export_glue_family_audit.py`（M3 家族误配率人工抽查工具，702 行）纳入版本控制。
+- [新功能] GOT A6 阶段 1·接线（2026-09-17）：将 Agent 语义粘合层（glue）输出接入 Node 6 主链路——8 交易日影子期实测相对规则侧 M1 +25.5 pp / 13.1×、M6 +31.4 pp，M4-b/c 7/7 PASS，项目负责人裁决直接转正；0915 已归因 Node 2 上游服务器故障（`sector.frame_groups=0` → glue `S2_parse_failed`），不计入降级样本。新增 `GOT_A6_ENABLED` 环境变量（默认 true）作为主链路门，`AGENT_SEMANTIC_GLUE_SHADOW` 默认翻为 false。4 个消费点：① `_build_sector_intel` 新增 Pass 1.5 `_apply_glue_override_to_raw_data`，以 `_GLUE_CAPITAL_READ_MAP` / `_GLUE_NEWS_READ_MAP` / `_GLUE_SENTIMENT_READ_MAP` 三套词汇直接替换 `composite_score / capital_check / news_check / sentiment_check / confidence`，`glue.degraded_sectors` 命中板块保留规则侧兜底；② `run()` 中 `refine_events_map` 改走 `_glue_aware_events_map`（`code_to_name` 反查 + 未覆盖事件回退 T5 扇出）；③ `_llm_refine_sectors` 在 `self._a6_glue_active=true` 时跳过 adjustments 分支（narrative / cross_sector_risks 保留），避免与 glue 双入口改同一 `classification` 字段；④ `_synthesize_mainline_endurance` 新增 `glue` 参数 + family_name 三级优先（`glue.families[code].family` → `intel.frame_group` → `intel.sector_name`）。E2 公式：`MainlineEndurance.family_resonance` 分母从固定 50.0 改为当日家族 `std_dev` P90 自适应归一化（P90=0 时 fallback 50.0），使 A5 实测「24/24 全 None」的字段真正具备区分度。归档 schema：`UnifiedContext` 新增 `glue_consumed: bool` + `glue_status: Optional[str]` 两个字段，**不删除**任何现有字段（阶段 2 才做 §6.1 17 项退役）。回滚：`GOT_A6_ENABLED=false` 一个环境变量即回到影子期行为（glue 归档不消费），零代码回退；三件套 `_cross_check_*` 继续计算但不写入 SectorIntel，保留僵尸期作为 0915 类上游故障的最后一道兜底。新增 `tests/test_a6_wiring.py` 9 个用例（C1 glue 直接替换 + C2 degraded_sectors 保留规则侧 + C3 A6=false 与影子期基线逐字段一致作为行为面验收锚点、替代原 R-C7 + C4 S2_parse_failed 四调用点全回退不抛异常 + C5 E2 P90 自适应 vs 固定 50 分母对比），回归 `pytest tests/ -k "node or got or portfolio or ambush"` 293 passed。详见 `docs/got_shadow_verification.md` 顶部「2026-09-17 状态变更」与 `docs/got_backlog.md` §4。
+- [文档] 文档结构重排（三区整合）：`docs/` 顶层只保留 INDEX/CHANGELOG/AGENTS/CLAUDE 与资源目录；旧项目（非 GOT）基底用户文档 28 篇整体移入 `docs/guide/`；GOT 现行文档收进 `docs/got/`（`backlog.md` ← `got_backlog.md`、`verification.md` ← `got_shadow_verification.md`、`architecture.md` ← 根目录 `agent_cot_design.md`、`plans/` ← 根目录 `plan.md` 与 `选股胜率优化_PLAN.md`）；`docs/archive/got/` 平移为 `docs/got/archive/` 并收入 `docs/custom/` 中 3 篇已完结 GOT 文档；非 GOT 已完结计划入 `docs/archive/plans/`，`docs/custom/` 撤销。全仓路径引用同步修复：`src/got/`、`scripts/`（含 `check_audit_claims.py` / `backtest_got_timeseries.py` 读盘路径）、`tests/` 注释、根 README/CLAUDE 死链（`AGENTS.md` → `docs/AGENTS.md`）。修复 `docs/INDEX.md` 收录失效（重写为三区导航全量索引）。收口 `docs/got/backlog.md` §8 文档层缺陷 #1/#2/#3/#5。
+
+### 上游同步（daily_stock_analysis 开源主线）
+
+- [文档] README 与繁中 README 快速开始入口补充视频教程链接，并将桌面客户端入口文案调整为客户端配置教程。
+- [修复] 问股从历史报告进入后的追问会持续携带当前标的，切回或重载已有会话时可从历史消息恢复基础当前标的，并由后端阻断未明确切换时的错误股票工具调用、交易所片段和指标缩写误路由。
+- [修复] 自选股加入和删除按等价股票代码匹配港股及大小写美股变体，避免 `00700`、`HK00700`、`00700.HK` 或 `aapl`、`AAPL` 被误判为不同标的。
+- [改进] #1390 P0 为个股分析与历史/回测展示新增可选八态 `action` / `action_label` 建议动作字段，保留 `operation_advice` 自由文本和 `decision_type=buy|hold|sell` 统计口径，不新增迁移或配置项。
+- [新功能] #1390 P1 新增独立 `DecisionSignal` 存储、Repository、Service 与 `/api/v1/decision-signals` API，支持按来源类型/市场/股票/动作/期限/阶段去重、按 `source_report_id` / `trace_id` 查询、同源过期信号续期且保留来源身份字段、禁止 expired 直接 PATCH 复活、价格计划校验、状态更新、懒过期、cache-only 持仓过滤、敏感信息脱敏、敏感 `trace_id` 拒绝和仅清理 `source_type=analysis` 历史绑定信号的历史删除联动。
+- [改进] #1390 P1 补充 Web decision-signals typed API wrapper 与契约隔离测试，暂不接入 UI。
+- [修复] #1390 收紧建议动作 legacy fallback：英文 `not to ...` 与 `avoid selling/reducing/trimming ...` 等否定/回避表达不再误判为买卖动作，Web 旧记录不再把中文金融上下文、`buy or sell`、多 guard 歧义文本或 `buyback` / `buy-back` / `buy back` / `selloff` / `sell-off` / `sell off` 等英文复合词渲染成 action badge，并在有结构化 `action` 时让回测/历史趋势等入口按界面语言显示 action 标签。
+- [改进] 完善运行时日志上下文，补充 logger name、触发来源、市场统计与实时行情预取链路状态，便于排查调度、API、Bot 和数据源降级路径。
+- [修复] #1662 股票新闻与多维情报搜索在相关度排序后新增域名无关的准入过滤，剔除下载/安装包/应用评分页及成人/招嫖服务垃圾页，并在同批已有有效标的/行业候选时移除 `score=0` 背景填充项，避免无关或低质量页面进入 Prompt、Agent 工具输出和历史情报缓存。
+- [新功能] 新增分析任务与历史报告运行流快照 API，提供 lanes、nodes、edges、events、summary 等统一契约，并从任务队列、运行诊断和 AnalysisContextPack overview 构建脱敏数据流/信息流。
+- [新功能] Web 端为活跃任务、历史报告和大盘复盘报告补充运行流视图入口，支持查看运行摘要、拓扑节点、事件流和基础排障详情。
+- [修复] 修复历史报告运行流快照在混合时区事件时间戳下返回 500 的问题。
+- [改进] #1459 持仓管理页新增持仓账户删除入口，复用现有账户软删除接口，误建账户会从默认列表、快照、风险、录入入口和事件列表隐藏且不物理清理历史流水。
+- [修复] 修复运行流 live SSE 事件未复用快照层递归脱敏规则的问题，避免本地路径、prompt/raw response、代理头等敏感诊断字段在 refetch 前短暂暴露。
 - [改进] AlphaSift 依赖锁定更新到 `d038c52c468543726fc1fd830b53c27d3f09d6da`，并为新版 last-good snapshot、日线历史、行业/概念 provider cache、hotspot 具体题材榜单、题材发酵路线、概念股详情、上次成功热点缓存与 post-analysis 元信息补齐 DSA 运行期和 Web 选股页适配；默认不启用 DSA deep-analysis 回调。
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。
 - [改进] #1381 个股分析新增按当日/市场复用的大盘环境摘要，普通 Pipeline 与 Agent 分析 Prompt 可读取低敏大盘背景，并在高风险/退潮环境下软化激进买入建议。
@@ -56,12 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 `docs/alphasift-integration.md`：明确 AlphaSift 锁定 commit 来源、Hotspot 契约边界、LLM/LiteLLM 兼容语义与关闭开关下回退路径。
 - [修复] 为 THS 发酵路线补充列名兜底：当 `stock_board_concept_summary_ths` 返回缺列时仅跳过该来源富化，不影响 `/api/v1/alphasift/hotspots/{topic}` 返回。
 - [测试] 新增/更新后端回归：`python -m pytest tests/test_alphasift_api.py -q`、`python -m pytest tests/test_docker_entrypoint.py -q`、`python -m pytest tests/test_main_schedule_mode.py -q -k "start_api_server_fails_before_thread_when_port_is_busy"`.
-- [修复] GOT 编排器交易日检查恢复生效：`_check_trading_day` 原 `import TradingCalendar` 引用的类在 `src/core/trading_calendar.py` 中不存在，恒抛 `ImportError` 且被 `except ImportError` 静默吞掉，周末/节假日照跑；改用模块级 `is_market_open()`（与 `src/core/pipeline.py` 同口径），并把 `try` 收窄到只包 import；`main.py --got` 新增 `except NonTradingDayError` 显式按「正常跳过」处理（`logger.info` + 退出码 0），不再被兜底 `logger.exception` 报成执行失败。注意：修复后非交易日不再运行 GOT。
-- [修复] GOT Phase 2 买入分配整手取整归零不再静默：`quantity = int(per_stock_budget / price / 100) * 100` 对高价股取整后为 0 时，原实现 `if quantity > 0:` 无 else 分支，候选被无声淘汰且其预算不回填（0914 实测方邦股份 ¥145.36 买 100 股需 ¥14,536 > 单只预算约 ¥11.7k）；现改为守卫子句提前 `continue` 并输出 WARNING，明确「100 股需 X，超出单只预算 Y」。
 - [测试] 新增 `tests/test_got_orchestrator_trading_day.py`（4 测试：交易日放行/非交易日抛错/不再触发导入降级告警）与 `tests/test_portfolio_decision_lot_rejection.py`（2 测试：整手归零留痕且不产生买单/预算充裕时高价股正常买入），前者同时填补 `_allocate` 此前零测试覆盖的盲区。
-- [文档] GOT 文档整合：13 份 GOT 文档整体归档至 `docs/archive/got/`（文件内容与节号一字未改，代码/脚本中的 `§X` 引用仍可解析），`docs/` 根目录只保留两份现行清单——`got_shadow_verification.md`（待验证 / 影子期：三条影子线可数性、M1–M6 定义与实测值、R-B/R-C/R1–R6 待回放红线、A-P0-4 已实测有效）与 `got_backlog.md`（待实施：四层未落地项、0902 报告 15 项处置表、OPEN 汇总、A6 转正与 17 项退役、后续 Phase、需裁决事项）。新增 `docs/archive/got/README.md` 归档索引与「已实施并完成验收」清单，防止归档后失联。
 - [文档] 明确验收红线判定标准并重划文档归属：**一条验收红线只能量已实施的东西**，读数由未实施工作决定的是 burndown chart 而非验收红线。据此 `R-D1` / `R-D2` / `R2` / `R5` 四条从待验证清单移入 `got_backlog.md`（分别归为工作进度 / 文档缺陷 / 红线设计缺陷）；`got_backlog.md` 新增 §0.1 把「未实施」拆为六类处置（待退役 / 已改归属 / 降级口径 / 挂起待查 / 明确延后 / 真·待实施），§2 由「10 项未修」改为 15 项处置表（真·未排期 = 0），新增 §9 登记红线与验收脚本自身的 5 条缺陷。
-- [chore] 同步 GOT 文档下沉后的路径引用：`src/got/`（archive/catalyst_config/index_registry/intelligence_service/schemas/nodes/aggregator 共 13 处，含 `aggregator.py` 一处运行时 f-string 提示文案）与 `scripts/`（`check_audit_claims.py` 的两处硬读盘路径 + 5 个验收脚本的出处常量）全部指向 `docs/archive/got/`；`intraday_gate_plan_0907.md` 的 12 条相对链接由 `../` 补为 `../../../`（下沉两级后到达仓库根的深度变化）。新增 `scripts/export_glue_family_audit.py`（M3 家族误配率人工抽查工具，702 行）纳入版本控制。
+<!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
+<!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
+
 
 ## [3.21.0] - 2026-06-07
 
@@ -867,7 +876,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 🗑️ **History batch deletion** — Web UI now supports multi-selection and batch deletion of analysis history; added `POST /api/v1/history/batch-delete` endpoint and `ConfirmDialog` component.
 - 🔐 **Auth settings API** — new `POST /api/v1/auth/settings` endpoint to enable or disable Web authentication at runtime and set the initial admin password when needed
-- openclaw Skill 集成指南 — 新增 [docs/openclaw-skill-integration.md](openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 DSA API
+- openclaw Skill 集成指南 — 新增 [docs/openclaw-skill-integration.md](guide/openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 DSA API
 - ⚙️ **LLM channel protocol/test UX** — `.env` and Web settings now share the same channel shape (`LLM_CHANNELS` + `LLM_<NAME>_PROTOCOL/BASE_URL/API_KEY/MODELS/ENABLED`); settings page adds per-channel connection testing, primary/fallback/vision model selection, and protocol-aware model prefixing
 - 🤖 **Agent architecture Phase 0+1** — shared protocols (`AgentContext`, `AgentOpinion`, `StageResult`), extracted `run_agent_loop()` runner, `AGENT_ARCH` switch (`single`/`multi`), config registry entries
 - 🔍 **Bot NL routing** — two-layer natural-language routing: cheap regex pre-filter (stock codes + finance keywords) → lightweight LLM intent parsing; controlled by `AGENT_NL_ROUTING=true`; supports multi-stock and strategy extraction
@@ -1768,6 +1777,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## GOT 架构实施记录（从 CLAUDE.md 归档）
 
 > 以下内容原为 CLAUDE.md 中的实施计划详细记录，于 2026-09-02 归档至此。包含各 Phase 实现记录、Node 重设计、修复日志和文件改动清单。
+> ℹ️ 2026-09-17 文档重排说明：本节为**历史实施流水**，位于 1.0.0 之后的旧版本段之后，不参与 Keep-a-Changelog 版本语义；GOT 现行有效文档见 [`docs/got/`](got/README.md)，更早的原始文档归档于 [`docs/got/archive/`](got/archive/README.md)。
 
 **Phase 1b 修复记录：**
 - ✅ A 股指数数据获取 KeyError 修复（`data_provider/base.py` + `akshare_fetcher.py`）

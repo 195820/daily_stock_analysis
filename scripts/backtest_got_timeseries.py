@@ -10,7 +10,7 @@ Phase 5a 回测脚本：GOT 时间线增强试点验证。
   5a.2 Node 6 regime 状态机平滑效果
   5a.3 Node 5 反向信号触发后反转命中率
 
-输出：docs/custom/got_timeseries_calibration.md
+输出：docs/got/archive/got_timeseries_calibration.md
 
 注意：样本 ≤27 天，不做统计显著性结论。
 """
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ─── 常量 ──────────────────────────────────────────────────────────────────────
 
 ARCHIVE_DIR = Path("data/got_daily")
-OUTPUT_PATH = Path("docs/custom/got_timeseries_calibration.md")
+OUTPUT_PATH = Path("docs/got/archive/got_timeseries_calibration.md")
 
 # 板块名 → TDX 代码（反向映射）
 NAME_TO_CODE: dict[str, str] = {v["name"]: k for k, v in TDX_BOARD_REGISTRY.items()}

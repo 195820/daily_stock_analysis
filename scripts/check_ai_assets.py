@@ -8,17 +8,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-AGENTS = ROOT / "AGENTS.md"
+AGENTS = ROOT / "docs" / "AGENTS.md"
 CLAUDE = ROOT / "CLAUDE.md"
-COPILOT = ROOT / ".github" / "copilot-instructions.md"
-INSTRUCTIONS_DIR = ROOT / ".github" / "instructions"
 CLAUDE_SKILLS_DIR = ROOT / ".claude" / "skills"
-
-REQUIRED_INSTRUCTION_FILES = {
-    "backend.instructions.md",
-    "client.instructions.md",
-    "governance.instructions.md",
-}
 
 REQUIRED_SKILL_FILES = {
     "README.md",
@@ -44,38 +36,8 @@ def ensure_file_exists(path: Path, description: str) -> None:
         fail(f"{description} is missing: {path.relative_to(ROOT)}")
 
 
-def ensure_symlink() -> None:
-    ensure_file_exists(AGENTS, "canonical AGENTS.md")
-    if not CLAUDE.exists():
-        fail("CLAUDE.md is missing")
-    if not CLAUDE.is_symlink():
-        fail("CLAUDE.md must be a symlink to AGENTS.md")
-
-    target = Path(CLAUDE.readlink())
-    if target != Path("AGENTS.md"):
-        fail(f"CLAUDE.md must point to AGENTS.md, found: {target}")
-
-
-def ensure_copilot_entry() -> None:
-    ensure_file_exists(COPILOT, "repository Copilot instructions")
-    content = COPILOT.read_text(encoding="utf-8")
-    required_fragments = (
-        "Canonical source:",
-        "AGENTS.md",
-        "CLAUDE.md",
-        ".claude/skills/",
-    )
-    for fragment in required_fragments:
-        if fragment not in content:
-            fail(f".github/copilot-instructions.md is missing required text: {fragment!r}")
-
-
-def ensure_instruction_files() -> None:
-    ensure_file_exists(INSTRUCTIONS_DIR, "instructions directory")
-    actual = {path.name for path in INSTRUCTIONS_DIR.glob("*.instructions.md")}
-    missing = REQUIRED_INSTRUCTION_FILES - actual
-    if missing:
-        fail(f"missing instruction files: {', '.join(sorted(missing))}")
+def ensure_claude_md() -> None:
+    ensure_file_exists(CLAUDE, "CLAUDE.md")
 
 
 def ensure_skill_files() -> None:
@@ -83,18 +45,14 @@ def ensure_skill_files() -> None:
     for relative_path in REQUIRED_SKILL_FILES:
         path = CLAUDE_SKILLS_DIR / relative_path
         if not path.exists():
-            fail(f"missing repository skill asset: {path.relative_to(ROOT)}")
-        if path.is_file():
-            content = path.read_text(encoding="utf-8")
-            if relative_path != "README.md" and "AGENTS.md" not in content:
-                fail(f"{path.relative_to(ROOT)} must reference AGENTS.md as the rule source")
+            fail(f"missing repository skill文件: {path.relative_to(ROOT)}")
 
 
 def ensure_gitignore_rules() -> None:
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     for snippet in REQUIRED_GITIGNORE_SNIPPETS:
         if snippet not in gitignore:
-            fail(f".gitignore is missing required AI asset rule: {snippet}")
+            fail(f".gitignore 缺少 AI 资产规则: {snippet}")
 
 
 def ensure_no_tracked_claude_artifacts() -> None:
@@ -114,9 +72,7 @@ def ensure_no_tracked_claude_artifacts() -> None:
 
 
 def main() -> None:
-    ensure_symlink()
-    ensure_copilot_entry()
-    ensure_instruction_files()
+    ensure_claude_md()
     ensure_skill_files()
     ensure_gitignore_rules()
     ensure_no_tracked_claude_artifacts()

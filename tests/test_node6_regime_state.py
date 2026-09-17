@@ -146,7 +146,7 @@ class TestApplyRegimeStateMachine(unittest.TestCase):
         # R2：情形 2 是唯一会让 previous_regime != regime 的路径，必须在此钉住。
         # 否则 R2「出现 previous_regime != regime 的归档日 ≥1 天」只能靠等真实市场切换
         # （自 08-27 接线以来 0 次触发），零切换无法区分「市场没切换」与「情形不可达」。
-        # 见 docs/got_backlog.md §9 #3 / §9.1。
+        # 见 docs/got/backlog.md §9 #3 / §9.1。
         self.assertEqual(result.previous_regime, "bull")
 
     def test_pending_first_appearance(self):

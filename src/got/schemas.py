@@ -880,6 +880,16 @@ class UnifiedContext(BaseModel):
         description="当前 EMA 基线值（用于时间一致性校验）",
     )
 
+    # ── A6 接线可观测性（2026-09-17）──
+    glue_consumed: bool = Field(
+        default=False,
+        description="当日 SectorIntel 是否已接入 glue 输出（A6 阶段 1）；false = 影子期行为或上游降级回退",
+    )
+    glue_status: Optional[str] = Field(
+        default=None,
+        description="当日 glue 产物状态（ok / S1_* / S2_* / S6_disabled / replay_mode），供归档回溯",
+    )
+
     # ── 板块情报（Level 1 板块 mini GOT 输出，替代旧 confirmed_sectors） ──
     confirmed_sectors: list[SectorIntel] = Field(
         default_factory=list,
@@ -1056,7 +1066,7 @@ class PortfolioDecision(BaseModel):
 
 
 # =============================================================================
-# Agent 语义粘合层输出（docs/archive/got/agent_glue_plan_0903.md §5.3）
+# Agent 语义粘合层输出（docs/got/archive/agent_glue_plan_0903.md §5.3）
 # =============================================================================
 
 # 受控家族词表（§5.3.3）— 已迁移至 src.got.family_keywords（B2 词表同源修复）
@@ -1096,7 +1106,7 @@ class GlueFamily(BaseModel):
 
 
 class SemanticGlueResult(BaseModel):
-    """Agent 语义粘合层输出（docs/archive/got/agent_glue_plan_0903.md §5.3 / §7.2）
+    """Agent 语义粘合层输出（docs/got/archive/agent_glue_plan_0903.md §5.3 / §7.2）
 
     包含三类结构化输出：关系图 + 板块强度 + 家族归属。
     `degraded=True` 时表示 F1 降级（全量或逐板块）。

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DOC_PATH = PROJECT_ROOT / "docs" / "alerts.md"
+DOC_PATH = PROJECT_ROOT / "docs" / "guide" / "alerts.md"
 
 
 def _read_doc() -> str:
@@ -345,4 +345,10 @@ def test_changelog_unreleased_keeps_flat_entries() -> None:
     changelog = (PROJECT_ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
     unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
 
-    assert "\n### " not in unreleased
+    # 2026-09-17 文档重排：[Unreleased] 按出处拆为两个固定子段，除此之外不允许任意嵌套小节
+    allowed_subsections = [
+        "### 本地工作（GOT 及仓库自维护，非上游发布内容）",
+        "### 上游同步（daily_stock_analysis 开源主线）",
+    ]
+    subsections = [line for line in unreleased.splitlines() if line.startswith("### ")]
+    assert subsections == allowed_subsections

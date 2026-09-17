@@ -65,6 +65,7 @@ from src.got.catalyst_config import (
     AGENT_SEMANTIC_GLUE_ENABLED,
     AGENT_SEMANTIC_GLUE_SHADOW,
     AGENT_SEMANTIC_GLUE_IN_REPLAY,
+    GOT_A6_ENABLED,
     LLM_CALL_TIMEOUT_S,
 )
 from src.got.catalyst_calendar import _count_trade_days
@@ -180,7 +181,7 @@ class AggregatorNode:
         """执行分层 GOT 聚合
 
         Args:
-            replay_mode: 回放模式（docs/archive/got/agent_glue_plan_0903.md §8.3 A1）。
+            replay_mode: 回放模式（docs/got/archive/agent_glue_plan_0903.md §8.3 A1）。
                          跳过 _save_context / _update_monitoring / EMA 回写 / 状态机，
                          不产生任何持久化副作用。
             run_date: 运行日期（用于 glue 落盘目录）。默认为 date.today()。
@@ -225,12 +226,21 @@ class AggregatorNode:
             sector, capital, news, sentiment, regime=regime,
         )
 
-        # ── Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.4 时序修订）──
+        # ── Agent 语义粘合层（docs/got/archive/agent_glue_plan_0903.md §5.4 时序修订）──
         # 在 _build_sector_intel 之前调用，结果作为参数传入
         # A4 阶段：调用 + 归档，glue 结果暂不影响 _build_sector_intel 行为
         candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, ambush_pool)
         glue = await self._agent_semantic_glue(
             candidates_for_glue, news, capital, sentiment,
+        )
+        # A6 接线：单一门变量，供 _llm_refine_sectors 等下游判断是否跳过 adjustments 分支
+        # 语义：GOT_A6_ENABLED=true 且 glue 全量 status=ok 时视为「glue 生效」；
+        # 任一条件不满足（如 0915 类 S2_parse_failed）自动回落影子期行为。
+        self._a6_glue_active = bool(
+            GOT_A6_ENABLED
+            and glue is not None
+            and getattr(glue, "status", None) == "ok"
+            and not getattr(glue, "degraded", False)
         )
 
         # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
@@ -259,8 +269,18 @@ class AggregatorNode:
 
         # LLM 精炼板块情报（决策 20：视野扩围 + 注入催化事件，让 Agent 看见带催化的埋伏候选）
         refine_calendar = getattr(news, "catalyst_calendar", None)
-        refine_events_map = self._group_events_by_sector(
-            refine_calendar.events if refine_calendar else []
+        # A6 接线：构建 board_code→sector_name 反查表，供 _glue_aware_events_map 使用。
+        # candidates_for_glue 已在上方收集，此处重新取一次以取到 detail.code。
+        code_to_name: dict = {}
+        for _name, _detail, _role in candidates_for_glue:
+            _code = getattr(_detail, "code", "") if _detail else ""
+            if _code:
+                code_to_name.setdefault(_code, _name)
+        refine_events_map = self._glue_aware_events_map(
+            self._group_events_by_sector,
+            refine_calendar.events if refine_calendar else [],
+            glue=glue,
+            code_to_name=code_to_name,
         )
         sector_intels = await self._llm_refine_sectors(
             sector_intels, regime, catalyst_events_by_sector=refine_events_map,
@@ -322,7 +342,7 @@ class AggregatorNode:
 
         # ── 主线续航评估（v3.5 S4：对 active_mainline 家族逐一生成）──
         mainline_endurance = self._synthesize_mainline_endurance(
-            sector_intels, sector, news, regime,
+            sector_intels, sector, news, regime, glue=glue,
         )
         if mainline_endurance:
             logger.info(
@@ -336,7 +356,7 @@ class AggregatorNode:
         if data_quality.missing_fields:
             logger.warning(
                 f"[Node 6] 数据质量告警: missing_fields={data_quality.missing_fields} "
-                f"（护栏可能空转，详见 docs/archive/got/agent_glue_plan_0903.md §9）"
+                f"（护栏可能空转，详见 docs/got/archive/agent_glue_plan_0903.md §9）"
             )
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
@@ -367,6 +387,14 @@ class AggregatorNode:
             # D-P2: 埋伏闸门漏斗 + 蓄水池溢出
             ambush_gate_funnel=self._ambush_gate_funnel,
             ambush_reservoir_overflow=self._ambush_reservoir_overflow if self._ambush_reservoir_overflow else None,
+            # A6 接线可观测性：glue 实际否进入 SectorIntel 下游，供归档回溯与回滚判断
+            glue_consumed=bool(
+                GOT_A6_ENABLED
+                and glue is not None
+                and glue.status == "ok"
+                and any(getattr(s, "reasoning", "").find("[A6-glue") >= 0 for s in sector_intels)
+            ),
+            glue_status=glue.status if glue is not None else None,
         )
 
         # 持久化（回放模式跳过）
@@ -684,7 +712,7 @@ class AggregatorNode:
         return candidates, member_to_group
 
     # =========================================================================
-    # Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
+    # Agent 语义粘合层（docs/got/archive/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
     # =========================================================================
 
     @staticmethod
@@ -970,7 +998,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         capital: CapitalContext,
         sentiment: SentimentContext,
     ) -> SemanticGlueResult:
-        """Agent 语义粘合层（docs/archive/got/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
+        """Agent 语义粘合层（docs/got/archive/agent_glue_plan_0903.md §5.2-5.3 / §7.2）
 
         单次全量 LLM 调用，输出三类结构化结果：
         - relations: 事件→板块关系图（替代 T5 映射）
@@ -1159,6 +1187,15 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             )
             raw_data.append((name, composite, capital_check, news_check, detail, sector_role, role_info, other))
 
+        # ── Pass 1.5 (A6 接线): glue 直接替换三件套输出 ──
+        # GOT_A6_ENABLED=true + glue.status=='ok' 时，用 GlueStrength 替换
+        # capital_check/news_check/composite/confidence；degraded_sectors 保留规则侧。
+        # classification 仍走 Pass 2，基于替换后的 composite 自然重算。
+        glue_hit_names: set[str] = set()
+        if GOT_A6_ENABLED and glue is not None and glue.status == "ok":
+            raw_data = self._apply_glue_override_to_raw_data(raw_data, glue)
+            glue_hit_names = {row[0] for row in raw_data if row[-1].get("_glue_applied")}
+
         # ── Pass 2: 批量分类（主线/降温走 TOP-N，埋伏按通道结果拆分）──
         # 埋伏板块不走 composite TOP-N：其准入由埋伏通道的闸门+B公式排序决定，
         # composite（Node 2 尺子）对低位埋伏板块天然偏见，不能当埋伏的尺子
@@ -1189,12 +1226,158 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 overheat_lookup=sector.overheat_lookup,
                 frame_group_lookup=sector.frame_group_lookup,
             )
+            if other.get("_glue_applied"):
+                # A6 接线可观测性：标记 SectorIntel 字段来源为 glue，保留证据链
+                evidence = other.get("_glue_evidence", "")
+                intel.reasoning = (
+                    f"{intel.reasoning} [A6-glue {other.get('_glue_strength_source', '')}"
+                    + (f" · {evidence[:60]}" if evidence else "")
+                    + "]"
+                )
             results.append(intel)
 
         # 按 composite_score 降序排列
         results.sort(key=lambda x: x.composite_score, reverse=True)
 
         return results
+
+    # ── A6 接线：glue 词汇映射 + 直接替换助手 ──
+    # 将 glue 侧 {high, medium, low, unknown} 映射到 SectorIntel 侧
+    # {aligned/divergent/neutral}、{catalyzed/negative/neutral}、{high/low/missing}。
+    # 与退役设计一致：直接替换，不做加权融合。
+    _GLUE_CAPITAL_READ_MAP = {
+        "high": "aligned",
+        "medium": "neutral",
+        "low": "divergent",
+        "unknown": "neutral",
+    }
+    _GLUE_NEWS_READ_MAP = {
+        "high": "catalyzed",
+        "medium": "neutral",
+        "low": "neutral",   # glue 的 low 不直接等价负面，中性处理
+        "unknown": "neutral",
+    }
+    _GLUE_SENTIMENT_READ_MAP = {
+        "high": "high",
+        "medium": "low",
+        "low": "low",
+        "unknown": "missing",
+    }
+
+    @classmethod
+    def _glue_map_capital_read(cls, read: str) -> str:
+        return cls._GLUE_CAPITAL_READ_MAP.get((read or "unknown").lower(), "neutral")
+
+    @classmethod
+    def _glue_map_news_read(cls, read: str) -> str:
+        return cls._GLUE_NEWS_READ_MAP.get((read or "unknown").lower(), "neutral")
+
+    @classmethod
+    def _glue_map_sentiment_read(cls, read: str) -> str:
+        return cls._GLUE_SENTIMENT_READ_MAP.get((read or "unknown").lower(), "missing")
+
+    def _apply_glue_override_to_raw_data(
+        self,
+        raw_data: list[tuple],
+        glue: SemanticGlueResult,
+    ) -> list[tuple]:
+        """Pass 1.5：用 glue.strengths 直接替换规则侧输出。
+
+        对每个候选板块：
+          1. 按 name 或 detail.code 查找 GlueStrength（先 name 后 code）
+          2. 命中且不在 glue.degraded_sectors 中 ⇒ 重写
+             composite/confidence/capital_check/news_check/sentiment_check，
+             在 other 中留痕 _glue_applied=True，供 Pass 3 标注 reasoning
+          3. 未命中 / 降级 ⇒ 保留规则侧三件套，不抛异常
+        """
+        # 建 name → GlueStrength 与 code → GlueStrength 双向索引
+        by_name: dict[str, GlueStrength] = {}
+        by_code: dict[str, GlueStrength] = {}
+        for st in glue.strengths or []:
+            if st.board_code:
+                by_code[st.board_code] = st
+        # strengths 只带 board_code；用 candidates 的 detail.name 反推。但 candidates 不传入
+        # 本函数，因此用 SectorDetail.name→code 的约定从 raw_data 里取。
+        degraded = set(glue.degraded_sectors or [])
+        patched: list[tuple] = []
+        for row in raw_data:
+            (name, composite, capital_check, news_check, detail,
+             sector_role, role_info, other) = row
+            code = getattr(detail, "code", "") if detail else ""
+            st = by_code.get(code) if code else None
+            if st is None or name in degraded:
+                patched.append(row)
+                continue
+            # 直接替换：glue.strength 0-1 → composite 0-100（C-P9 basis=composite 口径）
+            new_composite = float(st.strength) * 100.0
+            new_capital = self._glue_map_capital_read(st.capital_read)
+            new_news = self._glue_map_news_read(st.news_read)
+            new_sentiment = self._glue_map_sentiment_read(st.sentiment_read)
+            new_confidence = float(st.confidence)
+            other = dict(other)
+            other["capital_detail"] = f"[glue] {st.evidence or st.capital_read}"
+            other["news_detail"] = f"[glue] {st.news_read}"
+            other["sentiment_check"] = new_sentiment
+            other["sentiment_detail"] = f"[glue] {st.sentiment_read}"
+            other["confidence"] = new_confidence
+            other["_glue_applied"] = True
+            other["_glue_evidence"] = st.evidence or ""
+            other["_glue_strength_source"] = (
+                f"capital={st.capital_read}/news={st.news_read}/sent={st.sentiment_read}"
+            )
+            patched.append((
+                name, new_composite, new_capital, new_news, detail,
+                sector_role, role_info, other,
+            ))
+            by_name[name] = st  # 预留：目前未用，供后续需求反查
+        # 一次性 INFO，便于日志内快速定位 A6 生效日
+        applied = sum(1 for row in patched if row[-1].get("_glue_applied"))
+        if applied:
+            logger.info(
+                f"[Node 6][A6] glue 直接替换: {applied}/{len(patched)} 个板块的三件套输出"
+            )
+        return patched
+
+    @staticmethod
+    def _glue_aware_events_map(
+        self_events_group: callable,
+        events: list,
+        glue: Optional[SemanticGlueResult],
+        code_to_name: dict,
+    ) -> dict:
+        """A6 接线：将 glue.relations 翻译为 {sector_name: list[CatalystEvent]} 形态。
+
+        命中 glue.relations 的事件用 board_code→sector_name 反查（需 code_to_name）；
+        glue 未覆盖的事件回退 legacy T5 扇出，保证事件不丢。
+        GOT_A6_ENABLED=false 或 glue 非 ok 时，完全回退 legacy。
+        """
+        if not (GOT_A6_ENABLED and glue is not None and glue.status == "ok" and glue.relations and code_to_name):
+            return self_events_group(events)
+        event_by_id = {
+            getattr(e, "event_id", None): e
+            for e in events
+            if getattr(e, "event_id", None)
+        }
+        grouped: dict[str, list] = {}
+        used_ids: set[str] = set()
+        for rel in glue.relations:
+            ev = event_by_id.get(rel.event_id)
+            if ev is None:
+                continue
+            name = code_to_name.get(rel.board_code)
+            if name is None:
+                continue
+            grouped.setdefault(name, []).append(ev)
+            used_ids.add(rel.event_id)
+        uncovered = [
+            e for e in events
+            if getattr(e, "event_id", None) not in used_ids
+        ]
+        if uncovered:
+            legacy = self_events_group(uncovered)
+            for k, v in legacy.items():
+                grouped.setdefault(k, []).extend(v)
+        return grouped
 
     @staticmethod
     def _resolve_pool_sector_detail(
@@ -1957,7 +2140,15 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             result = self._parse_json(raw_text)
 
             # 应用调整（仅允许上调，禁止下调）
+            # A6 接线：glue 已在 _build_sector_intel Pass 1.5 直接替换三件套，
+            # 避免与 glue 双入口改同一 classification 字段 → 跳过 adjustments，
+            # 保留 narrative / cross_sector_risks 的全局摘要价值。
             adjustments = result.get("adjustments", [])
+            if getattr(self, "_a6_glue_active", False) and adjustments:
+                logger.info(
+                    f"[Node 6] A6 接线：跳过 {len(adjustments)} 条 LLM adjustments（classification 已由 glue 主导）"
+                )
+                adjustments = []
             for adj in adjustments:
                 sector_name = adj.get("sector", "")
                 new_class = adj.get("new_classification", "")
@@ -3612,6 +3803,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         sector: SectorContext,
         news: NewsContext,
         regime: MarketRegime,
+        glue: Optional[SemanticGlueResult] = None,
     ) -> list[MainlineEndurance]:
         """合成主线续航评估（v3.5 S4）。
 
@@ -3619,9 +3811,14 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         - 警示信号加权计分（评分制，不做硬闸门）
         - 支撑信号：全成员 leading、family_resonance ≥0.7、有催化剂、资金 passed、梯队仍有新补涨成员
         - band：警示分 ≤1 惯性期；2-3 分化期；≥4 见顶风险期（阈值可配）
+
+        A6 接线：
+        - family_name 三级优先：glue.families[board_code].family → intel.frame_group → intel.sector_name
+        - E2 公式：family_resonance 分母从固定 50.0 改为当日家族 std_dev P90 自适应归一化（P90=0 时 fallback 50.0）
         """
         from src.got.schemas import MainlineEndurance
         from collections import defaultdict
+        import statistics
 
         # 仅处理 actionable 板块（主线角色）
         actionable_intels = [
@@ -3630,12 +3827,6 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         ]
         if not actionable_intels:
             return []
-
-        # 按家族分组（使用 frame_group 字段）
-        families = defaultdict(list)
-        for intel in actionable_intels:
-            family_name = intel.frame_group or intel.sector_name
-            families[family_name].append(intel)
 
         # ── sector_name → SectorDetail 查表（审核 P0 修复）──
         # SectorIntel 不携带 detail/wave_days/RRG 等字段，续航合成所需的波次/趋势/RRG
@@ -3647,6 +3838,54 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         for _bucket in ("cooling_down", "exhausted_mainline", "top_by_score"):
             for _d in getattr(sector, _bucket, None) or []:
                 detail_lookup.setdefault(_d.name, _d)
+
+        # ── A6: glue.families 以 board_code 为键，构建 code → family 索引 ──
+        glue_family_by_code: dict[str, str] = {}
+        if (
+            GOT_A6_ENABLED
+            and glue is not None
+            and getattr(glue, "status", None) == "ok"
+            and not getattr(glue, "degraded", False)
+        ):
+            for gf in (glue.families or []):
+                if getattr(gf, "board_code", "") and getattr(gf, "family", ""):
+                    glue_family_by_code[gf.board_code] = gf.family
+
+        # 按家族分组（A6 三级优先：glue.families → intel.frame_group → intel.sector_name）
+        families: dict[str, list[SectorIntel]] = defaultdict(list)
+        for intel in actionable_intels:
+            _d = detail_lookup.get(intel.sector_name)
+            _code = getattr(_d, "code", "") if _d is not None else ""
+            family_name = (
+                (glue_family_by_code.get(_code) if _code else None)
+                or intel.frame_group
+                or intel.sector_name
+            )
+            families[family_name].append(intel)
+
+        # ── E2: 预计算各家族 strength std_dev，取当日 P90 作为归一化分母 ──
+        # P90=0 或不足两个家族时 fallback 50.0（保持与旧公式同量级）
+        per_family_std: dict[str, float] = {}
+        for fname, members in families.items():
+            strengths = [m.composite_score for m in members]
+            if len(strengths) >= 2:
+                per_family_std[fname] = float(statistics.stdev(strengths))
+            # 单成员家族无 std_dev，后续 resonance 直接返 1.0，不参与 P90
+        std_values = sorted(per_family_std.values())
+        if std_values:
+            # 简易 P90：线性插值（numpy 无依赖）
+            _n = len(std_values)
+            if _n == 1:
+                _p90 = std_values[0]
+            else:
+                _idx = 0.9 * (_n - 1)
+                _lo = int(_idx // 1)
+                _hi = min(_lo + 1, _n - 1)
+                _frac = _idx - _lo
+                _p90 = std_values[_lo] * (1 - _frac) + std_values[_hi] * _frac
+            resonance_denom = _p90 if _p90 > 1e-6 else 50.0
+        else:
+            resonance_denom = 50.0
 
         endurance_list = []
         crowded_families = set(getattr(sector, "crowded_families", []) or [])
@@ -3682,11 +3921,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
             # ── 厚度指标 ──
             # family_resonance：成员强度标准差的倒数（一致性越高，共振度越高）
+            # A6 E2: 分母从固定 50.0 改为当日家族 std_dev P90 自适应归一化
             strengths = [m.composite_score for m in members]
             if len(strengths) >= 2:
-                import statistics
-                std_dev = statistics.stdev(strengths)
-                family_resonance = max(0.0, 1.0 - std_dev / 50.0)  # 50 分为满分标准差
+                std_dev = float(statistics.stdev(strengths))
+                family_resonance = max(0.0, min(1.0, 1.0 - std_dev / resonance_denom))
             else:
                 family_resonance = 1.0
 
@@ -3967,7 +4206,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             failed.append("sentiment")
             available.remove("sentiment")
 
-        # ── 字段级完整性自检（docs/archive/got/agent_glue_plan_0903.md §9 OPEN-5）──
+        # ── 字段级完整性自检（docs/got/archive/agent_glue_plan_0903.md §9 OPEN-5）──
         # lifecycle 全部为 null → _is_hard_exclude 的 late_stage 分支空转
         all_members = []
         for group in (sector.active_mainline or []):
@@ -4009,7 +4248,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             if all_empty:
                 missing.append("hot_stocks_sectors_empty")
 
-        # F1-8: agent 语义粘合层降级 → glue 维度实质缺失（docs/archive/got/agent_glue_plan_0903.md §7.2）
+        # F1-8: agent 语义粘合层降级 → glue 维度实质缺失（docs/got/archive/agent_glue_plan_0903.md §7.2）
         if glue is not None and glue.degraded:
             missing.append("agent_semantic_glue")
 

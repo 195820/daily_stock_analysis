@@ -77,7 +77,7 @@ _session_lock = threading.Lock()
 _service_lock = threading.Lock()
 
 # =============================================================================
-# NewsNow 模板（A 股相关，均已在远端验证 — 见 docs/archive/got/remote_integration_plan.md §6.2）
+# NewsNow 模板（A 股相关，均已在远端验证 — 见 docs/got/archive/remote_integration_plan.md §6.2）
 # =============================================================================
 
 NEWSNOW_TEMPLATES = {

@@ -111,7 +111,7 @@ def _redirect_glue_archive(testcase, node, run_date=TEST_RUN_DATE):
     凡真实调用 `_agent_semantic_glue` 的测试都必须先调这一层：`_save_glue_result`
     是真实副作用，不重定向就会写进 `data/got_daily/{date.today()}/`，污染影子期归档
     —— 0911 / 0912 的 `agent_glue.json`（含 `_replay/` 那份）正是这样产生的，
-    见 `docs/got_shadow_verification.md` §2.2 / §4.1。
+    见 `docs/got/verification.md` §2.2 / §4.1。
 
     （不用 `TestCase.enterContext`：它需要 Python 3.11+，本仓库实测运行在 3.10。）
     """
@@ -441,7 +441,7 @@ class TestGlueReplay0903(unittest.TestCase):
 class TestGlueFailureSamplePersistence(unittest.TestCase):
     """R-C1：S1 / S2 失败样本必须落盘，且 `status` 取值正确。
 
-    红线原文（`docs/archive/got/got_layer_c_plan_0911.md` §6.1）：
+    红线原文（`docs/got/archive/got_layer_c_plan_0911.md` §6.1）：
     「制造 S1（断网/空响应）与 S2（畸形 JSON）各一次，`agent_glue.json`
       **仍存在**且 `status` 取值正确」—— 判据落在**落盘副作用**上。
 
