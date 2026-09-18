@@ -78,11 +78,16 @@ daily_stock_analysis/
 │   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向永久豁免/降级机制）
 │   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化/原始新闻跨日检测）
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数/时序动量）
-│   │   │   ├── aggregator.py         # Node 6: 聚合（A5匹配/A6泛化词/T3仲裁/埋伏通道/跨节点共振）
-│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+埋伏退出）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（A5匹配/A6语义粘合接线/T3仲裁/埋伏通道/跨节点共振）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+埋伏退出+T1-H持仓审查）
 │   │   ├── catalyst_calendar.py   # 催化剂日历（D1回声/D2周末/D3过期/D4置信守卫/T5对齐/T2校验）
-│   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/影子模式开关/可调参数集中管理）
+│   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/影子模式开关/A6与§15审查层开关/可调参数集中管理）
 │   │   ├── catalyst_realization.py # P6: 催化兑现追踪（A1三级解析/PEAD多窗口/故事寿命/resolution三态）
+│   │   ├── index_registry.py      # 指数注册表 + 身份解析（裸码→股票/带后缀→指数，消除 000001 双身份歧义）
+│   │   ├── intelligence_service.py # 情报服务
+│   │   ├── family_keywords.py     # 主线家族关键词（受控词表 12+1，glue 家族归属）
+│   │   ├── board_aliases.py       # 板块别名表
+│   │   ├── market_theme.py        # 市场主题
 │   │   ├── schemas.py           # 节点输入输出 Pydantic Schema（~45 模型）
 │   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度/use_mock主控）
 │   │   ├── indicators.py        # 纯规则指标函数（ADX/MACD/A-D线/截面百分位/RRG）
@@ -110,15 +115,6 @@ daily_stock_analysis/
 │   │   ├── pipeline.py               # 分析流水线编排
 │   │   └── config_manager.py         # 配置管理
 │   │
-│   ├── data_provider/           # 数据获取层（策略模式）
-│   │   ├── manager.py                # DataFetcherManager（故障切换+熔断器）
-│   │   ├── mootdx_fetcher.py         # 通达信 TCP P0（不封 IP，验活主站池+故障转移）
-│   │   ├── em_rate_limiter.py        # 东财 HTTP 统一限流（1s间隔+抖动+重试+连接池）
-│   │   ├── efinance_fetcher.py       # 东财 HTTP P0
-│   │   ├── akshare_fetcher.py        # akshare P1（多源降级）
-│   │   ├── tushare_fetcher.py        # Tushare Pro（P0 with Token）
-│   │   └── ...                         # 共 11 个数据源
-│   │
 │   ├── schemas/                 # Pydantic Schema
 │   │   ├── report_schema.py          # LLM 输出验证
 │   │   ├── analysis_context_pack.py  # 输入上下文（DataQuality 字段追踪）
@@ -130,21 +126,34 @@ daily_stock_analysis/
 │   ├── llm/                     # LLM 配置
 │   └── patches/                 # 反爬补丁
 │
+├── data_provider/               # 数据获取层（策略模式，仓库根目录）
+│   ├── base.py                       # DataFetcherManager（故障切换+熔断器）
+│   ├── mootdx_fetcher.py             # 通达信 TCP P0（不封 IP，验活主站池+故障转移）
+│   ├── em_rate_limiter.py            # 东财 HTTP 统一限流（1s间隔+抖动+重试+连接池）
+│   ├── efinance_fetcher.py           # 东财 HTTP P0
+│   ├── tencent_fetcher.py            # 腾讯免费指数 K 线 P1（仅指数可用，个股 fallback 排除）
+│   ├── akshare_fetcher.py            # akshare P1（多源降级）
+│   ├── tushare_fetcher.py            # Tushare Pro（P0 with Token）
+│   └── ...                           # 另含 baostock/longbridge/yfinance/finnhub 等
+│
 ├── data/                        # 数据文件
 │   ├── stock_analysis.db             # SQLite 数据库（30+ 表）
 │   ├── aggregator_contexts/          # GOT 上下文持久化（EMA基线/跨日ctx）
-│   ├── got_daily/YYYYMMDD/           # 每日历史档（6节点JSON+reasoning+meta）
+│   ├── got_daily/YYYYMMDD/           # 每日历史档（6节点JSON+reasoning+meta+agent_glue/shadow_t1/shadow_t1h）
 │   └── got_timeseries/               # 时序数据（monitoring.json）
 │
 ├── strategies/custom/           # 自定义选股策略（YAML）
-├── tests/                       # 191 个测试文件
-├── docs/                        # 文档
-│   ├── CLAUDE.md                     # 开发环境 + 个性化改造记录
-│   ├── AGENTS.md                     # AI 协作规则（真源）
-│   └── custom/
-│       └── screener_design.md        # 选股系统设计文档
-│
-└── docs/got/architecture.md          # GOT 架构设计文档（v1.0，2026-08-11）
+├── tests/                       # 212 个测试文件
+└── docs/                        # 文档（2026-09-17 三区重排，导航见 docs/INDEX.md）
+    ├── AGENTS.md                     # AI 协作规则（真源）
+    ├── CLAUDE.md                     # 重定向页（历史正文已归档）
+    ├── CHANGELOG.md                  # 变更日志（[Unreleased] 分「本地工作/上游同步」两段）
+    ├── guide/                        # 旧项目（非 GOT）基底用户文档 28 篇
+    ├── got/                          # GOT 现行：README（导航）/ backlog（待实施）/ verification（待验证）
+    │   ├── architecture.md           # GOT 架构设计文档（v1.0，2026-08-11，原根目录 agent_cot_design.md）
+    │   ├── plans/                    # 待实施计划（埋伏分支拆分 / 选股胜率优化）
+    │   └── archive/                  # GOT 历史文档（0902 审核 / 0903 主方案 / 0911 四层等）
+    └── archive/plans/                # 非 GOT 已完结计划（选股设计 / 持仓整合 / 云部署 / 选股开发日志）
 ```
 
 ---
@@ -286,8 +295,8 @@ run(use_mock=False)
 | **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound(永久豁免)`, `status`, `confidence_multiplier` | — |
 | **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
 | **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
-| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/transition_count/transition_pending), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json` |
-| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]` | `ambush_position_snapshots`（买入/退出快照） |
+| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/transition_count/transition_pending), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]` | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
 
 ### 持久化层总览
 
@@ -308,7 +317,7 @@ run(use_mock=False)
 
 | 路径 | 写入方 | 内容 |
 |------|--------|------|
-| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总）+ `meta.json` + `portfolio_decision.json` + `trading_recommendations.md` |
+| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总，末尾含🧪影子模式观测段）+ `meta.json` + `portfolio_decision.json` + `trading_recommendations.md` + `agent_glue.json` / `shadow_t1.json` / `shadow_t1h.json`（影子/审查产物） |
 | `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准 + 跨日记忆读取） |
 | `data/aggregator_contexts/ema_baseline.json` | `persistence.py` | EMA 基线（α=0.3, regime_score + 滚动标准差, 冷启动 5 日预热） |
 | `data/got_timeseries/monitoring.json` | `persistence.py` | 生产监控指标（运行耗时/数据质量/LLM调用次数/降级事件） |
@@ -333,7 +342,9 @@ run(use_mock=False)
 | 催化剂守卫 | D1回声检测 + D2周末守卫 + D3过期守卫 + D4置信度守卫 | 防止已发生事件回声、周末无效事件、低置信事件污染日历 |
 | 矛盾仲裁 | 规则检测 + LLM 语义裁决（T3, 仅 medium/high）| 规则层可能过度悲观/遗漏风险，LLM 补充语义判断但权限受限（不可 exclude） |
 | Agent 终审 | 只有否决权（reject→降级展示），默认关闭 | 防止 Agent 幻觉误删合格候选；影子模式验证准确率后再开写权限 |
-| 影子先行 | Track B 全部 `SHADOW=true` 默认，积累数据后转正 | 避免"一上来就 agent 化"掩盖管道 bug；用归档数据验证准确率 |
+| 审查层（T1/T1-H） | 独立 profile + 独立词表（confirm/warn/reject 与 hold/add/reduce/exit），默认关闭 + 影子 | T1 候选终审在选股漏斗末尾；T1-H 持仓审查在 Node 7 Step 2.5（埋伏持仓 > P4 退出 > 低分浮亏，reduce/exit 施加降档惩罚） |
+| A6 glue 接线 | 阶段 1 已转正（2026-09-17）：`GOT_A6_ENABLED` 默认 true，glue status=ok 时直接替换板块评分四件套；glue 运行本身仍需 `AGENT_SEMANTIC_GLUE_ENABLED=true` | 8 交易日影子实测 M1 +25.5pp / M6 +31.4pp；单环境变量即回影子期行为，零代码回退 |
+| 影子先行 | Track B 全部 `SHADOW=true` 默认，积累数据后转正（A6 已于 2026-09-17 转正，SHADOW 默认翻 false） | 避免"一上来就 agent 化"掩盖管道 bug；用归档数据验证准确率 |
 | 北向资金 | 永久豁免维度（`EXEMPT_DIMENSIONS`） | 2024-08 起官方停披，不计入 missing_dimensions 和 confidence 分母 |
 
 ### GOT 驱动选股流水线
@@ -369,7 +380,7 @@ run(use_mock=False)
 
 ## 环境
 
-- **Conda**: `daily_stock_analysis`（Python 3.12.13）
+- **Conda**: `daily_stock_analysis`（Python 3.12.13，日常运行主环境）；仓内另有 `.venv`（Python 3.14，pytest 回归/脚本校验用）
 - **数据库**: SQLite `data/stock_analysis.db`（自动建表）
 - **配置**: `.env`（LLM API Key、NGA Cookie、东财反爬等）
 

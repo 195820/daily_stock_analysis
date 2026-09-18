@@ -15,7 +15,7 @@
 | 序 | 计划 | 状态 | 前置 |
 | --- | --- | --- | --- |
 | 1 | **A6 阶段 2 · 退役**（backlog §4.2） | 待观察窗口 | ≥3 交易日 `glue_consumed=true` 且降级率 ≤10%；决策面无回归事故；0924 前 `transition_count` 不跌破阈值（OPEN-C1） |
-| 2 | [`plans/win_rate_optimization_plan.md`](plans/win_rate_optimization_plan.md) — 选股胜率优化 4 步（9 月回测驱动） | **待实施**（`GOT_WINRATE_*` 开关尚未入码，2026-09-17 核实） | 无（每步独立开关、独立可验证） |
+| 2 | [`plans/win_rate_optimization_plan.md`](plans/win_rate_optimization_plan.md) — 选股胜率优化 4 步（9 月回测驱动） | **已实施**（2026-09-17：4 步入码 + `GOT_WINRATE_*` 开关 + `tests/test_winrate_optimization.py` 16 测试，回归 309 passed；待 9 月后回测复验胜率改善） | 无（每步独立开关、独立可验证） |
 | 3 | [`plans/ambush_split_plan.md`](plans/ambush_split_plan.md) — 埋伏分支拆分 | 设计收口（18 项决策落定），待实施 | 注意其 P1/P2 子项已在 CHANGELOG 记为完成，实施前先对账 |
 | 4 | Phase 3b / 4b / 4d / 5b / 5c（backlog §5） | 排期未定 | 全部 **A6 之后**；5b 需 TickFlow API Key |
 | 5 | Phase 6 盘中 0→1 确认闸门（[`archive/intraday_gate_plan_0907.md`](archive/intraday_gate_plan_0907.md)） | 草案 | 硬前置 Phase 6-0 数据地基（五档量/分时/竞价/盘中调度），地基未验收前不开影子期 |

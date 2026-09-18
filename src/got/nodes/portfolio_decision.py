@@ -16,6 +16,7 @@ Phase 2: 统一决策节点（FINCON 风格的 Manager 角色）
 import asyncio
 import json
 import logging
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1800,7 +1801,18 @@ class PortfolioDecisionNode:
         elif lifecycle_phase == "launch":
             priority = 85  # launch 中后期
         elif lifecycle_phase == "acceleration":
-            priority = 70  # 加速期（仍在鱼身，但已不是最佳入场点）
+            # 加速期按 day 衰减：day 1-3 = 75（接近 launch），day 4-7 = 65，day 8+ = 50
+            # 依据：9月回测失败股集中 day 6-14（众兴菌业 day14 T+3 -10.17%，湘佳股份 day4 -7.92%），
+            # 成功股集中在 day 1-10（海通发展 day1 +9.84%）
+            if os.getenv("GOT_WINRATE_STEP2_ENABLED", "1") == "1" and lifecycle_day is not None:
+                if lifecycle_day <= 3:
+                    priority = 75
+                elif lifecycle_day <= 7:
+                    priority = 65
+                else:
+                    priority = 50
+            else:
+                priority = 70  # day 未知或开关关闭，保持原值
         elif lifecycle_phase == "mature" and lifecycle_day and lifecycle_day < 20:
             priority = 40  # 成熟早期（不推荐，但可观察）
         elif lifecycle_phase == "mature":
@@ -2810,6 +2822,21 @@ verdict 含义：
                 dimension_scores, dimension_available, SCORING_WEIGHTS
             )
 
+            # ── 过热降权（Part 2）：半幅传导到 composite（Step 4）──
+            # 原仅乘 adjusted_sector_score（25% 权重），其余 4 维（75%）不受影响；
+            # 半幅设计：过热板块仍有资金/技术面支撑时不过度降权，但确保过热信号传导到最终排序。
+            # 与 Step 3 正交：Step 4 影响排序（composite），Step 3 影响 action 建议。
+            if (
+                os.getenv("GOT_WINRATE_STEP4_ENABLED", "1") == "1"
+                and overheat_penalty < 1.0
+            ):
+                composite_penalty = 0.5 + 0.5 * overheat_penalty
+                adjusted_composite *= composite_penalty
+                logger.info(
+                    f"[Phase 2] [过热降权-Composite] {stock.code} {stock.name} "
+                    f"板块={stock_sector} 半幅系数={composite_penalty:.3f}"
+                )
+
             # 提取生命周期信息
             lifecycle_phase = None
             lifecycle_day = None
@@ -2837,12 +2864,30 @@ verdict 含义：
                 )
 
             # 动作建议：基于生命周期优先级
-            if lifecycle_priority > 60 and lifecycle_phase in ["launch", "acceleration"]:
-                action = "buy_trend"
-            elif lifecycle_priority > 50:
-                action = "buy_dip"
+            # 资金确认闸门（Step 3）：capital < 35 时降级为 watch（不禁止入选，只禁止激进买入建议）
+            # 依据：9月失败股 capital 18-56 仍获 buy_trend（湘佳股份 capital=18.2 → T+3 -7.92%）
+            # capital_score 缺失（None）时不触发闸门（缺失≠零分）
+            CAPITAL_GATE = float(os.getenv("GOT_WINRATE_CAPITAL_GATE", "35.0"))
+            capital_ok = (
+                capital_score is None
+                or not stock.capital_available
+                or capital_score >= CAPITAL_GATE
+            )
+            if os.getenv("GOT_WINRATE_STEP3_ENABLED", "1") == "1":
+                if lifecycle_priority > 60 and lifecycle_phase in ["launch", "acceleration"] and capital_ok:
+                    action = "buy_trend"
+                elif lifecycle_priority > 50 and capital_ok:
+                    action = "buy_dip"
+                else:
+                    action = "watch"
             else:
-                action = "watch"
+                # 回退旧逻辑
+                if lifecycle_priority > 60 and lifecycle_phase in ["launch", "acceleration"]:
+                    action = "buy_trend"
+                elif lifecycle_priority > 50:
+                    action = "buy_dip"
+                else:
+                    action = "watch"
 
             # 板块分类（用于输出可观测性）
             sector_classification = None

@@ -437,6 +437,9 @@ class AggregatorNode:
         # Node 1: 大盘
         adx_value = market.tech_growth.regime_metadata.adx_value
         cross_index_consistency = getattr(market.tech_growth, 'cross_index_consistency', 0.5)
+        # attack_power（Node 1 综合进攻强度 0-1，Optional 兼容，缺失时 None）
+        _market_state = getattr(market, 'market_state', None)
+        attack_power = getattr(_market_state, 'attack_power', None) if _market_state else None
 
         # Node 2: 板块
         market_direction = sector.market_direction
@@ -464,6 +467,11 @@ class AggregatorNode:
                 regime_score -= 0.3
         else:  # 无趋势
             regime_score += market.tech_growth.score * 0.2
+
+        # attack_power 作为 Node 1 第二信号（独立子项，与 ADX 分支叠加）
+        # 0.5 中性，±0.1 幅度：attack_power=0.15 → -0.07；attack_power=0.85 → +0.07
+        if attack_power is not None:
+            regime_score += (attack_power - 0.5) * 0.2
 
         # Node 2: 板块方向
         if market_direction == "普涨":
@@ -503,6 +511,27 @@ class AggregatorNode:
 
         # 分类 regime
         regime_score = clip(regime_score, -1.0, 1.0)
+
+        # Node 1 attack_power 双档熔断：技术面极弱时禁止判 bull
+        # 依据：Node 2 已有 5 档主线裁剪（<0.15→1 / <0.30→2），Step 1 与之对齐
+        # 9月回测：attack_power 0.16-0.17 时 Node 6 判 bull 导致 bear 市场采 bull 仓位
+        # 单档熔断只能压到 transition（bear 需 score<-0.3），无法触发 bear -5% stop_loss
+        import os
+        if os.getenv("GOT_WINRATE_STEP1_ENABLED", "1") == "1" and attack_power is not None:
+            if attack_power < 0.15 and regime_score > -0.35:
+                # 档 1：crash_override 区间 → 强制 bear
+                logger.info(
+                    f"[Node 6] attack_power={attack_power:.2f} < 0.15 熔断 → bear "
+                    f"(原 regime_score={regime_score:.2f})"
+                )
+                regime_score = min(regime_score, -0.35)
+            elif attack_power < 0.30 and regime_score > 0.25:
+                # 档 2：Node 2 主线裁剪第 2 档 → 压回 transition
+                logger.info(
+                    f"[Node 6] attack_power={attack_power:.2f} < 0.30 熔断 bull → transition "
+                    f"(原 regime_score={regime_score:.2f})"
+                )
+                regime_score = min(regime_score, 0.25)
 
         if regime_score > 0.3:
             regime = "bull"
