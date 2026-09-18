@@ -974,6 +974,15 @@ class UnifiedScoringResult(BaseModel):
     lifecycle_day: Optional[int] = Field(default=None, description="生命周期已运行天数")
     overheat_severity: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="过热严重度")
     family_name: Optional[str] = Field(default=None, description="所属主线家族名称")
+    # ── 板块漂移可观测性（Fix 1-3）──
+    sector_match_type: Optional[str] = Field(
+        default=None,
+        description="板块匹配方式：direct / relay / thesis / fallback / none",
+    )
+    sector_drift_grace: bool = Field(
+        default=False,
+        description="家族宽限标记（板块漂移但家族仍强，降级持有观察）",
+    )
     # ── P4 埋伏退出字段（仅埋伏持仓有效）──
     ambush_position_type: Optional[str] = Field(
         default=None,

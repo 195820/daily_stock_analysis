@@ -100,6 +100,60 @@ class TestReverseLookupThreeTier(unittest.TestCase):
         result = self._call([], _unified())
         self.assertEqual(result, [])
 
+    def test_family_relay_match_semiconductor(self):
+        """Fix 1: 家族中继匹配 - 半导体概念→AI 硬件家族→先进封装锚点"""
+        unified = _unified(confirmed_sectors=[
+            SectorIntel(
+                sector_name="先进封装",
+                composite_score=92.0,
+                sector_role="mainline",
+                capital_check="aligned",
+                news_check="catalyzed",
+                sentiment_check="high",
+                frame_group="AI 硬件",
+            ),
+        ])
+        boards = [
+            {"name": "石墨烯"},
+            {"name": "半导体概念"},
+        ]
+        frame_group_lookup = {
+            "半导体": "AI 硬件",
+            "石墨烯": "周期资源",
+        }
+        result = self._call(boards, unified, frame_group_lookup=frame_group_lookup)
+        # 验证 Fix 1 全链：normalize + 家族中继 + 强度打折/角色注入
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sector_name"], "半导体")
+        self.assertAlmostEqual(result[0]["strength"], 92.0 * 0.85, places=1)  # 打折后≈78.2
+        self.assertEqual(result[0]["sector_role"], "mainline")
+        self.assertTrue(result[0]["is_relay"])
+        self.assertEqual(result[0]["relay_family"], "AI 硬件")
+        self.assertEqual(result[0]["relay_anchor_sector"], "先进封装")
+
+    def test_family_relay_skipped_when_direct_match(self):
+        """直接命中优先于中继（回归锚定）"""
+        unified = _unified(confirmed_sectors=[
+            SectorIntel(sector_name="半导体", composite_score=70.0),
+        ])
+        boards = [{"name": "半导体概念"}]
+        result = self._call(boards, unified, frame_group_lookup={"半导体": "AI 硬件"})
+        # 应走一级 confirmed 匹配，不走中继
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sector_name"], "半导体")
+        self.assertEqual(result[0]["strength"], 70.0)
+        self.assertFalse(result[0].get("is_relay", False))
+
+    def test_family_relay_no_anchor_returns_fallback(self):
+        """家族在 lookup 但 confirmed 无该家族成员 → 维持原 fallback 行为"""
+        unified = _unified()  # 无 confirmed_sectors
+        boards = [{"name": "半导体概念"}]
+        frame_group_lookup = {"半导体": "AI 硬件"}
+        result = self._call(boards, unified, frame_group_lookup=frame_group_lookup)
+        # 无锚点 → 返回 fallback
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["is_fallback"])
+
 
 if __name__ == "__main__":
     unittest.main()

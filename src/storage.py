@@ -1254,6 +1254,39 @@ class AmbushPositionSnapshotRecord(Base):
     )
 
 
+class HoldingThesisRecord(Base):
+    """持仓论点快照（Fix 1-3）。
+
+    Phase 2 建仓时写入：记录买入时的板块/家族锚点，用于板块漂移时校验论点是否仍成立。
+    漂移观察时懒建：若 _drift_action_with_grace 发现漂移但家族仍强，则创建 drift_watch 记录。
+    卖出时 is_open=False，保留完整复盘记录。
+
+    去重策略：symbol + entry_date 唯一（同一股票同一天不会重复建仓）。
+    """
+
+    __tablename__ = 'holding_thesis_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    sector_name = Column(String(64), nullable=False, index=True)
+    family_name = Column(String(64), nullable=False)  # 买入时的家族名
+    # 买入信息
+    entry_date = Column(Date, nullable=False, index=True)
+    entry_price = Column(Float, nullable=False)
+    composite_at_entry = Column(Float, nullable=True)
+    source = Column(String(20), nullable=False)  # "got_buy" / "drift_watch"
+    drift_watch_since = Column(Date, nullable=True)  # Fix 3: 漂移观察起始日
+    drift_family = Column(String(64), nullable=True)  # Fix 3: 观察时的家族名
+    is_open = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'entry_date', name='uix_holding_thesis_symbol_date'),
+        Index('ix_holding_thesis_family', 'family_name', 'is_open'),
+    )
+
+
 class CatalystRealizationRecord(Base):
     """催化剂事件兑现归档（P6）。
 

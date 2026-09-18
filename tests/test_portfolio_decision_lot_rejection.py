@@ -17,7 +17,7 @@ from src.got.schemas import PortfolioRiskAssessment, UnifiedScoringResult
 EQUITY = 100_000.0
 # 买入预算 30,000 / 3 只候选 = 单只 ¥10,000 ⇒ 方邦（100 股需 ¥14,536）取整归零
 TOTAL_CASH = 30_000.0
-PRICES = {"688020": 145.36, "002040": 9.58, "000070": 16.64}
+PRICES = {"688020": 145.36, "002040": 9.58, "000070": 16.64, "603773": 25.0, "688598": 30.0}
 
 
 def _candidate(symbol: str, name: str, composite_score: float) -> UnifiedScoringResult:
@@ -84,4 +84,148 @@ def test_affordable_candidate_buys_whole_lots(node: PortfolioDecisionNode) -> No
     )
 
     assert [a.symbol for a in allocations] == ["688020"]
-    assert allocations[0].target_quantity == 200  # 30,000 / 145.36 → 2 手
+    # 修复后：无 sector_name 的候选走 unknown 分支（乘数 0.55）
+    # buy_budget = min(position_limit×equity, cash) = min(30_000, 100_000) = 30_000
+    # 1 只候选 → base_budget = 30_000，×0.55 = 16_500
+    # 16_500 / 145.36 / 100 = 1.13 手 → 取整 1 手 → 100 股
+    assert allocations[0].target_quantity == 100  # unknown 乘数 0.55：16.5k/145.36 → 1 手
+
+
+def test_cleared_sector_gets_conservative_budget_branch(node: PortfolioDecisionNode) -> None:
+    """板块验证清空的候选（sector_name=None）走 unknown 分支：预算乘数 0.55 而非主线 1.0"""
+    cleared = _candidate("603773", "沃格光电", 83.7)   # sector_name 未传 → None
+    tagged = _candidate("688598", "金博股份", 76.9)
+    tagged.sector_name = "半导体"
+
+    allocations, _vetoed = node._allocate([cleared, tagged], _risk(), _portfolio())
+
+    by_symbol = {a.symbol: a for a in allocations}
+    assert by_symbol["603773"].sector_limit_detail["branch"] == "unknown"
+    assert by_symbol["603773"].sector_limit_detail["sector_role"] == "unknown"
+
+
+def test_cleared_sector_dimension_excluded_from_composite() -> None:
+    """sector_available=False 时，sector 维度权重归一化剔除，composite 仅含其余 4 维"""
+    from src.services.stock_screener import SCORING_WEIGHTS, weighted_score_with_redistribution
+
+    scores = {"capital": 100.0, "news": 91.0, "sector": 94.1, "tech": 46.0, "risk": 100.0}
+    avail = {"capital": True, "news": True, "sector": False, "tech": True, "risk": True}
+    composite, actual_weights = weighted_score_with_redistribution(scores, avail, SCORING_WEIGHTS)
+
+    assert actual_weights.get("sector", 0.0) == 0.0          # sector 剔除
+    # (100×0.2 + 91×0.2 + 46×0.333 + 100×0.267) = 80.2（sector 剔除后权重归一化）
+    assert composite == pytest.approx(80.2, abs=0.2)
+
+
+def test_strip_sector_reasoning() -> None:
+    """_strip_sector_reasoning 剥离板块强度段落，替换为验证未通过提示"""
+    from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+    text = (
+        "1. **资金面** (15.0/15): \n"
+        "   - 资金面评分 100/100\n"
+        "2. **消息面** (13.7/15): \n"
+        "   - 消息面评分 91/100\n"
+        "3. **板块强度** (23.5/25): \n"
+        "   - 属于active_mainline板块「存储芯片」\n"
+        "   - 板块强度 94 分\n"
+        "4. **技术面** (11.5/25): \n"
+        "   - 波段技术指标评分 46/100\n"
+        "5. **风险** (20.0/20): \n"
+        "   - 安全评分 100/100"
+    )
+    stripped = PortfolioDecisionNode._strip_sector_reasoning(text)
+    assert "存储芯片" not in stripped
+    assert "板块验证未通过" in stripped
+    assert "4. **技术面**" in stripped   # 后续段落保留
+
+
+# ── Fix 3: 漂移宽限单测 ──
+
+def test_drift_action_grace_hold() -> None:
+    """家族锚点 >=60 → hold + grace_applied=True"""
+    from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+    from datetime import date
+
+    node = PortfolioDecisionNode()
+    family_anchor = {
+        "AI 硬件": {
+            'sector_name': '先进封装',
+            'composite_score': 92.0,
+            'sector_role': 'mainline',
+            'capital_check': 'aligned',
+            'news_check': 'catalyzed',
+            'sentiment_check': 'high',
+        }
+    }
+    action, grace = node._drift_action_with_grace(
+        "688598", "半导体", 33.0,
+        {"半导体": "AI 硬件"}, family_anchor,
+        thesis=None, today=date.today(),
+    )
+    assert action == "hold", f"期望 hold，实际{action}"
+    assert grace == True, f"期望 grace=True，实际{grace}"
+
+
+def test_drift_action_grace_reduce_then_sell() -> None:
+    """家族锚点 [40,60) + drift_watch_since=昨天 → sell；drift_watch_since=None → reduce"""
+    from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+    from datetime import date, timedelta
+
+    node = PortfolioDecisionNode()
+    family_anchor = {
+        "周期资源": {
+            'sector_name': '石墨烯',
+            'composite_score': 50.0,
+            'sector_role': 'caution',
+            'capital_check': 'neutral',
+            'news_check': 'neutral',
+            'sentiment_check': 'medium',
+        }
+    }
+
+    # 首次 → reduce
+    action, grace = node._drift_action_with_grace(
+        "688598", "石墨烯", 33.0,
+        {"石墨烯": "周期资源"}, family_anchor,
+        thesis=None, today=date.today(),
+    )
+    assert action == "reduce", f"首次期望 reduce，实际{action}"
+    assert grace == True, f"首次期望 grace=True，实际{grace}"
+
+    # 模拟已观察跨日（thesis.drift_watch_since=昨天）
+    class Thesis:
+        drift_watch_since = date.today() - timedelta(days=1)
+        drift_family = "周期资源"
+    action, grace = node._drift_action_with_grace(
+        "688598", "石墨烯", 33.0,
+        {"石墨烯": "周期资源"}, family_anchor,
+        thesis=Thesis(), today=date.today(),
+    )
+    assert action == "sell", f"跨日期望 sell，实际{action}"
+    assert grace == False, f"跨日期望 grace=False，实际{grace}"
+
+
+def test_drift_action_deep_break_sells() -> None:
+    """家族锚点 <40 → sell（不宽限）"""
+    from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+    from datetime import date
+
+    node = PortfolioDecisionNode()
+    family_anchor = {
+        "冷门行业": {
+            'sector_name': '传统机械',
+            'composite_score': 30.0,
+            'sector_role': 'neutral',
+            'capital_check': 'divergent',
+            'news_check': 'negative',
+            'sentiment_check': 'low',
+        }
+    }
+    action, grace = node._drift_action_with_grace(
+        "688598", "传统机械", 25.0,
+        {"传统机械": "冷门行业"}, family_anchor,
+        thesis=None, today=date.today(),
+    )
+    assert action == "sell", f"深度破位期望 sell，实际{action}"
+    assert grace == False, f"深度破位期望 grace=False，实际{grace}"

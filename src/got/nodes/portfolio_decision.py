@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 # ── 板块角色参数（模块级：_assess_risk 与 _allocate 共用，避免两处各写一份魔法值）──
 # 角色 → 仓位乘数（参与 sector_exposure_limits 公式；cooling 取最低档）
-ROLE_MULTIPLIER: dict[str, float] = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3}
+ROLE_MULTIPLIER: dict[str, float] = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3, "unknown": 0.55}
 # 角色 → 单笔止损比例（埋伏 / 降温用更紧的止损）
-ROLE_STOP_LOSS: dict[str, float] = {"mainline": 0.07, "ambush": 0.05, "cooling": 0.05}
+ROLE_STOP_LOSS: dict[str, float] = {"mainline": 0.07, "ambush": 0.05, "cooling": 0.05, "unknown": 0.05}
 # 角色未命中映射时的兜底（保持现状取主线；是否改为保守档属策略决策，见审核报告 R2.5）
 DEFAULT_SECTOR_ROLE = "mainline"
 
@@ -147,14 +147,26 @@ class PortfolioDecisionNode:
             # 关闭已退出的快照（is_open=False）
             self._close_ambush_snapshots(ambush_exit_signals, portfolio)
 
+        # Fix 2: 持仓论点快照写入（买入 + 漂移观察）
+        thesis_buys, thesis_failed = self._write_thesis_snapshots(
+            allocation, unified_scoring, unified_context,
+        )
+        if thesis_buys:
+            logger.info(f"[Phase 2] Fix 2 持仓论点快照：{len(thesis_buys)} 条")
+        if thesis_failed:
+            logger.warning(f"[Phase 2] Fix 2 持仓论点快照写入失败：{thesis_failed}")
+
         # P4：埋伏仓买入快照写入（买入催化剂快照）
         ambush_buys, ambush_failed = self._write_ambush_buy_snapshots(
             allocation, unified_scoring, unified_context,
         )
         if ambush_buys:
-            logger.info(f"[Phase 2] P4 埋伏买入快照: {len(ambush_buys)} 条")
+            logger.info(f"[Phase 2] P4 埋伏买入快照：{len(ambush_buys)} 条")
         if ambush_failed:
-            logger.warning(f"[Phase 2] P4 埋伏快照写入失败: {ambush_failed}")
+            logger.warning(f"[Phase 2] P4 埋伏快照写入失败：{ambush_failed}")
+        
+        # Fix 2: 关闭已卖出的持仓论点快照
+        self._close_thesis_snapshots(allocation, portfolio)
 
         # LLM 精炼（生成可追溯的推理总结）
         reasoning = await self._llm_refinement(
@@ -428,6 +440,8 @@ class PortfolioDecisionNode:
         sector_strength_map = self._build_sector_strength_map(sector_context)
         # P0-2 修复：sector_context.strength_lookup 覆盖全量板块（双保险）
         strength_lookup = getattr(sector_context, "strength_lookup", {}) or {}
+        # Fix 1: frame_group_lookup 用于家族中继匹配
+        frame_group_lookup = getattr(sector_context, "frame_group_lookup", {}) or {}
 
         # 构建板块情报映射（从 Node 6 v3 的 confirmed_sectors）
         sector_intel_map = self._build_sector_intel_map(unified)
@@ -449,6 +463,12 @@ class PortfolioDecisionNode:
         ambush_snapshot_map = self._load_ambush_snaphots(positions)
         # 供 Step 2.5 T1-H 持仓审查复用完整催化剂快照（§15.4 P4 快照输入契约）
         self._ambush_snapshot_map = ambush_snapshot_map
+
+        # Fix 2: 加载持仓论点快照
+        thesis_map = self._load_holding_theses(positions)
+
+        # Fix 3: 构建家族→锚点映射（漂移宽限需要）
+        family_anchor_map = self._build_family_anchor_map(unified)
 
         # 批量计算资金面/消息面评分（复用 screener 的方法，避免重复实现）
         holding_candidates = []
@@ -494,6 +514,11 @@ class PortfolioDecisionNode:
                 symbol, unified,
                 sector_strength_map=sector_strength_map,
                 strength_lookup=strength_lookup,
+                frame_group_lookup=frame_group_lookup,
+            )
+            # Fix 2: 消费论点快照（fallback 路径）
+            stock_sector_info = self._find_stock_sector_with_thesis(
+                stock_sector_info, symbol, unified, family_anchor_map, thesis_map,
             )
             sector_name = stock_sector_info.get("sector_name", "")
             sector_type = stock_sector_info.get("sector_type", "")
@@ -513,8 +538,12 @@ class PortfolioDecisionNode:
             )
 
             # ── 过热降权（Part 1）：对板块维度施加乘性惩罚 ──
+            # Fix 1-2: 中继/论点命中项用 relay_anchor_sector 查惩罚，不可逃逸过热
+            overheat_lookup_name = (
+                stock_sector_info.get("relay_anchor_sector") or sector_name
+            )
             overheat_penalty = self._compute_overheat_penalty(
-                sector_name, sector_intel_map, unified,
+                overheat_lookup_name, sector_intel_map, unified,
             )
             if overheat_penalty < 1.0:
                 logger.info(
@@ -555,8 +584,16 @@ class PortfolioDecisionNode:
             lifecycle_day = None
             overheat_severity = None
             family_name = None
+            anchor_name = stock_sector_info.get("relay_anchor_sector")
             if sector_name and sector_name in sector_intel_map:
                 intel = sector_intel_map[sector_name]
+                lifecycle_phase = intel.get('lifecycle_phase')
+                lifecycle_day = intel.get('lifecycle_day')
+                overheat_severity = intel.get('overheat_severity')
+                family_name = intel.get('frame_group')
+            elif anchor_name and anchor_name in sector_intel_map:
+                # Fix 1: 中继/论点命中，从锚点板块获取生命周期
+                intel = sector_intel_map[anchor_name]
                 lifecycle_phase = intel.get('lifecycle_phase')
                 lifecycle_day = intel.get('lifecycle_day')
                 overheat_severity = intel.get('overheat_severity')
@@ -579,8 +616,14 @@ class PortfolioDecisionNode:
 
             # 分层决策（方案 C：组合方案 + Invesco 2024 非对称门槛）
             if not sector_name:
-                # 完全不在追踪范围
-                action = "sell"
+                # Fix 3: 漂移 sell 分支接入宽限逻辑
+                thesis = thesis_map.get(symbol)
+                action, grace_applied = self._drift_action_with_grace(
+                    symbol, sector_name, sector_strength,
+                    frame_group_lookup, family_anchor_map, thesis, date.today(),
+                )
+                if grace_applied:
+                    reasoning += f", [家族宽限]"
             elif lifecycle_phase is None:
                 # 板块不在 confirmed_sectors 中（可能被踢出）
                 # Invesco 2024 非对称门槛：持仓者降温期保护
@@ -602,7 +645,14 @@ class PortfolioDecisionNode:
                 # （2026-08-17 状态机校准：冷却板块不再被误标为弱势卖出）
                 action = "hold"
             elif sector_role not in ("mainline", "ambush"):
-                action = "sell"
+                # Fix 3: 漂移 sell 分支接入宽限逻辑
+                thesis = thesis_map.get(symbol)
+                action, grace_applied = self._drift_action_with_grace(
+                    symbol, sector_name, sector_strength,
+                    frame_group_lookup, family_anchor_map, thesis, date.today(),
+                )
+                if grace_applied:
+                    reasoning += f", [家族宽限]"
             elif sector_role == "ambush" and symbol in ambush_snapshot_map:
                 # P4 埋伏退出分支：催化剂驱动，替代生命周期逻辑
                 snapshot = ambush_snapshot_map[symbol]
@@ -686,12 +736,20 @@ class PortfolioDecisionNode:
                     sector_display = "板块[未知]"
 
             # 增强 reasoning：标注板块踢出情况（仅在板块名确实不在 intel map 时触发）
-            if lifecycle_phase is None and sector_name and not in_intel_map:
+            is_relay = stock_sector_info.get("is_relay", False)
+            if lifecycle_phase is None and sector_name and not in_intel_map and not is_relay:
                 lifecycle_info = "（板块已踢出）"
             elif lifecycle_phase:
                 lifecycle_info = f"[{lifecycle_phase}]"
             else:
                 lifecycle_info = ""
+
+            # Fix 1: 中继展示分支
+            relay_family = stock_sector_info.get("relay_family")
+            anchor_strength = stock_sector_info.get("strength", 0)
+            if is_relay and relay_family:
+                anchor_name = stock_sector_info.get("relay_anchor_sector", "")
+                sector_display = f"板块 [{sector_name}→家族{relay_family}·锚点{anchor_name}{anchor_strength:.0f}分]"
 
             reasoning = (
                 f"持仓 P&L {pnl_pct:.1f}%, "
@@ -723,6 +781,20 @@ class PortfolioDecisionNode:
             if sector_name and sector_name in sector_intel_map:
                 sector_classification = sector_intel_map[sector_name].get('classification')
 
+            # Fix 1-3: sector_match_type / drift_grace 填充
+            is_relay = stock_sector_info.get("is_relay", False)
+            relay_source = stock_sector_info.get("relay_source")
+            if is_relay and relay_source == "thesis":
+                sector_match_type = "thesis"
+            elif is_relay:
+                sector_match_type = "relay"
+            elif stock_sector_info.get("is_fallback", False):
+                sector_match_type = "fallback"
+            elif sector_name and sector_name in sector_intel_map:
+                sector_match_type = "direct"
+            else:
+                sector_match_type = "none"
+
             results.append(
                 UnifiedScoringResult(
                     symbol=symbol,
@@ -745,6 +817,8 @@ class PortfolioDecisionNode:
                     lifecycle_day=lifecycle_day,
                     overheat_severity=overheat_severity,
                     family_name=family_name,
+                    sector_match_type=sector_match_type,
+                    sector_drift_grace=grace_applied if 'grace_applied' in locals() else False,
                     ambush_position_type=ambush_position_type,
                     ambush_exit_signal=ambush_exit_signal,
                     ambush_exit_reason=ambush_exit_reason,
@@ -870,7 +944,11 @@ class PortfolioDecisionNode:
         - caution: 主线 +3, 埋伏 +1（缩小但仍参与）
         - exclude: -20
         """
-        if not sector_name or sector_name not in sector_intel_map:
+        if not sector_name:
+            # 板块验证失败的兜底：中性 50，防止上游 sector_score（问财灌入的错误板块强度）
+            # 原样透传。主路径依赖 dimension_available=False 剔除该维度，此值仅防御。
+            return 50.0
+        if sector_name not in sector_intel_map:
             return base_score
 
         intel = sector_intel_map[sector_name]
@@ -993,6 +1071,36 @@ class PortfolioDecisionNode:
         score = news_context.impact_score or 0.0
         return 50.0 + score * 50.0
 
+    @staticmethod
+    def _strip_sector_reasoning(text: str) -> str:
+        """剥离 ai_reasoning 中的板块强度段落，替换为验证未通过提示。
+
+        screener `_generate_got_reasoning` 生成的段落格式：
+            3. **板块强度** (xx/25):
+               - 属于active_mainline板块「存储芯片」
+               - 板块强度 94 分
+            4. **技术面** ...
+
+        删除从 ``3. **板块强度**`` 到下一个 ``4. `` 开头行之间的所有行，
+        并在原位置插入一行提示。找不到标记时原样返回（防御性 no-op）。
+        """
+        if not text:
+            return text
+        lines = text.split("\n")
+        start_idx = None
+        end_idx = None
+        for i, line in enumerate(lines):
+            if line.startswith("3. **板块强度**"):
+                start_idx = i
+            elif start_idx is not None and line.startswith("4. "):
+                end_idx = i
+                break
+        if start_idx is None:
+            return text
+        replacement = "3. **板块强度**（板块验证未通过，已剔除该维度）"
+        new_lines = lines[:start_idx] + [replacement] + (lines[end_idx:] if end_idx is not None else [])
+        return "\n".join(new_lines)
+
     async def _verify_candidate_sectors(
         self,
         finalists: list,
@@ -1008,7 +1116,7 @@ class PortfolioDecisionNode:
         2. L1 别名归一化匹配：处理跨口径命名差异（如"券商" vs "券商概念"）
         3. L2 LLM 仲裁：L1 未命中时批量交由 LLM 判断是否同一概念，
            LLM 不可用时降级为信任问财（保留标签）
-        4. 两者都未命中，清空板块标签（打分时板块维度给中性分 50）
+        4. 两者都未命中，清空板块标签（sector 维度按缺失处理，权重归一化剔除）
 
         注意：只在候选股数量较少时（≤15）执行，避免过多 API 调用。
         """
@@ -1117,11 +1225,18 @@ class PortfolioDecisionNode:
                             f"✗ 问财标签'{item['tagged']}'与 efinance 板块{item['boards'][:5]}...不匹配，"
                             f"清空板块标签"
                         )
-                        # 清空板块标签，打分时板块维度会给中性分
+                        # 清空板块标签：sector 维度按缺失处理（权重归一化剔除，非零分非中性分）
                         if hasattr(stock, 'sector'):
                             stock.sector = ""
                         if hasattr(stock, 'sector_name'):
                             stock.sector_name = ""
+                        # 显式标志，供打分循环 dimension_available["sector"] 消费
+                        stock.sector_available = False
+                        # 剥离 ai_reasoning 中的错误板块段落，防止陈旧文本透传到 reasoning.md
+                        if hasattr(stock, 'ai_reasoning'):
+                            stock.ai_reasoning = self._strip_sector_reasoning(
+                                getattr(stock, 'ai_reasoning', '') or ''
+                            )
                         verified.append(stock)
 
         logger.info(
@@ -1319,6 +1434,7 @@ class PortfolioDecisionNode:
         self, symbol: str, unified_context: UnifiedContext,
         sector_strength_map: Dict[str, float] = None,
         strength_lookup: Dict[str, float] = None,
+        frame_group_lookup: Dict[str, str] = None,  # Fix 1: 家族中继匹配
     ) -> Dict[str, Any]:
         """查找股票所属板块及其强度
 
@@ -1345,6 +1461,7 @@ class PortfolioDecisionNode:
                 clean_symbol, unified_context,
                 sector_strength_map=sector_strength_map,
                 strength_lookup=strength_lookup,
+                frame_group_lookup=frame_group_lookup,  # Fix 1: 家族中继匹配
             )
             if sectors_list:
                 self._stock_sector_map[clean_symbol] = sectors_list
@@ -1490,6 +1607,7 @@ class PortfolioDecisionNode:
         self, symbol: str, unified_context: UnifiedContext,
         sector_strength_map: Dict[str, float] = None,
         strength_lookup: Dict[str, float] = None,
+        frame_group_lookup: Dict[str, str] = None,  # Fix 1: 家族中继匹配
     ) -> list:
         """反向查询股票所属板块，匹配 Node 6 聚合后的板块情报
 
@@ -1563,6 +1681,18 @@ class PortfolioDecisionNode:
             # 附加全量板块信息用于展示
             matched[0]["all_belong_boards"] = all_board_names
             return matched
+
+        # ── Fix 1: 家族中继匹配（一级半层）──
+        relay_matched = self._family_relay_match(
+            boards, unified_context, frame_group_lookup,
+        )
+        if relay_matched:
+            logger.info(
+                f"[反向查询] {symbol}: 家族中继匹配到 {len(relay_matched)} 个板块 "
+                f"{[(m['sector_name'], m.get('relay_family')) for m in relay_matched]}"
+            )
+            relay_matched[0]["all_belong_boards"] = all_board_names
+            return relay_matched
 
         # ── 二/三级：埋伏正式池 + 蓄水池（2026-08-28 扩展）──
         # 综合分低于 floor 的板块落在蓄水池，不在 confirmed_sectors 中；
@@ -1663,6 +1793,112 @@ class PortfolioDecisionNode:
 
         logger.debug(f"[反向查询] {symbol}: 所属板块均不在 Node 6 confirmed_sectors 中")
         return []
+
+    # ── Fix 1: 家族中继匹配方法 ──
+
+    def _build_family_anchor_map(
+        self, unified_context: UnifiedContext,
+    ) -> Dict[str, Any]:
+        """构建家族→锚点映射（Fix 1）
+
+        遍历 confirmed_sectors，按 frame_group 分组取 composite 最高者为锚点。
+        Returns:
+            {family_name: {
+                'sector_name': str,      # 锚点板块名
+                'composite_score': float,  # 综合分
+                'sector_role': str,       # mainline/ambush
+                'capital_check': str,
+                'news_check': str,
+                'sentiment_check': str,
+                'frame_group': str,
+            }}
+        """
+        family_anchor: Dict[str, Any] = {}
+        if not unified_context.confirmed_sectors:
+            return family_anchor
+
+        for intel in unified_context.confirmed_sectors:
+            family = getattr(intel, 'frame_group', None)
+            if not family:
+                continue
+            if family not in family_anchor:
+                family_anchor[family] = {
+                    'sector_name': intel.sector_name,
+                    'composite_score': intel.composite_score,
+                    'sector_role': getattr(intel, 'sector_role', 'mainline'),
+                    'capital_check': intel.capital_check,
+                    'news_check': intel.news_check,
+                    'sentiment_check': intel.sentiment_check,
+                    'frame_group': family,
+                }
+            else:
+                # 取 composite 最高者
+                if intel.composite_score > family_anchor[family]['composite_score']:
+                    family_anchor[family] = {
+                        'sector_name': intel.sector_name,
+                        'composite_score': intel.composite_score,
+                        'sector_role': getattr(intel, 'sector_role', 'mainline'),
+                        'capital_check': intel.capital_check,
+                        'news_check': intel.news_check,
+                        'sentiment_check': intel.sentiment_check,
+                        'frame_group': family,
+                    }
+        return family_anchor
+
+    def _family_relay_match(
+        self, boards: list, unified_context: UnifiedContext,
+        frame_group_lookup: Dict[str, str],
+    ) -> list:
+        """家族中继匹配（Fix 1）：板块名不在 confirmed_sectors，但所属家族内有 confirmed 板块。
+
+        板块名 → normalize → frame_group_lookup → 家族名 → 家族内 composite 最高的
+        confirmed 板块作锚点（anchor）。强度取 anchor.composite_score * 0.85（打折），
+        sector_role/三维 check 注入锚点值；sector_name 保留归一化后的原板块名（如"半导体"），
+        避免误标"先进封装"。weight 1.2（直接主线命中 1.5 / 普通命中 1.0 之间）。
+        """
+        from src.got.board_aliases import normalize_sector_name
+
+        # 构建家族→锚点映射
+        family_anchor = self._build_family_anchor_map(unified_context)
+        if not family_anchor:
+            return []
+
+        matched = []
+        seen_families = set()
+
+        for board in boards:
+            board_name = board.get("name", "") or board.get("board_name", "")
+            if not board_name:
+                continue
+            canon = normalize_sector_name(board_name)
+            # 查家族：优先 canon，其次原 board_name
+            family = frame_group_lookup.get(canon) or frame_group_lookup.get(board_name)
+            if not family:
+                continue
+            # 同族多板块只占一个名额（D-P7 精神）
+            if family in seen_families:
+                continue
+            anchor = family_anchor.get(family)
+            if not anchor:
+                continue
+            seen_families.add(family)
+
+            # 中继命中项
+            matched.append({
+                "sector_name": canon,                  # 归一化原板块名，如"半导体"
+                "sector_type": anchor['sector_type'] if 'sector_type' in anchor else "relay",
+                "strength": anchor['composite_score'] * 0.85,  # 家族锚点综合分打折（问题 1 修正）
+                "weight": 1.2,
+                "sector_role": anchor['sector_role'],     # mainline → 不再落入 :604 sell 分支
+                "capital_check": anchor['capital_check'],
+                "news_check": anchor['news_check'],
+                "sentiment_check": anchor['sentiment_check'],
+                "is_relay": True,
+                "relay_family": family,
+                "relay_anchor_sector": anchor['sector_name'],
+            })
+
+        return matched
 
     def _estimate_tech_score(
         self, pnl_pct_decimal: float, unified: UnifiedContext
@@ -2090,6 +2326,326 @@ class PortfolioDecisionNode:
                     failed_symbols.append(alloc.symbol)
 
         return written, failed_symbols
+
+    # ── Fix 2: 持仓论点快照方法 ──
+
+    def _write_thesis_snapshots(
+        self,
+        allocation: List[TradeAllocation],
+        unified_scoring: List[UnifiedScoringResult],
+        unified_context: UnifiedContext,
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        """Fix 2: 持仓论点快照写入
+
+        对每个 buy 类型的 allocation：
+        1. 从 unified_scoring 找到该 symbol 的板块
+        2. 若 sector_name 非空 → 写入论点快照到 SQLite
+        3. 返回 (成功写入的快照列表，失败的 symbol 列表)
+
+        降级：表不存在/写入失败 → 记录日志但不阻塞主流程。
+        """
+        buy_allocations = [a for a in allocation if a.action == "buy" and a.quantity_delta > 0]
+        if not buy_allocations:
+            return [], []
+
+        # 构建 symbol → scoring 映射（获取板块名）
+        symbol_to_scoring = {s.symbol: s for s in unified_scoring}
+
+        written = []
+        failed_symbols = []
+        try:
+            from src.storage import HoldingThesisRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                for alloc in buy_allocations:
+                    scoring = symbol_to_scoring.get(alloc.symbol)
+                    if not scoring:
+                        continue
+
+                    sector_name = scoring.sector_name if scoring else ""
+                    if not sector_name:
+                        continue  # 无法锚定，跳过
+
+                    family_name = scoring.family_name or ""
+                    today = date.today()
+                    entry_price = alloc.price_range[0] if alloc.price_range else 0.0
+
+                    # UPSERT 逻辑
+                    existing = session.query(HoldingThesisRecord).filter(
+                        HoldingThesisRecord.symbol == alloc.symbol,
+                        HoldingThesisRecord.entry_date == today,
+                    ).first()
+
+                    if existing:
+                        # 同日重跑：更新快照字段
+                        existing.sector_name = sector_name
+                        existing.family_name = family_name
+                        existing.composite_at_entry = scoring.composite_score
+                        existing.entry_price = entry_price
+                        existing.source = "got_buy"
+                        existing.is_open = True
+                        logger.info(f"[Fix 2] 持仓论点快照已更新（同日重跑）: {alloc.symbol} @ {today}")
+                    else:
+                        record = HoldingThesisRecord(
+                            symbol=alloc.symbol,
+                            sector_name=sector_name,
+                            family_name=family_name,
+                            entry_date=today,
+                            entry_price=entry_price,
+                            composite_at_entry=scoring.composite_score,
+                            source="got_buy",
+                            is_open=True,
+                        )
+                        session.add(record)
+
+                    written.append({
+                        "symbol": alloc.symbol,
+                        "sector": sector_name,
+                        "family": family_name,
+                        "entry_price": entry_price,
+                    })
+
+                session.commit()
+
+        except Exception as e:
+            logger.warning(f"[Fix 2] 持仓论点快照写入失败（降级，不阻塞 Phase 2）: {e}")
+            for alloc in buy_allocations:
+                if not any(w["symbol"] == alloc.symbol for w in written):
+                    failed_symbols.append(alloc.symbol)
+
+        return written, failed_symbols
+
+    def _load_holding_theses(
+        self, positions: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Fix 2: 加载持仓论点快照
+
+        从 holding_thesis_snapshots 表查询 is_open=True 的记录，
+        每 symbol 取 entry_date 最新一条，返回 symbol → record 映射。
+
+        降级：查询失败 → 返回空 dict。
+        """
+        symbol_set = {p.get("symbol", "") for p in positions if p.get("symbol")}
+        if not symbol_set:
+            return {}
+
+        try:
+            from src.storage import HoldingThesisRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                records = (
+                    session.query(HoldingThesisRecord)
+                    .filter(
+                        HoldingThesisRecord.is_open == True,  # noqa: E712
+                        HoldingThesisRecord.symbol.in_(symbol_set),
+                    )
+                    .order_by(HoldingThesisRecord.entry_date.desc())
+                    .all()
+                )
+                # 每 symbol 取第一条（entry_date 最新）
+                seen = set()
+                result = {}
+                for r in records:
+                    if r.symbol not in seen:
+                        result[r.symbol] = r
+                        seen.add(r.symbol)
+                return result
+        except Exception as e:
+            logger.debug(f"[Fix 2] 加载持仓论点快照失败（降级跳过）: {e}")
+            return {}
+
+    def _close_thesis_snapshots(
+        self,
+        allocation: List[TradeAllocation],
+        portfolio: Dict[str, Any],
+    ) -> None:
+        """Fix 2: 关闭已卖出的持仓论点快照（is_open=False）
+
+        action=="sell"的 allocation 置 is_open=False；reduce 保持 open。
+        降级：写库失败只记 warning。
+        """
+        sell_allocations = [a for a in allocation if a.action == "sell" and a.quantity_delta < 0]
+        if not sell_allocations:
+            return
+
+        try:
+            from src.storage import HoldingThesisRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                for alloc in sell_allocations:
+                    session.query(HoldingThesisRecord).filter(
+                        HoldingThesisRecord.symbol == alloc.symbol,
+                        HoldingThesisRecord.is_open == True,  # noqa: E712
+                    ).update({"is_open": False})
+                session.commit()
+        except Exception as e:
+            logger.warning(f"[Fix 2] 关闭持仓论点快照失败：{e}")
+
+    def _find_stock_sector_with_thesis(
+        self,
+        stock_sector_info: Dict[str, Any],
+        symbol: str,
+        unified_context: UnifiedContext,
+        family_anchor: Dict[str, Any],
+        thesis_map: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fix 2: 消费论点快照（fallback 路径）
+
+        当 stock_sector_info 为 fallback（is_fallback=True）或 sector_name 为空时，
+        若论点快照存在且 thesis.family_name 仍在当日确认家族中 → 构造中继型结果。
+
+        优先级：当日 boards 家族中继（Fix 1）> 论点快照（Fix 2）> fallback > 空。
+        """
+        is_fallback = stock_sector_info.get("is_fallback", False)
+        sector_name = stock_sector_info.get("sector_name", "")
+
+        if not is_fallback and sector_name:
+            # 已有有效匹配，不消费论点
+            return stock_sector_info
+
+        # 查论点快照
+        thesis = thesis_map.get(symbol)
+        if not thesis:
+            return stock_sector_info
+
+        # 论点家族的家族名仍在当日 confirmed 家族中？
+        thesis_family = thesis.family_name
+        if not thesis_family or thesis_family not in family_anchor:
+            return stock_sector_info
+
+        anchor = family_anchor[thesis_family]
+        today = date.today()
+
+        # 构造中继型结果（strength 打折比当日 boards 中继再低一档）
+        return {
+            "sector_name": thesis.sector_name,
+            "sector_type": "thesis_relay",
+            "strength": anchor['composite_score'] * 0.75,  # 论点家族当日锚点强度打折
+            "weight": 1.0,
+            "sector_role": anchor['sector_role'],
+            "capital_check": anchor['capital_check'],
+            "news_check": anchor['news_check'],
+            "sentiment_check": anchor['sentiment_check'],
+            "is_relay": True,
+            "relay_family": thesis_family,
+            "relay_anchor_sector": anchor['sector_name'],
+            "relay_source": "thesis",
+        }
+
+    # ── Fix 3: 卖出宽限方法 ──
+
+    def _drift_action_with_grace(
+        self,
+        symbol: str,
+        sector_name: str,
+        sector_strength: float,
+        frame_group_lookup: Dict[str, str],
+        family_anchor: Dict[str, Any],
+        thesis: Any,
+        today: date,
+    ) -> tuple[str, bool]:
+        """Fix 3: 板块漂移卖出分支的宽限判定（Invesco 非对称门槛）
+
+        逻辑：
+        - 漂移板块所属家族锚点 composite >= 60 → hold + 置观察（首次）
+        - 家族锚点 [40, 60)：观察已跨交易日 → sell；首次 → reduce + 置观察
+        - 家族锚点 < 40 或无家族/无锚点 → sell（深度破位，不宽限）
+
+        Returns:
+            (action, grace_applied)：grace_applied=True 时上游 reasoning 加 [家族宽限：家族 X]
+        """
+        from src.got.board_aliases import normalize_sector_name
+
+        # 确定板块家族名
+        canon = normalize_sector_name(sector_name) if sector_name else ""
+        family = frame_group_lookup.get(canon)
+        if not family and sector_name:
+            family = frame_group_lookup.get(sector_name)
+
+        # 无家族 → 不宽限
+        if not family or family not in family_anchor:
+            return "sell", False
+
+        anchor = family_anchor[family]
+        anchor_composite = anchor['composite_score']
+
+        # 深度破位：不宽限
+        if anchor_composite < 40:
+            return "sell", False
+
+        # 家族强（>=60）→ hold + 置观察
+        if anchor_composite >= 60:
+            # 懒建 drift_watch 记录
+            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis)
+            return "hold", True
+
+        # 家族弱 [40, 60)：查是否已观察跨日
+        drift_watch_since = None
+        drift_family = None
+        if thesis:
+            drift_watch_since = thesis.drift_watch_since
+            drift_family = thesis.drift_family
+
+        if drift_watch_since and drift_family == family:
+            # 已观察跨交易日 → sell
+            return "sell", False
+        else:
+            # 首次 → reduce + 置观察
+            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis)
+            return "reduce", True
+
+    def _apply_drift_watch(
+        self,
+        symbol: str,
+        family: str,
+        today: date,
+        anchor_composite: float,
+        thesis: Any,
+    ) -> None:
+        """Fix 3: 应用漂移观察（持久化到 holding_thesis_snapshots）
+
+        写库 try/except 降级（宽限判定本身不依赖写库成功）。
+        """
+        try:
+            from src.storage import HoldingThesisRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                # 查是否存在该 symbol 的 open 记录
+                record = (
+                    session.query(HoldingThesisRecord)
+                    .filter(
+                        HoldingThesisRecord.symbol == symbol,
+                        HoldingThesisRecord.is_open == True,  # noqa: E712
+                    )
+                    .first()
+                )
+
+                if record:
+                    # 存在则 UPDATE
+                    record.drift_watch_since = today
+                    record.drift_family = family
+                    logger.info(f"[Fix 3] 漂移观察更新：{symbol} 家族{family} 锚点{anchor_composite:.0f}")
+                else:
+                    # 不存在则懒建（source="drift_watch"）
+                    last_price = 0.0  # TODO: 从 position 获取实际价格
+                    record = HoldingThesisRecord(
+                        symbol=symbol,
+                        sector_name="",
+                        family_name=family,
+                        entry_date=today,
+                        entry_price=last_price,
+                        composite_at_entry=anchor_composite,
+                        source="drift_watch",
+                        drift_watch_since=today,
+                        drift_family=family,
+                        is_open=True,
+                    )
+                    session.add(record)
+                    logger.info(f"[Fix 3] 漂移观察懒建：{symbol} 家族{family} 锚点{anchor_composite:.0f}")
+
+                session.commit()
+        except Exception as e:
+            logger.warning(f"[Fix 3] 漂移观察写库失败（降级）: {e}")
 
     def _close_ambush_snapshots(
         self,
@@ -2814,7 +3370,7 @@ verdict 含义：
             dimension_available = {
                 "capital": stock.capital_available,
                 "news": stock.news_available,
-                "sector": True,
+                "sector": getattr(stock, "sector_available", True),
                 "tech": True,
                 "risk": True,
             }
@@ -3085,17 +3641,18 @@ verdict 含义：
             for score in candidates[:3]:  # 最多买 3 只
                 # 获取实时价格（只有 3 只，很快）
                 estimated_price = self._get_realtime_price(score.symbol)
-                if estimated_price <= 0:
+                if estimated_price is None or estimated_price <= 0:
                     logger.warning(f"[Phase 2] 无法获取 {score.symbol} 价格，跳过")
                     continue
 
-                # D-P11 + D-P13: 使用 sector_role 判定分支（不再用 limit 反推）。
-                # 角色未命中映射时取 DEFAULT_SECTOR_ROLE（主线）。
-                sector_role = (
-                    sector_role_map.get(score.sector_name, DEFAULT_SECTOR_ROLE)
-                    if score.sector_name else DEFAULT_SECTOR_ROLE
-                )
-                sector_limit = sector_limits.get(score.sector_name, 0.20) if score.sector_name else 0.20
+                # 板块验证清空的候选（sector_name 为空）走 unknown 保守分支（乘数 0.55，与埋伏同档）
+                # 而非默认主线——验证失败是负面信号，不应获得主线标准预算
+                if score.sector_name:
+                    sector_role = sector_role_map.get(score.sector_name, DEFAULT_SECTOR_ROLE)
+                    sector_limit = sector_limits.get(score.sector_name, 0.20)
+                else:
+                    sector_role = "unknown"
+                    sector_limit = 0.20
 
                 # 修正（2026-09-11）：cooling 此前落入 else 拿到主线仓位与止损，与本项目
                 # 「cooling 最低档」的设计意图相反 —— ROLE_MULTIPLIER["cooling"] 从未对任何
