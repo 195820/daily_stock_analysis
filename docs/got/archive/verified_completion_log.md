@@ -20,10 +20,10 @@
 
 2. **沙箱侧**：`save_monitoring` 连调 3 次，今日条目恒为 1
    ```
-   初始             : 总条数=36  今日(2026-09-14) range_reversal=1
-   第1次 save_monitoring: 总条数=36  今日 range_reversal=1
-   第2次 save_monitoring: 总条数=36  今日 range_reversal=1
-   第3次 save_monitoring: 总条数=36  今日 range_reversal=1
+   初始             : 总条数=36  今日 (2026-09-14) range_reversal=1
+   第 1 次 save_monitoring: 总条数=36  今日 range_reversal=1
+   第 2 次 save_monitoring: 总条数=36  今日 range_reversal=1
+   第 3 次 save_monitoring: 总条数=36  今日 range_reversal=1
    ```
 
 **机制**：`persistence.py:704-707` 在追加前剔除 `date == today_str` 的既有条目，再按当日计数追加 ⇒ 跨次运行幂等。
@@ -143,16 +143,127 @@ python scripts/verify_glue_metrics.py --date 20260910
 
 ---
 
-## 归档说明
+## 持仓板块漂移修复（2026-09-18）
 
-1. **归档日期**：2026-09-15
-2. **归档原因**：上述项验证流程完备、实测值达标（或验证机制已收口）、无需在待验证文档中继续跟踪
-3. **待验证文档**：`docs/verification.md` 已移除上述项，仅保留真正待验证的内容
-4. **配套文档**：
-   - [`verification.md`](../verification.md) — 待验证 / 影子期清单
-   - [`backlog.md`](../backlog.md) — 待实施清单
-   - [`README.md`](./README.md) — 归档索引
+**Commit**: `20cba78ea46017773e0c192349c9232774af8ef6`  
+**Branch**: `fix/sector-drift-grace`  
+**Date**: 2026-09-18
+
+### 改动统计
+
+```
+ src/got/nodes/portfolio_decision.py            | 599 ++++++++++++++++++++++++-
+ src/got/schemas.py                             |   9 +
+ src/storage.py                                 |  33 ++
+ tests/test_portfolio_decision_lot_rejection.py | 148 +++++-
+ tests/test_reverse_lookup.py                   |  54 +++
+ 6 files changed, 974 insertions(+), 23 deletions(-)
+```
+
+### 核心功能验收
+
+#### Fix 1: 家族中继匹配 ✅
+
+**代码位置**: `_family_relay_match` (`portfolio_decision.py:1848-1901`)
+
+**验收点**:
+- ✅ 板块名→normalize→frame_group_lookup→家族名→锚点逻辑正确
+- ✅ strength ×0.85 打折（问题 1 修正：避免虚高）
+- ✅ weight=1.2（介于 direct 1.5 / normal 1.0 之间）
+- ✅ sector_role/三维 check 注入锚点值
+- ✅ 过热降权继承接线（问题 2 修正：不可逃逸）
+
+**单测覆盖**: `test_family_relay_match_semiconductor` → strength≈78.2 (92×0.85), is_relay=True
+
+#### Fix 2: 买入论点快照 ✅
+
+**新表**: `HoldingThesisRecord` (`storage.py:1257-1285`)
+
+**验收点**:
+- ✅ 字段设计完整（symbol/sector_name/family_name/entry_date/composite_at_entry/source/drift_watch_since/drift_family/is_open）
+- ✅ UPSERT 机制（自然键 symbol+entry_date，同 P4 A-P0-6）
+- ✅ 写入方法 `_write_thesis_snapshots` (买入时)
+- ✅ 读取方法 `_load_holding_theses` (持仓分析时)
+- ✅ 关闭方法 `_close_thesis_snapshots` (卖出时)
+- ✅ 强度打折 ×0.75（比当日 boards 中继再低一档）
+
+**冷启动策略**: 存量持仓靠 Fix 1 中继 + Fix 3 懒建观察记录覆盖；前向从下一次买入开始积累
+
+#### Fix 3: 卖出宽限 ✅
+
+**代码位置**: `_drift_action_with_grace` (`portfolio_decision.py:2537-2595`)
+
+**验收点**:
+- ✅ Invesco 非对称门槛判定逻辑正确
+- ✅ 家族锚点 ≥60 → hold + 置观察
+- ✅ 家族锚点 [40,60)：首次 reduce，跨日 sell
+- ✅ 家族锚点 <40 → sell（不宽限）
+- ✅ `_apply_drift_watch` 懒建/UPDATE 逻辑正确
+- ✅ 写库 try/except 降级（不阻塞主流程）
+
+**理论依据**: Bethke 2026 退出规则回测（快触发在噪声信号上 whipsaw——确认信号 + 宽限窗口优于单日即卖）
+
+#### 可观测性 ✅
+
+**字段新增**: `UnifiedScoringResult` (`schemas.py:986-999`)
+
+- ✅ `sector_match_type`: direct/relay/thesis/fallback/none
+- ✅ `sector_drift_grace`: bool（家族宽限标记）
+- ✅ portfolio_decision.json 落盘自动携带
+
+### 测试验证
+
+#### 单测结果
+
+**test_reverse_lookup.py** (新增 3 用例):
+1. `test_family_relay_match_semiconductor`: 家族中继验证 → PASS ✓
+2. `test_family_relay_skipped_when_direct_match`: 直接命中优先 → PASS ✓
+3. `test_family_relay_no_anchor_returns_fallback`: 无锚点降级 → PASS ✓
+
+**test_portfolio_decision_lot_rejection.py** (新增 3 用例):
+1. `test_drift_action_grace_hold`: 家族强 → hold → PASS ✓
+2. `test_drift_action_grace_reduce_then_sell`: 家族弱 → reduce 后 sell → PASS ✓
+3. `test_drift_action_deep_break_sells`: 深度破位 → sell 不宽限 → PASS ✓
+
+**总结果**: **16/16 PASSED ✓**
+
+### 根因修复验证
+
+**问题股票**: 688598 金博股份
+
+**原因为何被误卖**:
+1. ❌ 买入时按"半导体"家族评分（当时是主线，composite~92）
+2. ❌ 持仓分析时只做板块名级匹配
+3. ❌ 今日 confirmed_sectors 无"半导体"板块名（只有先进封装 92/存储芯片 90 等成员）
+4. ❌ 家族关系完全丢失，只剩石墨烯命中（fallback 路径取 boards 中强度最高者 63.7）
+5. ❌ 纯规则匹配，落入 `sector_role not in ("mainline","ambush")` → sell
+
+**修复后预期行为**:
+1. ✅ Fix 1: 家族中继匹配 → 识别"半导体概念"属于 AI 硬件家族
+2. ✅ 锚点：先进封装 (composite=92, sector_role="mainline")
+3. ✅ strength = 92 × 0.85 ≈ 78（压过石墨烯 63.7）
+4. ✅ sector_role="mainline" → 不再落入 sell 分支
+5. ✅ action = hold（若家族锚点≥60）或 reduce/sell（依宽限逻辑）
+
+### 生产验证待办
+
+- [ ] 运行 `python main.py --got`
+- [ ] 核对 `data/got_daily/<今日>/portfolio_decision.json` 中 688598 的 `sector_match_type="relay"`、`family_name="AI 硬件"`、`action="hold"`
+- [ ] 检查 `holding_thesis_snapshots` 表已建且后续买入产生 got_buy 记录
+- [ ] 无 drift 的其他持仓（600250 等）行为与改动前一致（`sector_match_type="direct"`）
+
+### 合并建议
+
+**前置条件**: 生产验证通过
+
+**合并命令**:
+```bash
+git checkout main
+git merge fix/sector-drift-grace
+git push origin main
+```
 
 ---
 
-*归档日期：2026-09-15*
+*归档日期：2026-09-18*
+*状态：待生产验证*

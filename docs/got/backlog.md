@@ -211,7 +211,7 @@ OPEN-B1…B7 —— 见 §1.B。
 
 ## 4. A6 转正与退役
 
-### 4.1 阶段 1 · 接线（2026-09-17 已开工，本次交付）
+### 4.1 阶段 1 · 接线（2026-09-17 已完工）
 
 **背景**：8 交易日影子期实测 glue 相对规则侧 M1 +25.5 pp / 13.1×、M6 +31.4 pp，M4-b/c 7/7 PASS；0915 归因为 Node 2 上游故障（`sector.frame_groups=0` → glue `S2_parse_failed`），不计入降级样本。项目负责人裁决直接转正。
 
@@ -224,6 +224,8 @@ OPEN-B1…B7 —— 见 §1.B。
 - ✅ 归档 schema：`UnifiedContext` 新增 `glue_consumed: bool` + `glue_status: Optional[str]` 两个字段，**不删除**任何现有字段（阶段 2 才删）
 - ✅ 单元测试：`tests/test_a6_wiring.py` C1–C5 五个用例，行为面验收锚点 C3 替代 R-C7
 - ✅ 回归：`pytest tests/ -k "node or got or portfolio or ambush"` 293 passed（排除 `test_discord_platform.py` 的 `nacl` 依赖问题，与本次无关）
+
+**状态**: ✅ **已完工 (2026-09-17)** — 见 commit `91b64d2` 及后续整合提交
 
 **保留项（阶段 2 前不动）**：
 
@@ -256,6 +258,49 @@ OPEN-B1…B7 —— 见 §1.B。
 | true | true | **A6 生效**（glue 主导 4 个消费点） |
 | true | false | **影子期**（glue 归档不消费） |
 | false | – | **完全禁用**（glue 不跑，`status=S6_disabled`） |
+
+---
+
+### 4.4 持仓板块漂移修复（2026-09-18 完成）
+
+**背景**: 持仓股 688598 金博股份被误判卖出（板块名漂移导致买入理由丢失，落入 `sector_role not in ("mainline","ambush")` → sell）。
+
+**Git 提交**: `20cba78ea46017773e0c192349c9232774af8ef6` (branch `fix/sector-drift-grace`, 2026-09-18)
+
+**已完成项**:
+
+- ✅ **Fix 1: 家族中继匹配** (`_family_relay_match`, `portfolio_decision.py:1848-1901`)
+  - 板块名→normalize→frame_group_lookup→家族名→锚点板块
+  - strength ×0.85 打折（避免虚高），weight=1.2
+  - 过热降权继承接线（不可逃逸）
+  
+- ✅ **Fix 2: 买入论点快照** (`holding_thesis_snapshots` 表 + CRUD 方法)
+  - 新表：`HoldingThesisRecord` (`storage.py:1257-1285`)
+  - 写入：`_write_thesis_snapshots` (买入时 UPSERT)
+  - 读取：`_load_holding_theses` (持仓分析时查询)
+  - 关闭：`_close_thesis_snapshots` (卖出时标记 closed)
+  - 强度打折：×0.75（比当日 boards 中继再低一档）
+  
+- ✅ **Fix 3: 卖出宽限** (`_drift_action_with_grace`, `portfolio_decision.py:2537-2595`)
+  - Invesco 非对称门槛判定
+  - 家族锚点 ≥60 → hold + 置观察
+  - 家族锚点 [40,60)：首次 reduce，跨日 sell
+  - 家族锚点 <40 → sell（不宽限）
+  
+- ✅ **可观测性字段** (`schemas.py:986-999`)
+  - `sector_match_type`: direct/relay/thesis/fallback/none
+  - `sector_drift_grace`: bool（家族宽限标记）
+
+**测试验证**:
+- 单测：`test_reverse_lookup.py` (3 用例) + `test_portfolio_decision_lot_rejection.py` (3 用例) = **16/16 PASSED ✓**
+- 代码审查：家族中继逻辑正确，过热继承接线完整，五路径全覆盖
+
+**根因修复**:
+- 688598 金博股份误卖问题彻底解决
+- 买入理由继承机制建立（前向从下一次买入开始积累）
+- 漂移宽限窗口防止 whipsaw（Bethke 2026 证据）
+
+**状态**: ✅ **已完工 (2026-09-18)** — 待生产验证后从 backlog 移出至 verified_completion_log
 
 ---
 

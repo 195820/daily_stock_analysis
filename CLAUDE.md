@@ -13,6 +13,7 @@
   - 影子模式输出内容（如 `agent_glue.json` 的关系/强度/家族统计）
   - Phase 2 交易建议（持仓分析/候选股/操作建议）
   - 关键风险提示和主线续航评估
+- **长时间运行命令必须加 `timeout: 0`**：执行 `python main.py --got`、`python main.py --screener` 等命令时，必须在 bash 工具调用中设置 `timeout: 0` 参数，禁止使用默认超时。
 
 ---
 
