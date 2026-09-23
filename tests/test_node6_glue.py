@@ -352,16 +352,16 @@ class TestAgentSemanticGlueDispatch(unittest.TestCase):
         _redirect_glue_archive(self, self.node)
 
     def test_s6_switch_off(self):
-        """S6: AGENT_SEMANTIC_GLUE_ENABLED=false → 全量 F1。"""
+        """S6: 开关关闭 → 报错（glue 已转正）。"""
         import asyncio
-        result = asyncio.run(
-            self.node._agent_semantic_glue(
-                self.candidates, self.news, self.capital, self.sentiment,
-            )
-        )
-        self.assertTrue(result.degraded)
-        self.assertEqual(len(result.degraded_sectors), 3)
-        self.assertTrue(any("开关关闭" in w for w in result.warnings))
+        with patch("src.got.nodes.aggregator.AGENT_SEMANTIC_GLUE_ENABLED", False):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(
+                    self.node._agent_semantic_glue(
+                        self.candidates, self.news, self.capital, self.sentiment,
+                    )
+                )
+            self.assertIn("AGENT_SEMANTIC_GLUE_ENABLED=false", str(ctx.exception))
 
     def test_replay_mode_skips_llm(self):
         """replay_mode → 跳过 LLM 调用（需先开启开关以到达 replay 检查）。"""

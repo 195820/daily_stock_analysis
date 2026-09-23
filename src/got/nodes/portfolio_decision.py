@@ -149,7 +149,7 @@ class PortfolioDecisionNode:
 
         # Fix 2: 持仓论点快照写入（买入 + 漂移观察）
         thesis_buys, thesis_failed = self._write_thesis_snapshots(
-            allocation, unified_scoring, unified_context,
+            allocation, unified_scoring, unified_context, sector_context,
         )
         if thesis_buys:
             logger.info(f"[Phase 2] Fix 2 持仓论点快照：{len(thesis_buys)} 条")
@@ -615,15 +615,34 @@ class PortfolioDecisionNode:
             sector_role = stock_sector_info.get("sector_role", "")
 
             # 分层决策（方案 C：组合方案 + Invesco 2024 非对称门槛）
+            thesis_drift = stock_sector_info.get("thesis_drift", False)
             if not sector_name:
                 # Fix 3: 漂移 sell 分支接入宽限逻辑
                 thesis = thesis_map.get(symbol)
+                all_boards = stock_sector_info.get("all_belong_boards", [])
                 action, grace_applied = self._drift_action_with_grace(
                     symbol, sector_name, sector_strength,
                     frame_group_lookup, family_anchor_map, thesis, date.today(),
+                    drift_sector_name=all_boards[0] if all_boards else "",
                 )
                 if grace_applied:
                     reasoning += f", [家族宽限]"
+            elif thesis_drift:
+                # Fix 2: 板块漂移检测 — 论点板块与当日匹配不一致
+                thesis = thesis_map.get(symbol)
+                thesis_family = stock_sector_info.get("thesis_family", "")
+                # 用论点家族查锚点强度，走宽限逻辑
+                thesis_action, thesis_grace = self._drift_action_with_grace(
+                    symbol, sector_name, sector_strength,
+                    frame_group_lookup, family_anchor_map, thesis, date.today(),
+                    drift_sector_name=sector_name,
+                )
+                if thesis_grace:
+                    action = thesis_action
+                    reasoning += f", [论点漂移宽限: {thesis_family}]"
+                else:
+                    action = "sell"
+                    reasoning += f", [论点漂移卖出: {thesis_family}→{sector_name}]"
             elif lifecycle_phase is None:
                 # 板块不在 confirmed_sectors 中（可能被踢出）
                 # Invesco 2024 非对称门槛：持仓者降温期保护
@@ -647,9 +666,11 @@ class PortfolioDecisionNode:
             elif sector_role not in ("mainline", "ambush"):
                 # Fix 3: 漂移 sell 分支接入宽限逻辑
                 thesis = thesis_map.get(symbol)
+                all_boards = stock_sector_info.get("all_belong_boards", [])
                 action, grace_applied = self._drift_action_with_grace(
                     symbol, sector_name, sector_strength,
                     frame_group_lookup, family_anchor_map, thesis, date.today(),
+                    drift_sector_name=all_boards[0] if all_boards else "",
                 )
                 if grace_applied:
                     reasoning += f", [家族宽限]"
@@ -2334,13 +2355,15 @@ class PortfolioDecisionNode:
         allocation: List[TradeAllocation],
         unified_scoring: List[UnifiedScoringResult],
         unified_context: UnifiedContext,
+        sector_context: Any,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         """Fix 2: 持仓论点快照写入
 
         对每个 buy 类型的 allocation：
         1. 从 unified_scoring 找到该 symbol 的板块
         2. 若 sector_name 非空 → 写入论点快照到 SQLite
-        3. 返回 (成功写入的快照列表，失败的 symbol 列表)
+        3. family_name 从 sector_name 经 confirmed_sectors 反推（scoring.family_name 恒为 null）
+        4. 返回 (成功写入的快照列表，失败的 symbol 列表)
 
         降级：表不存在/写入失败 → 记录日志但不阻塞主流程。
         """
@@ -2350,6 +2373,20 @@ class PortfolioDecisionNode:
 
         # 构建 symbol → scoring 映射（获取板块名）
         symbol_to_scoring = {s.symbol: s for s in unified_scoring}
+
+        # 构建 sector_name → family_name 映射（从 confirmed_sectors 反推）
+        # scoring.family_name 恒为 null（候选股不打家族标签），必须从板块名反查
+        sector_to_family: dict[str, str] = {}
+        for intel in (unified_context.confirmed_sectors or []):
+            sn = intel.sector_name
+            fg = intel.frame_group
+            if sn and fg:
+                sector_to_family[sn] = fg
+        # 补充：frame_group_lookup 覆盖全量板块（含未确认的），兜底 confirmed_sectors 未命中的情况
+        fgl = getattr(sector_context, "frame_group_lookup", None) or {}
+        for sn, fg in fgl.items():
+            sector_to_family.setdefault(sn, fg)
+
 
         written = []
         failed_symbols = []
@@ -2363,10 +2400,10 @@ class PortfolioDecisionNode:
                         continue
 
                     sector_name = scoring.sector_name if scoring else ""
-                    if not sector_name:
-                        continue  # 无法锚定，跳过
+                    family_name = scoring.family_name or sector_to_family.get(sector_name, "")
+                    if not sector_name and not family_name:
+                        continue  # 板块和家族都无法锚定，跳过
 
-                    family_name = scoring.family_name or ""
                     today = date.today()
                     entry_price = alloc.price_range[0] if alloc.price_range else 0.0
 
@@ -2377,9 +2414,10 @@ class PortfolioDecisionNode:
                     ).first()
 
                     if existing:
-                        # 同日重跑：更新快照字段
-                        existing.sector_name = sector_name
-                        existing.family_name = family_name
+                        # 同日重跑：更新快照字段（反推失败时保留旧值）
+                        if sector_name:
+                            existing.sector_name = sector_name
+                        existing.family_name = family_name or existing.family_name
                         existing.composite_at_entry = scoring.composite_score
                         existing.entry_price = entry_price
                         existing.source = "got_buy"
@@ -2461,10 +2499,11 @@ class PortfolioDecisionNode:
     ) -> None:
         """Fix 2: 关闭已卖出的持仓论点快照（is_open=False）
 
-        action=="sell"的 allocation 置 is_open=False；reduce 保持 open。
+        仅当卖出后持仓归零（is_open 且 quantity_delta 清仓）时关闭论点；
+        部分减仓（reduce）保持论点 open。
         降级：写库失败只记 warning。
         """
-        sell_allocations = [a for a in allocation if a.action == "sell" and a.quantity_delta < 0]
+        sell_allocations = [a for a in allocation if a.action in ("sell", "reduce") and a.quantity_delta < 0]
         if not sell_allocations:
             return
 
@@ -2473,10 +2512,23 @@ class PortfolioDecisionNode:
             db = DatabaseManager()
             with db.get_session() as session:
                 for alloc in sell_allocations:
-                    session.query(HoldingThesisRecord).filter(
-                        HoldingThesisRecord.symbol == alloc.symbol,
-                        HoldingThesisRecord.is_open == True,  # noqa: E712
-                    ).update({"is_open": False})
+                    # 查当前持仓数量，判断是否清仓
+                    current_qty = 0.0
+                    for pos in portfolio.get("accounts", [{}])[0].get("positions", []):
+                        if pos.get("symbol") == alloc.symbol:
+                            current_qty = pos.get("quantity", 0.0)
+                            break
+
+                    # 仅当卖出后持仓归零时才关闭论点
+                    remaining = current_qty + alloc.quantity_delta  # quantity_delta 为负
+                    if remaining <= 0:
+                        session.query(HoldingThesisRecord).filter(
+                            HoldingThesisRecord.symbol == alloc.symbol,
+                            HoldingThesisRecord.is_open == True,  # noqa: E712
+                        ).update({"is_open": False})
+                        logger.info(f"[Fix 2] 论点快照关闭（清仓）: {alloc.symbol}")
+                    else:
+                        logger.info(f"[Fix 2] 论点快照保持（部分减仓）: {alloc.symbol} 剩余{remaining:.0f}股")
                 session.commit()
         except Exception as e:
             logger.warning(f"[Fix 2] 关闭持仓论点快照失败：{e}")
@@ -2489,22 +2541,37 @@ class PortfolioDecisionNode:
         family_anchor: Dict[str, Any],
         thesis_map: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Fix 2: 消费论点快照（fallback 路径）
-
-        当 stock_sector_info 为 fallback（is_fallback=True）或 sector_name 为空时，
-        若论点快照存在且 thesis.family_name 仍在当日确认家族中 → 构造中继型结果。
+        """Fix 2: 消费论点快照
 
         优先级：当日 boards 家族中继（Fix 1）> 论点快照（Fix 2）> fallback > 空。
+
+        板块漂移检测：即使有直接匹配，若 thesis 存在且 thesis.sector_name 与当前
+        sector_name 不同 → 标记 thesis_drift=True，上游 _score_holdings 将其作为
+        漂移入口喂给 _drift_action_with_grace。
         """
         is_fallback = stock_sector_info.get("is_fallback", False)
         sector_name = stock_sector_info.get("sector_name", "")
 
-        if not is_fallback and sector_name:
-            # 已有有效匹配，不消费论点
-            return stock_sector_info
-
         # 查论点快照
         thesis = thesis_map.get(symbol)
+
+        # 板块漂移检测：有直接匹配但板块名与论点不一致（归一化后比对，避免别名/后缀误报）
+        from src.got.board_aliases import normalize_sector_name
+        thesis_sector = normalize_sector_name(thesis.sector_name) if thesis and thesis.sector_name else ""
+        current_sector = normalize_sector_name(sector_name) if sector_name else ""
+        if thesis_sector and current_sector and thesis_sector != current_sector:
+            stock_sector_info["thesis_drift"] = True
+            stock_sector_info["thesis_sector_name"] = thesis.sector_name
+            stock_sector_info["thesis_family"] = thesis.family_name or ""
+            logger.info(
+                f"[Fix 2] 板块漂移检测: {symbol} 论点={thesis.sector_name}({thesis_sector}) → 当日={sector_name}({current_sector})"
+            )
+            return stock_sector_info
+
+        if not is_fallback and sector_name:
+            # 已有有效匹配且无漂移，不消费论点
+            return stock_sector_info
+
         if not thesis:
             return stock_sector_info
 
@@ -2543,6 +2610,7 @@ class PortfolioDecisionNode:
         family_anchor: Dict[str, Any],
         thesis: Any,
         today: date,
+        drift_sector_name: str = "",
     ) -> tuple[str, bool]:
         """Fix 3: 板块漂移卖出分支的宽限判定（Invesco 非对称门槛）
 
@@ -2576,7 +2644,7 @@ class PortfolioDecisionNode:
         # 家族强（>=60）→ hold + 置观察
         if anchor_composite >= 60:
             # 懒建 drift_watch 记录
-            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis)
+            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis, sector_name=drift_sector_name)
             return "hold", True
 
         # 家族弱 [40, 60)：查是否已观察跨日
@@ -2591,7 +2659,7 @@ class PortfolioDecisionNode:
             return "sell", False
         else:
             # 首次 → reduce + 置观察
-            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis)
+            self._apply_drift_watch(symbol, family, today, anchor_composite, thesis, sector_name=drift_sector_name)
             return "reduce", True
 
     def _apply_drift_watch(
@@ -2601,9 +2669,11 @@ class PortfolioDecisionNode:
         today: date,
         anchor_composite: float,
         thesis: Any,
+        sector_name: str = "",
     ) -> None:
         """Fix 3: 应用漂移观察（持久化到 holding_thesis_snapshots）
 
+        sector_name 优先使用 thesis 原始板块名，其次用调用方传入的 all_belong_boards 首项。
         写库 try/except 降级（宽限判定本身不依赖写库成功）。
         """
         try:
@@ -2627,10 +2697,12 @@ class PortfolioDecisionNode:
                     logger.info(f"[Fix 3] 漂移观察更新：{symbol} 家族{family} 锚点{anchor_composite:.0f}")
                 else:
                     # 不存在则懒建（source="drift_watch"）
+                    # sector_name 优先用 thesis 原始板块名，其次用调用方传入值
+                    fallback_sector = sector_name or (thesis.sector_name if thesis and getattr(thesis, "sector_name", "") else "")
                     last_price = 0.0  # TODO: 从 position 获取实际价格
                     record = HoldingThesisRecord(
                         symbol=symbol,
-                        sector_name="",
+                        sector_name=fallback_sector,
                         family_name=family,
                         entry_date=today,
                         entry_price=last_price,
@@ -2641,7 +2713,7 @@ class PortfolioDecisionNode:
                         is_open=True,
                     )
                     session.add(record)
-                    logger.info(f"[Fix 3] 漂移观察懒建：{symbol} 家族{family} 锚点{anchor_composite:.0f}")
+                    logger.info(f"[Fix 3] 漂移观察懒建：{symbol} 家族{family} 板块={fallback_sector} 锚点{anchor_composite:.0f}")
 
                 session.commit()
         except Exception as e:
