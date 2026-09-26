@@ -293,10 +293,10 @@ C 层给出的修正方向是 **C-P6（M1 改 glue 侧）**——
 |---|---|---|---|
 | **R-C2** | `--got-replay 20260901` 的 glue 产物落在 `20260901/_replay/` | 路径精确匹配 | **部分**——路径约定 `{date}/_replay/` 在 **1 份**真实产物上成立（`20260903/_replay/unified.json`）；其余 2 份为**测试污染**（§2.2 / §4.1），不计为证据。`20260901` 本身无产物 |
 | **R-C4** | `status=ok` 的交易日 ≥ 7 且连续，**须分列实盘 / 回填来源** | 7 天 | 实盘仅 **5 天**且缺 0908、不连续（见 §2） |
-| **R-C6** | M2 × M3 在 8 天回填样本上的 A/B 对照表 | 2×8 = 16 点 | 🔴 **SKIP**——回填产物文件 2 份但**去重后仅 1 份**，且为禁用态占位 ⇒ **有效样本 0 天**，见 §4.1。脚本已改为分列「文件数 / 去重数 / 有效数」 |
+| **R-C6** | M2 × M3 在 8 天回填样本上的 A/B 对照表 | 2×8 = 16 点 | 🟡 **矩阵已产出、待负责人判读**（2026-09-26 C-P12）——两版 prompt 各回放 9 日（0901/02/03/04/07/08/09/10/14）均 `status=ok`、md5 互异，`verify_glue_metrics.py --compare variant_a variant_b` 出 **M2×M3 对照矩阵**（A 均值 M2=35.5%/低置信 6.8%，B 均值 M2=46.3%/低置信 40.8%）+ `--m3-audit` 预审表（`cp12_m3_audit_20260926.md`）。⚠️ 0902 因 B 版撞 max_tokens=16000 截断、临时 24000(A)/32000(B) 重跑，与其他日不对称，**有效对照日建议取 8 天（剔除 0902）**。脚本仍判 SKIP：R-C6 为曲线判读而非 PASS/FAIL，达标判定归负责人（见 §3 与 `cp12_prompt_variants_draft_20260926.md`） |
 | **R-C7** | C 层零行为变更项落地后同期归档逐字段不变 | 100% 一致 | 待回放 |
 
-> R-C6 是 `verify_glue_metrics.py` 内**唯一被判为 SKIP** 的一条（该脚本只含 R-C3 / R-C6 两条，R-C3 已归档），前置为 C-P11（回填跑批）+ C-P12（prompt A/B），两项均未实施。
+> R-C6 是 `verify_glue_metrics.py` 内**唯一被判为 SKIP** 的一条（该脚本只含 R-C3 / R-C6 两条，R-C3 已归档）。前置 C-P11（回填跑批）+ C-P12（prompt A/B）**均已实施**（2026-09-26），两版各 9 日对照矩阵已产出；SKIP 不是缺数据，而是脚本不代判曲线（D-C6），达标判读归项目负责人。
 
 ### 4.1 `_replay/` 产物全量盘点（2026-09-14 实测，含污染溯源）
 
@@ -504,3 +504,4 @@ ls -la data/got_screener/ | tail
 *修订：2026-09-15（第七轮，T1/T1-H 影子产物落盘）—— **T1/T1-H 新增独立影子产物文件**：`shadow_t1.json` / `shadow_t1h.json`，与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落。**零 schema 改动**（不碰 `schemas.py`，不影响 R-B8/R-C7 逐字段 diff）。§1 表更新 T1/T1-H 的「实跑 ENABLED」与「归档产物」列：T1 现有 4 天日志 + 1 天归档，T1-H 现有 1 天归档（未执行：持仓不满足三类筛选条件）。新增 §2 末尾「T1/T1-H 影子产物」小节说明设计要点。11 个测试用例覆盖（含重跑不堆积、「未执行+原因」分支）。端到端验证通过（0915 归档，T1 否决广立微 301095，T1-H 未执行）。*
 *修订：2026-09-15（第八轮，归档已验证项）—— **7 项已通过验证的内容归档至 [`archive/verified_completion_log.md`](archive/verified_completion_log.md)**：A-P0-4（monitoring 按日去重）、R-C1（S1/S2 失败样本落盘）、R-C3（十锚点逐位一致）、R-C5（零引用复验）、R2（状态机收口）、R4（EMA 计数按日）、M6（回收率 90.9% 达标）。源文档删除对应段落（§3 M6 行、§4 R-C1/C3/C5 行、§5 R2/R4 行、§6 A-P0-4 整节、§8 对应复现命令），§7→§6 重编号，脚本输出描述同步更新。*
 *修订：2026-09-26（第九轮，拍板落地）—— 决策简报（`decision_brief_20260926.md`）七项拍板实施：**#3a** `signal_dates` 改按日去重（`persistence.py`，`signal_count_30d` 语义由次数变天数，单测 2 例）；**#4b** 4 份测试污染产物备份后删除（移入 `data/got_daily_backup_20260926_1700/`）；**#5a** `market_regime` 跨日状态机 5 字段移出 R-B8 不变组（`verify_layer_b_consistency.py` 单独比对、按设计 SKIP 不计 FAIL，§4/§5.1 同步）；**#1a/#6a/C-P13a/OPEN-C1a** 维持现状，已在 backlog §7 标已拍板。*
+*修订：2026-09-26（第十轮，C-P12 prompt A/B 双版回放）—— **R-C6 由「有效样本 0 天 SKIP」→「两版各 9 天 M2×M3 对照矩阵已产出、待负责人判读」**（§4 R-C6 行）：新增 `GLUE_PROMPT_VARIANT`（a/b）/`GLUE_MAX_TOKENS` env（均仅 replay 生效、生产零影响）+ `agent_glue.json` `prompt_variant` 留痕 + `verify_glue_metrics.py --compare`（按变体逐日 M1′/M2/低置信占比/放弃事件 + ΔM2 矩阵 + 目录尾缀一致性校验 + `--m3-audit` 分层预审表）。A/B 各回放 0901/02/03/04/07/08/09/10/14 共 9 日（`{date}/_replay/variant_a|b/agent_glue.json`、均 status=ok/md5 互异）；矩阵：A 均值 M2=35.5%/低置信 6.8%、B 均值 M2=46.3%/低置信 40.8%（印证 §2.6 M2↔M3 拉锯）。⚠️ 0902 B 版撞 16000 截断、临时 24000(A)/32000(B) 重跑，与其他日不对称，有效对照建议取 8 天（剔除 0902）。矩阵/预审表见 `cp12_prompt_variants_draft_20260926.md` / `cp12_m3_audit_20260926.md`；`--date 20260910` R-C3 锚点逐字节一致，R-C6 按设计仍 SKIP（无曲线判读即 SKIP，非缺数据）。达标判读 / C-P13 标定 / OPEN-C1 阈值重标归项目负责人。*

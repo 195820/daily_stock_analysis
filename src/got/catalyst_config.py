@@ -187,6 +187,14 @@ AGENT_SEMANTIC_GLUE_ENABLED = os.environ.get("AGENT_SEMANTIC_GLUE_ENABLED", "tru
 AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "false").lower() == "true"
 # C-P3: replay_mode 下允许运行 glue（默认关闭，保持 0903 A1「不产生任何持久化副作用」契约）
 AGENT_SEMANTIC_GLUE_IN_REPLAY = os.environ.get("AGENT_SEMANTIC_GLUE_IN_REPLAY", "false").lower() == "true"
+# C-P12 prompt A/B（D-C6）：glue 回放变体文案选择——"a"=保守版（现行口径+澄清句）/ "b"=全量归属版 /
+# 其余值（默认空）= 现行生产 prompt。⚠️ 仅 replay_mode 下生效（aggregator 调用点强制），
+# 生产链路永远忽略该变量；与 GLUE_REPLAY_VARIANT（落盘目录隔离）双保险配套，防「以为跑 B 实际跑 A」。
+GLUE_PROMPT_VARIANT = os.environ.get("GLUE_PROMPT_VARIANT", "").strip().lower()
+# C-P12 配套：glue LLM 输出 max_tokens（默认 16000 = 现行生产值，不改行为）。
+# B 版（全量归属）输出体量更大，0902 实测撞 16000 顶被截断（finish_reason=length）；
+# 需要时仅对回放日临时调高，且 A/B 同侧重跑须用同一值以保对照公平。
+GLUE_MAX_TOKENS = int(os.environ.get("GLUE_MAX_TOKENS", "16000"))
 # A6 灰度总开关：控制 4 个消费点（_build_sector_intel / refine_events_map / _llm_refine_sectors.adjustments /
 # _synthesize_mainline_endurance）是否走 glue 分支。false = 完全回退到影子期行为。
 GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"

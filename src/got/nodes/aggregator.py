@@ -65,6 +65,8 @@ from src.got.catalyst_config import (
     AGENT_SEMANTIC_GLUE_ENABLED,
     AGENT_SEMANTIC_GLUE_SHADOW,
     AGENT_SEMANTIC_GLUE_IN_REPLAY,
+    GLUE_PROMPT_VARIANT,
+    GLUE_MAX_TOKENS,
     GOT_A6_ENABLED,
     LLM_CALL_TIMEOUT_S,
 )
@@ -865,8 +867,15 @@ class AggregatorNode:
         news: NewsContext,
         capital: CapitalContext,
         sentiment: SentimentContext,
+        variant: str = "",
     ) -> str:
-        """组装 Agent 输入 prompt（§5.2：只喂候选 + 去冗余事件 + 3d 资金流 + 瘦身情绪）"""
+        """组装 Agent 输入 prompt（§5.2：只喂候选 + 去冗余事件 + 3d 资金流 + 瘦身情绪）
+
+        C-P12 prompt A/B（D-C6）variant 参数：""=现行默认 / "a"=保守版（现行口径+澄清句）/
+        "b"=全量归属版（任务1 不得留 unknown + 任务3 全量归属低置信保留，带防幻觉护栏）。
+        两版仅改「无把握时的输出策略」一个自由度，输入区块/输出 schema/任务2 完全共用；
+        未知取值回退现行默认。仅 replay 调用点会传非空值（生产链路强制 ""）。
+        """
         # ── 候选板块（受控词表）──
         sector_lines = []
         for name, detail, role_info in candidates:
@@ -922,6 +931,41 @@ class AggregatorNode:
             "hot_topics": list(getattr(sentiment, "hot_topics", None) or [])[:20],
         } if sentiment else {}
 
+        # ── C-P12 变体文案区块（只替换任务1 的 unknown 行与任务3 整块，其余两版共用）──
+        if variant == "b":
+            t1_unknown_line = (
+                '- 每个维度都必须给出 high/medium/low 判据，不得留 "unknown"：\n'
+                '  输入中完全没有该维度证据时写 "low"，并在 evidence 中注明「无直接证据，保守取值」'
+            )
+            t3_block = """### 任务3: relations — 事件→板块归属
+**每条有传导链的事件都要给出归属**，不允许整条省略。要求：
+- board_code 必须从上方候选列表中选择
+- propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
+- strength: 事件对该板块的影响强度 (0-1)
+- confidence: 你对这个归属判断的置信度 (0-1)
+- 把握不足的**用低 confidence（<0.5）表达，不要省略**——省略会让该事件在验收统计中不可见
+- **禁止编造**：低 confidence 是指「传导链真实但你不确定其强度/范围」，不是指「可以虚构
+  propagation_path」；构造不出「事件→实体→候选板块」真实链条的事件，允许不输出（这是
+  本版唯一的合法省略通道，放弃量将作为本版纪律指标统计）
+- **去重**：每个 (event_id, board_code) 组合只输出 1 条 relation，选最强的传播路径。禁止同一事件对同一板块输出多条不同 propagation_path"""
+        else:
+            # ""（现行默认）/ "a"（保守版）共用；a 仅多一条澄清句，消除指令模糊混杂变量
+            t1_unknown_line = '- 没有判据的维度必须写 "unknown"（不要写 "neutral"）'
+            t3_lead = "### 任务3: relations — 事件→板块归属" + (
+                "\n只对**有把握**的事件输出归属判断。要求："
+                if variant == "a" else
+                "\n对每条有把握的事件，判断它影响哪个**候选板块**。要求："
+            )
+            t3_block = t3_lead + """
+- board_code 必须从上方候选列表中选择
+- propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
+- strength: 事件对该板块的影响强度 (0-1)
+- confidence: 你对这个归属判断的置信度 (0-1)
+- 没把握的事件不要输出（不要编造）""" + (
+                "——宁缺毋滥，省略不是错误" if variant == "a" else ""
+            ) + """
+- **去重**：每个 (event_id, board_code) 组合只输出 1 条 relation，选最强的传播路径。禁止同一事件对同一板块输出多条不同 propagation_path"""
+
         prompt = f"""你是一个 A 股板块语义分析引擎。请根据以下输入数据完成三个任务。
 
 ## 候选板块（受控词表 — 你只能使用这些板块代码）
@@ -952,21 +996,14 @@ class AggregatorNode:
 - sentiment_read: 情绪面判据 ("high"/"medium"/"low"/"unknown")
 - confidence: 你对这个评估的置信度 (0-1)
 - evidence: 一句话说明判断依据
-- 没有判据的维度必须写 "unknown"（不要写 "neutral"）
+{t1_unknown_line}
 
 ### 任务2: families — 家族归属（仅对落「其他」的板块）
 以下家族名称是受控词表，你只能从中选择：
 AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消费 / 智能驾驶 / 金融 / 机器人 / 生态环保
 如果某板块不属于任何家族，family 写 "无归属"。
 
-### 任务3: relations — 事件→板块归属
-对每条有把握的事件，判断它影响哪个**候选板块**。要求：
-- board_code 必须从上方候选列表中选择
-- propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
-- strength: 事件对该板块的影响强度 (0-1)
-- confidence: 你对这个归属判断的置信度 (0-1)
-- 没把握的事件不要输出（不要编造）
-- **去重**：每个 (event_id, board_code) 组合只输出 1 条 relation，选最强的传播路径。禁止同一事件对同一板块输出多条不同 propagation_path
+{t3_block}
 
 ## 输出格式（严格 JSON）
 ```json
@@ -1165,16 +1202,22 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             return result
 
         # ── 组装 prompt ──
-        prompt = self._build_glue_prompt(candidates, news, capital, sentiment)
+        # C-P12: 变体文案仅在 replay 生效（GLUE_PROMPT_VARIANT=a|b，catalyst_config 读取），
+        # 生产链路强制现行默认 ""——守 D-C6「拿到曲线前不改生产 prompt」；未知取值回退默认。
+        prompt_variant = (
+            GLUE_PROMPT_VARIANT if (GLUE_PROMPT_VARIANT in ("a", "b") and getattr(self, '_replay_mode', False)) else ""
+        )
+        prompt = self._build_glue_prompt(candidates, news, capital, sentiment, variant=prompt_variant)
 
         # ── LLM 调用（C1: temperature=0，D9 甲: 单次全量）──
-        # max_tokens=16000: 周末事件堆积时 8000 不够（0921 截断导致 S2_parse_failed）
+        # max_tokens=GLUE_MAX_TOKENS（默认 16000）: 周末事件堆积时 8000 不够（0921 截断导致 S2_parse_failed）；
+        # C-P12 配套：B 版全量归属输出更大（0902 撞顶），回放日可用 env 临时调高，默认值不变=生产零影响
         # max_retries=3: 仅对网络错误/空响应重试；finish_reason="length" 立即失败（Q1 audit）
         try:
             raw = await self._call_llm_async(
                 prompt,
                 temperature=0.0,
-                max_tokens=16000,
+                max_tokens=GLUE_MAX_TOKENS,
                 max_retries=3,
                 call_type="got_node6_semantic_glue",
                 timeout=float(LLM_CALL_TIMEOUT_S),
@@ -1184,6 +1227,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             logger.warning(f"[Node 6] glue LLM 调用失败，F1 降级: {e}")
             result = self._glue_f1_degraded(candidates, reason=f"S1 调用失败: {e}")
             result.status = "S1_call_failed"
+            result.prompt_variant = prompt_variant
             self._save_glue_result(result)
             return result
 
@@ -1192,6 +1236,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             logger.warning("[Node 6] glue LLM 返回空，F1 降级")
             result = self._glue_f1_degraded(candidates, reason="S1 空响应")
             result.status = "S1_empty"
+            result.prompt_variant = prompt_variant
             self._save_glue_result(result)
             return result
 
@@ -1204,6 +1249,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             result = self._glue_f1_degraded(candidates, reason=f"S2 解析失败")
             result.raw_response = raw
             result.status = "S2_parse_failed"
+            result.prompt_variant = prompt_variant
             self._save_glue_result(result)
             return result
 
@@ -1216,10 +1262,13 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             result = self._glue_f1_degraded(candidates, reason=f"S2 校验失败: {e}")
             result.raw_response = raw
             result.status = "S2_validate_failed"
+            result.prompt_variant = prompt_variant
             self._save_glue_result(result, prompt_bytes=len(prompt.encode("utf-8")))
             return result
         result.raw_response = raw
         result.status = "ok"
+        # C-P12 留痕：成功/失败态均记录本次调用实际使用的变体文案（生产恒为空）
+        result.prompt_variant = prompt_variant
 
         for w in result.warnings:
             logger.warning(f"[Node 6] glue 校验: {w}")

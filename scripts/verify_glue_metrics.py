@@ -284,12 +284,204 @@ def _latest_complete_day() -> str | None:
 
     0911/0912 只有 `agent_glue.json`（且 `_replay/` 那份也无对应 unified），
     是测试直调 `_agent_semantic_glue` 产生的污染产物（污染源已在
-    tests/test_node6_glue.py 中隔离），不能作为指标复算样本，必须成对存在。
+    tests/test_node6_glue.py 中隔离，产物本体已按 2026-09-26 决策 #4b 移入
+    data/got_daily_backup_20260926_1700/ 留档），不能作为指标复算样本，必须成对存在。
     """
     for day in reversed(iter_archive_days()):
         if (day / "agent_glue.json").exists() and (day / "unified.json").exists():
             return day.name
     return None
+
+
+# ── C-P12 --compare：A/B 变体 M2×M3 对照矩阵（R-C6 验收锥点，D-C6）──
+
+def _compare_day(variant: str, date: str) -> dict | None:
+    """单变体单日读数：glue 取 `_replay/<variant>/agent_glue.json`，unified 取根目录生产归档。
+
+    口径与 compute_metrics 同源：M1′=strengths[].news_read 非 low/unknown；
+    M2=confirmed_sectors 中≥一条 relation 的占比。另列 B 版纪律两项：
+    低置信占比（relations 中 confidence<0.5）与事件放弃数（当日事件 event_id 去重后
+    未出现在任何 relation 中的个数；A 版省略不入relation的事件全部计入，非惩罚项只作读盘背景）。
+    """
+    day_dir = got_daily_root() / date
+    glue = read_json(day_dir / "_replay" / variant / "agent_glue.json")
+    unified = read_json(day_dir / "unified.json")
+    if glue is None or unified is None:
+        return None
+
+    sectors = unified.get("confirmed_sectors", [])
+    strengths = glue.get("strengths", [])
+    relations = glue.get("relations", [])
+
+    relation_codes = {r.get("board_code") for r in relations}
+    m2_num = sum(1 for c in sectors if c.get("sector_code") in relation_codes)
+    m1p_num = sum(1 for s in strengths if s.get("news_read") not in NON_NEUTRAL_READS)
+    low_conf = [r for r in relations if float(r.get("confidence", 1.0)) < 0.5]
+    # 事件全集取当日归档 news.json 的催化剂日历（unified.json 不携带事件清单）
+    news_doc = read_json(day_dir / "news.json") or {}
+    cal_events = (news_doc.get("catalyst_calendar") or {}).get("events") or []
+    event_ids = {e.get("event_id") for e in cal_events if e.get("event_id")}
+    if not event_ids:
+        # news.json 缺失/无事件时，退回用 relations 涉及的 event_id 计数（放弃数不可得，置 None 明示）
+        event_ids = {r.get("event_id") for r in relations if r.get("event_id")}
+        abandoned = None
+    else:
+        abandoned = len(event_ids - {r.get("event_id") for r in relations})
+    return {
+        "date": date,
+        "glue_status": glue.get("status", "?"),
+        "prompt_variant": glue.get("prompt_variant", ""),
+        "n_sectors": len(sectors),
+        "n_relations": len(relations),
+        "n_events": len(event_ids),
+        "m1p": pct(m1p_num, len(strengths)) if strengths else None,
+        "m2": pct(m2_num, len(sectors)),
+        "low_conf_share": pct(len(low_conf), len(relations)) if relations else None,
+        "abandoned_events": abandoned,
+    }
+
+
+def run_compare(variants: list[str], as_json: bool, audit_path: Path | None) -> int:
+    """--compare 主流程：逐变体逐日读数 → M2×M3 矩阵 + 留痕一致性校验 + M3 预审表。
+
+    不判 PASS/FAIL（D-C6：曲线是标定输入，不是门禁）；退出码 0=矩阵完整，2=有变体样本不足 8 天。
+    """
+    print_header("C-P12 A/B 变体对照：M2 × M3 矩阵（R-C6）", REDLINE_DOC)
+    matrices: dict[str, list[dict]] = {}
+    trace_issues: list[str] = []
+    for v in variants:
+        inv = _replay_sample_inventory(v)
+        rows = []
+        for d in inv["valid_days"]:
+            row = _compare_day(v, d)
+            if row is None:
+                trace_issues.append(f"{v}@{d}: 有效样本但 unified.json/产物读取失败，跳过")
+                continue
+            if row["glue_status"] != "ok":
+                trace_issues.append(f"{v}@{d}: status={row['glue_status']} 非 ok，读数不计入均值")
+            # 双保险校验：产物内 prompt_variant 留痕必须与目录变体尾缀一致（防错跑）
+            expected_tail = v.split("_")[-1]  # variant_a -> a
+            if row["prompt_variant"] and row["prompt_variant"] != expected_tail:
+                trace_issues.append(
+                    f"{v}@{d}: prompt_variant 留痕={row['prompt_variant']!r} 与目录尾缀 {expected_tail!r} 不一致——疑似错跑"
+                )
+            rows.append(row)
+        matrices[v] = rows
+
+    for v, rows in matrices.items():
+        print(f"\n── 变体 {v}（有效 {len(rows)} 天）──")
+        print(f"  {'日期':<10} {'M1′':>7} {'M2':>7} {'低置信占比':>9} {'放弃事件':>7} {'relations':>9} {'事件':>5}")
+        for r in rows:
+            print(
+                f"  {r['date']:<10} "
+                f"{(str(round(r['m1p'] * 100, 1)) + '%') if r['m1p'] is not None else '—':>7} "
+                f"{(str(round(r['m2'] * 100, 1)) + '%') if r['m2'] is not None else '—':>7} "
+                f"{(str(round(r['low_conf_share'] * 100, 1)) + '%') if r['low_conf_share'] is not None else '—':>9} "
+                f"{(str(r['abandoned_events']) + '/' + str(r['n_events'])) if r['abandoned_events'] is not None else '—':>7} "
+                f"{r['n_relations']:>9} {r['n_events']:>5}"
+            )
+        ok_rows = [r for r in rows if r["glue_status"] == "ok"]
+        if ok_rows:
+            mean = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
+            m2_mean = mean([r["m2"] for r in ok_rows if r["m2"] is not None])
+            m1p_mean = mean([r["m1p"] for r in ok_rows if r["m1p"] is not None])
+            lc_mean = mean([r["low_conf_share"] for r in ok_rows if r["low_conf_share"] is not None])
+            ab_sum = sum(r["abandoned_events"] for r in ok_rows if r["abandoned_events"] is not None)
+            print(
+                f"  均值: M1′={m1p_mean * 100:.1f}%  M2={m2_mean * 100:.1f}%  低置信占比={lc_mean * 100:.1f}%  "
+                f"放弃事件合计={ab_sum}"
+            )
+
+    if len(variants) == 2:
+        va, vb = variants[0], variants[1]
+        common = {r["date"] for r in matrices[va]} & {r["date"] for r in matrices[vb]}
+        print(f"\n── A/B 交叠日 = {len(common)} 天（矩阵仅在交叠日逐日对照）──")
+        print(f"  {'日期':<10} {va + ' M2':>12} {vb + ' M2':>12} {'Δ M2':>8} {va + ' 低置信':>10} {vb + ' 低置信':>10}")
+        for d in sorted(common):
+            ra = next(r for r in matrices[va] if r["date"] == d)
+            rb = next(r for r in matrices[vb] if r["date"] == d)
+            delta = ((ra["m2"] or 0) - (rb["m2"] or 0)) * 100
+            print(
+                f"  {d:<10} {ra['m2'] * 100:>11.1f}% {rb['m2'] * 100:>11.1f}% {delta:>7.1f}pp "
+                f"{(str(round(ra['low_conf_share'] * 100, 1)) + '%') if ra['low_conf_share'] is not None else '—':>10} "
+                f"{(str(round(rb['low_conf_share'] * 100, 1)) + '%') if rb['low_conf_share'] is not None else '—':>10}"
+            )
+
+    if trace_issues:
+        print("\n── ⚠️ 留痕/读数异常 ──")
+        for t in trace_issues:
+            print(f"  {t}")
+    else:
+        print("\n  留痕校验：各产物 prompt_variant 与目录变体一致，无错跑嫌疑。")
+
+    # M3 预审表（OPEN-C2 分层：低置5 + 高置3 + 随机2，固定种子可复现；只列事实，判读归人）
+    if audit_path is not None:
+        lines = _build_m3_audit_lines(variants, matrices)
+        audit_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"\n  M3 预审表已写出：{audit_path}（判读三档：无关系/弱关系/强关系，只「无关系」计误配）")
+
+    if as_json:
+        print("\n── --json ──")
+        print(json.dumps(
+            {"variants": matrices, "trace_issues": trace_issues,
+             "note": "矩阵为 C-P13/OPEN-C1 标定输入，不判 PASS/FAIL（D-C6）"},
+            ensure_ascii=False, indent=2, default=str,
+        ))
+
+    incomplete = [v for v, rows in matrices.items() if len([r for r in rows if r["glue_status"] == "ok"]) < 8]
+    if incomplete:
+        print(f"\n[SKIP] 变体样本不足 8 个 ok 日：{', '.join(incomplete)}（R-C6 要求两版各 ≥8 点）")
+        return 2
+    print("\n[OK] 两版各有 ≥8 个 ok 日，R-C6 对照矩阵完整（达标判读归负责人）。")
+    return 0
+
+
+def _build_m3_audit_lines(variants: list[str], matrices: dict[str, list[dict]]) -> list[str]:
+    """按 OPEN-C2 建议口径分层抽样生成 M3 预审表（固定种子 42，可复现）。"""
+    import random
+
+    lines = [
+        "# C-P12 M3 误配率预审表（自动生成，终审划勾归负责人）",
+        "",
+        "判据三档：无关系 / 弱关系 / 强关系 —— 只有「无关系」计入误配（M3 ≤15% 为 0903 参考线，待 C-P13 标定）。",
+        "抽样：每变体全窗 relations 总体，低置信(<0.5) 5 条 + 高置信(≥0.7) 3 条 + 随机 2 条，种子=42。",
+        "",
+    ]
+    for v in variants:
+        pool = []
+        for r in matrices[v]:
+            if r["glue_status"] != "ok":
+                continue
+            glue = read_json(got_daily_root() / r["date"] / "_replay" / v / "agent_glue.json") or {}
+            for rel in glue.get("relations", []):
+                pool.append({"date": r["date"], **rel})
+        low = [x for x in pool if float(x.get("confidence", 1.0)) < 0.5]
+        high = [x for x in pool if float(x.get("confidence", 0.0)) >= 0.7]
+        mid = [x for x in pool if x not in low and x not in high]
+        rng = random.Random(42)
+        sample = (
+            rng.sample(low, min(5, len(low)))
+            + rng.sample(high, min(3, len(high)))
+            + rng.sample(mid, min(2, len(mid)))
+        )
+        lines.append(f"## 变体 {v}（总体 {len(pool)} 条 relation，低置信 {len(low)} / 高置信 {len(high)}）")
+        lines.append("")
+        lines.append("| # | 日期 | event_id | board_code | strength | confidence | propagation_path | 判读(无/弱/强) |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        seen = set()
+        idx = 0
+        for x in sample:
+            key = (x["date"], x.get("event_id"), x.get("board_code"))
+            if key in seen:
+                continue
+            seen.add(key)
+            idx += 1
+            path = "→".join(str(p) for p in (x.get("propagation_path") or []))
+            lines.append(
+                f"| {idx} | {x['date']} | {x.get('event_id', '')} | {x.get('board_code', '')} "
+                f"| {x.get('strength', '')} | {x.get('confidence', '')} | {path} |  |")
+        lines.append("")
+    return lines
 
 
 def run(date: str | None, as_json: bool, spearman_method: str) -> int:
@@ -465,12 +657,33 @@ def main() -> int:
     parser.add_argument("--date", help="归档日 YYYYMMDD（默认取最近一个有 agent_glue.json 的归档日）")
     parser.add_argument("--json", action="store_true", help="附加输出机器可读 JSON")
     parser.add_argument(
+        "--compare",
+        nargs="*",
+        metavar="VARIANT",
+        default=None,
+        help="C-P12 A/B 对照模式：按变体目录名输出 M2×M3 矩阵（不传参数=自动发现全部变体）",
+    )
+    parser.add_argument(
+        "--m3-audit",
+        metavar="PATH",
+        default=None,
+        help="与 --compare 配合：M3 分层抽查预审表输出路径",
+    )
+    parser.add_argument(
         "--spearman-method",
         choices=["first", "average"],
         default="first",
         help="Spearman 并列秩处理；first 复现文档锚点，average 为统计学标准值（默认 first）",
     )
     args = parser.parse_args()
+
+    if args.compare is not None:
+        variants = [v.strip("/\\") for v in args.compare if v.strip()] or _discover_replay_variants()
+        if len(variants) < 2:
+            print(f"[ERROR] --compare 需要 ≥2 个变体目录，当前识别到：{variants or '（无，先跑 A/B 回放或显式传变体名）'}")
+            return 2
+        audit = Path(args.m3_audit) if args.m3_audit else None
+        return run_compare(variants, args.json, audit)
 
     print_header("C 层 §6.1 红线复算：R-C3 / R-C6", REDLINE_DOC)
     return run(args.date, args.json, args.spearman_method)

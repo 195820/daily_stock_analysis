@@ -95,6 +95,8 @@
 | [got/plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | 埋伏分支拆分设计（设计收口，待实施；原根目录 `plan.md`） |
 | [got/audit_20260922.md](got/audit_20260922.md) | 2026-09-22 当日运行审计报告（P0-P3 分级 + Q1-Q9 决策 + 修复锚点） |
 | [got/decision_brief_20260926.md](got/decision_brief_20260926.md) | 2026-09-26 决策简报（三类未结项分诊的待拍板项：选项/影响面/实测证据/建议，对应 backlog §7） |
+| [got/cp12_prompt_variants_draft_20260926.md](got/cp12_prompt_variants_draft_20260926.md) | C-P12 prompt A/B 两版文案草案 + 拍板结果 + M2×M3 对照矩阵运行结论（含 0902 max_tokens 不对称披露） |
+| [got/cp12_m3_audit_20260926.md](got/cp12_m3_audit_20260926.md) | C-P12 M3 误配率分层抽样预审表（两变体各 10 条 relation，待负责人终审划勾） |
 | [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动，待实施） |
 
 ---
