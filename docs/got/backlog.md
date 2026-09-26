@@ -101,7 +101,7 @@
 | **D-P2** | 埋伏闸门逐层漏斗 `ambush_gate_funnel`（含 `evaluated` / `skipped_reason`） | 部分——**`skipped_reason` 全仓 0 命中，该字段在当前代码里根本不存在**；真实残留是"死闸仍被计 `evaluated`" |
 | **D-P3** | 定义并落盘「正式池水位」目标 `AMBUSH_POOL_TARGET_RANGE` | 部分——常量双源（`archive.py` 仍硬编码 `(2,6)` + 过期 TODO）；`AMBUSH_POOL_MIN_DAYS` 零消费者（R2.9 #3 记为已删） |
 | **D-P5** | 闸门文档诚实化（「4 层闸门」→ 标注 G2 注意力闸 / G3 未启用 + 加「未评估」留痕） | 部分——留痕未落地；且**文档位置指错**（真正的载体在 `architecture.md:505`，不在 `CLAUDE.md`） |
-| **D-P9** | `scripts/check_audit_claims.py` | 已建并入版本控制；实跑 `unverified = 9` |
+| **D-P9** | `scripts/check_audit_claims.py` | 已建并入版本控制；实跑 `unverified = 9`（**2026-09-26 收口复算：`unverified = 7`**，差异均可归因，见 §2 注） |
 | **D-P10** | 附录 A 的可复算性（与 R-D2 对齐） | ✗——实算 4 项中 2 项与文档不一致 |
 | **D-P11** | E3 第三层：修解析 + 落盘分支走向 | 首轮"仅解析层"（P1-4），R2.1 记为已修（改由 `sector_role` 决定） |
 | **D-P12** | E3 第一层：口径声明 + 落盘绑定次数（**不归一化**） | 部分——绑定次数未落盘；`PortfolioDecision.sector_exposure_binding` 无消费者 |
@@ -135,19 +135,21 @@
 `archive/GOT_0902_audit_report.md` 的 15 项，逐条给出真实处置。
 **本表取代原先的「10 项未修」**——那 10 项里有 4 项实为「待退役」（修了会随 §6.1 删除而消解），1 项已改归属，1 项降级为口径标注，2 项挂起，1 项明确延后，只有 1 项是真的未排期。
 
+> **2026-09-26 收口更新**：A6 阶段 2 落地后复算（`check_audit_claims.py`），原「待退役」4 项处置已逐条更新——P0-1 / P0-2 随退役消解，P0-5 自愈，P2-1 因 T5 对齐层接线后重判保留而**不再随退役消失**，改挂起待裁决。
+
 | 编号 | 级别 | 现象 | 处置 | 出处 |
 |---|---|---|---|---|
-| **P0-1** | 立即 | `capital_check="divergent"` 是死分支（生产端从不 return，消费端 4 处检查它） | **待退役** | §6.1 #1 `_cross_check_capital`【删】+ #9 四个阈值常量【删】：*"2026-09-02 P0-1 刚校准完，校准完即退役"* |
-| **P0-2** | 立即 | `confidence` 恒 0.7——三个加分项全悬在 #1/#2/#3 上（`aggregator.py:790-800`） | **待退役** | 同上，同一批机制；修它等于给待拆的机器换零件 |
+| **P0-1** | 立即 | `capital_check="divergent"` 是死分支（生产端从不 return，消费端 4 处检查它） | ✅ **已随退役消解**（2026-09-26） | 阶段 2 已删 `_cross_check_capital` + `_divergent_threshold` + 阈值常量（§4.2 动作 1）。`divergent` 现由 glue `capital_read=low` 产出，0917 起 6 个归档日有触发（20260924=22 条）——原「死分支」症状已不存在。`check_audit_claims.py` 仍记 INEFFECTIVE 系旧声明指标形状消失，证据行已消歧（见 §4.2） |
+| **P0-2** | 立即 | `confidence` 恒 0.7——三个加分项全悬在 #1/#2/#3 上（`aggregator.py:790-800`） | ✅ **已随退役自然消解**（2026-09-26 复算） | 阶段 2 后 confidence 分布：规则侧基础 0.5 / 0.5+0.2，glue 命中板块取 `st.confidence`。20260924 实测 `{0.5:8, 0.55:8, 0.6:5, 0.65:4, 0.7:3}`，0.7 占比 10.7%（<50% 阈值）——塌陷解除，脚本判 EFFECTIVE |
 | **P0-3** | 立即 | 粮食概念 -4.26% 仍 `active_mainline` A 档 | ✅ **已生效** | — |
 | **P0-4** | 立即 | 液冷服务 tier=S 却标 exhausted | **不修（行为正确）** | 走 exhausted→active 回归路径，弱反弹不触发是正确行为 |
-| **P0-5** | 1 周内 | `ambush_pool` 全被闸门拦死（8 个埋伏板块 → 池空） | **待退役** | 闸门判据即 §6.1 #10/#11（T5 对齐层），随退役消失 |
+| **P0-5** | 1 周内 | `ambush_pool` 全被闸门拦死（8 个埋伏板块 → 池空） | ✅ **已自愈**（2026-09-26 复算，待负责人确认了结） | 原归因「闸门判据即 §6.1 #10/#11，随退役消失」已作废——接线后重判 T5 对齐层**保留**（§4.2）。实际走势：近 12 归档日池规模 0–5（0914=3、0915=5、0921=1、0923=1、0924=1），「池空」症状不可复现；归因是上游候选质量改善还是运气，不追认 |
 | **P1-1** | 1 周内 | 持仓股 `name == symbol`（600250 / 605566） | **明确延后** | OPEN-D8：排在下一批 |
 | **P1-2** | 1 周内 | reasoning 中同一板块出现 ×3 | ✅ **已生效** | `portfolio_decision.py:1526-1535` `seen_canons` set 去重（D-P7）；⚠️ 原「代码未去重」的记载已过期 |
 | **P1-3** | 2 周内 | 50 只热股 `mention_count` 极差 <3%，无区分度 | **降级口径** | D-P8：加 `mention_source` 标注字段，**数值不动** |
 | **P1-4** | 2 周内 | `associated_sectors` 50/50 全空 | **挂起待查** | OPEN-D2：是否真无可靠数据源 |
 | **P1-5** | 2 周内 | `reasoning.md` 中 Node 7 段出现 ×2 | ✅ **已生效**（见下注） | D-P6 → 并入 A-P0-8；`archive.py:642` 覆盖写 |
-| **P2-1** | 按需 | `affected_sectors` 不区分正负面 | **待退役** | 该字段属 T5 事件→板块对齐层 §6.1 #10/#11 |
+| **P2-1** | 按需 | `affected_sectors` 不区分正负面 | **挂起待裁决**（原「待退役」作废，2026-09-26） | 原预期「随 §6.1 #10/#11 退役消失」不成立：T5 对齐层接线后重判**保留**，该字段仍被 `_group_events_by_sector` 扇出与 `portfolio_decision.py` 新闻加分活消费（`list[str]` 类型不变）。是否升级 `list[dict]` 转 §7 裁决 #8 |
 | **P2-2** | 按需 | 催化剂日历膨胀至 92 个事件 | **症状消失，无归因** | — |
 | **P2-3** | 按需 | `current_position_ratio` 被 `min(1.0, raw)` 截断 ⇒ 26 个归档日中 **13 天 `buy_budget = 0`**，一笔都买不了 | **挂起待查** | OPEN-D9：截断不可证伪，建议落盘 `raw_position` |
 | **P2-4** | 按需 | "其他"家族成垃圾箱 | ✅ **已生效** | "其他"占比 40.0% → 34.4% |
@@ -165,9 +167,11 @@
 >
 > 0904 的 ×2 是修复前归档；09-07 起无重复。脚本把**修复前的历史归档**当成了修复失效的证据。
 > 因此 **R-D1 的正确读数是 8，不是脚本输出的 9**（差 1 即 P1-5）。脚本缺陷见 §9。
+>
+> **2026-09-26 收口复算**：A6 阶段 2 落地后重跑，脚本 `unverified = 7`（P0-1 为退役后形状消失的残留计数，见 §2 表）。剩余 6 项均有归属（见 §2），R-D1 作为 burndown 已从 10 降到 7，本身不再阻塞任何验收。
 
-**统计**：已生效 4（P0-3 / P1-2 / P2-4 / P2-5）+ 不修 1（P0-4）+ 症状消失 1（P2-2）= **6 项了结**；
-待退役 4 + 已改归属 1 + 降级口径 1 + 挂起 2 + 延后 1 = **9 项各有归属**；**真·未排期 = 0**。
+**统计**（2026-09-26 收口后）：已生效 6（P0-3 / P1-2 / P2-4 / P2-5 + 随退役消解 P0-1 / P0-2）+ 不修 1（P0-4）+ 症状消失 1（P2-2）+ 自愈待确认 1（P0-5）= **9 项了结**；
+降级口径 1 + 挂起 3（P1-4 / P2-3 / P2-1）+ 延后 1 = **5 项各有归属**；**真·未排期 = 0**。
 
 ---
 
@@ -193,7 +197,7 @@
 
 ### 3.3 C 层（`archive/got_layer_c_plan_0911.md` §7.2）
 
-- **OPEN-C1** `transition_count` 时间炸弹（约 2026-09-25）
+- **OPEN-C1** `transition_count` 时间炸弹（约 2026-09-25）—— ✅ 语义缺陷已随 §7.1 实施修复（改统确认切换事件，不再依赖输出值存量）；阈值 5 未重标（原建议③），继续观察
 - **OPEN-C2** M3 人工流程未定义
 - **OPEN-C3** `persistence_regime == "low"` 也是 11/11 恒真 → 与 OPEN-C1 同批排查
 - **OPEN-C4** M1 的信息量到底多大 → 由 C-P12 曲线回答，**不预设**
@@ -255,7 +259,7 @@ OPEN-B1…B7 —— 见 §1.B。
 6. ✅ `GOT_A6_ENABLED`/`AGENT_SEMANTIC_GLUE_ENABLED`/`SHADOW` 开关保留为 fail-fast（置 false 直接抛错，不静默改行为）
 
 **§6.1「删」清单接线后重判（防误删，均修正为保留）**：
-- `_match_sector` / `_GENERIC_ROOTS`：仍供 `_resolve_pool_sector_detail` 消费 → 保留
+- `_match_sector` / `_GENERIC_ROOTS`：仍供 `_lookup_flow_map`（吸筹确认闸门 `_check_accumulation_gate` 的资金流比对）消费 → 保留
 - `_parse_sector_level_flows` / `_CAPITAL_CHANNEL_TERMS`：仍供 `_detect_family_capital_mismatch` 消费 → 保留
 - `_group_events_by_sector` / `_lookup_sector_events` / `_extract_hot_sectors`：glue 事件供给 + 埋伏/蓄水池路径仍消费 → 保留
 - `MainlineEndurance.family_resonance`（E2 公式）：保留；`SectorIntel.family_resonance` 全仓无读取方，已随本次删除
@@ -372,7 +376,8 @@ OPEN-B1…B7 —— 见 §1.B。
 | 4 | 存量的 **4 份测试污染归档产物**是否清理（`data/got_daily/20260911/agent_glue.json`、`20260912/agent_glue.json` 及各自 `_replay/` 一份） | 污染源已修（测试已隔离 `GLUE_ARCHIVE_ROOT`），存量文件**未删**——它们是该结论的现场证据。清理会失去现场，不清理则 `data/got_daily/` 里始终有 4 份非生产产物。取舍见 [`verification.md`](verification.md) §2.2 |
 | 5 | **R-B8 的 `market_regime.*` 字段去留**（2026-09-14 干跑发现） | 验收判据决策：① 移出「应不变」清单（承认跨日状态机在回放下必然变，见 §9 #6）；② 或改判据为「回放前后**窗口对齐**」；③ 或让 R-B8 只验 `unified.json` 的非状态字段 |
 | 6 | **R-B8 / R-B9 / R-C7 在现工器下是否继续推进** | 工器决策：`--got-replay` 不跑 Node 2 ⇒ **验不到 B 层改动本身**；不跑 Phase 2 ⇒ `portfolio.*` 必然缺失。要么扩 `--got-replay`（成本较高），要么收缩红线范围。见 §1.F |
-| 7 | **regime 状态机切换计数器停摆根因分析**（2026-09-26 新增并经归档实测定根因，自 A6 阶段 2 条件 3 移出时登记）：见下方「§7.1 停摆根因实测」 | 真·待实施（修复任务）：两层缺陷（确认死锁 + 计数器语义），`aggregator.py:3531` 仓位 ×0.8 震荡惩罚与 `range_reversal` 信号均建立在失效输入上；与 A6 退役解耦，独立排期 |
+| 7 | **regime 状态机切换计数器停摆根因分析**（2026-09-26 新增并经归档实测定根因，自 A6 阶段 2 条件 3 移出时登记）：见下方「§7.1 停摆根因实测」 | ✅ **已实施**（2026-09-26）：迟滞豁免（`pinned_days≥3`）解确认死锁 + `transition_events` 事件列表修正 `transition_count` 语义 + 应急回退开关 `DISABLE_REGIME_OSCILLATION_FIX`，详见 §7.1 实施记录 |
+| 8 | **P2-1 `affected_sectors` 是否升级 `list[dict]`（区分正负面）**（2026-09-26 收口时登记）：原预期随 T5 对齐层退役消失，接线后重判该层保留、字段活消费，「待退役」归属作废（见 §2 表） | 待定范围：若做，需同步改 `catalyst_calendar` 对齐 prompt、`_group_events_by_sector` 扇出与 `portfolio_decision` 加分三处；若不做，明示接受「不区分正负面」为长期口径 |
 
 ### 7.1 停摆根因实测（2026-09-26，逐日扫 `data/got_daily/*/unified.json` 的 `market_regime`）
 
@@ -382,7 +387,15 @@ OPEN-B1…B7 —— 见 §1.B。
 2. **计数器语义缺陷（即 OPEN-C1 时间炸弹的实装形态）**：`transition_count`（`aggregator.py:638-642`）统计的是 `load_regime_state_history(20)` 回读的 **`[日期, regime]` 序列相邻变化次数**——用的是状态机**输出值**而非「确认切换事件」。因 0910 后输出被钉住不再变化，计数只能靠 0910 前的波动存量支撑（11→...→5），随旧高波动日逐日滚出 20 日窗口单调衰减且**无法回补**⇒ 下一交易日必跌破 5，触发仓位惩罚自行翻转。
 
 > 修正旧认知：0827–0910 期间确认切换确实发生过多次（0901 bull→transition / 0902 →bear / 0904 →bull / 0910 →transition 均 情形 2 命中），所以「自 0827 零切换」仅对 **0910 后**成立。条件 3 当时给的「字面擦边未跌破」仍成立，但机制上已确定后续必跌破。
-> 修法方向（待专项拍板）：① 计数器改统「确认切换事件」（状态机自记而非回看输出 diff）；② 振荡保护：pending 交替达阈值时强锁或回到情形 1；③ 重标阈值 + 窗口限定为状态机生效日后（OPEN-C1）。取证脚本：本次为一次性扫描，已删。
+> 修法方向（提出时）：① 计数器改统「确认切换事件」（状态机自记而非回看输出 diff）；② 振荡保护；③ 重标阈值 + 窗口限定为状态机生效日后（OPEN-C1）。取证脚本：本次为一次性扫描，已删。
+> **2026-09-26 拍板并实施**：①② 已做（迟滞豁免 + 事件列表），③ 未做（阈值 5 保持原值，OPEN-C1 继续观察）。
+
+**实施记录（2026-09-26，拍板：迟滞豁免；计数口径：事件列表 + 窗口计数；带回滚开关；同日代码复审修正）**：
+- `schemas.MarketRegime` 新增 `pinned_days` / `transition_events` / `regime_switch_exempt`（默认值向后兼容，旧归档无需迁移）；`persistence.load_previous_regime_state` 回读新字段，新增 `seed_regime_transition_events`（旧输出相邻 diff 作迁移种子）
+- `aggregator._apply_regime_state_machine` 新增**迟滞豁免分支**（复审后合并原「候选再现/换挂」两条行为一致的分支）：连续情形 3 钉住 `pinned_days ≥ REGIME_PINNED_EXEMPT_DAYS(=3)` 时直接信任当日 raw（放弃两日确认）⇒ 打破交替死锁；脱钉后纯交替信号被迟滞抑制（输出锁在首个脱钉值），持续两日的真实信号仍按情形 2 正常确认——**非强锁**；豁免日归档标 `regime_switch_exempt=True`（R2 复盘区分两日确认 vs 单日强切）
+- `transition_count` 改统**确认切换事件**：事件日期 append 进 `transition_events` 随归档落盘，计数 = **日期区间**窗口（历史最早日..今日，含当日）内事件数，同日重跑幂等不重复 append；旧归档无事件记忆时迁移种子**播种进列表**续记（切换日计数只增不归零，读数与旧 diff 口径无缝衔接）；`[]`（已迁移）照落与 `None`（未迁移/回滚期）区分
+- 回滚开关 `DISABLE_REGIME_OSCILLATION_FIX=true` → 无豁免 + 输出 diff 计数 + 不记事件（避免半新半旧；关闭后事件链从迁移种子重建）
+- 回归：`tests/test_node6_regime_state.py::TestRegimeOscillationFix` 8 例（含 0910 交替链路复现 / 事件窗口与幂等 / 种子续接 / 迁移空列表 / 开关回退）；got 域 405 全绿
 | — | ~~`A-P0-4`（monitoring 按日去重）效果未验证~~ | ✅ **已结**（2026-09-14）：沙箱实测 + 09-14 归档旁证确认有效，见 [`verification.md`](verification.md) §6 |
 
 > 另有一条**曾被公开撤销的错误断言**记录在 `archive/agent_glue_plan_0903.md` §9：原断言"`base_position` 是死参数"曾在写作阶段被错误撤销（查错了文件），**撤销作废**——`aggregator.py` 的 `base_position` 确是死参数。
@@ -400,7 +413,7 @@ OPEN-B1…B7 —— 见 §1.B。
 | 5 | ~~**文档状态字段过期**~~ | ✅ **已结**（2026-09-17）：`archive/plan_got_timeseries_enhancement.md` 状态头「待评审」已改为「已实施并归档（commit `03bb3d1`）」 |
 | 6 | **未纳入版本控制的验收脚本** | `.gitignore:76` 的 `verify_*.py` 规则下仍有 6 个：`verify_flow_archive.py`、`verify_position_sizing.py`、`verify_remote_data_sources.py`、`verify_risk_fix.py`、`verify_t5_alignment.py`、`verify_ths_*.py`（4 个 0911 手具已有负向例外） |
 | 7 | ~~**未跟踪工具**~~ | ✅ **已结**（2026-09-14）：`scripts/export_glue_family_audit.py`（M3 人工抽查工具，702 行）已入库，commit `0ac5252` |
-| 8 | **附录 A 基线不可复现（R-D2 FAIL）** | `archive/got_layer_d_plan_0911.md` §附录 A 的四个子计数中 **2 项与实算不一致**：① `ambush_pool_saturation_days` 文档记 **≥10**，实算 **5**（顶格日共 8 天、最长连续 5 天）——文档自注"缺口见 D-P2 落盘"，即**该基线的数据源未落盘、无法复核**；② `dead_signal_count` 文档记 **4**，实算 **3**——文档基线早于 D-P14 删 E10 落地。R-D2 由「验收红线」降级为**文档缺陷**：它的输入是一份过期基线，不是代码状态。 |
+| 8 | **附录 A 基线不可复现（R-D2 FAIL）** | `archive/got_layer_d_plan_0911.md` §附录 A 的四个子计数与实算不一致。**2026-09-26 收口复算**（A6 阶段 2 后）：① `divergent_trigger_days` 实算 **6** / 文档 **0**——退役后 `divergent` 改由 glue `capital_read=low` 产出，0917 起 6 日有触发，基线测的是规则时代，语义已换；② `ambush_pool_saturation_days` 实算 **8**（顶格日共 15 天）/ 文档 **≥10**——基线数据源未落盘（D-P2）仍无法复核；③ `dead_signal_count` 实算 **2**（E5/E11）/ 文档 **4**——基线早于 D-P14 删 E10；④ `dead_branch_count` 实算 = 文档 = **1** ✅。R-D2 维持「文档缺陷」定性：输入是过期基线而非代码状态，四项差异均可归因；建议下次触及 `got_layer_d_plan` 时整体重标基线，不单独立项 |
 
 ---
 
@@ -412,7 +425,7 @@ OPEN-B1…B7 —— 见 §1.B。
 |---|---|---|
 | 1 | **R-D1 口径自相矛盾** | `archive/got_layer_d_plan_0911.md` §6 的**定义**是「报告中每个**已修复/已解决**声明都附一条可复算证据」= **窄口径**；但同节**基线明细**把 9 条「待修」全算进去了 = **宽口径**。15 项里只有 P0-1 是「已修复」声明 ⇒ 窄口径 `unverified = 1`，宽口径 `= 8`（脚本输出 9，多算 1，见 #4）。**宽口径下「如实标注待修」反而被罚**，与「可复算率」这个名称的语义相反 |
 | 2 | **R-D1 是 burndown 而非验收红线** | 它的 9 项读数**全部由未实施工作决定**（见 §2 处置表：待退役 4 / 延后 1 / 挂起 2 / 降级 1 / 改归属 1）。A6 退役一落地，4 项随 §6.1 删除自动消解 ⇒ **R-D1 → 0 是 A6 的副产品，不是 A6 的前置任务** |
-| 3 | **R2 把市场事件当验收条件** | 「出现 `previous_regime != regime` 的归档日 ≥ 1 天」。按状态机设计（`aggregator.py:583-590`），`prev != cur` **只在情形 2（确认切换）**发生，其余两情形**按设计就相等**；自 08-27 接线以来 0 次触发。**零切换无法区分「市场没切换」与「情形不可达」**，两种解释都不可由该红线区分。✅ **已收口（2026-09-14）**，见 §9.1 |
+| 3 | **R2 把市场事件当验收条件** | 「出现 `previous_regime != regime` 的归档日 ≥ 1 天」。按状态机设计（`aggregator.py:583-590`），`prev != cur` **只在情形 2（确认切换）**发生，其余两情形**按设计就相等**；自 08-27 接线以来 0 次触发。**零切换无法区分「市场没切换」与「情形不可达」**，两种解释都不可由该红线区分。✅ **已收口（2026-09-14）**，见 §9.1。<br>⚠️ **§7.1 后（2026-09-26）补充**：迟滞豁免分支也可产生 `prev != cur`（单日强切），豁免日以归档字段 `regime_switch_exempt=True` 区分——R2 复盘需将豁免日单列或剔除，否则「≥1 天」可被强切假性满足 |
 | 4 | ~~**`check_audit_claims.py` 把修复前归档当失效证据**~~ ✅ **已修（2026-09-14）** | P1-5 被判 `INEFFECTIVE`，理由「修复代码尚未产生修复后归档，20260904 仍可复现重复」——**该理由不成立**：修复于 commit `8ad119b`（**09-12**）落地，`20260914` 即修复后归档且当日 ≥ 2 跑，其 `reasoning.md` 中「Node 7」仅出现 1 次（逐日实测见 §2 注）。<br>⚠️ **原记「根因：脚本不区分 pre-fix / post-fix 归档，只扫全量找复发」有误**：实测 `check_p1_5` **本来就有**分流 `recent = [d for d in duplicates if d.split("×")[0] > "20260901"]`，只是**阈值写的是 0901**，而修复落地在 0912 ⇒ 修复前的 0904 被判进了「之后」。真正的修法是改一个日期字面量，不是加分流。<br>**已修**：阈值提取为常量 `P1_5_FIX_DATE = "20260912"`（注明 commit `8ad119b`）⇒ **R-D1 实跑读数 = 8**，与本节预期一致 |
 | 5 | **R5 与 `signal_dates` 的设计语义冲突** | R5 要求同 `(type, date)` 至多 1 条；但 `persistence.py:709-711` **有意**按当日信号出现次数逐条落盘（`for _ in range(count)`），`persistence.py:713-716` 的 `signal_count_30d` 正依赖该计数。当前 7 组重复全部是**修复前**的历史条目（去重只剔 `date == today_str`，历史条目靠 30 日窗口裁剪）⇒ **预计 2026-10-11 起自动归零**（最晚重复日 09-10 滚出窗口）。⚠️ 若某天单次运行就产生 ≥2 条同类信号，R5 会**再次** FAIL —— 那时是定义与实现语义打架，**需裁决「按次」还是「按日」** |
 | 6 | **R-B8 的字段清单含跨日状态机输出**（2026-09-14 干跑发现） | `check_r_b8_r_b9`（`scripts/verify_layer_b_consistency.py:217-243`）把 `unified.market_regime.{regime,dwell_days,previous_regime,transition_count,transition_pending}` 归入「**应不变**字段」——只有 `classification` / `dimension_scores` / `frame_group_lookup` 三个分支被分流出去。但 `market_regime` 是**跨日状态机**，输入为 `load_regime_state_history(days=20)`：回放跑在**今天**（窗口 `0817…0914`）、原归档跑在当日（窗口不同）⇒ **输出必然不同**。而 `verify_same_day_idempotency.py` 的 docstring 自己写过「回放不含状态推进」。⇒ **R-B8 在回放语义下不可能 PASS**，属**判据与手段不匹配**，不是实现缺陷。干跑实测：喂 `20260903` 那对得 7 项差异，其中 5 项全来自 `market_regime.*` |
@@ -464,3 +477,6 @@ python scripts/export_glue_family_audit.py                                      
 *修订：2026-09-14（第五轮，C-P6/C-P7 落地）—— §1.C 的 C-P6 / C-P7 由「✗ 未落地」改判 **✅ 已落地**：`scripts/verify_glue_metrics.py` 主口径切换为 glue 侧（M1）/「其他」回收率（M6），规则侧降为对照列与观察项，**退出码与 R-C3 十锚点均不变**；⚠️ 只解除死锁、不解除 M1 不可达。同步收口 `verification.md` §3 与 `archive/agent_glue_plan_0903.md` §8.1（自注 ③「尚待落地」已结，并更正「回收率 ≠ M6′ 覆盖率」这处口径混用：分母 11 vs 32）。M1 / M6 达标判定仍归负责人，脚本不代判。*
 *修订：2026-09-14（第六轮，首跑实测）—— 新增 **§1.F 验收工器的能力缺口**（两项：`--got-replay` 只跑 Node 6 ⇒ 验不到 B 层所在的 Node 2 且缺 `portfolio.*`；Phase 2 路径不落 T1 归档）；§9 增第 6 条（**R-B8 把跨日状态机输出 `market_regime.*` 归入「应不变」字段 ⇒ 回放语义下不可能 PASS**，属判据与手段不匹配）；§7 增裁决 #5（该字段去留）与 #6（R-B8/R-B9/R-C7 是否在现工器下继续推进）。*
 *修订：2026-09-17（文档结构重排）—— §8 文档层缺陷 #1/#2/#3/#4/#5 全部收口 ✅：`docs/INDEX.md` 重写为三区全量索引、死链修复、`docs/CLAUDE.md` 归档并改重定向页、`CHANGELOG.md` [Unreleased] 拆「本地工作/上游同步」两子段（实算 23+30）、`plan_got_timeseries_enhancement.md` 状态头更正。本仓文档物理归位：旧项目基底 → `docs/guide/`，GOT 现行 → `docs/got/`（本文件即 `got/backlog.md`），GOT 归档 → `docs/got/archive/`，非 GOT 已完结计划 → `docs/archive/plans/`。§8 #6（未跟踪 verify 脚本）为代码资产，不在本次文档重排范围。*
+*修订：2026-09-26（R-D1 收口轮，A6 阶段 2 后复算）—— §2 原「待退役」4 项逐条更新：P0-1 / P0-2 → ✅ 随退役消解（脚本实算证据行同步消歧），P0-5 → ✅ 自愈（近 12 日池规模 0–5，池空不可复现），P2-1 → 挂起待裁决（T5 对齐层接线后重判保留、字段活消费，「随退役消失」归属作废，转 §7 裁决 #8）；统计行同步（了结 6→9，归属 9→5）。§2 注补 R-D1 最新读数：脚本 `unverified = 7`（基线 10）。§8 #8（R-D2）刷新为 0926 四子计数实算（divergent 6/饱和 8/死信号 2/死分支 1✅），维持「文档缺陷」定性。D-P9 行补复算值。R-D1 / R-D2 收口完成，脚本仍 exit 1 系基线对照语义（非代码问题）。*
+*修订：2026-09-26（§7.1 实施轮）—— 裁决 #7「真·待实施」→ ✅ 已实施：regime 状态机振荡修复（`pinned_days` 迟滞豁免 + `transition_events` 事件列表计数 + `DISABLE_REGIME_OSCILLATION_FIX` 回退开关），详见 §7.1 实施记录；OPEN-C1 标注「语义已修、阈值未重标」。回归 `TestRegimeOscillationFix` + got 域全绿（例数/域读数以复审修正轮为准）。*
+*修订：2026-09-26（§7.1 复审修正轮）—— 代码审核发现并修复：**Critical①** 迁移种子改播种进事件列表 + 窗口改日期区间（含当日），消除升级后首个切换日 `transition_count` 一夜 5→0 静默翻转 ×0.8 惩罚与 `range_reversal`；**②** 合并「2-豁免/3-豁免」冗余分支（含错误日志文案），新增归档字段 `regime_switch_exempt` 使豁免强切可复盘（§9 #3 同步加注）；**③** `[]`（已迁移）照落与 `None`（未迁移）区分，补种子续接/迁移空列表两回归例；**④** 测试数订正为 8 例、got 域 405。未修缓办：⑤事件链断链回溯（回滚开关不可逆已在开关文案说明）、⑥新字段未入 R-B8/幂等验收清单（与裁决 #5 张力待拍板）、⑦回读归一、⑩阈值重标（归 OPEN-C1）。*

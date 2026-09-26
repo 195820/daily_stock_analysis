@@ -490,7 +490,7 @@ emerging → fermenting → peak → fading → archived
 
 **regime 判定**: score>0.3=bull，<-0.3=bear，else=transition  
 **risk_budget**: bull [0.6-0.8]，bear [0.3-0.5]，transition [0.4-0.6]  
-**状态追踪**: dwell_days, previous_regime, transition_count, transition_pending
+**状态追踪**: dwell_days, previous_regime, transition_count, transition_pending, pinned_days, transition_events, regime_switch_exempt（v2.1 + §7.1 振荡修复 2026-09-26：连续情形 3 钉住 `pinned_days≥3` 当日直接确认 raw 脱钉并标 `regime_switch_exempt=True`；`transition_count` 改统日期区间窗口（含当日）内确认切换事件数，旧归档把输出 diff 迁移种子播种进列表续记；回滚 `DISABLE_REGIME_OSCILLATION_FIX=true`，详见 docs/got/backlog.md §7.1）
 
 ### 7.2 L1: 板块 mini-GOT（4 维交叉验证）
 
@@ -646,6 +646,7 @@ PMI（月末），CPI/PPI（月中 10 日），社融/M2（月中 13 日），LP
 | NARRATIVE_CRITIC_SHADOW | NARRATIVE_CRITIC_SHADOW | true | T2 影子（2 周） |
 | AGENT_STOCK_REVIEW_ENABLED | AGENT_STOCK_REVIEW_ENABLED | false | T1 Agent 终审 |
 | AMBUSH_NOMINATION_DISABLED | AMBUSH_NOMINATION_DISABLED | "" | 应急回退开关 |
+| DISABLE_REGIME_OSCILLATION_FIX | DISABLE_REGIME_OSCILLATION_FIX | "" | §7.1 应急回退：true 恢复旧行为（无迟滞豁免 + 输出 diff 计数）；开启期间不记事件，关闭后事件链从迁移种子重建 |
 
 ### 8.3 兑现追踪（catalyst_realization.py, 772 行）
 
@@ -840,7 +841,7 @@ Final = 0.6×lifecycle_priority + 0.4×composite_score
 ### 11.3 跨日记忆（v2.1）
 
 - 资金流时序: load_capital_flow_series(days=5) → 板块+DDE 日序列
-- Regime 状态机: load_previous_regime_state() → dwell_days/transition_count
+- Regime 状态机: load_previous_regime_state() → dwell_days/transition_count/pinned_days/transition_events
 - 情绪阶段: load_previous_stage_state() → current_stage/dwell_days
 - 情绪分数历史: load_sentiment_score_history(days=20) → AR(1) 计算
 - 最大连续缺失: _MAX_CONSECUTIVE_MISSING=5（超过→序列降级为 None）

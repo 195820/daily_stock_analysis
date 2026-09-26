@@ -772,7 +772,7 @@ Node 6 现有 4 个调用点：
 > | # | 符号 | 原处置 | 重判 | 新消费者（接线后出现） |
 > |---|---|---|---|---|
 > | #6 | `_GENERIC_ROOTS` | 删 | **保留** | `_match_sector` 保留（见 #7），其 generic 判定仍依赖本词根表 |
-> | #7 | `_match_sector` | 删 | **保留** | `_resolve_pool_sector_detail` 仍调它做池外补入板块名匹配 |
+> | #7 | `_match_sector` | 删 | **保留** | `_lookup_flow_map` 仍调它做板块名→资金流表归一化匹配（吸筹确认闸门 `_check_accumulation_gate` 链路；初次登记时误写为 `_resolve_pool_sector_detail`，0926 审核已更正） |
 > | — | `_parse_sector_level_flows` + `_CAPITAL_CHANNEL_TERMS` | （§2/§5 旁及） | **保留** | `_detect_family_capital_mismatch` 仍消费（家族级资金错位比对，非三件套） |
 > | #10 | `_group_events_by_sector` | 删 | **保留** | 接线后成为 glue 事件供给基础设施：`_glue_aware_events_map` legacy 回退 + 埋伏 G2 + 蓄水池升格仍用 |
 > | #11 | `_lookup_sector_events` | 删 | **保留** | 同上，埋伏/蓄水池路径活代码 |
