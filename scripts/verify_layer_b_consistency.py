@@ -155,9 +155,10 @@ def _collect_state_fields(day_dir: Path) -> dict:
     unified = read_json(day_dir / "unified.json")
     if unified is not None:
         state["unified.final_position_limit"] = unified.get("final_position_limit")
-        regime = unified.get("market_regime", {}) or {}
-        for key in ("regime", "dwell_days", "previous_regime", "transition_count", "transition_pending"):
-            state[f"unified.market_regime.{key}"] = regime.get(key)
+        # 决策 #5a（2026-09-26 简报）：market_regime 跨日状态机输出移出「应不变」清单——
+        # regime/dwell_days/previous_regime/transition_count/transition_pending 按设计
+        # 依赖前一日归档，回放语义下不可能逐字段一致（永久 SKIP 属口径错误而非缺陷）。
+        # 差异仍在 check_r_b8_r_b9 中单独比对并标注「按设计 SKIP」，不计入 FAIL。
         for sector in unified.get("confirmed_sectors", []):
             key = sector.get("sector_name")
             for field in ("composite_score", "classification", "frame_group", "confidence"):
@@ -183,7 +184,10 @@ def _collect_state_fields(day_dir: Path) -> dict:
 def check_r_b8_r_b9(
     verifier: Verifier, before_dir: str | None, after_dir: str | None
 ) -> None:
-    r_b8_name = "R-B8 值不变性（同期归档 final_position_limit / composite_score / confirmed_sectors 逐字段一致）"
+    r_b8_name = (
+        "R-B8 值不变性（同期归档 final_position_limit / composite_score / confirmed_sectors 逐字段一致；"
+        "market_regime 跨日状态机字段已按决策 #5a 移出不变组，另列 SKIP 留痕）"
+    )
     r_b9_name = "R-B9 行为变更留痕（classification / dimension_scores[\"sector\"] 变化逐条列出）"
 
     if not before_dir or not after_dir:
@@ -208,6 +212,16 @@ def check_r_b8_r_b9(
     before_state = _collect_state_fields(before_path)
     after_state = _collect_state_fields(after_path)
     all_keys = sorted(set(before_state) | set(after_state))
+
+    # 决策 #5a：market_regime 子集单独比对，只留痕不计 FAIL（按设计 SKIP）
+    regime_before = read_json(before_path / "unified.json") or {}
+    regime_after = read_json(after_path / "unified.json") or {}
+    regime_changes: list[str] = []
+    for key in ("regime", "dwell_days", "previous_regime", "transition_count", "transition_pending"):
+        b = (regime_before.get("market_regime") or {}).get(key)
+        a = (regime_after.get("market_regime") or {}).get(key)
+        if b != a:
+            regime_changes.append(f"market_regime.{key}: {b} → {a}")
 
     invariant_diffs: list[str] = []
     classification_changes: list[str] = []
@@ -248,7 +262,13 @@ def check_r_b8_r_b9(
         "零行为变更字段逐字段一致（100%）"
         if not invariant_diffs
         else f"{len(invariant_diffs)} 个应不变字段发生变化",
-        invariant_diffs or [f"比对字段数 = {len(all_keys)}"],
+        (invariant_diffs or [f"比对字段数 = {len(all_keys)}"])
+        + ([
+            f"🧾 market_regime 跨日状态机字段（按设计 SKIP，不计 FAIL）"
+            f"——差异 {len(regime_changes)} 项：{regime_changes or '比对值相同'}"
+        ] if regime_changes else [
+            "🧾 market_regime 跨日状态机字段已按决策 #5a 移出不变组（本次比对值恰好相同）"
+        ]),
     )
 
     change_ledger = classification_changes + dimension_changes + frame_group_changes

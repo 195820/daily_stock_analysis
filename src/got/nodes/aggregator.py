@@ -1255,7 +1255,10 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         replay_mode 下写入 _replay/ 子目录，避免污染真实归档（A1「不写归档」契约）。
         C-P2: 使用 _run_date 替代 date.today()，回放时日期正确。
-        
+        C-P12: 环境变量 GLUE_REPLAY_VARIANT（仅 replay_mode 生效）→ 落 _replay/<variant>/，
+               使 A/B 两版 prompt 的回放产物各自隔离，不再同写 {date}/_replay/agent_glue.json 互相覆盖；
+               默认空 = 现路径（不改变 C-P11 单跑回填行为）。
+
         Q1 audit: status != "ok" 时写入 agent_glue_degraded_HHMMSS_毫秒.json，
         不覆盖主文件（保留现场供事后分析）。
         """
@@ -1266,6 +1269,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         run_date = getattr(self, '_run_date', None) or date.today()
         today_str = run_date.strftime("%Y%m%d")
         base = GLUE_ARCHIVE_ROOT / today_str / ("_replay" if replay else "")
+        # C-P12: 变体目录隔离——A/B prompt 变体回放各落 _replay/<variant>/，避免互相覆盖。
+        # 仅 replay_mode 生效、默认空；生产链路（非 replay）永远不受该变量影响，守住 A1 契约。
+        variant = os.environ.get("GLUE_REPLAY_VARIANT", "").strip().strip("/\\") if replay else ""
+        if variant:
+            base = base / variant
         os.makedirs(base, exist_ok=True)
         
         # Q1 audit: LLM 失败态（含截断）写独立取证文件 agent_glue_degraded_HHMMSS.json，
@@ -2378,14 +2386,23 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         
         # D-P2: 闸门漏斗追踪（初始化）
         # Q2 audit: G2/G3 闸门已修复，使用 THS 板块热度数据
+        # D-P2 补全: skipped/skipped_reason 区分「未评估」与「评估后拒绝」——
+        # 死闸（无数据源）不再被计 evaluated，与 architecture.md §7.3 的诚实化标注对齐
         gate_funnel = {
             "initial_candidates": 0,
             "G1_利空": {"evaluated": 0, "rejected": 0},
-            "G2_防买顶": {"evaluated": 0, "rejected": 0, "data_source": "THS板块热度" if hot_sectors else "无数据"},
-            "G3_拥挤度": {"evaluated": 0, "rejected": 0, "data_source": "THS板块热度" if hot_sectors else "无数据"},
-            "G4_吸筹": {"evaluated": 0, "rejected": 0, "accepted": 0},
+            "G2_防买顶": {"evaluated": 0, "rejected": 0, "skipped": 0, "skipped_reason": None, "data_source": "THS板块热度" if hot_sectors else "无数据"},
+            "G3_拥挤度": {"evaluated": 0, "rejected": 0, "skipped": 0, "skipped_reason": None, "data_source": "THS板块热度" if hot_sectors else "无数据"},
+            "G4_吸筹": {"evaluated": 0, "rejected": 0, "accepted": 0, "skipped": 0, "skipped_reason": None},
             "final_pool": 0,
         }
+
+        def _gate_stat(gate_key: str, kind: str, skip_reason: Optional[str] = None) -> None:
+            """D-P2: 漏斗计数唯一入口（计数确定、与输入顺序无关，守同日重跑幂等）。"""
+            entry = gate_funnel[gate_key]
+            entry[kind] += 1
+            if kind == "skipped" and entry.get("skipped_reason") != skip_reason:
+                entry["skipped_reason"] = skip_reason
         
         if hot_sectors:
             logger.info(f"[Node 6] G2/G3 闸门启用: {len(hot_sectors)} 个 THS 热度板块")
@@ -2426,26 +2443,35 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                     name, sector_events, capital, hot_sectors, today,
                 )
 
-                # D-P2: 根据 fail_reason 追踪闸门漏斗
+                # D-P2: 根据 fail_reason 追踪闸门漏斗（计数口径见 _gate_stat，
+                # 仅「评估过」才计 evaluated；数据缺失的 G4 记未评估留痕）
                 if not gate_passed:
                     if "★★★利空否决" in fail_reason:
-                        gate_funnel["G1_利空"]["rejected"] += 1
+                        _gate_stat("G1_利空", "rejected")
                     elif "防买顶否决" in fail_reason:
-                        gate_funnel["G2_防买顶"]["evaluated"] += 1
-                        gate_funnel["G2_防买顶"]["rejected"] += 1
+                        _gate_stat("G2_防买顶", "evaluated")
+                        _gate_stat("G2_防买顶", "rejected")
                     elif "拥挤度黑名单" in fail_reason:
-                        gate_funnel["G3_拥挤度"]["evaluated"] += 1
-                        gate_funnel["G3_拥挤度"]["rejected"] += 1
-                    elif "吸筹观察" in fail_reason or accum_strength == "missing":
-                        gate_funnel["G4_吸筹"]["evaluated"] += 1
-                        gate_funnel["G4_吸筹"]["rejected"] += 1
+                        _gate_stat("G3_拥挤度", "evaluated")
+                        _gate_stat("G3_拥挤度", "rejected")
+                    elif "吸筹观察" in fail_reason:
+                        _gate_stat("G4_吸筹", "evaluated")
+                        _gate_stat("G4_吸筹", "rejected")
+                    elif accum_strength == "missing":
+                        # 资金流数据缺失 ≠ 市场否决：G4 未真正评估，记未评估留痕（死闸口径）
+                        _gate_stat("G4_吸筹", "skipped", "flow_data_missing")
                     # 继续处理后续逻辑（蓄水池/否决日志等）
                 else:
-                    # D-P2: 闸门全通过，追踪 G2/G3/G4 评估通过
-                    gate_funnel["G2_防买顶"]["evaluated"] += 1
-                    gate_funnel["G3_拥挤度"]["evaluated"] += 1
-                    gate_funnel["G4_吸筹"]["evaluated"] += 1
-                    gate_funnel["G4_吸筹"]["accepted"] += 1
+                    # D-P2: 闸门全通过。G2 注意力子闸/G3 依赖 hot_sectors，无数据时结构性
+                    # 不可达 ⇒ 只记 skipped 留痕，不再虚计 evaluated（死闸仍被计 evaluated 的残留项）
+                    if hot_sectors:
+                        _gate_stat("G2_防买顶", "evaluated")
+                        _gate_stat("G3_拥挤度", "evaluated")
+                    else:
+                        _gate_stat("G2_防买顶", "skipped", "data_unavailable(THS热度为空)")
+                        _gate_stat("G3_拥挤度", "skipped", "data_unavailable(THS热度为空)")
+                    _gate_stat("G4_吸筹", "evaluated")
+                    _gate_stat("G4_吸筹", "accepted")
                     # 继续处理后续逻辑（催化剂排序等）
 
                 # 以下保持原有逻辑不变

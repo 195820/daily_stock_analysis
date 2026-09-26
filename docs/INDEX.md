@@ -94,6 +94,7 @@
 | [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；原根目录 `agent_cot_design.md`） |
 | [got/plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | 埋伏分支拆分设计（设计收口，待实施；原根目录 `plan.md`） |
 | [got/audit_20260922.md](got/audit_20260922.md) | 2026-09-22 当日运行审计报告（P0-P3 分级 + Q1-Q9 决策 + 修复锚点） |
+| [got/decision_brief_20260926.md](got/decision_brief_20260926.md) | 2026-09-26 决策简报（三类未结项分诊的待拍板项：选项/影响面/实测证据/建议，对应 backlog §7） |
 | [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动，待实施） |
 
 ---

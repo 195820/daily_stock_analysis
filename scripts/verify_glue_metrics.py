@@ -26,6 +26,16 @@ Spearman 口径声明（不得静默取数）
     `first` 口径依赖输入顺序，仅在「归档顺序不变」时稳定，这是文档锚点的既有性质，
     不是本脚本引入的近似。
 
+C-P8 红线口径声明（M4 系数判定 + M4-a 独立性前提与数值标定，2026-09-26 落地）
+    ① **M4 的判定系数 = Spearman**：Pearson 与 Spearman 对同一批数据给出不同的值
+      （M4-a Pearson 0.591 vs Spearman 0.419），0903 §8.1 旧表从未写明用哪个系数——本脚本
+      已固定以 **Spearman** 作为 M4-a/b/c 的判定系数（first 口径复现文档锚点，average 为统计标准值）。
+    ② **M4-a 的独立性以 B1 修复为条件**：当规则侧退化（B1：同一组信号被 Node 6 与 Phase 2 重复消费）
+      未修时，实测 `ρ(tech, composite)≈0.985` 使 M4-a ≡ M4-c（共线）。B1 现状 = D-B1「只标注口径、不改数值」
+      ⇒ **仍未修**，M4-a 与 M4-c 目前测的是同一个量，删除 M4-a 会把「由 B1 引起的共线」固化成永久设计决定。
+    ③ **M4-a 红线数值 0.6 标记「待标定」**：n=32 下 Spearman 标准误 ≈ 1/√(n-1) ≈ 0.18，0.591 的 95% 区间
+      约 ±0.35——「0.591 不过 0.6」是一次抽样不是结论。红线留到 C-P13 标定阶段按实测重设（本轮不标定）。
+
 指标口径（逐项标注，禁止跨口径比对）
     M1   规则侧：`unified.json` `confirmed_sectors[].news_check != "neutral"` 占比
     M1′  glue 侧：`agent_glue.json` `strengths[].news_read` 非 low/unknown 占比
@@ -212,24 +222,30 @@ def compare_anchor(metrics: dict) -> list[tuple[str, str, str, bool]]:
     return [(name, actual, expected, actual == expected) for name, actual, expected in comparisons]
 
 
-def _replay_sample_inventory() -> dict:
-    """盘点 `{date}/_replay/agent_glue.json` 回填样本（R-C6 前置）。
+def _replay_sample_inventory(variant: str = "") -> dict:
+    """盘点 `_replay/` 回填样本（R-C6 前置）。
+
+    variant="" → 基线路径 `{date}/_replay/agent_glue.json`（C-P11 单跑回填，行为与旧版一致）；
+    variant="variant_a" → `{date}/_replay/variant_a/agent_glue.json`（C-P12 A/B 变体隔离目录）。
 
     ⚠️ 必须分开数「文件数」与「有效样本数」：
       - 同一份产物在不同日期重复落盘会被文件数数成多天（实测 0911 / 0912 两份 md5 相同）；
       - `S6_disabled` / `replay_mode` 是开关短路产生的**占位**，回放在此处即返回，
         从未调用 LLM，不构成 A/B 对照的有效样本。
     """
-    file_paths = [
-        day / "_replay" / "agent_glue.json"
-        for day in iter_archive_days()
-        if (day / "_replay" / "agent_glue.json").exists()
-    ]
+    rel = Path("_replay") / variant if variant else Path("_replay")
+    day_of: dict[Path, str] = {}
+    file_paths: list[Path] = []
+    for day in iter_archive_days():
+        p = day / rel / "agent_glue.json"
+        if p.exists():
+            file_paths.append(p)
+            day_of[p] = day.name
     by_digest: dict[str, list[str]] = {}
     placeholders: list[str] = []
     valid_days: list[str] = []
     for path in file_paths:
-        day = path.parent.parent.name
+        day = day_of[path]
         by_digest.setdefault(hashlib.md5(path.read_bytes()).hexdigest(), []).append(day)
         status = (read_json(path) or {}).get("status")
         if status in REPLAY_PLACEHOLDER_STATUSES:
@@ -237,12 +253,30 @@ def _replay_sample_inventory() -> dict:
         else:
             valid_days.append(day)
     return {
+        "variant": variant,
         "files": len(file_paths),
         "distinct": len(by_digest),
         "valid_days": valid_days,
         "placeholders": placeholders,
         "duplicate_groups": [days for days in by_digest.values() if len(days) > 1],
     }
+
+
+def _discover_replay_variants() -> list[str]:
+    """列出归档中实际存在的 C-P12 变体目录名（`_replay/<variant>/agent_glue.json`）。
+
+    基线 `_replay/agent_glue.json`（C-P11 单跑回填）不算变体，返回空列表时
+    R-C6 渲染与旧版逐字节一致（无变体目录 ⇒ 无新增证据行）。
+    """
+    found: set[str] = set()
+    for day in iter_archive_days():
+        replay_dir = day / "_replay"
+        if not replay_dir.is_dir():
+            continue
+        for sub in replay_dir.iterdir():
+            if sub.is_dir() and (sub / "agent_glue.json").exists():
+                found.add(sub.name)
+    return sorted(found)
 
 
 def _latest_complete_day() -> str | None:
@@ -363,6 +397,13 @@ def run(date: str | None, as_json: bool, spearman_method: str) -> int:
             "⚠️ 占位态（开关短路，未调用 LLM，不计入有效样本）："
             + ", ".join(replay["placeholders"])
         )
+    variants = _discover_replay_variants()
+    if variants:
+        per_variant = "；".join(
+            f"{v}: 有效 {len(_replay_sample_inventory(v)['valid_days'])} 天"
+            for v in variants
+        )
+        sample_evidence.append(f"🧬 已识别 C-P12 变体目录（{len(variants)} 个）：{per_variant}")
     sample_evidence += [
         "前置条件：① C-P11 回填跑批产出 ≥8 天 _replay/agent_glue.json；"
         "② C-P12 prompt A/B 两版各跑这 8 天；③ 回填期 M3 需人工抽查样本（OPEN-C2 流程未定义）",

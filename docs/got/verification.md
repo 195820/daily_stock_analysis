@@ -277,6 +277,12 @@ C 层给出的修正方向是 **C-P6（M1 改 glue 侧）**——
 文档锚点 `M4-a = 0.419S` / `M4-b/c = 0.500S` **只在 `rank(method="first")` 下复现**；统计学标准平均秩给出 **0.478 / 0.564**，差 0.06–0.14。
 `scripts/verify_glue_metrics.py` **同时打印两个值并声明依赖输入顺序**，未静默取舍（`archive/got_impl_review_0911.md` §R2.10）。
 
+> ✅ **C-P8 已落地（2026-09-26，纯注记零行为变更）**：脚本顶部 docstring 新增「C-P8 红线口径声明」——
+> ① **M4 判定系数固定为 Spearman**（旧 0903 §8.1 表未写明系数，Pearson 0.591 vs Spearman 0.419 会翻转达标结论）；
+> ② **M4-a 的独立性以 B1 修复为条件**——B1 现状为 D-B1「只标注口径、不改数值」（**仍未修**），故实测 `ρ(tech, composite)≈0.985` 使 M4-a ≡ M4-c（共线）；
+> ③ **M4-a 红线 0.6 标「待标定」**（n=32 下 Spearman 标准误 ≈0.18，0.591 的 95% 区间约 ±0.35，「0.591 不过 0.6」是一次抽样非结论）——归 C-P13。
+> 本表上行 M4-a 的 `0.591 P / 0.419 S` 口径随之明确为「判定取 Spearman（first）0.419」；**达标与否仍归项目负责人**。
+
 ---
 
 ## 4. C 层验收红线 R-C1…R-C7 的当前状态
@@ -330,7 +336,7 @@ C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据�
 | 红线 | 出处 | 判据 | 证据 | 当前状态（2026-09-14） |
 |---|---|---|---|---|
 | **R-B3** | `got_layer_b_plan_0911.md` §6 | 家族降权影响面有界（无单日增幅 > 100%） | 修复前后两组多日归档 | 脚本 SKIP（`--replay-before/--replay-after` 未提供） |
-| **R-B8** | 同上 | B1/B3/B4（零行为变更项）前后 `final_position_limit` / `composite_score` / `confirmed_sectors` 逐字段一致 | 同期单日归档对 | SKIP——**且干跑证明其输入在当前工器下无法产出**，见 §5.1 |
+| **R-B8** | 同上 | B1/B3/B4（零行为变更项）前后 `final_position_limit` / `composite_score` / `confirmed_sectors` 逐字段一致。**market_regime 跨日状态机 5 字段（regime/dwell_days/previous_regime/transition_count/transition_pending）已按决策 #5a（2026-09-26）移出不变组，脚本另列「按设计 SKIP」留痕不计 FAIL** | 同期单日归档对 | SKIP——**且干跑证明其输入在当前工器下无法产出**，见 §5.1 |
 | **R-B9** | 同上 | B2/B6（行为变更项）的 `classification` 与 `dimension_scores["sector"]` 变化逐条列出 | 同上 | 同上 |
 | **R-C7** | `got_layer_c_plan_0911.md` §6 | C 层零行为变更项落地后归档逐字段不变 | 修复前后两组归档 | 待回放 |
 | **R1** | `got_run_model_plan_0911.md` §6 | 同日两跑状态字段逐字节一致（100%） | `data/_run1` / `_run2` | ❌ **FAIL（177/569）**——归因为**数据差异，非幂等缺陷**，见 §5.2 |
@@ -357,7 +363,7 @@ C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据�
 |---|---|---|---|
 | 1 | `portfolio.*` → `<缺失>` | `--got-replay` **不跑 Phase 2**（`main.py:1318` 注释「只跑 Node 6…不写归档」），仅写 `_replay/unified.json` | 可修（扩 CLI 或先跑 Phase 2） |
 | 2 | `sector.frame_group_lookup` 无法比对 | `--got-replay` **不跑 Node 2**，`_replay/` 内无 `sector.json` | **不可修**——见下 |
-| 3 | `unified.market_regime.*` 必然变化 | 它是**跨日状态机**，输入为 `load_regime_state_history(days=20)`；回放跑在**今天**，读到 `0817…0914`，与原归档当日的窗口不同 ⇒ 输出必然不同 | **需裁决** |
+| 3 | `unified.market_regime.*` 必然变化 | 它是**跨日状态机**，输入为 `load_regime_state_history(days=20)`；回放跑在**今天**，读到 `0817…0914`，与原归档当日的窗口不同 ⇒ 输出必然不同 | ✅ **已裁决（决策 #5a，2026-09-26）**：移出不变组，按设计 SKIP |
 
 ⚠️ **障碍 2 牵连出根本矛盾**：B 层修的是 `family_keywords.py` + `sector_analysis.py`（**Node 2** 的家族词表），
 而 `--got-replay` **设计上不跑 Node 2**。⇒ **即使补齐产物，该回放也验不到 B 层修的东西**。
@@ -367,6 +373,10 @@ C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据�
 而 `check_r_b8_r_b9` 把 `market_regime.*` **归入「应不变字段」**（仅 `classification` /
 `dimension_scores` / `frame_group_lookup` 三个分支被分流出去）
 ⇒ **R-B8 在回放语义下不可能 PASS**。属 [`backlog.md`](backlog.md) §9 那一类「红线本身设计有缺陷」。
+
+> ✅ **2026-09-26 已裁决并实施（决策 #5a）**：`market_regime` 5 字段移出不变组，`_collect_state_fields`
+> 不再提取；`check_r_b8_r_b9` 对该子集单独比对并在 R-B8 证据行列「按设计 SKIP，不计 FAIL」。
+> 零生产代码改动，仅验器脚本口径变更。
 
 ### 5.2 R1 / R3 的 FAIL 归因：数据差异，非幂等缺陷（2026-09-14 实算）
 
@@ -493,3 +503,4 @@ ls -la data/got_screener/ | tail
 *修订：2026-09-14（第六轮，首跑实测）—— **首次产出同日两跑快照并开启三条影子线**：① §5 R1/R3/R4 **首次真算**（R4 PASS；R1/R3 FAIL 但经 DB 级逐事件比对**归因为数据差异而非幂等缺陷**——`node4_events` 零漂移、`peak` 两表不变、`node4_raw_news` 仅 3 条跨日重采且 `last_seen` 同步推进）；② 新增 §5.1（R-B8/R-B9 输入产不出的三障碍，含「`--got-replay` 不跑 Node 2 ⇒ 验不到 B 层改动」这一根本矛盾）、§5.2（R1/R3 归因证据）、§5.3（R6 为脚本硬编码 SKIP）；③ §1 三条影子线改为实测：**T1 跑通且 `reject=1` 但产物被 Phase 2 路径丢弃**（新 §1.2）、**T1-H 开关生效却因持仓 50.1 分未命中筛选条件而审不到任何目标**（新 §1.3），并据此**修正 §1.1 末尾「开关打开跑一天即有结论」的结论**；④ §2 的 0914 行更新为第 4 跑产物（当日共跑 4 次，前三跑被覆盖）；⑤ §8 增 DB 级差异归因命令。*
 *修订：2026-09-15（第七轮，T1/T1-H 影子产物落盘）—— **T1/T1-H 新增独立影子产物文件**：`shadow_t1.json` / `shadow_t1h.json`，与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾的「🧪 影子模式观测」段落。**零 schema 改动**（不碰 `schemas.py`，不影响 R-B8/R-C7 逐字段 diff）。§1 表更新 T1/T1-H 的「实跑 ENABLED」与「归档产物」列：T1 现有 4 天日志 + 1 天归档，T1-H 现有 1 天归档（未执行：持仓不满足三类筛选条件）。新增 §2 末尾「T1/T1-H 影子产物」小节说明设计要点。11 个测试用例覆盖（含重跑不堆积、「未执行+原因」分支）。端到端验证通过（0915 归档，T1 否决广立微 301095，T1-H 未执行）。*
 *修订：2026-09-15（第八轮，归档已验证项）—— **7 项已通过验证的内容归档至 [`archive/verified_completion_log.md`](archive/verified_completion_log.md)**：A-P0-4（monitoring 按日去重）、R-C1（S1/S2 失败样本落盘）、R-C3（十锚点逐位一致）、R-C5（零引用复验）、R2（状态机收口）、R4（EMA 计数按日）、M6（回收率 90.9% 达标）。源文档删除对应段落（§3 M6 行、§4 R-C1/C3/C5 行、§5 R2/R4 行、§6 A-P0-4 整节、§8 对应复现命令），§7→§6 重编号，脚本输出描述同步更新。*
+*修订：2026-09-26（第九轮，拍板落地）—— 决策简报（`decision_brief_20260926.md`）七项拍板实施：**#3a** `signal_dates` 改按日去重（`persistence.py`，`signal_count_30d` 语义由次数变天数，单测 2 例）；**#4b** 4 份测试污染产物备份后删除（移入 `data/got_daily_backup_20260926_1700/`）；**#5a** `market_regime` 跨日状态机 5 字段移出 R-B8 不变组（`verify_layer_b_consistency.py` 单独比对、按设计 SKIP 不计 FAIL，§4/§5.1 同步）；**#1a/#6a/C-P13a/OPEN-C1a** 维持现状，已在 backlog §7 标已拍板。*

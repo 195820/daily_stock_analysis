@@ -746,9 +746,12 @@ def save_monitoring(
         if d.get("date", "") >= cutoff_30d and d.get("date") != today_str
     ]
     # 追加今日信号
-    for sig_type, count in cross_node_signal_counts.items():
-        for _ in range(count):
-            prev_signal_dates.append({"type": sig_type, "date": today_str})
+    # 决策拍板 #3a（2026-09-26 简报）：按日去重——每种信号类型每日最多记 1 条。
+    # 语义由「30 日内出现次数」变为「30 日内出现天数」；逐板块明细仍在
+    # unified.json 的 cross_node_signals 原文可取证，monitoring 只做日粒度计数。
+    # （根因：catalyst_confirmation 在按板块循环中同日多次产出，0915 曾单日占 7 席）
+    for sig_type in cross_node_signal_counts:
+        prev_signal_dates.append({"type": sig_type, "date": today_str})
     # 重新计算 30 日计数
     merged_signal_counts: dict[str, int] = {}
     for entry in prev_signal_dates:

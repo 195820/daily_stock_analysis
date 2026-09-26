@@ -307,6 +307,53 @@ class TestMonitoring(unittest.TestCase):
         warnings = [a for a in result["anomalies"] if a["level"] == "warning"]
         self.assertTrue(len(warnings) >= 1)
 
+    def test_signal_dates_dedup_per_day(self):
+        """决策 #3a：同类型信号同日多板块共振也只记 1 条（计数=天数非次数）。"""
+        from src.got.persistence import save_monitoring
+        result = save_monitoring(
+            regime_dwell=1,
+            regime_switch_count_20d=0,
+            flow_5d_non_null_rate=0.95,
+            flow_5d_total_boards=50,
+            mainline_consistency_avg=0.0,
+            contrarian_alert_today=False,
+            persistence_regime=None,
+            # 0915 实态复现：catalyst_confirmation 同日 7 个板块各产 1 个
+            cross_node_signal_counts={"catalyst_confirmation": 7, "bull_confirmation": 1},
+        )
+        dates = result["cross_node"]["signal_dates"]
+        catalyst_entries = [d for d in dates if d["type"] == "catalyst_confirmation"]
+        self.assertEqual(len(catalyst_entries), 1)
+        self.assertEqual(result["cross_node"]["signal_count_30d"]["catalyst_confirmation"], 1)
+        self.assertEqual(result["cross_node"]["signal_count_30d"]["bull_confirmation"], 1)
+
+    def test_signal_dates_rerun_same_day_idempotent(self):
+        """决策 #3a：同日重跑不叠加席位（剔旧追新后仍每种类型 1 条）。"""
+        from src.got.persistence import save_monitoring
+        save_monitoring(
+            regime_dwell=1,
+            regime_switch_count_20d=0,
+            flow_5d_non_null_rate=0.95,
+            flow_5d_total_boards=50,
+            mainline_consistency_avg=0.0,
+            contrarian_alert_today=False,
+            persistence_regime=None,
+            cross_node_signal_counts={"catalyst_confirmation": 3},
+        )
+        result = save_monitoring(
+            regime_dwell=1,
+            regime_switch_count_20d=0,
+            flow_5d_non_null_rate=0.95,
+            flow_5d_total_boards=50,
+            mainline_consistency_avg=0.0,
+            contrarian_alert_today=False,
+            persistence_regime=None,
+            cross_node_signal_counts={"catalyst_confirmation": 5},
+        )
+        dates = result["cross_node"]["signal_dates"]
+        self.assertEqual(len([d for d in dates if d["type"] == "catalyst_confirmation"]), 1)
+        self.assertEqual(result["cross_node"]["signal_count_30d"]["catalyst_confirmation"], 1)
+
 
 class TestUnifiedContextBackwardCompat(unittest.TestCase):
     """测试 UnifiedContext.cross_node_signals 向后兼容。"""

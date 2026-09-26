@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 ROLE_MULTIPLIER: dict[str, float] = {"mainline": 1.0, "ambush": 0.55, "cooling": 0.3, "unknown": 0.55}
 # 角色 → 单笔止损比例（埋伏 / 降温用更紧的止损）
 ROLE_STOP_LOSS: dict[str, float] = {"mainline": 0.07, "ambush": 0.05, "cooling": 0.05, "unknown": 0.05}
-# 角色未命中映射时的兜底（保持现状取主线；是否改为保守档属策略决策，见审核报告 R2.5）
+# 角色未命中映射时的兜底（✅ 2026-09-26 决策 #1a 已拍板：保持主线取档，见
+# docs/got/backlog.md §7 #1；「验证清空→unknown」与「非空未命中→mainline」口径
+# 不一致为已知并被接受，再翻案需新证据，原审核报告 R2.5 关闭）
 DEFAULT_SECTOR_ROLE = "mainline"
 
 
@@ -217,14 +219,27 @@ class PortfolioDecisionNode:
             warnings.extend(f"⚠️ 降级：{step}" for step in degraded_steps)
 
         # D-P12: 落盘板块暴露绑定信息（口径声明 + 绑定次数）
+        # 绑定次数为「可观测留痕」，不参与任何决策（D-P13：分支由 sector_role 决定，
+        # sector_exposure_limits 仅参考值）——从已生成的 allocation 反推，无需改动分配循环。
         sector_limits = risk_assessment.sector_exposure_limits
         sum_limits = sum(sector_limits.values()) if sector_limits else 0.0
         position_limit = risk_assessment.position_limit
+        buy_allocations = [a for a in allocation if a.action == "buy"]
+        # binding_count：买入分配中命中 sector_exposure_limits 显式条目（非 0.20 兜底）的次数（不归一化）
+        binding_count = sum(
+            1
+            for a in buy_allocations
+            if a.sector_limit_detail
+            and (a.sector_limit_detail.get("sector_name") or "") in (sector_limits or {})
+        )
         sector_exposure_binding = {
             "sum_limits": round(sum_limits, 4),
             "position_limit": round(position_limit, 4),
             "ratio": round(sum_limits / position_limit, 2) if position_limit > 0 else 0.0,
-            "note": "确信度乘数非敞口上限，只乘不除，与板块数无关",
+            "buy_allocation_count": len(buy_allocations),
+            "binding_count": binding_count,
+            "note": "确信度乘数非敞口上限，只乘不除，与板块数无关；"
+                    "binding_count 仅为可观测留痕（命中显式 limit 的买入次数），不参与决策",
         }
 
         # 审核修复 W9/3.3：决策审计字段（回测据此识别口径断点与降级日）

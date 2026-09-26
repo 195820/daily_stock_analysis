@@ -541,7 +541,8 @@ class HotStock(BaseModel):
     mention_count: int
     sentiment: str = Field(default="positive")
     associated_sectors: list[str] = Field(default_factory=list)
-    mention_source: str = "unknown"  # D-P8: 口径声明（eastmoney_attention_index / xueqiu_attention / nga_mention）
+    mention_source: str = "unknown"  # D-P8: 口径声明。当前生产者仅 eastmoney_attention_index / xueqiu_attention 两个（sentiment_analysis.py）；
+    # nga_mention 为预留值，当前无生产者（A6 退役后 NGAS 源不在链路）——是否接线需先定语义，见 backlog §7 裁决 #2
 
 
 class SentimentStageState(BaseModel):
@@ -967,10 +968,12 @@ class UnifiedContext(BaseModel):
         description="资金背离阈值诊断信息（样本数/5%分位/最终阈值/确认板块匹配详情），仅落盘不进评分",
     )
 
-    # ── D-P2: 埋伏闸门漏斗 + 蓄水池溢出（2026-09-11）──
+    # ── D-P2: 埋伏闸门漏斗 + 蓄水池溢出（2026-09-11，2026-09-26 补 skipped 留痕）──
     ambush_gate_funnel: Optional[dict] = Field(
         default=None,
-        description="埋伏闸门逐层漏斗（G1利空→G2防买顶→G3拥挤→G4吸筹→入池的逐层计数）",
+        description="埋伏闸门逐层漏斗（G1利空→G2防买顶→G3拥挤→G4吸筹→入池的逐层计数；"
+                    "各闸 evaluated/rejected/skipped 分列，skipped_reason 标注未评估成因"
+                    "（死闸无数据源/资金流缺失），死闸不再被计 evaluated）",
     )
     ambush_reservoir_overflow: Optional[list[dict]] = Field(
         default=None,
@@ -1121,10 +1124,11 @@ class PortfolioDecision(BaseModel):
         default_factory=list,
         description="主线家族续航评估（信号展示+降权提示，不触发强制卖出）",
     )
-    # ── D-P12: 板块暴露绑定信息（口径声明 + 落盘绑定次数）──
+    # ── D-P12: 板块暴露绑定信息（口径声明 + 落盘绑定次数，2026-09-26 补 binding_count）──
     sector_exposure_binding: Optional[dict] = Field(
         default=None,
-        description="板块暴露绑定信息: {sum_limits, position_limit, ratio, note}",
+        description="板块暴露绑定信息: {sum_limits, position_limit, ratio, "
+                    "buy_allocation_count, binding_count, note}（binding_count 仅可观测留痕，不参与决策）",
     )
 
 
