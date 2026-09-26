@@ -234,20 +234,35 @@ OPEN-B1…B7 —— 见 §1.B。
 - `_llm_refine_sectors.adjustments` 分支代码本体保留，仅用 if 早退
 - `AGENT_SEMANTIC_GLUE_ENABLED` 保留（阶段 2 前不能关，否则 glue 不跑就没数据）
 
-### 4.2 阶段 2 · 退役（3–5 交易日后单独 commit，本次不做）
+> ✅ 上述「阶段 2 前不动」保留项已于 **2026-09-26 阶段 2 退役**全部删除（三件套僵尸期结束、`SectorIntel.family_resonance` 删字段、`adjustments` 分支本体删），详见 §4.2「已执行动作」。`MainlineEndurance.family_resonance`（E2 公式，与 `SectorIntel` 同名异体）保留。
 
-**触发条件**（三条全满足）：
+### 4.2 阶段 2 · 退役（✅ 已执行，2026-09-26 负责人裁决提前跨过条件 2）
+
+**触发条件**（原三条）：
 1. 观察窗口 ≥ 3 个交易日 `glue_consumed=true`，且 `S1/S2` 降级率 ≤ 10%
+   —— ✅ **已过（2026-09-26 核验）**：0917/0918/0921/0922/0923/0924 六个归档日全部 `glue_consumed=true` + `status=ok`，降级率 0%（0/30、0/34、0/28，无 degraded 取证文件）
 2. 决策面结果无回归事故（Node 7 推荐 T+3 胜率相对 9 月基线不劣化）
-3. 0924 前 `transition_count` 未跌破阈值 5（OPEN-C1 时间窗）
+   —— ⏩ **负责人裁决提前跨过（2026-09-26）**：条件 2 T+3 样本未收齐（首批可收日 0930 起）即执行退役。已有读数：0922 批 T+2 胜率 33.3% / alpha -0.72%（n=3，相对基线 28.1% / -1.67% 不劣化）。全局回退本已失效（`aggregator.py` run() 入口对 false/None/非 ok/degraded 全 raise），删除不损失活的安全网，故接受提前执行；取证脚本 `.review_tmp/backtest_a6_condition2.py`
+3. ~~0924 前 `transition_count` 未跌破阈值 5（OPEN-C1 时间窗）~~
+   —— ✅ **已移出（2026-09-26 负责人裁决）**：实测序列 10→9→8→7→5→5（字面擦边未跌破），但该指标不携带市场信息——状态机自 0827 接线以来零次真实切换（`previous_regime==regime` 恒等），读数完全由窗口滚动的历史残留决定（即 OPEN-C1 预告的时间炸弹）。按 §0.1 判定标准属缺陷红线（同 §9 谱系），移出触发条件；停摆根因专项见 §7 裁决 #7
 
-**动作**（`archive/agent_glue_plan_0903.md` §6.1 / §11.3）：
-1. 退役 §6.1 的 **17 项**（跨维校验三件套 / T5 事件→板块对齐层 / 手写映射表消费点 / LLM 权限与准入阈值）
-2. 删 `SectorIntel.family_resonance` 字段
-3. 删 `_llm_refine_sectors.adjustments` 分支代码本体
-4. 修订 `archive/remote_integration_plan.md`
+**已执行动作**（`archive/agent_glue_plan_0903.md` §6.1 / §11.3）：
+1. ✅ 退役 §6.1 三件套本体：`_cross_check_capital/news/sentiment` + `_lookup_capital_flow` + `_divergent_threshold` + `_parse_capital_flows` + `_extract_news_keywords` + 专用常量（`_NEWS_*`/`_CAPITAL_DIVERGENT_*`/`_CAPITAL_ALIGNED_MIN_YI`/`_UNRELIABLE_MATCH_TYPES`）全部删除
+2. ✅ `_compute_sector_scores` 精简为「tech + lifecycle 修正」，`capital_check`/`news_check` 返回 `neutral`、`sentiment_check=missing`、detail 文案置「规则模式已退役」——漏命中/降级板块**放弃逐板块兜底**，改为 neutral 中性垫底（负责人裁决）
+3. ✅ Pass 1.5 删 `rule_capital_check`/`rule_capital_detail` 留存；`_build_sector_intel_from_scores` 删对应传参；`schemas.py` 删 `SectorIntel.rule_capital_check`/`rule_capital_detail`
+4. ✅ 删 `_llm_refine_sectors.adjustments` 分支代码本体（保留 narrative / cross_sector_risks）
+5. ✅ 删 `_detect_glue_capital_mismatch`（Q8-A2）及其调用；D-P1 资金背离诊断 `_build_capital_divergence_info` 删除，`UnifiedContext.capital_divergence` 置 `None`（schema 字段保留，archive 仍读）
+6. ✅ `GOT_A6_ENABLED`/`AGENT_SEMANTIC_GLUE_ENABLED`/`SHADOW` 开关保留为 fail-fast（置 false 直接抛错，不静默改行为）
 
-> ⚠️ 不可在阶段 1 观察期未满时删除三件套——0915 类上游故障日 `glue.degraded_sectors` 非空或 `status != "ok"` 时，A6 分支自动跳过，等价于影子期行为。三件套代码本体删除 = 失去最后一道兜底。
+**§6.1「删」清单接线后重判（防误删，均修正为保留）**：
+- `_match_sector` / `_GENERIC_ROOTS`：仍供 `_resolve_pool_sector_detail` 消费 → 保留
+- `_parse_sector_level_flows` / `_CAPITAL_CHANNEL_TERMS`：仍供 `_detect_family_capital_mismatch` 消费 → 保留
+- `_group_events_by_sector` / `_lookup_sector_events` / `_extract_hot_sectors`：glue 事件供给 + 埋伏/蓄水池路径仍消费 → 保留
+- `MainlineEndurance.family_resonance`（E2 公式）：保留；`SectorIntel.family_resonance` 全仓无读取方，已随本次删除
+
+**回归**：`pytest tests/` got 域 248 passed / 0 failed；全量 3704 passed，25 failed 均为无关环境项（docker/nacl/pypinyin/network/config），无本次改动引入的失败。`tests/test_node6_glue.py::TestGlueCapitalMismatch` 随 `_detect_glue_capital_mismatch` 一并删除。
+
+> ℹ️ 原阶段 1 观察期「不可提前删三件套」的告警已被负责人「提前跨过条件 2」裁决覆盖；删除依据是全局回退已失效 + glue 命中板块覆写后规则值本就丢弃，对命中板块零行为变更，唯一受影响者为漏命中/降级板块（改 neutral 垫底）。
 
 ### 4.3 回滚开关
 
@@ -357,6 +372,17 @@ OPEN-B1…B7 —— 见 §1.B。
 | 4 | 存量的 **4 份测试污染归档产物**是否清理（`data/got_daily/20260911/agent_glue.json`、`20260912/agent_glue.json` 及各自 `_replay/` 一份） | 污染源已修（测试已隔离 `GLUE_ARCHIVE_ROOT`），存量文件**未删**——它们是该结论的现场证据。清理会失去现场，不清理则 `data/got_daily/` 里始终有 4 份非生产产物。取舍见 [`verification.md`](verification.md) §2.2 |
 | 5 | **R-B8 的 `market_regime.*` 字段去留**（2026-09-14 干跑发现） | 验收判据决策：① 移出「应不变」清单（承认跨日状态机在回放下必然变，见 §9 #6）；② 或改判据为「回放前后**窗口对齐**」；③ 或让 R-B8 只验 `unified.json` 的非状态字段 |
 | 6 | **R-B8 / R-B9 / R-C7 在现工器下是否继续推进** | 工器决策：`--got-replay` 不跑 Node 2 ⇒ **验不到 B 层改动本身**；不跑 Phase 2 ⇒ `portfolio.*` 必然缺失。要么扩 `--got-replay`（成本较高），要么收缩红线范围。见 §1.F |
+| 7 | **regime 状态机切换计数器停摆根因分析**（2026-09-26 新增并经归档实测定根因，自 A6 阶段 2 条件 3 移出时登记）：见下方「§7.1 停摆根因实测」 | 真·待实施（修复任务）：两层缺陷（确认死锁 + 计数器语义），`aggregator.py:3531` 仓位 ×0.8 震荡惩罚与 `range_reversal` 信号均建立在失效输入上；与 A6 退役解耦，独立排期 |
+
+### 7.1 停摆根因实测（2026-09-26，逐日扫 `data/got_daily/*/unified.json` 的 `market_regime`）
+
+**不是「市场未切换」，是两层缺陷叠加使确认切换无法达成：**
+
+1. **确认死锁（主因）**：自 **0910** 起，归档 `regime` 每日恒为 `transition`（上一交易日→今日均相等，即情形 1/3），但 `transition_pending` 在 0914=bull / 0915=bear / 0916=bull / 0918=bull 之间**日日交替**——说明 Node 1 每日算出的 raw regime 在 bull↔bear 之间高频振荡，**从未连续两日落在同一非-`transition` 值**⇒ 情形 2（`raw==prev_pending` 确认切换）永不触发，状态机被永久钉在 `transition`（`dwell_days` 一路从2累到 12）。两日确认机制本为去噪，但遇振荡信号会锁死。
+2. **计数器语义缺陷（即 OPEN-C1 时间炸弹的实装形态）**：`transition_count`（`aggregator.py:638-642`）统计的是 `load_regime_state_history(20)` 回读的 **`[日期, regime]` 序列相邻变化次数**——用的是状态机**输出值**而非「确认切换事件」。因 0910 后输出被钉住不再变化，计数只能靠 0910 前的波动存量支撑（11→...→5），随旧高波动日逐日滚出 20 日窗口单调衰减且**无法回补**⇒ 下一交易日必跌破 5，触发仓位惩罚自行翻转。
+
+> 修正旧认知：0827–0910 期间确认切换确实发生过多次（0901 bull→transition / 0902 →bear / 0904 →bull / 0910 →transition 均 情形 2 命中），所以「自 0827 零切换」仅对 **0910 后**成立。条件 3 当时给的「字面擦边未跌破」仍成立，但机制上已确定后续必跌破。
+> 修法方向（待专项拍板）：① 计数器改统「确认切换事件」（状态机自记而非回看输出 diff）；② 振荡保护：pending 交替达阈值时强锁或回到情形 1；③ 重标阈值 + 窗口限定为状态机生效日后（OPEN-C1）。取证脚本：本次为一次性扫描，已删。
 | — | ~~`A-P0-4`（monitoring 按日去重）效果未验证~~ | ✅ **已结**（2026-09-14）：沙箱实测 + 09-14 归档旁证确认有效，见 [`verification.md`](verification.md) §6 |
 
 > 另有一条**曾被公开撤销的错误断言**记录在 `archive/agent_glue_plan_0903.md` §9：原断言"`base_position` 是死参数"曾在写作阶段被错误撤销（查错了文件），**撤销作废**——`aggregator.py` 的 `base_position` 确是死参数。

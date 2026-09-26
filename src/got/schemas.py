@@ -715,11 +715,6 @@ class SectorIntel(BaseModel):
     tech_detail: str = Field(default="", description="技术面详情（lifecycle/tier/trajectory）")
     capital_check: str = Field(default="neutral", description="aligned / neutral / divergent")
     capital_detail: str = Field(default="", description="资金面验证细节")
-    # Q8-A1（audit_20260922）：glue 直替（Pass 1.5）前留存的规则侧（Node 3）资金判定证据，
-    # 供 Q8-A2 矛盾对账消费；未被 glue 覆盖时为 None。
-    # ⚠️ 实施顺序第 5 步删除规则评分模式后永久为空，届时随 _detect_glue_capital_mismatch 一并清理
-    rule_capital_check: Optional[str] = Field(default=None, description="规则侧 capital_check 原值（glue 覆盖前证据链）")
-    rule_capital_detail: str = Field(default="", description="规则侧资金面细节原文（glue 覆盖前证据链）")
     news_check: str = Field(default="neutral", description="catalyzed / neutral / negative")
     news_detail: str = Field(default="", description="消息催化细节")
     sentiment_check: str = Field(default="low", description="high / medium / low（散户热度）")

@@ -207,9 +207,16 @@ def _collect_by_key(nodes: dict | list, key: str, out: list) -> list[dict]:
 
 
 def check_p0_1() -> tuple[str, list[str]]:
-    """P0-1：capital_check 的 divergent 死分支 → 改为全市场最差 5% 相对分位自适应。"""
+    """P0-1：capital_check 的 divergent 死分支 → 改为全市场最差 5% 相对分位自适应。
+
+    ❗ A6 阶段 2（2026-09-26）：规则评分模式（含本自适应阈值）已整体退役，
+    `capital_check=="divergent"` 现由 glue `capital_read=low` 覆写产出，不再由规则自适应产生。
+    本项保持 INEFFECTIVE（与原 0911 基线一致，不改动 verified/unverified 计数），
+    但证据行区分「代码形状已退役」 vs 「分支仍未触发」，避免被误读为修复回退。
+    """
     code = _text(AGGREGATOR)
     adaptive = "_CAPITAL_DIVERGENT_TAIL_PCT" in code and "_divergent_threshold" in code
+    retired = "A6 阶段 2" in code and not adaptive  # 规则自适应已随退役删除
     divergent_days = []
     for day in _days_with("unified.json"):
         unified = _load(day, "unified.json") or {}
@@ -218,13 +225,17 @@ def check_p0_1() -> tuple[str, list[str]]:
         if hits:
             divergent_days.append(f"{day.name}({len(hits)})")
     effective = adaptive and bool(divergent_days)
+    if retired:
+        adaptive_note = "规则相对分位自适应已随 A6 阶段 2 退役（divergent 现由 glue capital_read=low 产出）"
+    else:
+        adaptive_note = f"代码含相对分位自适应（_CAPITAL_DIVERGENT_TAIL_PCT / _divergent_threshold）：{adaptive} [{_landing(AGGREGATOR, '_divergent_threshold')}]"
     return (
         EFFECTIVE if effective else INEFFECTIVE,
         [
-            f"代码含相对分位自适应（_CAPITAL_DIVERGENT_TAIL_PCT / _divergent_threshold）：{adaptive}"
-            f" [{_landing(AGGREGATOR, '_divergent_threshold')}]",
+            adaptive_note,
             f"全部 {len(_days_with('unified.json'))} 个归档日中 capital_check==divergent 的日数 = "
-            f"{len(divergent_days)}{'（' + ', '.join(divergent_days) + '）' if divergent_days else ' ⇒ 分支仍为 0 触发（改了但未生效）'}",
+            f"{len(divergent_days)}{'（' + ', '.join(divergent_days) + '）' if divergent_days else ' ⇒ 分支仍为 0 触发（改了但未生效）'}"
+            + ('【退役后来源为 glue，非规则自适应】' if retired else ''),
         ],
     )
 

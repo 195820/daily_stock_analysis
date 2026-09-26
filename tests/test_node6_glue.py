@@ -553,76 +553,8 @@ class TestGlueFailureSamplePersistence(unittest.TestCase):
         )
 
 
-class TestGlueCapitalMismatch(unittest.TestCase):
-    """Q8-A2（audit_20260922）：glue vs Node 3 资金口径对账。
-
-    回归护栏：原实现 skip 条件 `rule_check == s.capital_check` 前置，
-    双方同为 neutral 时永早退，big_outflow 分支不可达（死代码）。
-    """
-
-    @staticmethod
-    def _intel(**kw):
-        from src.got.schemas import SectorIntel
-        base = dict(sector_name="半导体", capital_check="neutral")
-        base.update(kw)
-        return SectorIntel(**base)
-
-    def test_both_neutral_big_outflow_triggers(self):
-        """实锤场景：双方 neutral 但规则侧 1 日净流出 31.96 亿 → 必须报矛盾。"""
-        s = self._intel(
-            rule_capital_check="neutral",
-            rule_capital_detail="1日净流出31.96亿",
-        )
-        found = AggregatorNode._detect_glue_capital_mismatch([s])
-        self.assertEqual(len(found), 1, "大额流出应触发口径矛盾告警")
-        self.assertEqual(found[0].pair, "glue_vs_node3_capital")
-
-    def test_both_neutral_small_outflow_no_trigger(self):
-        """同值但流出未过阈（5 亿 < 20 亿）→ 不触发。"""
-        s = self._intel(
-            rule_capital_check="neutral",
-            rule_capital_detail="1日净流出5.0亿",
-        )
-        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
-
-    def test_opposite_direction_triggers(self):
-        """方向相反（规则 divergent vs glue aligned）→ 触发。"""
-        s = self._intel(
-            capital_check="aligned",
-            rule_capital_check="divergent",
-            rule_capital_detail="1日净流出25.0亿",
-        )
-        found = AggregatorNode._detect_glue_capital_mismatch([s])
-        self.assertEqual(len(found), 1)
-
-    def test_signed_inflow_format_triggers(self):
-        """带符号文案「净流入-31.96亿」同样触发（旧正则唯一能命中的格式）。"""
-        s = self._intel(
-            rule_capital_check="neutral",
-            rule_capital_detail="净流入-31.96亿(全量)",
-        )
-        self.assertEqual(len(AggregatorNode._detect_glue_capital_mismatch([s])), 1)
-
-    def test_multi_window_takes_weakest(self):
-        """多窗口拼接文案取最弱值：3d 流入 + 1d 大额流出 → 仍触发。"""
-        s = self._intel(
-            rule_capital_check="neutral",
-            rule_capital_detail="3d净流入9.25亿，1日净流出31.96亿",
-        )
-        self.assertEqual(len(AggregatorNode._detect_glue_capital_mismatch([s])), 1)
-
-    def test_no_rule_evidence_skipped(self):
-        """未被 glue 覆盖（rule_capital_check=None）→ 不参与对账。"""
-        s = self._intel(rule_capital_detail="1日净流出31.96亿")
-        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
-
-    def test_inflow_never_triggers(self):
-        """净流入不触发 big_outflow 分支。"""
-        s = self._intel(
-            rule_capital_check="neutral",
-            rule_capital_detail="1日净流入31.96亿",
-        )
-        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
+# A6 阶段 2：TestGlueCapitalMismatch（Q8-A2 glue vs Node 3 资金口径对账）随
+# _detect_glue_capital_mismatch 及 rule_capital_check/rule_capital_detail 字段一并退役删除。
 
 
 if __name__ == "__main__":

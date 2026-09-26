@@ -765,6 +765,22 @@ Node 6 现有 4 个调用点：
 | 16 | `SectorIntel.family_resonance` | `schemas.py`；0903 实测 **24/24 全 `None`** | **删** | D7。⚠️ **`MainlineEndurance.family_resonance` 是另一个字段，必须保留**（L3001/L3091/L3124/L3645 活代码） |
 | 17 | `_llm_refine_sectors` 的 `adjustments` 分支 + `_classify_all_sectors` 的 `score >= 50` 与 `_is_hard_exclude` 的 `composite < 40` | L1355-1382（adjustments）/ L1207（`score >= 50`）/ L1244（`composite < 40`） | **删 adjustments 分支**；**两个阈值改由 D10 处置** | ① adjustments 与 glue 改同一字段 ⇒ 两个 Agent 入口打架；② `score>=50` / `composite<40` 是**按旧 composite 语义**校准的绝对阈值，而 0903 实测 composite 与 classification **已经脱钩**（旅游景点 99.1→caution、汽车整车 35.7→actionable，因埋伏绕过 TOP-N），阈值早已半失效 |
 
+> ### ✅ 接线后重判（阶段 2 退役执行时，2026-09-26）——部分「删」项修正为「保留」
+>
+> 本清单写于 0903，未预见阶段 1 接线后 glue 事件供给链路的新增消费者。执行退役时逐个精确 grep，**发现下列符号仍有活消费者，【删】作废、改为【保留】**：
+>
+> | # | 符号 | 原处置 | 重判 | 新消费者（接线后出现） |
+> |---|---|---|---|---|
+> | #6 | `_GENERIC_ROOTS` | 删 | **保留** | `_match_sector` 保留（见 #7），其 generic 判定仍依赖本词根表 |
+> | #7 | `_match_sector` | 删 | **保留** | `_resolve_pool_sector_detail` 仍调它做池外补入板块名匹配 |
+> | — | `_parse_sector_level_flows` + `_CAPITAL_CHANNEL_TERMS` | （§2/§5 旁及） | **保留** | `_detect_family_capital_mismatch` 仍消费（家族级资金错位比对，非三件套） |
+> | #10 | `_group_events_by_sector` | 删 | **保留** | 接线后成为 glue 事件供给基础设施：`_glue_aware_events_map` legacy 回退 + 埋伏 G2 + 蓄水池升格仍用 |
+> | #11 | `_lookup_sector_events` | 删 | **保留** | 同上，埋伏/蓄水池路径活代码 |
+> | — | `_extract_hot_sectors` | 删 | **保留** | 埋伏/蓄水池路径仍消费（仅断掉 `_compute_sector_scores` 内的调用） |
+> | #16 | `SectorIntel.family_resonance` | 删 | **已删** ✅ | 全仓无读取方，随阶段 2 删除（`MainlineEndurance.family_resonance` 仍按 P4 保留） |
+>
+> **确认按原计划删除的项**：#1/#2/#3 三件套、#4 `_NEWS_*` 7 常量、#5 `_UNRELIABLE_MATCH_TYPES`、#8 `_lookup_capital_flow`、#9 `_CAPITAL_DIVERGENT_*`/`_CAPITAL_ALIGNED_MIN_YI`/`_divergent_threshold`，以及 `_parse_capital_flows`/`_extract_news_keywords`（审计确认均真孤儿）。`_compute_sector_scores` 精简为 tech+lifecycle，漏命中/降级板块改 **neutral 中性垫底**（负责人裁决放弃逐板块兜底）。D-P1 `capital_divergence` 诊断置 `None`（schema 字段保留）。
+
 ### 6.2 必须保留项（防误删清单，5 项）
 
 | # | 符号 | 位置 | 保留理由 |

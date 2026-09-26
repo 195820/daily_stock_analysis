@@ -142,12 +142,7 @@ OVERHEAT_ADMISSION_LIMIT = 0.3
 # 泛化后缀：匹配时需剥离，防止 "概念" 等无意义后缀造成假阳性
 GENERIC_SUFFIXES = ("概念",)
 
-# 不可靠匹配类型（P0-1，2026-09-02）
-# generic：命中泛化词根（A6 护栏），大类的资金流/热度不代表该细分板块
-# narrow ：目标比查询更窄（查询是目标的子串），如"化工"→"磷化工"，
-#          窄类不代表宽类，否则以偏概全（0902 实测 11/15 通用名会误配到细分）
-# 两类均须降权/不确认方向，三处调用方（资金面/消息面/情绪面）统一处理。
-_UNRELIABLE_MATCH_TYPES = frozenset({"generic", "narrow"})
+# （A6 阶段 2：_UNRELIABLE_MATCH_TYPES 随规则评分模式三件套一并退役）
 
 
 # =============================================================================
@@ -159,6 +154,8 @@ class AggregatorNode:
 
     # 资金流中的通道/杠杆聚合项（非真实板块），板块级错位比对一律排除，
     # 防止"融资融券/深股通"这类通道资金被误当成板块资金参与家族错位归并。
+    # A6 阶段 2：_parse_sector_level_flows 仍供 _detect_family_capital_mismatch 使用，
+    # 本常量随之保留（§6.1 将 #8/#9 列为「删」但审计后发现新消费者，修正为保留）。
     _CAPITAL_CHANNEL_TERMS = frozenset({
         "融资融券", "深股通", "沪股通", "北向资金",
         "陆股通", "融资余额", "融券余额", "两融",
@@ -198,9 +195,7 @@ class AggregatorNode:
         today = self._run_date
         self._run_cache = {}  # 单次 run() 内归档回读缓存
 
-        # D-P1/D-P2: 可观测性数据追踪（每次 run() 重置）
-        self._last_capital_threshold_info = None  # D-P1: 资金背离阈值信息
-        self._capital_sector_details = []  # D-P1: 确认板块资金匹配详情
+        # D-P2: 可观测性数据追踪（每次 run() 重置）
         self._ambush_gate_funnel = None  # D-P2: 埋伏闸门逐层漏斗
         self._ambush_reservoir_overflow = []  # D-P2: 蓄水池容量驱逐记录
 
@@ -387,8 +382,8 @@ class AggregatorNode:
             crowded_families=getattr(sector, "crowded_families", []) or [],
             mainline_endurance=mainline_endurance,
             cross_node_signals=cross_node_signals,
-            # D-P1: 资金背离阈值可观测性
-            capital_divergence=self._build_capital_divergence_info(),
+            # A6 阶段 2：资金背离诊断随规则模式退役，恒为 None（schema 字段保留）
+            capital_divergence=None,
             # D-P2: 埋伏闸门漏斗 + 蓄水池溢出
             ambush_gate_funnel=self._ambush_gate_funnel,
             ambush_reservoir_overflow=self._ambush_reservoir_overflow if self._ambush_reservoir_overflow else None,
@@ -1249,21 +1244,13 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         if not candidates:
             return []
 
-        # 预提取各维度数据
-        capital_flows = self._parse_capital_flows(capital)
-        capital_flow_map = self._parse_sector_level_flows(capital)  # A4: 全量 464 板块
-        news_keywords = self._extract_news_keywords(news)
-        # Q2 audit: 补传 SectorContext，优先消费 ths_hot_sectors（associated_sectors 恒空）
-        hot_sectors = self._extract_hot_sectors(sentiment, sector)
-
-        # ── Pass 1: 计算所有板块的 composite score 和验证数据 ──
+        # ── Pass 1: 计算所有板块的技术面 composite（规则三件套已随 A6 阶段 2 退役）──
         # 不创建 SectorIntel，先收集原始数据用于批量分类
         raw_data = []  # [(name, composite, capital_check, news_check, detail, sector_role, ...)]
         for name, detail, role_info in candidates:
             sector_role = role_info.get("role", "mainline")
             composite, capital_check, news_check, other = self._compute_sector_scores(
-                name, detail, capital_flows, news_keywords, hot_sectors, role_info,
-                capital_flow_map=capital_flow_map,
+                name, detail, role_info,
             )
             raw_data.append((name, composite, capital_check, news_check, detail, sector_role, role_info, other))
 
@@ -1365,7 +1352,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
           2. 命中且不在 glue.degraded_sectors 中 ⇒ 重写
              composite/confidence/capital_check/news_check/sentiment_check，
              在 other 中留痕 _glue_applied=True，供 Pass 3 标注 reasoning
-          3. 未命中 / 降级 ⇒ 保留规则侧三件套
+          3. 未命中 / 降级 ⇒ 保留技术面中性垫底（规则三件套已随 A6 阶段 2 退役，
+             capital_check/news_check=neutral、sentiment_check=missing）
         glue.status != 'ok' 时（replay degraded）直接原样返回，不做替换。
         """
         if not GOT_A6_ENABLED or glue is None or glue.status != "ok":
@@ -1395,11 +1383,9 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             new_sentiment = self._glue_map_sentiment_read(st.sentiment_read)
             new_confidence = float(st.confidence)
             other = dict(other)
-            # Q8-A1（audit_20260922）：替换前留存规则侧（Node 3）资金判定证据，
-            # 供矛盾检测对账；注意 capital_detail 此处仍是规则侧原文（下方才被覆写）；
-            # ⚠️ 实施顺序第 5 步删除规则评分模式后本字段永久为空，届时同步清理
-            other["_rule_capital_check"] = capital_check
-            other["_rule_capital_detail"] = other.get("capital_detail", "")
+            # A6 阶段 2：规则评分模式已退役（实施顺序第 5 步）。
+            # capital_detail 原为规则侧原文，现直接以 glue 证据覆写；
+            # Q8-A1 的 rule_capital_check/rule_capital_detail 留存随之移除。
             other["capital_detail"] = f"[glue] {st.evidence or st.capital_read}"
             other["news_detail"] = f"[glue] {st.news_read}"
             other["sentiment_check"] = new_sentiment
@@ -1500,22 +1486,22 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         self,
         name: str,
         detail: Optional[SectorDetail],
-        capital_flows: list[tuple[str, float]],
-        news_keywords: list[tuple[str, dict]],
-        hot_sectors: list[str],
         role_info: Optional[dict] = None,
-        capital_flow_map: Optional[dict[str, float]] = None,
     ) -> tuple[float, str, str, dict]:
-        """计算板块的 4 维评分和综合分（不含分类）
+        """计算板块的技术面综合分（A6 阶段 2：规则评分模式已退役）
+
+        跨维校验三件套（资金/消息/情绪）已随 glue 转正删除：命中板块的三态判定与
+        composite 由 Pass 1.5 用 glue 输出直接覆写；本函数只为「glue 漏命中/降级」的
+        板块垫一个技术面中性分（放弃逐板块规则兜底，负责人 2026-09-26 裁决）。
 
         Returns:
             (composite_score, capital_check, news_check, other_data_dict)
-            other_data_dict 包含创建 SectorIntel 所需的所有中间数据
+            capital_check/news_check 恒为 "neutral"，情绪态在 other 中置 "missing"。
         """
         role_info = role_info or {"role": "mainline", "tier": None, "quality": None, "mainline_days": None}
         sector_role = role_info.get("role", "mainline")
 
-        # ── 维度 1: 技术面（来自 Node 2）──
+        # ── 技术面（来自 Node 2）──
         if detail:
             tech_score = detail.strength_score
             lifecycle = detail.lifecycle
@@ -1547,77 +1533,34 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             tech_score = 50.0  # 默认中等
             tech_detail = "无 Node 2 数据"
 
-        # ── 维度 2: 资金面（A4: 优先全量查找，Top-8 兜底）──
-        capital_check, capital_detail = self._cross_check_capital(
-            name, capital_flows, capital_flow_map=capital_flow_map,
-        )
-
-        # ── 维度 3: 消息面（分级修正：影响等级 × 多源确认 × 海外联动）──
-        news_check, news_detail, news_adjust = self._cross_check_news(name, news_keywords)
-
-        # ── 维度 4: 情绪面 ──
-        sentiment_check, sentiment_detail = self._cross_check_sentiment(name, hot_sectors)
-
-        # ── 综合评分 ──
-        # 基础分 = 技术面（Node 2 的 strength_score）
+        # ── 综合评分：技术面 + Lifecycle 修正（跨维修正随规则模式退役移除）──
+        # 注：命中板块的 composite 会在 Pass 1.5 被 glue 输出（strength×100）整体覆写，
+        #     本函数值仅对 glue 漏命中/降级板块生效。
         composite = tech_score
-
-        # B1 口径标注 + 重复计数留痕：
-        # capital_check / news_check / sentiment_check 已在本函数计过一次分。
-        # Phase 2 的 _adjust_score_by_sector_intel 中的对应加减项是第二次计入，幅度不同。
-        # ⚠️ 若将来统一为一次，必须同时调整 composite_score 的 clip 区间。
-
-        # 资金面修正（从门槛变为放大器）
-        if capital_check == "aligned":
-            composite += 10
-        elif capital_check == "divergent":
-            composite -= 15
-
-        # 消息面修正（分级：高影响事件修正幅度最高可达 ±20/−24，不再是扁平 ±8/−12）
-        composite += news_adjust
-
-        # 情绪面修正（P3: 埋伏板块不惩罚低热度——低关注度是埋伏的利润来源）
-        # D-P4 后缺失态为 "missing"：为保持「D-P4 零分数变更」，缺失仍按 low 同档罚分
-        if sentiment_check == "high":
-            composite += 5
-        elif sentiment_check in ("low", "missing") and sector_role != "ambush":
-            composite -= 5
-
-        # Lifecycle 修正
         if detail and detail.lifecycle:
             phase = detail.lifecycle.phase
             if phase in ("launch", "acceleration"):
                 composite += 8  # 早期阶段加分
             elif phase in ("late_stage", "mature_exhausted"):
                 composite -= 15  # 晚期阶段减分
-
         composite = clip(composite, 0, 100)
 
-        # 置信度（基于数据完整度）
-        confidence = 0.5
-        if detail:
-            confidence += 0.2  # 有 Node 2 数据
-        if capital_check != "neutral":
-            confidence += 0.1  # 资金面有信号
-        if news_check != "neutral":
-            confidence += 0.1  # 消息面有信号
-        # D-P4: "missing" 表示数据源未接入，不计入置信度（与 "neutral" 同等处理）
-        if sentiment_check not in ("low", "missing"):
-            confidence += 0.1  # 情绪面有信号
-        confidence = clip(confidence, 0.0, 1.0)
+        # 置信度：仅基于 Node 2 数据完整度（跨维信号加成随规则模式退役移除，
+        # glue 命中板块的 confidence 由 Pass 1.5 覆写）
+        confidence = clip(0.5 + (0.2 if detail else 0.0), 0.0, 1.0)
 
         other = {
             "tech_score": tech_score,
             "tech_detail": tech_detail,
-            "capital_detail": capital_detail,
-            "news_detail": news_detail,
-            "sentiment_check": sentiment_check,
-            "sentiment_detail": sentiment_detail,
+            "capital_detail": "规则模式已退役",
+            "news_detail": "规则模式已退役",
+            "sentiment_check": "missing",
+            "sentiment_detail": "规则模式已退役",
             "confidence": confidence,
             "sector_role": sector_role,
         }
 
-        return composite, capital_check, news_check, other
+        return composite, "neutral", "neutral", other
 
     def _build_sector_intel_from_scores(
         self,
@@ -1661,9 +1604,6 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             tech_detail=other["tech_detail"],
             capital_check=capital_check,
             capital_detail=other["capital_detail"],
-            # Q8-A1：透传规则侧证据（仅在 glue 直替时由 Pass 1.5 写入 other）
-            rule_capital_check=other.get("_rule_capital_check"),
-            rule_capital_detail=other.get("_rule_capital_detail", ""),
             news_check=news_check,
             news_detail=other["news_detail"],
             sentiment_check=other["sentiment_check"],
@@ -1676,344 +1616,6 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             overheat_severity=overheat_severity,
             frame_group=frame_group,
         )
-
-    # 资金面背离阈值（P0-1，2026-09-02 审核新增）
-    # capital_check 的 "divergent" 分支原为死代码（审核结论：所有板块大额净流出时
-    # 仍判 neutral，资金面验证形同虚设）。
-    #
-    # 判定维度必须是「相对」而非「绝对」（审核校准修订）：
-    #   净流出绝对金额同时编码了板块体量与市场水位两个无关因子。0902 全市场大单
-    #   净流出 255.57 亿、板块中位流出 12.2 亿时，-50 亿只是略差于中位（373 板块中
-    #   53 个命中 = 14%）；0901 更达 89 个。绝对阈值在普跌日把「常态」判成「背离」，
-    #   与 P0-5 吸筹闸门的一刀切同型。
-    # 故改为：板块净流出落在当日全市场最差 CAPITAL_DIVERGENT_TAIL_PCT 分位才算背离，
-    # 自动随市场水位缩放；样本不足时回退到绝对下限兜底。
-    _CAPITAL_DIVERGENT_TAIL_PCT = 0.05       # 全市场最差 5% 视为背离
-    _CAPITAL_DIVERGENT_MIN_SAMPLES = 60      # 分位判定所需最小板块样本数
-    _CAPITAL_DIVERGENT_FALLBACK_YI = -80.0   # 样本不足时的绝对兜底阈值（亿）
-
-    # 净流入判定下限（P0-1 配套，2026-09-02）
-    # 原判据 `amount > 0` 对浮点噪声也成立：0902 实测"橡胶"经子串匹配后取到
-    # 0.02 亿（200 万元），被判 aligned 并加 10 分——该量级对板块资金面无意义
-    # （全市场板块净额中位约 -15 亿）。匹配率从 33% 提到 80% 后此类噪声必然暴露。
-    _CAPITAL_ALIGNED_MIN_YI = 1.0        # ≥1 亿才算有意义的净流入
-
-    def _divergent_threshold(self, capital_flow_map: dict[str, float]) -> float:
-        """按当日全市场净流出分布，计算背离阈值（返回负数，单位：亿）。
-
-        取全市场板块净流出的最差 TAIL_PCT 分位。样本不足时回退绝对兜底，
-        避免小样本下分位抖动。
-
-        D-P1（2026-09-11）：每次计算后把阈值信息存到实例变量，供落盘使用。
-        """
-        amounts = sorted(
-            v for v in capital_flow_map.values() if isinstance(v, (int, float))
-        )
-        sample_count = len(amounts)
-
-        if sample_count < self._CAPITAL_DIVERGENT_MIN_SAMPLES:
-            # 样本不足，回退到绝对兜底
-            effective_threshold = self._CAPITAL_DIVERGENT_FALLBACK_YI
-            percentile_5pct = None
-        else:
-            idx = int(sample_count * self._CAPITAL_DIVERGENT_TAIL_PCT)
-            percentile_5pct = amounts[idx]
-            # min() 作用：取分位值和硬下限中更严格的（更负的）
-            effective_threshold = min(percentile_5pct, self._CAPITAL_DIVERGENT_FALLBACK_YI)
-
-        # D-P1: 存到实例变量供落盘
-        self._last_capital_threshold_info = {
-            "sample_count": sample_count,
-            "percentile_5pct": percentile_5pct,
-            "effective_threshold": effective_threshold,
-            "min_cap": self._CAPITAL_DIVERGENT_FALLBACK_YI,
-        }
-
-        return effective_threshold
-
-    def _lookup_capital_flow(
-        self,
-        name: str,
-        capital_flow_map: dict[str, float],
-    ) -> tuple[Optional[float], Optional[str], str]:
-        """在全量资金流表中定位板块，返回 (amount, matched_name, match_type)。
-
-        match_type: "exact" / "alias" / "substring" / "narrow" / "generic"（A6 护栏）/ None（未命中）
-
-        P0-1（2026-09-02 审核）：原实现只用 `dict.get` + 别名循环，实测 0902
-        15 个确认板块仅命中 5 个（33%）——资金流表有 476 个板块且命名口径与
-        Node 2 不同（"旅游" vs "旅游概念"、"橡胶" vs "橡胶制品"）。
-        改为复用统一匹配入口 _match_sector，子串门槛放宽到 2 字后匹配率 33%→80%。
-
-        三道约束（放宽门槛的必要代价控制）：
-          1. 多候选取「最短包含串」——"旅游"同时匹配"旅游概念"与"旅游及酒店"时，
-             最短者语义最贴近，不按 dict 遍历顺序随机取。
-          2. "narrow"（目标比查询更窄，如"化工"→"磷化工"）与 generic 同等降级：
-             窄类的资金流不能代表宽类，否则以偏概全（实测 11/15 通用名会误配）。
-          3. 泛化大类（"石油贸易"→"贸易"）判 generic，调用方须走 neutral。
-        """
-        direct = capital_flow_map.get(name)
-        if direct is not None:
-            return direct, name, "exact"
-
-        candidates: list[tuple[int, str, float, str]] = []
-        for flow_name, amount in capital_flow_map.items():
-            hit, match_type = self._match_sector(name, flow_name, min_substr_len=2)
-            if hit:
-                candidates.append((len(flow_name), flow_name, amount, match_type))
-
-        if not candidates:
-            return None, None, ""
-
-        # 可靠匹配优先（exact/alias/substring）；全不可靠时才退到 generic/narrow
-        solid = [c for c in candidates if c[3] not in _UNRELIABLE_MATCH_TYPES]
-        pool = solid or candidates
-        pool.sort(key=lambda c: c[0])   # 同级取最短（语义最贴近）
-        _, matched_name, amount, match_type = pool[0]
-        return amount, matched_name, match_type
-
-    def _cross_check_capital(
-        self,
-        name: str,
-        flows: list[tuple[str, float]],
-        capital_flow_map: Optional[dict[str, float]] = None,
-    ) -> tuple[str, str]:
-        """资金面交叉验证: (check, detail)
-
-        A4: 优先从全量 sector_flow_all (464 板块) 查找，Top-8 榜单作模糊兜底。
-
-        D-P1（2026-09-11）：每次调用后把板块匹配详情存到实例变量，供落盘使用。
-        """
-        # A4: 全量查找（优先）
-        if capital_flow_map:
-            amount, matched_name, match_type = self._lookup_capital_flow(
-                name, capital_flow_map,
-            )
-            if amount is not None:
-                label = name if matched_name == name else f"{name}[{matched_name}]"
-                # A6: 泛化关联不确认方向（大类的资金流不代表该细分板块）；
-                # narrow 同理——目标比查询更窄，窄类资金流亦不代表宽类
-                if match_type in _UNRELIABLE_MATCH_TYPES:
-                    # D-P1: 记录板块匹配详情
-                    self._capital_sector_details.append({
-                        "sector": name,
-                        "amount": amount,
-                        "match_type": match_type,
-                        "check": "neutral",
-                    })
-                    return "neutral", (
-                        f"{label}关联净额{amount:.1f}亿(全量，{match_type}匹配不确认方向)"
-                    )
-                if amount > 10:
-                    # D-P1: 记录板块匹配详情
-                    self._capital_sector_details.append({
-                        "sector": name,
-                        "amount": amount,
-                        "match_type": match_type,
-                        "check": "aligned",
-                    })
-                    return "aligned", f"{label}净流入{amount:.1f}亿(全量)"
-                elif amount >= self._CAPITAL_ALIGNED_MIN_YI:
-                    # D-P1: 记录板块匹配详情
-                    self._capital_sector_details.append({
-                        "sector": name,
-                        "amount": amount,
-                        "match_type": match_type,
-                        "check": "aligned",
-                    })
-                    return "aligned", f"{label}净流入{amount:.1f}亿(小额/全量)"
-                elif amount < self._divergent_threshold(capital_flow_map):
-                    # P0-1: 复活 divergent 生产分支（此前为死代码）。
-                    # 阈值随当日全市场水位自适应，普跌日不会把常态流出误判为背离。
-                    thr = self._divergent_threshold(capital_flow_map)
-                    # D-P1: 记录板块匹配详情
-                    self._capital_sector_details.append({
-                        "sector": name,
-                        "amount": amount,
-                        "match_type": match_type,
-                        "check": "divergent",
-                    })
-                    return "divergent", (
-                        f"{label}净流出{abs(amount):.1f}亿(全量)，居全市场最差"
-                        f"{self._CAPITAL_DIVERGENT_TAIL_PCT:.0%}（阈值{thr:.1f}亿）"
-                    )
-                else:
-                    # D-P1: 记录板块匹配详情
-                    self._capital_sector_details.append({
-                        "sector": name,
-                        "amount": amount,
-                        "match_type": match_type,
-                        "check": "neutral",
-                    })
-                    return "neutral", f"{label}净流出{abs(amount):.1f}亿(全量)"
-
-        # Top-8 兜底（A5: 统一匹配入口）
-        if not flows:
-            return "neutral", "资金面数据缺失"
-
-        for flow_name, amount in flows:
-            hit, match_type = self._match_sector(name, flow_name)
-            if hit:
-                # A6: 泛化词匹配只给 neutral（不确认方向）
-                if match_type == "generic":
-                    return "neutral", f"泛化关联[{flow_name}]流入{amount:.1f}亿"
-                if amount > 10:
-                    return "aligned", f"{flow_name}净流入{amount:.1f}亿"
-                else:
-                    return "aligned", f"{flow_name}净流入{amount:.1f}亿（小额）"
-
-        return "neutral", f"{name}不在资金流入 top"
-
-    def _build_capital_divergence_info(self) -> Optional[dict]:
-        """D-P1: 构建资金背离阈值诊断信息（供 unified.json 落盘）。
-
-        每次 run() 结束时调用，将当日的阈值计算结果和确认板块匹配详情
-        组装成可落盘的 dict。无数据时返回 None。
-        """
-        if not self._last_capital_threshold_info:
-            return None
-
-        info = {
-            **self._last_capital_threshold_info,
-            "sector_details": self._capital_sector_details or [],
-        }
-        return info
-
-    # 消息面分级修正参数（v2：消息面权重加大）
-    # 基础修正按影响等级分档，多源确认与海外联动再放大，正负各自封顶
-    _NEWS_POS_ADJUST = {"high": 12.0, "medium": 8.0, "low": 4.0}
-    _NEWS_NEG_ADJUST = {"high": -18.0, "medium": -12.0, "low": -6.0}
-    _NEWS_SOURCE_MULTIPLIER = 1.3   # source_count >= 3：多源确认放大
-    _NEWS_GLOBAL_MULTIPLIER = 1.3   # event_type == "global"：海外科技消息→A股联动放大
-    _NEWS_FADING_MULTIPLIER = 0.5   # fading/archived：行情已 price-in，减半
-    _NEWS_POS_CAP = 20.0            # 正面修正封顶
-    _NEWS_NEG_CAP = -24.0           # 负面修正封顶
-
-    def _cross_check_news(
-        self,
-        name: str,
-        keywords: list[tuple[str, dict]],
-    ) -> tuple[str, str, float]:
-        """消息面交叉验证（分级修正版）: (check, detail, adjustment)
-
-        修正幅度 = Σ(影响等级基础分 × 多源系数 × 海外联动系数 × 生命周期衰减)，
-        正面封顶 +20、负面封顶 −24。
-        设计依据：国内科技股高度跟随海外科技消息，global 事件额外放大 1.3×。
-        """
-        if not keywords:
-            return "neutral", "无消息催化", 0.0
-
-        # A5: 统一匹配入口替代 _split_sector_name 子词匹配。
-        # 注：不得以"关键词出现在标题中"作兜底——_extract_news_keywords 会把事件标题本身
-        # 作为关键词加入（kw == meta["title"]），该条件恒真，会导致所有板块匹配全部新闻。
-        # "标题含板块名"的合法场景已由 _match_sector 的 L3 受控子串覆盖。
-        matched: list[tuple[dict, str]] = []  # (meta, match_type)
-
-        for kw, meta in keywords:
-            hit, match_type = self._match_sector(name, kw)
-            if hit:
-                matched.append((meta, match_type))
-
-        if not matched:
-            return "neutral", f"{name}无直接消息催化", 0.0
-
-        # 去重（按标题）
-        seen = set()
-        unique: list[tuple[dict, str]] = []
-        for meta, mt in matched:
-            if meta["title"] not in seen:
-                seen.add(meta["title"])
-                unique.append((meta, mt))
-
-        pos_adjust = 0.0
-        neg_adjust = 0.0
-        pos_count = 0
-        neg_count = 0
-        global_hit = False
-
-        for meta, match_type in unique:
-            sentiment = meta.get("sentiment", "neutral")
-            if sentiment not in ("positive", "negative"):
-                continue
-            base = (
-                self._NEWS_POS_ADJUST.get(meta.get("impact_level", "low"), 4.0)
-                if sentiment == "positive"
-                else self._NEWS_NEG_ADJUST.get(meta.get("impact_level", "low"), -6.0)
-            )
-            magnitude = abs(base)
-            if meta.get("source_count", 1) >= 3:
-                magnitude *= self._NEWS_SOURCE_MULTIPLIER
-            if meta.get("event_type") == "global":
-                magnitude *= self._NEWS_GLOBAL_MULTIPLIER
-                global_hit = True
-            if meta.get("lifecycle_state") in ("fading", "archived"):
-                magnitude *= self._NEWS_FADING_MULTIPLIER
-            # A6: 泛化词根匹配降权（防止 "AI" 等短词假阳性加分）；
-            # narrow（目标比查询更窄，如"化工"→"磷化工"）同样降权——窄类事件
-            # 不代表宽类板块，与 generic 同处理
-            if match_type in _UNRELIABLE_MATCH_TYPES:
-                    magnitude *= 0.5
-            if sentiment == "positive":
-                pos_adjust += magnitude
-                pos_count += 1
-            else:
-                neg_adjust -= magnitude
-                neg_count += 1
-
-        pos_adjust = min(pos_adjust, self._NEWS_POS_CAP)
-        neg_adjust = max(neg_adjust, self._NEWS_NEG_CAP)
-        adjustment = pos_adjust + neg_adjust
-
-        top_title = unique[0][0]["title"][:30]
-        if pos_count > neg_count and adjustment >= 6:
-            global_note = "（含海外联动）" if global_hit else ""
-            check = "catalyzed"
-            detail = f"{pos_count}条正面催化{global_note} +{adjustment:.0f}: {top_title}"
-        elif neg_count > pos_count and adjustment <= -6:
-            global_note = "（含海外联动）" if global_hit else ""
-            check = "negative"
-            detail = f"{neg_count}条负面消息{global_note} {adjustment:.0f}: {top_title}"
-        else:
-            check = "neutral"
-            detail = f"消息中性: {top_title}"
-
-        return check, detail, round(adjustment, 1)
-
-    def _cross_check_sentiment(
-        self,
-        name: str,
-        hot_sectors: list[str],
-    ) -> tuple[str, str]:
-        """情绪面交叉验证: (check, detail) — A5 统一匹配
-
-        D-P4: 无热榜数据时返回 "missing"（数据源未接入），不再是 "low"（低热度）。
-        缺失维度不计入置信度加减分。
-        """
-        if not hot_sectors:
-            # D-P4: "missing" 表示数据源未接入，与 "low"（低热度）区分
-            return "missing", "无热榜数据"
-
-        # A5: 统一匹配入口替代 _split_sector_name 子词匹配
-        match_count = 0
-        generic_count = 0
-
-        for hot_sector in hot_sectors:
-            hit, match_type = self._match_sector(name, hot_sector)
-            if hit:
-                match_count += 1
-                # narrow 与 generic 同等：窄类热榜不代表宽类板块热度
-                if match_type in _UNRELIABLE_MATCH_TYPES:
-                    generic_count += 1
-
-        # A6: 泛化词根匹配不计入有效匹配数；narrow（目标比查询更窄）同理
-        effective_count = match_count - generic_count
-
-        if effective_count >= 3:
-            return "high", f"{effective_count}只关联股票上热榜"
-        elif effective_count >= 1:
-            return "medium", f"{effective_count}只关联股票上热榜"
-        else:
-            return "low", f"{name}未上热榜"
 
     def _classify_all_sectors(
         self,
@@ -2205,69 +1807,19 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 板块情报：
 {sectors_text}
 
-判断规则补充：埋伏角色（ambush）板块若带有日历催化剂但当前为 caution，
-可结合催化强度与资金面证据建议上调为 actionable；无催化剂支撑不要上调。
-
 请输出 JSON：
 {{
   "narrative": "一段话总结板块格局（50字内）",
-  "cross_sector_risks": ["跨板块风险1", "跨板块风险2"],
-  "adjustments": [
-    {{"sector": "板块名", "new_classification": "actionable/caution/exclude", "reason": "调整理由"}}
-  ]
+  "cross_sector_risks": ["跨板块风险1", "跨板块风险2"]
 }}"""
 
         raw_text = await self._call_llm_async(prompt, temperature=0.3, max_tokens=500, call_type="got_node6_refine")
 
-        # 分类层级（数值越大越"好"），用于判断上调/下调
-        CLASS_RANK = {
-            "exclude": 0, "caution": 1, "actionable": 2,
-        }
-
+        # A6 阶段 2（规则模式退役）：classification 改由 glue 主导 + 确定性提升兜底，
+        # 本函数不再接受 LLM adjustments 回写（避免双入口打架），只保留 narrative /
+        # cross_sector_risks 的全局摘要价值。
         try:
             result = self._parse_json(raw_text)
-
-            # 应用调整（仅允许上调，禁止下调）
-            # A6 接线：glue 已在 _build_sector_intel Pass 1.5 直接替换三件套，
-            # 避免与 glue 双入口改同一 classification 字段 → 跳过 adjustments，
-            # 保留 narrative / cross_sector_risks 的全局摘要价值。
-            adjustments = result.get("adjustments", [])
-            if getattr(self, "_a6_glue_active", False) and adjustments:
-                logger.info(
-                    f"[Node 6] A6 接线：跳过 {len(adjustments)} 条 LLM adjustments（classification 已由 glue 主导）"
-                )
-                adjustments = []
-            for adj in adjustments:
-                sector_name = adj.get("sector", "")
-                new_class = adj.get("new_classification", "")
-                reason = adj.get("reason", "")
-
-                if new_class not in CLASS_RANK:
-                    continue
-
-                for s in sectors:
-                    if s.sector_name != sector_name:
-                        continue
-                    old_rank = CLASS_RANK.get(s.classification, 2)
-                    new_rank = CLASS_RANK.get(new_class, 2)
-                    if new_rank <= old_rank:
-                        # 禁止下调：confirmed → watch 等
-                        logger.warning(
-                            f"[Node 6] 跳过降级: {sector_name} {s.classification}→{new_class}（{reason}）"
-                        )
-                    elif (
-                        new_class == "actionable"
-                        and (getattr(s, "overheat_severity", None) or 0.0) > OVERHEAT_ADMISSION_LIMIT
-                    ):
-                        # 过热闸门：LLM 不得把过热板块抬回主线（防绕过准入闸门）
-                        logger.warning(
-                            f"[Node 6] 拦截 LLM 上调（过热）: {sector_name} "
-                            f"overheat={s.overheat_severity:.2f}（{reason}）"
-                        )
-                    else:
-                        s.classification = new_class
-                        s.reasoning += f" [LLM调整: {reason}]"
-                    break
 
             # 添加 narrative 到第一个板块的 reasoning（作为全局摘要）
             narrative = result.get("narrative", "")
@@ -3747,27 +3299,14 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
     # =========================================================================
 
     @staticmethod
-    def _parse_capital_flows(capital: CapitalContext) -> list[tuple[str, float]]:
-        """解析资金流数据: [("核电", 31.6), ("绿色电力", 23.9), ...]"""
-        flows = []
-        evidence = capital.evidence
-        if not evidence.sector_flow:
-            return flows
-
-        for key in ("top_concepts", "top_industries"):
-            items = evidence.sector_flow.get(key, [])
-            for item in items:
-                match = re.match(r'(.+?)\(([+-]?[\d.]+)亿\)', item)
-                if match:
-                    flows.append((match.group(1), float(match.group(2))))
-        return flows
-
-    @staticmethod
     def _parse_sector_level_flows(capital: CapitalContext) -> dict[str, float]:
         """解析板块级资金流（capital.sector_flow_all），排除通道/杠杆聚合项。
 
         Returns:
             {板块名: 净流入(亿)} — 仅用于板块级错位比对，不做家族级归并。
+
+        A6 阶段 2：规则三件套已退役，本函数仍供 `_detect_family_capital_mismatch`
+        消费（主线家族 vs 板块资金错位检测），保留。
         """
         flows: dict[str, float] = {}
         sector_flow = capital.evidence.sector_flow if capital and capital.evidence else None
@@ -3785,40 +3324,6 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             except (TypeError, ValueError):
                 continue
         return flows
-
-    @staticmethod
-    def _extract_news_keywords(news: NewsContext) -> list[tuple[str, dict]]:
-        """提取消息面关键词: [(关键词, 事件元数据), ...]
-
-        元数据保留影响等级/多源数/事件类型/生命周期，供分级修正使用
-        （旧版只保留 sentiment，导致高影响事件与低影响事件修正幅度相同）。
-        """
-        keywords = []
-        for event in news.major_events:
-            meta = {
-                "title": event.title,
-                "sentiment": event.sentiment,
-                "impact_level": event.impact_level,
-                "source_count": event.source_count,
-                "event_type": event.event_type,
-                "lifecycle_state": event.lifecycle_state,
-            }
-            for sector_name in event.affected_sectors:
-                keywords.append((sector_name, meta))
-            keywords.append((event.title, meta))
-
-        for concept in news.concept_suggestions:
-            name = concept.get("concept_name", "")
-            if name:
-                keywords.append((name, {
-                    "title": name,
-                    "sentiment": "positive",
-                    "impact_level": "low",
-                    "source_count": 1,
-                    "event_type": "industry",
-                }))
-        
-        return keywords
 
     @staticmethod
     def _extract_hot_sectors(sentiment: SentimentContext, sector_ctx: Optional[SectorContext] = None) -> list[str]:
@@ -3859,6 +3364,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         return False
 
     # A6: 高频泛化词根（≤2 字），子串匹配命中时降权
+    # A6 阶段 2：_match_sector 仍供 _lookup_flow_map（吸筹确认闸门 _check_accumulation_gate
+    # 的资金流比对）消费，本常量随之保留。
     _GENERIC_ROOTS = frozenset({
         "AI", "芯片", "电力", "新能源", "医药", "军工", "消费", "金融",
         "周期", "地产", "汽车", "数据", "软件", "硬件", "网络", "通信",
@@ -3875,25 +3382,18 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         匹配链路：归一化精确 → 别名变体 → 受控子串（≥min_substr_len 字）
 
+        A6 阶段 2：规则三件套已退役，本函数仍供 `_lookup_flow_map` 消费（板块名→
+        资金流表的归一化匹配，由吸筹确认闸门 `_check_accumulation_gate` 调用），保留。
+
         Args:
             min_substr_len: L3 子串匹配的最小字数门槛，默认 3。
-                P0-1（2026-09-02 审核）：资金面全量表口径差异大，大量中文板块名
-                是 2 字（橡胶/航空/种业/渔业），默认门槛会把它们整体排除在子串
-                匹配外。资金面路径显式传 2 以提升匹配率；其余调用方保持默认 3
-                ——2 字子串误命中风险高（如"银行"命中"参股银行"），不宜全局放宽。
 
         Returns:
             (matched, match_type): match_type = "exact" / "alias" / "substring"
                 / "narrow" / "generic" / "none"
-            "generic" 表示命中泛化词根（A6 护栏），调用方应降权处理
-            "narrow" 表示目标比查询更窄（查询是目标的子串），见下方说明
+            "generic" 表示命中泛化词根（护栏），调用方自行判断是否降权
+            "narrow" 表示目标比查询更窄（查询是目标的子串）
         """
-
-        # 子串方向判定（2026-09-02 P0-1 修复）
-        #   查询"化工" 命中"磷化工"：目标更窄 → 拿窄类资金流代表宽类是**以偏概全**
-        #     （0902 实测：化工/农业/电子/材料/医疗 等通用名 11/15 被匹配到细分窄类）
-        #   查询"旅游概念" 命中"旅游"：目标更宽 → 宽类包含查询，语义可接受
-        # 故目标更长者判 "narrow"，调用方须与 generic 同等降级。
         if not name or not target:
             return False, "none"
 
@@ -3919,11 +3419,9 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         t = AggregatorNode._strip_generic_suffix(norm_target)
         if len(s) >= min_substr_len and len(t) >= min_substr_len:
             if s in t or t in s:
-                # A6: 命中泛化词根 → 降级为 "generic"
                 core = s if s in t else t
                 if core in AggregatorNode._GENERIC_ROOTS:
                     return True, "generic"
-                # 目标比查询更长（即查询是目标的子串）→ 窄类代表宽类，不可靠
                 if s in t and len(t) > len(s):
                     return True, "narrow"
                 return True, "substring"
@@ -4690,72 +4188,7 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                 resolution="regime 处于过渡期，信号不稳定，建议降低仓位或观望",
             ))
 
-        # ── 矛盾 6: glue vs Node 3 资金口径对账（Q8-A2，audit_20260922）──
-        contradictions.extend(AggregatorNode._detect_glue_capital_mismatch(sectors))
-
         return contradictions
-
-    # Q8-A2: 规则侧大额流出阈值（亿）——glue 判 medium/unknown（映射后 neutral）
-    # 而 Node 3 实测流出超过该值时记口径矛盾（9/22 半导体 -31.96 亿无告警的实锤场景）
-    _CAPITAL_GLUE_OUTFLOW_WARN_YI = 20.0
-
-    @classmethod
-    def _detect_glue_capital_mismatch(cls, sectors: list[SectorIntel]) -> list[Contradiction]:
-        """Q8-A2（audit_20260922）：glue 覆盖后的资金判定 vs 规则侧证据对账
-
-        仅标记不排除：命中时产出 severity=warning(medium) 的 contradiction，
-        保留人工/下游感知通道。规则侧证据来自 Pass 1.5 写入 SectorIntel 的
-        rule_capital_check/rule_capital_detail 留存（Q8-A1；实施顺序第 5 步删除
-        规则评分模式后该字段恒空，本检测自然退出，届时随字段一并清理）。
-        """
-        out: list[Contradiction] = []
-        for s in sectors:
-            rule_check = getattr(s, "rule_capital_check", None)
-            if not rule_check:
-                continue
-            rule_detail = str(getattr(s, "rule_capital_detail", "") or "")
-            # 兼容规则侧文案：「净流出X亿」（neutral/divergent 分支主流格式）与
-            # 「净流入±X亿」（带符号）；多窗口拼接时用 finditer 取最弱值，
-            # 防 re.search 首命中非 1d 窗口数字；原正则只认带符号形式，
-            # 导致「流出」取反分支同样不可达（审核修复轮 P1 连带发现）
-            amounts: list[float] = []
-            for m in re.finditer(r"(净流入?)\s*(-?\d+(?:\.\d+)?)亿|(净流出?)\s*(\d+(?:\.\d+)?)亿", rule_detail):
-                if m.group(2) is not None:
-                    val = float(m.group(2))
-                    amounts.append(-val if "流出" in m.group(1) else val)
-                else:
-                    val = float(m.group(4))
-                    amounts.append(-val if "流出" in m.group(3) else val)
-            amount = min(amounts) if amounts else None
-            # 双方同为 neutral 但规则侧实测大额流出 → 口径矛盾；
-            # 必须在大额流出判定之前不做同值 skip，否则本分支永不可达
-            # （9/22 半导体 -31.96 亿无告警的实锤场景，审核修复轮 P1）
-            big_outflow = (
-                rule_check == "neutral"
-                and s.capital_check == "neutral"
-                and amount is not None
-                and amount <= -cls._CAPITAL_GLUE_OUTFLOW_WARN_YI
-            )
-            if rule_check == s.capital_check and not big_outflow:
-                continue
-            opposite = (
-                (rule_check == "divergent" and s.capital_check == "aligned")
-                or (rule_check == "aligned" and s.capital_check == "divergent")
-            )
-            if not (opposite or big_outflow):
-                continue
-            out.append(Contradiction(
-                pair="glue_vs_node3_capital",
-                timeframe="cross_dimension",
-                description=(
-                    f"「{s.sector_name}」glue 资金口径({s.capital_check}) 与 "
-                    f"Node 3 规则口径({rule_check}) 不一致: {rule_detail[:40]}"
-                ),
-                severity="medium",
-                conflict_type="factual",
-                resolution="保留 glue 判定（A6 直替契约），仅标记口径矛盾供复核",
-            ))
-        return out
 
     @staticmethod
     def _detect_family_capital_mismatch(

@@ -324,8 +324,7 @@ class TestC4S2ParseFailedFallback(unittest.TestCase):
             and not getattr(glue, "degraded", False)
         )
         self.assertFalse(active,
-                         "S2_parse_failed 时 _a6_glue_active 应为 False，"
-                         "避免 adjustments 分支被误跳过")
+                         "S2_parse_failed 时 _a6_glue_active 应为 False（glue 未转正成功）")
 
     def test_mainline_endurance_skips_glue_families(self):
         """glue.status != ok 时不消费 glue.families（即使有数据）。"""
