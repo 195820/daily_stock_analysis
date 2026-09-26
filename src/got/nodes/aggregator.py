@@ -76,6 +76,7 @@ from src.got.persistence import (
     save_ema_baseline,
     load_previous_regime_state,
     load_regime_state_history,
+    seed_regime_transition_events,
     EMA_ALPHA,
     EMA_WARMUP_SAMPLES,
 )
@@ -143,6 +144,11 @@ OVERHEAT_ADMISSION_LIMIT = 0.3
 GENERIC_SUFFIXES = ("概念",)
 
 # （A6 阶段 2：_UNRELIABLE_MATCH_TYPES 随规则评分模式三件套一并退役）
+
+# §7.1 振荡修复：连续钉住（情形 3）达该天数后，挂起候选次日再现即豁免确认
+# （迟滞豁免）。0910 实态：raw 在 bull↔bear 日日交替，两日确认永不触发，
+# 输出被永久钉死；禁用开关 DISABLE_REGIME_OSCILLATION_FIX=true 回退旧行为。
+REGIME_PINNED_EXEMPT_DAYS = 3
 
 
 # =============================================================================
@@ -575,19 +581,35 @@ class AggregatorNode:
     def _apply_regime_state_machine(regime: MarketRegime) -> MarketRegime:
         """Regime 状态机：跨日记忆 + 转换确认 + dwell 追踪。
 
-        状态转换规则（v2.1）：
+        状态转换规则（v2.1 + §7.1 振荡修复）：
         - raw == previous → dwell_days += 1
         - raw != previous 且 raw == transition_pending → 确认切换，dwell_days = 1
         - raw != previous 且 raw != transition_pending → 保持 previous，
-          transition_pending = raw（首次出现，待次日确认）
+          transition_pending = raw（首次出现，待次日确认），pinned_days += 1
+        - 迟滞豁免（§7.1 主因修复）：pinned_days ≥ REGIME_PINNED_EXEMPT_DAYS 时，
+          当日 raw（≠previous）直接确认为新 regime（放弃两日确认），
+          打破 bull↔bear 日日交替导致的确认死锁（交替态下「候选再现」永不
+          成立，只有即时确认才能真正脱钉）。脱钉后纯交替信号被迟滞抑制
+          （输出锁在首个脱钉值），持续两日的真实信号仍按情形 2 正常确认
         - 冷启动（无归档/缺字段）→ current = raw，dwell_days = 1，不阻塞
 
-        transition_count：近 20 交易日确认切换次数（从归档序列统计）
+        transition_count：近 20 交易日**确认切换事件**数（§7.1 缺陷②修复：
+        由状态机自记 transition_events 事件列表作真相源，不再回看输出值
+        相邻 diff；旧归档无事件记忆时把 seed_regime_transition_events 迁移种子
+        **播种进列表**后继续追加，窗口按日期区间判定（含当日）。
+        豁免强切日归档标 regime_switch_exempt=True（与两日确认区分，R2 复盘）。
+        DISABLE_REGIME_OSCILLATION_FIX=true 一键回退旧行为（无豁免、
+        输出 diff 计数、不记事件；关闭后事件链从迁移种子重建）。
         """
+        import os as _os
+        legacy_no_osc_fix = _os.environ.get(
+            "DISABLE_REGIME_OSCILLATION_FIX", ""
+        ).strip().lower() == "true"
+
         # 加载前日 regime 状态
         prev_state = load_previous_regime_state()
 
-        # 加载 20 日 regime 历史（用于 transition_count）
+        # 加载 20 日 regime 历史（用于 transition_count 窗口/迁移种子）
         regime_history = load_regime_state_history(days=20)
 
         raw_regime = regime.regime
@@ -600,41 +622,95 @@ class AggregatorNode:
                 "previous_regime": None,
                 "transition_count": 0,
                 "transition_pending": None,
+                "pinned_days": 0,
+                "transition_events": None,
             })
 
         prev_regime = prev_state["regime"]
         prev_dwell = prev_state["dwell_days"]
         prev_pending = prev_state["transition_pending"]
+        prev_pinned = int(prev_state.get("pinned_days") or 0)
+        prev_events: list[str] = list(
+            prev_state.get("transition_events") or []
+        )
 
         # 状态转换判定
+        switch_confirmed = False
+        exempt_applied = False
         if raw_regime == prev_regime:
-            # 情形 1：与昨日相同 → dwell+1，清除 pending
+            # 情形 1：与昨日相同 → dwell+1，清除 pending，解除钉住
             new_regime = prev_regime
             new_dwell = prev_dwell + 1
             new_pending = None
-        elif raw_regime == prev_pending:
-            # 情形 2：与 pending 相同 → 确认切换
+            new_pinned = 0
+        elif raw_regime == prev_pending and (
+            legacy_no_osc_fix or prev_pinned < REGIME_PINNED_EXEMPT_DAYS
+        ):
+            # 情形 2：与 pending 相同 → 确认切换（旧行为在开关开启时原样保留）
             new_regime = prev_pending
             new_dwell = 1
             new_pending = None
+            new_pinned = 0
+            switch_confirmed = True
             logger.info(
                 f"[Node 6] Regime 切换确认: {prev_regime} → {new_regime}"
             )
+        elif not legacy_no_osc_fix and prev_pinned >= REGIME_PINNED_EXEMPT_DAYS:
+            # 豁免分支（§7.1 核心出口，审核⑧合并原「2-豁免/3-豁免」两分支：
+            # 行为完全相同）。日日交替下 pending 每日被换挂、「候选再现」
+            # 很少命中；钉住满阈值后直接信任当日 raw（含再现与换挂两种情形）
+            new_regime = raw_regime
+            new_dwell = 1
+            new_pending = None
+            new_pinned = 0
+            switch_confirmed = True
+            exempt_applied = True
+            logger.info(
+                f"[Node 6] Regime 迟滞豁免切换: {prev_regime} → {new_regime}"
+                f"（已钉住 {prev_pinned} 日，直接确认当日信号，放弃两日确认"
+                + ("，候选再现）" if raw_regime == prev_pending else "）")
+            )
         else:
-            # 情形 3：新信号 ≠ pending → 保持昨日，设新 pending
+            # 情形 3：新信号 ≠ pending → 保持昨日，设新 pending，钉住 +1
             new_regime = prev_regime
             new_dwell = prev_dwell + 1
             new_pending = raw_regime
+            new_pinned = prev_pinned + 1
             logger.info(
                 f"[Node 6] Regime 首次出现: {raw_regime}，待次日确认"
+                + (f"（已钉住 {new_pinned} 日）" if new_pinned else "")
             )
 
-        # transition_count：统计历史序列中 regime 切换次数
-        transition_count = 0
-        if len(regime_history) >= 2:
-            for i in range(1, len(regime_history)):
-                if regime_history[i][1] != regime_history[i-1][1]:
-                    transition_count += 1
+        # transition_count（§7.1 缺陷②）：确认切换事件列表在 20 日窗口内的条数。
+        # 窗口按**日期区间**判定（历史最早日 ≤ e ≤ 今日）：当日归档在运行时
+        # 尚未落盘，按归档成员包含判定会系统性漏计当日事件（审核修正①）
+        today_str = date.today().strftime("%Y%m%d")
+        window_lo = regime_history[0][0] if regime_history else None
+        if legacy_no_osc_fix:
+            # 回退旧行为：输出值相邻 diff 计数，不记事件（None 保留「未迁移」
+            # 语义，关闭开关后从种子重建）
+            transition_count = sum(
+                1 for i in range(1, len(regime_history))
+                if regime_history[i][1] != regime_history[i - 1][1]
+            )
+            events = None
+        else:
+            events = prev_events
+            if prev_state.get("transition_events") is None and not events:
+                # 未迁移归档：迁移种子（旧输出相邻 diff）**播种进列表**作
+                # 续记真相源——避免切换日整盘丢弃种子致计数一夜归零（审核①）
+                events = seed_regime_transition_events(regime_history)
+            if switch_confirmed and today_str not in events:
+                # 确认切换日记今日事件（幂等：同日重跑不重复 append）
+                events = events + [today_str]
+            transition_count = sum(
+                1 for e in events
+                if (window_lo is None or e >= window_lo) and e <= today_str
+            )
+            # 列表只保留窗口长度，防无限增长（多跑冗余日修剪最早事件）
+            max_keep = max(len(regime_history), 1)
+            if len(events) > max_keep:
+                events = events[-max_keep:]
 
         return regime.model_copy(update={
             "regime": new_regime,
@@ -642,6 +718,11 @@ class AggregatorNode:
             "previous_regime": prev_regime,
             "transition_count": transition_count,
             "transition_pending": new_pending,
+            "pinned_days": new_pinned,
+            # 豁免强切归档标记（R2 复盘区分两日确认 vs 单日强切，审核②）
+            "regime_switch_exempt": exempt_applied,
+            # 旧行为模式不记事件→None；新行为空列表照落（保留「已迁移」标记）
+            "transition_events": events,
         })
 
     # =========================================================================

@@ -403,7 +403,8 @@ def load_previous_regime_state() -> Optional[dict[str, Any]]:
 
     Returns:
         {"regime": str, "dwell_days": int, "previous_regime": str|None,
-         "transition_count": int, "transition_pending": str|None}
+         "transition_count": int, "transition_pending": str|None,
+         "pinned_days": int, "transition_events": list[str]|None}
         不存在或缺少 regime 字段时返回 None。
 
     用于 Node 6 Level 0 状态机的跨日记忆。
@@ -423,6 +424,9 @@ def load_previous_regime_state() -> Optional[dict[str, Any]]:
             "previous_regime": regime_data.get("previous_regime"),
             "transition_count": regime_data.get("transition_count", 0),
             "transition_pending": regime_data.get("transition_pending"),
+            # §7.1 振荡修复（2026-09-26）：钉住计数 + 确认切换事件列表
+            "pinned_days": regime_data.get("pinned_days", 0),
+            "transition_events": regime_data.get("transition_events"),
         }
     logger.info("[persistence] 无 regime 状态机归档")
     return None
@@ -463,6 +467,24 @@ def load_regime_state_history(
             f"从 {entries[0][0]} 到 {entries[-1][0]}"
         )
     return entries
+
+
+def seed_regime_transition_events(history: list[tuple[str, str]]) -> list[str]:
+    """§7.1 迁移种子：从归档 regime 序列的相邻变化（旧输出 diff 法）提取切换日。
+
+    事件列表（transition_events）上线前，transition_count 统的是输出值 diff；
+    为避免升级当日计数直接归零（翻转震荡惩罚），首次运行时用旧口径算一次
+    种子。仅在「无事件记忆且无本次确认切换」时作为回退，随窗口老化自然衰减；
+    真实确认切换事件记入后优先使用事件列表。
+
+    Returns:
+        切换日列表（升序）：history[i].regime != history[i-1].regime 时取 history[i][0]。
+    """
+    return [
+        history[i][0]
+        for i in range(1, len(history))
+        if history[i][1] != history[i - 1][1]
+    ]
 
 
 def load_regime_raw_segment_days(days: int = 20) -> int:

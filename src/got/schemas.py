@@ -671,6 +671,18 @@ class MarketRegime(BaseModel):
     previous_regime: Optional[str] = Field(default=None, description="前一交易日的 regime（用于状态转换）")
     transition_count: int = Field(default=0, description="近 20 交易日 regime 确认切换次数（震荡度）")
     transition_pending: Optional[str] = Field(default=None, description="待确认的新 regime（首次出现，待次日确认）")
+    # ── §7.1 振荡修复（2026-09-26）──
+    pinned_days: int = Field(default=0, description="连续「保持昨日且挂起待确认」（情形 3）天数，振荡钉住计数")
+    transition_events: Optional[list[str]] = Field(
+        default=None,
+        description="确认切换事件日期列表（YYYYMMDD 升序），transition_count 的真相源；"
+                    "None=无事件记忆（旧归档或回滚开关期，按输出 diff 迁移种子重建），"
+                    "[]=已迁移且暂无事件",
+    )
+    regime_switch_exempt: bool = Field(
+        default=False,
+        description="今日切换是否为 §7.1 迟滞豁免强切（True=放弃两日确认，供 R2 复盘区分）",
+    )
 
 
 class CrossNodeTemporalSignal(BaseModel):

@@ -48,6 +48,9 @@ class TestLoadPreviousRegimeState(unittest.TestCase):
         self.assertEqual(result["regime"], "bull")
         self.assertEqual(result["dwell_days"], 5)
         self.assertEqual(result["transition_count"], 2)
+        # §7.1 新字段：旧归档无该键时回读默认值（pinned=0 / events=None=未迁移）
+        self.assertEqual(result["pinned_days"], 0)
+        self.assertIsNone(result["transition_events"])
 
     def test_skips_missing_regime_field(self):
         """跳过无 regime 字段的归档。"""
@@ -143,11 +146,12 @@ class TestApplyRegimeStateMachine(unittest.TestCase):
         self.assertEqual(result.regime, "bear")
         self.assertEqual(result.dwell_days, 1)
         self.assertIsNone(result.transition_pending)
-        # R2：情形 2 是唯一会让 previous_regime != regime 的路径，必须在此钉住。
-        # 否则 R2「出现 previous_regime != regime 的归档日 ≥1 天」只能靠等真实市场切换
-        # （自 08-27 接线以来 0 次触发），零切换无法区分「市场没切换」与「情形不可达」。
+        # R2：情形 2（以及 §7.1 迟滞豁免分支）会让 previous_regime != regime。
+        # 豁免强切日由 regime_switch_exempt=True 归档标记区分（审核修正②），
+        # 本例验证情形 2 的两日确认路径该标记为 False。
         # 见 docs/got/backlog.md §9 #3 / §9.1。
         self.assertEqual(result.previous_regime, "bull")
+        self.assertFalse(result.regime_switch_exempt)
 
     def test_pending_first_appearance(self):
         """raw != previous 且 raw != transition_pending → 保持 previous，设新 pending。"""
@@ -205,6 +209,172 @@ class TestApplyRegimeStateMachine(unittest.TestCase):
              patch("src.got.nodes.aggregator.load_regime_state_history", return_value=history):
             result = AggregatorNode._apply_regime_state_machine(regime)
         self.assertEqual(result.transition_count, 4)
+
+
+class TestRegimeOscillationFix(unittest.TestCase):
+    """§7.1 振荡修复（2026-09-26）：迟滞豁免 + 确认切换事件计数 + 回退开关。"""
+
+    def _make_regime(self, regime="bull", **kwargs):
+        from src.got.schemas import MarketRegime
+        return MarketRegime(regime=regime, risk_budget=0.6, **kwargs)
+
+    @staticmethod
+    def _prev(regime="transition", dwell=12, pending=None, pinned=0, events=None):
+        return {
+            "regime": regime,
+            "dwell_days": dwell,
+            "previous_regime": regime,
+            "transition_count": 0,
+            "transition_pending": pending,
+            "pinned_days": pinned,
+            "transition_events": events,
+        }
+
+    def _run_day(self, raw, prev_state, history=None, today=None):
+        from datetime import date as _real_date, datetime as _real_dt
+        from src.got.nodes.aggregator import AggregatorNode
+
+        if today is None:
+            today = _real_date.today().strftime("%Y%m%d")
+
+        class _FixedDate:
+            @staticmethod
+            def today():
+                return _real_dt.strptime(today, "%Y%m%d").date()
+
+        with patch("src.got.nodes.aggregator.load_previous_regime_state", return_value=prev_state), \
+             patch("src.got.nodes.aggregator.load_regime_state_history",
+                   return_value=history if history is not None else []), \
+             patch("src.got.nodes.aggregator.date", _FixedDate):
+            return AggregatorNode._apply_regime_state_machine(self._make_regime(raw))
+
+    def test_seed_from_output_diff(self):
+        """迁移种子：旧输出 diff 法的切换日列表。"""
+        from src.got.persistence import seed_regime_transition_events
+        history = [
+            ("20260825", "transition"),
+            ("20260826", "bull"),
+            ("20260827", "bull"),
+            ("20260828", "bear"),
+        ]
+        self.assertEqual(seed_regime_transition_events(history), ["20260826", "20260828"])
+        self.assertEqual(seed_regime_transition_events([]), [])
+
+    def test_below_threshold_keeps_two_day_confirmation(self):
+        """钉住未达阈值且候选易主：仍按旧逻辑换挂新候选、继续钉住（情形 3）。"""
+        r = self._run_day("bear", self._prev(pending="bull", pinned=2))
+        self.assertEqual(r.regime, "transition")       # 保持昨日
+        self.assertEqual(r.transition_pending, "bear")  # 换挂新候选
+        self.assertEqual(r.pinned_days, 3)
+
+    def test_exempt_switch_after_pinned_threshold(self):
+        """钉住≥阈值后候选再现 → 豁免确认切换（死锁打破）。"""
+        r = self._run_day("bear", self._prev(pending="bear", pinned=3))
+        from datetime import date
+        self.assertEqual(r.regime, "bear")
+        self.assertEqual(r.dwell_days, 1)
+        self.assertIsNone(r.transition_pending)
+        self.assertEqual(r.pinned_days, 0)
+        self.assertTrue(r.regime_switch_exempt)   # 豁免强切需可归档复盘
+        today = date.today().strftime("%Y%m%d")
+        self.assertEqual(r.transition_events, [today])
+        self.assertEqual(r.transition_count, 1)
+
+    def test_oscillation_chain_exits_pinning(self):
+        """0910 实态复现：bull/bear 日日交替 + 起始 pinned=3 → 当日迟滞豁免脱钉
+        （打破 transition 死锁）；此后纯交替信号被迟滞抑制（输出锁在脱钉值），
+        持续两日的真实信号（末尾两日 bull）仍按情形 2 正常确认——机器不再死锁。"""
+        state = self._prev(regime="transition", dwell=12, pending="bull", pinned=3)
+        sequence = ["bear", "bull", "bear", "bear", "bull", "bull"]
+        states = []
+        for raw in sequence:
+            r = self._run_day(raw, state)
+            states.append(r.regime)
+            state = {
+                "regime": r.regime, "dwell_days": r.dwell_days,
+                "previous_regime": r.previous_regime,
+                "transition_count": r.transition_count,
+                "transition_pending": r.transition_pending,
+                "pinned_days": r.pinned_days,
+                "transition_events": r.transition_events,
+            }
+        # 首日 pinned=3 已满阈值 → 迟滞豁免直接确认 bear；交替噪声被抑制，
+        # 末尾两日连续 bull 触发情形 2 二次确认切换
+        self.assertEqual(states, ["bear", "bear", "bear", "bear", "bear", "bull"])
+        self.assertNotIn("transition", states)
+        # 豁免脱钉计入确认切换事件（同日重跑幂等，不重复 append）
+        self.assertGreaterEqual(state["transition_count"], 1)
+
+    def test_event_list_accumulates_and_windows(self):
+        """事件列表：确认切换 append 当日日期；同日重跑不重复 append；
+        窗口外事件不计入 transition_count（窗口=历史最早日..今日，含当日）。"""
+        # 生产语义：history 来自 before=today 的归档，末元素必 < 今日
+        history = [("20260909", "bull"), ("20260910", "bear"), ("20260911", "bear")]
+        prev = self._prev(regime="bear", dwell=4, pending="bull", pinned=2,
+                          events=["20260901", "20260910"])
+        r = self._run_day("bull", prev, history=history, today="20260912")
+        self.assertEqual(r.regime, "bull")            # 情形 2：pinned=2 < 3，两日确认
+        self.assertFalse(r.regime_switch_exempt)
+        self.assertEqual(
+            r.transition_events, ["20260901", "20260910", "20260912"]
+        )
+        # 窗口 [20260909, 20260912]：20260901 在外，今日事件计入
+        self.assertEqual(r.transition_count, 2)
+        # 同日重跑幂等：事件列表已含今日 → 不重复 append
+        prev2 = self._prev(regime="bear", dwell=4, pending="bull", pinned=2,
+                           events=["20260901", "20260910", "20260912"])
+        r2 = self._run_day("bull", prev2, history=history, today="20260912")
+        self.assertEqual(
+            r2.transition_events, ["20260901", "20260910", "20260912"]
+        )
+        self.assertEqual(r2.transition_count, 2)
+
+    def test_seed_carries_over_on_first_switch(self):
+        """审核修正①回归：迁移种子播种进事件列表，首个确认切换日计数
+        只增（种子+当日）不归零；当日事件按日期窗口计入。"""
+        history = [
+            ("20260918", "bull"), ("20260919", "bear"), ("20260920", "bull"),
+            ("20260921", "bear"), ("20260922", "bull"),
+        ]  # 旧输出相邻 diff = 4 次切换
+        prev = self._prev(regime="bull", pending="bear", pinned=0)
+        # 无切换日（情形 1）：种子读数与旧 diff 口径一致
+        r0 = self._run_day("bull", prev, history=history, today="20260923")
+        self.assertEqual(r0.transition_count, 4)
+        # 确认切换日（情形 2）：种子 4 + 今日 = 5，不再整盘丢弃种子
+        r1 = self._run_day("bear", prev, history=history, today="20260923")
+        self.assertEqual(r1.transition_count, 5)
+        self.assertEqual(
+            r1.transition_events,
+            ["20260919", "20260920", "20260921", "20260922", "20260923"],
+        )
+
+    def test_migrated_empty_events_counts_zero(self):
+        """已迁移归档（transition_events=[]）：不回退种子，计数从 0；
+        空列表照落保留「已迁移」标记（与 None=未迁移区分）。"""
+        history = [("20260918", "bull"), ("20260919", "bear")]  # 旧 diff=1，不应被用
+        r = self._run_day(
+            "bull", self._prev(regime="bull", events=[]),
+            history=history, today="20260923",
+        )
+        self.assertEqual(r.transition_count, 0)
+        self.assertEqual(r.transition_events, [])
+
+    def test_legacy_switch_disables_fix_and_seed_fallback(self):
+        """DISABLE_REGIME_OSCILLATION_FIX=true：无豁免，计数回退旧输出 diff（种子）。"""
+        import os as _os
+        history = [
+            ("20260825", "transition"),
+            ("20260826", "bull"),
+            ("20260827", "bear"),
+            ("20260828", "bull"),
+        ]
+        prev = self._prev(pending="bear", pinned=5)
+        os_ctx = patch.dict(_os.environ, {"DISABLE_REGIME_OSCILLATION_FIX": "true"})
+        with os_ctx:
+            r = self._run_day("bear", prev, history=history)
+        self.assertEqual(r.regime, "bear")   # 旧行为：raw==pending 仍为情形 2 确认
+        self.assertEqual(r.transition_count, 3)  # 旧 diff 法：4 日序列 3 次变化
+        self.assertIsNone(r.transition_events)   # 旧模式不记事件，避免半新半旧
 
 
 class TestComputePositionDwellAware(unittest.TestCase):
