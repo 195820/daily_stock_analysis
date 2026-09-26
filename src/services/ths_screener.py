@@ -42,6 +42,7 @@ class THSStock:
     price: float = 0.0
     change_pct: float = 0.0
     dde_net_pct: float = 0.0
+    dde_5d_sum: float = 0.0   # 近5个交易日 dde 大单净量合计（ambush 口径，查询未请求时为 0）
     turnover_rate: float = 0.0
     volume: float = 0.0
     sector: str = ""  # 概念板块
@@ -207,6 +208,13 @@ class THSScreenerService:
                 or self._find_float_field(row, '涨跌幅')
             )
             dde_net = self._find_float_field(row, 'dde大单净量')
+            # 审核修复 2.2：5日累计 DDE 列（键名形如「近5个交易日的dde大单净量合计:xxx」，
+            # startswith 匹配不到，需 contains 匹配；与单日列区分开）
+            dde_5d_sum = 0.0
+            for k, v in row.items():
+                if 'dde大单净量合计' in k:
+                    dde_5d_sum = self._safe_float(v)
+                    break
             turnover = self._safe_float(
                 row.get('换手率') or self._find_float_field(row, '换手率')
             )
@@ -229,6 +237,7 @@ class THSScreenerService:
                 price=price,
                 change_pct=change_pct,
                 dde_net_pct=dde_net,
+                dde_5d_sum=dde_5d_sum,
                 turnover_rate=turnover,
                 volume=volume,
                 sector=sector,

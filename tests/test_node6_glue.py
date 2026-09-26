@@ -445,6 +445,11 @@ class TestGlueFailureSamplePersistence(unittest.TestCase):
     「制造 S1（断网/空响应）与 S2（畸形 JSON）各一次，`agent_glue.json`
       **仍存在**且 `status` 取值正确」—— 判据落在**落盘副作用**上。
 
+    audit_20260922 Q1-3 契约更新：失败态（S1/S2/S3 forensics 名单）改写入
+    `agent_glue_degraded_HHMMSS.json`、**不再覆盖主文件**（Run 2 物证被 Run 3
+    抹掉的实锤修复），故本组断言改为 degraded 取证文件存在且内容正确；
+    主文件仅由非失败态（含良性跳过）写入，见 test_ok_status_writes_main_file。
+
     这正是 `TestAgentSemanticGlueDispatch` 覆盖不到的那一层：那一组断言的是返回值
     （`degraded` / `warnings`），把 `_save_glue_result(...)` 删掉它照样全绿。
     """
@@ -468,8 +473,15 @@ class TestGlueFailureSamplePersistence(unittest.TestCase):
                 result = asyncio.run(self.node._agent_semantic_glue(
                     self.candidates, self.news, self.capital, self.sentiment,
                 ))
-            path = tmp_root / TEST_RUN_DATE.strftime("%Y%m%d") / "agent_glue.json"
-            self.assertTrue(path.exists(), f"失败样本未落盘: {path}")
+            base = tmp_root / TEST_RUN_DATE.strftime("%Y%m%d")
+            # Q1-3：失败态写 agent_glue_degraded_HHMMSS.json，不覆盖主文件
+            degraded = sorted(base.glob("agent_glue_degraded_*.json"))
+            self.assertTrue(degraded, f"失败样本未落盘（degraded 取证文件）: {base}")
+            path = degraded[-1]
+            self.assertFalse(
+                (base / "agent_glue.json").exists(),
+                "Q1-3：失败态不得写主文件 agent_glue.json",
+            )
             return result, json.loads(path.read_text(encoding="utf-8"))
         finally:
             agg_mod.AGENT_SEMANTIC_GLUE_ENABLED = original_enabled
@@ -503,6 +515,114 @@ class TestGlueFailureSamplePersistence(unittest.TestCase):
         self._assert_failure_sample_landed(
             AsyncMock(return_value='{"relations": 123}'), "S2_validate_failed",
         )
+
+    def test_ok_status_writes_main_file(self):
+        """W8/Q1-3 契约：良性非 forensics 态（no_candidates/replay_mode）写主文件。
+
+        下游消费方（verify_glue_metrics、影子报告 _render_shadow_a5）读主文件，
+        良性跳过态若也写 degraded 会被误报缺失。
+        """
+        from src.got.schemas import SemanticGlueResult
+
+        tmp_root = _redirect_glue_archive(self, self.node)
+        base = tmp_root / TEST_RUN_DATE.strftime("%Y%m%d")
+        for status in ("no_candidates", "replay_mode"):
+            self.node._save_glue_result(SemanticGlueResult(status=status))
+        self.assertTrue((base / "agent_glue.json").exists(), "良性态应写主文件")
+        self.assertFalse(
+            list(base.glob("agent_glue_degraded_*")),
+            "良性态不应写 degraded 取证文件",
+        )
+
+    def test_forensics_status_writes_degraded_file(self):
+        """Q1-3 契约：S3_truncated（forensics 名单）只写 degraded，不碰主文件。"""
+        from src.got.schemas import SemanticGlueResult
+
+        tmp_root = _redirect_glue_archive(self, self.node)
+        base = tmp_root / TEST_RUN_DATE.strftime("%Y%m%d")
+        self.node._save_glue_result(
+            SemanticGlueResult(status="S3_truncated", degraded=True),
+        )
+        self.assertTrue(
+            list(base.glob("agent_glue_degraded_*.json")),
+            "S3_truncated 应写 degraded 取证文件",
+        )
+        self.assertFalse(
+            (base / "agent_glue.json").exists(),
+            "S3_truncated 不应写主文件",
+        )
+
+
+class TestGlueCapitalMismatch(unittest.TestCase):
+    """Q8-A2（audit_20260922）：glue vs Node 3 资金口径对账。
+
+    回归护栏：原实现 skip 条件 `rule_check == s.capital_check` 前置，
+    双方同为 neutral 时永早退，big_outflow 分支不可达（死代码）。
+    """
+
+    @staticmethod
+    def _intel(**kw):
+        from src.got.schemas import SectorIntel
+        base = dict(sector_name="半导体", capital_check="neutral")
+        base.update(kw)
+        return SectorIntel(**base)
+
+    def test_both_neutral_big_outflow_triggers(self):
+        """实锤场景：双方 neutral 但规则侧 1 日净流出 31.96 亿 → 必须报矛盾。"""
+        s = self._intel(
+            rule_capital_check="neutral",
+            rule_capital_detail="1日净流出31.96亿",
+        )
+        found = AggregatorNode._detect_glue_capital_mismatch([s])
+        self.assertEqual(len(found), 1, "大额流出应触发口径矛盾告警")
+        self.assertEqual(found[0].pair, "glue_vs_node3_capital")
+
+    def test_both_neutral_small_outflow_no_trigger(self):
+        """同值但流出未过阈（5 亿 < 20 亿）→ 不触发。"""
+        s = self._intel(
+            rule_capital_check="neutral",
+            rule_capital_detail="1日净流出5.0亿",
+        )
+        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
+
+    def test_opposite_direction_triggers(self):
+        """方向相反（规则 divergent vs glue aligned）→ 触发。"""
+        s = self._intel(
+            capital_check="aligned",
+            rule_capital_check="divergent",
+            rule_capital_detail="1日净流出25.0亿",
+        )
+        found = AggregatorNode._detect_glue_capital_mismatch([s])
+        self.assertEqual(len(found), 1)
+
+    def test_signed_inflow_format_triggers(self):
+        """带符号文案「净流入-31.96亿」同样触发（旧正则唯一能命中的格式）。"""
+        s = self._intel(
+            rule_capital_check="neutral",
+            rule_capital_detail="净流入-31.96亿(全量)",
+        )
+        self.assertEqual(len(AggregatorNode._detect_glue_capital_mismatch([s])), 1)
+
+    def test_multi_window_takes_weakest(self):
+        """多窗口拼接文案取最弱值：3d 流入 + 1d 大额流出 → 仍触发。"""
+        s = self._intel(
+            rule_capital_check="neutral",
+            rule_capital_detail="3d净流入9.25亿，1日净流出31.96亿",
+        )
+        self.assertEqual(len(AggregatorNode._detect_glue_capital_mismatch([s])), 1)
+
+    def test_no_rule_evidence_skipped(self):
+        """未被 glue 覆盖（rule_capital_check=None）→ 不参与对账。"""
+        s = self._intel(rule_capital_detail="1日净流出31.96亿")
+        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
+
+    def test_inflow_never_triggers(self):
+        """净流入不触发 big_outflow 分支。"""
+        s = self._intel(
+            rule_capital_check="neutral",
+            rule_capital_detail="1日净流入31.96亿",
+        )
+        self.assertEqual(AggregatorNode._detect_glue_capital_mismatch([s]), [])
 
 
 if __name__ == "__main__":

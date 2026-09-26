@@ -74,6 +74,7 @@ class LLMResponse:
     provider: str = ""                     # which provider handled this call
     model: str = ""                        # full model name used (e.g. gemini/gemini-2.0-flash), for report meta
     raw: Any = None                        # raw provider response for debugging
+    finish_reason: Optional[str] = None    # Q1 audit: "stop"/"length"/"content_filter"/etc — "length" means truncated
 
 
 # Models that auto-return reasoning_content; do NOT send extra_body (may cause 400).
@@ -810,6 +811,10 @@ class LLMToolAdapter:
 
         model_list = getattr(getattr(self, "_config", None), "llm_model_list", []) or []
         provider_name = resolved_provider_namespace(model, model_list)
+        
+        # Extract finish_reason for Q1 audit observability
+        finish_reason = getattr(choice, "finish_reason", None)
+        
         return LLMResponse(
             content=text_content,
             tool_calls=tool_calls,
@@ -819,6 +824,7 @@ class LLMToolAdapter:
             provider=provider_name,
             model=model,
             raw=response,
+            finish_reason=finish_reason,
         )
 
 

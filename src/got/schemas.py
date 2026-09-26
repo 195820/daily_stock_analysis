@@ -39,6 +39,23 @@ class DataQuality(BaseModel):
         default=None,
         description="板块获取统计 {total, success, failed}",
     )
+    # ── Phase 2 决策审计字段（审核修复计划 W9/3.3 新增，向后兼容）──
+    sector_verify_degraded: Optional[bool] = Field(
+        default=None,
+        description="板块验证 LLM 仲裁不可用，pending 候选改走保守分支",
+    )
+    sector_verify_pending_count: Optional[int] = Field(
+        default=None,
+        description="板块验证降级日待仲裁候选数",
+    )
+    sector_available_false_count: Optional[int] = Field(
+        default=None,
+        description="sector_available=False 的候选数（板块标签被清空/验证降级）",
+    )
+    sector_vetoed_count: Optional[int] = Field(
+        default=None,
+        description="vetoed 中因板块失效被否决的候选数",
+    )
 
 
 class Signal(BaseModel):
@@ -416,6 +433,12 @@ class SectorContext(BaseModel):
         default_factory=dict,
         description="板块名→家族名（覆盖全量 analyzed 板块，合成 detail 回退时查表），用于拥挤降权",
     )
+    # Q2 audit: THS 板块热度（供 Node 6 G2/G3 闸门消费）
+    ths_hot_sectors: dict[str, float] = Field(
+        default_factory=dict,
+        description="同花顺板块热度 {板块名: 热度值}，供 Node 6 埋伏通道 G2/G3 闸门消费（替代恒空的 associated_sectors）"
+    )
+
 
 
 # =============================================================================
@@ -692,6 +715,11 @@ class SectorIntel(BaseModel):
     tech_detail: str = Field(default="", description="技术面详情（lifecycle/tier/trajectory）")
     capital_check: str = Field(default="neutral", description="aligned / neutral / divergent")
     capital_detail: str = Field(default="", description="资金面验证细节")
+    # Q8-A1（audit_20260922）：glue 直替（Pass 1.5）前留存的规则侧（Node 3）资金判定证据，
+    # 供 Q8-A2 矛盾对账消费；未被 glue 覆盖时为 None。
+    # ⚠️ 实施顺序第 5 步删除规则评分模式后永久为空，届时随 _detect_glue_capital_mismatch 一并清理
+    rule_capital_check: Optional[str] = Field(default=None, description="规则侧 capital_check 原值（glue 覆盖前证据链）")
+    rule_capital_detail: str = Field(default="", description="规则侧资金面细节原文（glue 覆盖前证据链）")
     news_check: str = Field(default="neutral", description="catalyzed / neutral / negative")
     news_detail: str = Field(default="", description="消息催化细节")
     sentiment_check: str = Field(default="low", description="high / medium / low（散户热度）")
@@ -1009,6 +1037,20 @@ class UnifiedScoringResult(BaseModel):
         default=None,
         description="T1-H 降档惩罚系数（0.0-1.0，已乘入 composite_score）",
     )
+    # ── Q9-B: 板块验证失败标记（审计 2026-09-22）──
+    sector_available: bool = Field(
+        default=True,
+        description="板块身份是否可信（False=验证失败，禁入买入池）",
+    )
+    # ── 审核修复计划 W10/S2：候选来源可观测性 ──
+    dde_degraded: bool = Field(
+        default=False,
+        description="问财初筛 DDE 轮全空降级候选（区分真弱势出局与缺数据被动出局）",
+    )
+    pool_source: str = Field(
+        default="",
+        description="选股池来源标记：空=Node2 actionable 正常通道 / bypass_ambush=蓄水池升格旁路补选",
+    )
 
 
 class TradeAllocation(BaseModel):
@@ -1042,11 +1084,16 @@ class TradeAllocation(BaseModel):
         default=None,
         description="板块限制明细: {sector_name, sector_role, stock_limit, branch}（判据为 sector_role，limit 仅参考值）",
     )
+    # ── Q4 audit: 盘中快照标记（bar_complete=false 时为 True）──
+    intraday_snapshot: bool = Field(
+        default=False,
+        description="Q4 audit: True if based on intraday data (bar_complete=false)",
+    )
 
 
 class PortfolioDecision(BaseModel):
     """Phase 2 统一决策节点输出"""
-    status: str = Field(description="normal/manual_review_required")
+    status: str = Field(description="normal/manual_review_required/partial(部分步骤降级)/failed(流水线失败占位)")
     risk_assessment: PortfolioRiskAssessment
     unified_scoring: list[UnifiedScoringResult] = Field(description="所有标的统一排序")
     allocation: list[TradeAllocation] = Field(description="最终交易建议")

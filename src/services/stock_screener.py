@@ -101,6 +101,11 @@ class ScreenerStock:
     agent_notes: str = ""                  # Agent 审查备注
     agent_decision_signal: str = ""        # reject 时的降级信号: "demoted" / ""
 
+    # 审核修复 W10/2.1/S2：候选来源可观测性
+    dde_degraded: bool = False             # 问财初筛 DDE 轮全空降级 / ambush 5日值缺失回退单日
+    capital_floor_restored: bool = False   # 轮次 2 Tier A 主线保底补回
+    pool_source: str = ""                  # 空=Node2 actionable 正常通道 / bypass_ambush=蓄水池升格旁路补选
+
 
 @dataclass
 class ScreenerRunResult:
@@ -1100,6 +1105,8 @@ class StockScreenerPipeline:
                     # 保留问财量价+DDE 数据（供资金面/技术面评分使用）
                     "price": stock_info.get("price", 0),
                     "dde_net_pct": stock_info.get("dde_net_pct", 0),
+                    "dde_5d_sum": stock_info.get("dde_5d_sum", 0),
+                    "dde_degraded": stock_info.get("dde_degraded", False),
                     "change_pct": stock_info.get("change_pct", 0),
                     "turnover_rate": stock_info.get("turnover_rate", 0),
                     "volume": stock_info.get("volume", 0),
@@ -1141,6 +1148,13 @@ class StockScreenerPipeline:
             # L3 清洗 + L1/L2 解析（含 kind 信息）
             sector_name = clean_board_name(sector_name)
             resolver = get_board_name_resolver()
+
+            # Q7-B（audit_20260922）：当日负缓存预检——已知失败名同日直接短路，
+            # 不再白烧双语法 × 两轮问财查询
+            if resolver.is_failed_today(sector_name):
+                logger.info(f"[问财初筛-{sector_type}] {sector_name} 当日负缓存命中，跳过重试")
+                return []
+
             board_name, kind = resolver.resolve_with_kind(sector_name)
 
             # DDE 筛选条件
@@ -1237,17 +1251,35 @@ class StockScreenerPipeline:
                 board_clauses = [concept_clause, industry_clause]
 
             common_suffix = "上市天数>365天，非ST，所属同花顺行业，"
+            if sector_type != "active_mainline":
+                # 审核修复 2.2：ambush 候选追加请求 5 日累计 DDE 列，
+                # 与初筛口径（近5日合计>0）对齐，供 _score_capital 同口径打分
+                common_suffix += "近5个交易日的dde大单净量合计，"
 
-            def _try_query(query_template: str, max_results: int) -> Optional[List[Dict]]:
-                """按 board_clauses 顺序尝试查询，命中返回 stocks 列表"""
-                for clause in board_clauses:
+            def _try_query(query_template: str, max_results: int,
+                           healed_name: Optional[str] = None) -> Optional[List[Dict]]:
+                """按 board_clauses 顺序尝试查询，命中返回 stocks 列表
+
+                healed_name: Q7-B 自愈重试时覆盖解析名（回写别名用原始 sector_name 不变）
+                """
+                _board_name = healed_name or board_name
+                _clauses = board_clauses
+                if healed_name:
+                    _clauses = [
+                        f"所属同花顺概念板块是{healed_name}，",
+                        f"所属同花顺板块是{healed_name}，",
+                    ]
+                for clause in _clauses:
                     query = query_template.replace("{board_clause}", clause)
                     logger.info(f"[问财初筛-{sector_type}] {sector_name} (kind={kind}): {query[:80]}...")
                     ths_result = ths_service.query(query)
                     if not ths_result or not ths_result.stocks:
                         continue
-                    # 命中：回写别名表
-                    resolver.confirm(sector_name, board_name, kind=kind)
+                    # 命中：回写别名表（自愈路径写低置信，L1 不消费，需人工升级）
+                    resolver.confirm(
+                        sector_name, _board_name, kind=kind,
+                        source="auto_lowconf" if healed_name else "auto",
+                    )
                     # 行业过滤
                     industry_keywords = concept_industry_map.get(sector_name, [])
                     filtered_stocks = []
@@ -1270,6 +1302,7 @@ class StockScreenerPipeline:
                             "name": s.name,
                             "price": s.price,
                             "dde_net_pct": s.dde_net_pct,
+                            "dde_5d_sum": getattr(s, "dde_5d_sum", 0.0),
                             "change_pct": s.change_pct,
                             "turnover_rate": s.turnover_rate,
                             "volume": s.volume,
@@ -1326,6 +1359,9 @@ class StockScreenerPipeline:
                 max_results=5,
             )
             if result is not None:
+                # 审核修复 W10：降级候选打标，区分"真弱势出局"与"缺 DDE 数据被动出局"
+                for s in result:
+                    s["dde_degraded"] = True
                 return result
 
             # 双语法 × 两轮全空 → 醒目告警
@@ -1334,6 +1370,28 @@ class StockScreenerPipeline:
                 f"resolved={board_name}, kind={kind}。"
                 f"尝试过的语法: {board_clauses}"
             )
+
+            # Q7-B 自愈闭环（audit_20260922）：拉概念板块全列表做相似度匹配，
+            # 命中候选名重试一次，成功则回写别名表（source: auto）
+            healed = resolver.aggressive_match(board_name)
+            if healed and healed != board_name:
+                for _tmpl, _maxr in (
+                    ("{board_clause}" + f"{dde_condition}{common_suffix}按dde大单净量降序", 15),
+                    ("{board_clause}dde大单净量，" + f"{common_suffix}按dde大单净量降序", 5),
+                ):
+                    result = _try_query(_tmpl, _maxr, healed_name=healed)
+                    if result is not None:
+                        logger.info(
+                            f"[问财初筛-{sector_type}] {sector_name} 自愈成功："
+                            f"{board_name} → {healed}，别名表已回写"
+                        )
+                        return result
+
+            # 自愈未挽回 → 当日负缓存（原始名+解析名都登记，覆盖入口预检与
+            # resolve 兜底两处短路），同日不再重试
+            resolver.mark_failed(sector_name)
+            if board_name != sector_name:
+                resolver.mark_failed(board_name)
             return []
 
         except Exception as e:
@@ -1518,9 +1576,21 @@ class StockScreenerPipeline:
         for c in candidates:
             c["capital_score"] = capital_scores.get(c["code"], 0)
             c["capital_available"] = capital_avail.get(c["code"], False)
-        candidates.sort(key=lambda x: x["capital_score"], reverse=True)
-        candidates = candidates[:20]
-        logger.info(f"轮次 2: {len(candidates)} 只（资金面 Top 20）")
+        # 审核修复 2.3：三元组排序键——无数据票显式后置，同分用单日 DDE 打破并列
+        candidates.sort(
+            key=lambda x: (
+                x["capital_available"],
+                x["capital_score"],
+                x.get("dde_net_pct") or 0,
+            ),
+            reverse=True,
+        )
+        top_pool = candidates[:20]
+        dropped_pool = candidates[20:]
+
+        # 审核修复 2.1：Tier A 主线保底（抽取为独立方法供单测）
+        top_pool = self._apply_capital_floor(top_pool, dropped_pool, candidates)
+        candidates = top_pool
 
         # 轮次 3: 波段技术确认 Top 15
         tech_scores = self._score_technical_wave(candidates, fetcher_manager)
@@ -1594,6 +1664,9 @@ class StockScreenerPipeline:
                     sector_name=c["sector"],
                     sector_score=c["sector_score"],
                     sector_type=c["sector_type"],
+                    # 审核修复 W10/2.1：候选来源可观测性透传
+                    dde_degraded=c.get("dde_degraded", False),
+                    capital_floor_restored=c.get("capital_floor_restored", False),
                     # P5 催化剂关联度
                     catalyst_relevance_score=c.get("catalyst_relevance_score", 0),
                     catalyst_event_title=catalyst_details.get(c["code"], {}).get("event_title", ""),
@@ -1820,21 +1893,47 @@ verdict 含义：
             availability[code]=True 表示该股票有真实资金数据（DDE 或板块资金流命中）
         """
         # ── 维度1: DDE 大单净量百分位 (0-50分) ──
-        dde_data = {}
+        # 审核修复 2.2：主线候选用单日 DDE，ambush 候选用 5 日累计 DDE（与问财初筛口径一致），
+        # 两套口径分组内各自百分位，避免量纲混排；ambush 5日值缺失时回退单日并打标 dde_degraded
+        dde_data_main: Dict[str, float] = {}
+        dde_data_ambush: Dict[str, float] = {}
         for c in candidates:
+            if c.get("sector_type") == "ambush":
+                val_5d = c.get("dde_5d_sum") or 0
+                if val_5d != 0:
+                    dde_data_ambush[c["code"]] = val_5d
+                    continue
+                c["dde_degraded"] = True  # 5日累计不可用，回退单日口径
             dde = c.get("dde_net_pct", 0)
             if dde != 0:
-                dde_data[c["code"]] = dde
+                dde_data_main[c["code"]] = dde
 
-        if dde_data:
+        if dde_data_main or dde_data_ambush:
+            range_desc = ""
+            if dde_data_main:
+                range_desc = (
+                    f", 单日范围 {min(dde_data_main.values()):.2f}%"
+                    f"~{max(dde_data_main.values()):.2f}%"
+                )
             logger.info(
-                f"[资金面-DDE] {len(dde_data)} 只, "
-                f"范围 {min(dde_data.values()):.2f}%~{max(dde_data.values()):.2f}%"
+                f"[资金面-DDE] {len(dde_data_main) + len(dde_data_ambush)} 只"
+                f"（单日口径 {len(dde_data_main)} + ambush 5日口径 {len(dde_data_ambush)}）"
+                f"{range_desc}"
             )
         else:
             logger.warning("[资金面-DDE] 候选股无 DDE 数据")
 
-        dde_sorted = sorted(dde_data.values(), reverse=True) if dde_data else []
+        main_sorted = sorted(dde_data_main.values(), reverse=True)
+        ambush_sorted = sorted(dde_data_ambush.values(), reverse=True)
+
+        def _percentile_desc(sorted_vals: List[float], val: float) -> Optional[float]:
+            """降序百分位（审核修复 2.3：并列取最优名次=严格大于计数，两维度口径统一）；
+            样本 <2 时返回 None（孤样本不计分，避免退化满分）"""
+            n = len(sorted_vals)
+            if n < 2:
+                return None
+            rank = sum(1 for v in sorted_vals if v > val)
+            return 1.0 - rank / (n - 1)
 
         # ── 维度2: 板块资金流 (0-50分) ──
         # 从 sector_flow 解析板块名→净流入金额（亿）
@@ -1857,11 +1956,38 @@ verdict 含义：
             logger.warning("[资金面-板块] 无 sector_flow 数据")
 
         # 为每个候选股匹配其所属板块的资金流（包含负值——净流出也是有效数据）
+        # 审核修复 3.1：精确键 → 别名变体 → 归一化键三级匹配，消除同花顺小概念
+        # （如红黄酒）因键名口径不一致而静默丢 50 分；未命中聚合告警
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        norm_flow_map: Dict[str, float] = {}
+        for k, v in sector_flow_map.items():
+            norm_flow_map.setdefault(normalize_sector_name(k), v)
+
         sector_flow_by_stock = {}
+        unmatched_sectors = set()
         for c in candidates:
             sector = c.get("sector", "")
-            if sector in sector_flow_map:
-                sector_flow_by_stock[c["code"]] = sector_flow_map[sector]
+            if not sector:
+                continue
+            flow = sector_flow_map.get(sector)
+            if flow is None:
+                flow = next(
+                    (sector_flow_map[v] for v in sector_name_variants(sector)
+                     if v in sector_flow_map),
+                    None,
+                )
+            if flow is None:
+                flow = norm_flow_map.get(normalize_sector_name(sector))
+            if flow is not None:
+                sector_flow_by_stock[c["code"]] = flow
+            else:
+                unmatched_sectors.add(sector)
+        if unmatched_sectors and sector_flow_map:
+            logger.warning(
+                f"[资金面-板块] {len(unmatched_sectors)} 个板块无资金流数据"
+                f"（sector_flow_all 未收录且别名/归一化未命中，板块维度 0 分）: "
+                f"{'、'.join(sorted(unmatched_sectors))}"
+            )
 
         # 板块资金流百分位：基于全量板块排名（而非仅候选股之间）
         all_flows = sorted(sector_flow_map.values(), reverse=True) if sector_flow_map else []
@@ -1872,33 +1998,80 @@ verdict 含义：
         for c in candidates:
             score = 0.0
             has_data = False
+            code = c["code"]
 
-            # DDE 百分位 (0-50)
-            if c["code"] in dde_data and dde_sorted:
-                dde_val = dde_data[c["code"]]
-                rank_idx = dde_sorted.index(dde_val)
-                percentile = 1.0 - (rank_idx / max(len(dde_sorted) - 1, 1))
-                score += 50 * percentile
+            # DDE 百分位 (0-50)：ambush/主线各自口径分组内排名（审核修复 2.2）
+            if code in dde_data_ambush:
+                pct = _percentile_desc(ambush_sorted, dde_data_ambush[code])
+            elif code in dde_data_main:
+                pct = _percentile_desc(main_sorted, dde_data_main[code])
+            else:
+                pct = None
+            if pct is not None:
+                score += 50 * pct
                 has_data = True
 
-            # 板块资金流百分位 (0-50)：在全量板块中的排名位置
-            if c["code"] in sector_flow_by_stock and all_flows:
-                flow_val = sector_flow_by_stock[c["code"]]
-                # 计算 flow_val 在 all_flows 中的排名（二分查找更高效）
-                rank_idx = 0
-                for i, v in enumerate(all_flows):
-                    if v >= flow_val:
-                        rank_idx = i
-                    else:
-                        break
-                percentile = 1.0 - (rank_idx / max(len(all_flows) - 1, 1))
-                score += 50 * percentile
-                has_data = True
+            # 板块资金流百分位 (0-50)：在全量板块中的排名位置（tie 口径与 DDE 统一）
+            if code in sector_flow_by_stock and all_flows:
+                pct = _percentile_desc(all_flows, sector_flow_by_stock[code])
+                if pct is not None:
+                    score += 50 * pct
+                    has_data = True
 
-            scores[c["code"]] = round(score, 1)
-            availability[c["code"]] = has_data
+            scores[code] = round(score, 1)
+            availability[code] = has_data
 
         return scores, availability
+
+    @staticmethod
+    def _apply_capital_floor(
+        top_pool: List[Dict], dropped_pool: List[Dict], candidates: List[Dict],
+    ) -> List[Dict]:
+        """审核修复 2.1：轮次 2 Tier A 主线保底。
+
+        Node2 用技术面选主线，强度≥90 的主线板块不得被资金面 Top20
+        整板块歼灭（红黄酒 0910-0924 全灭教训）；每板块按 capital_score
+        降序补回 1 只（dropped_pool 已按轮次 2 排序键降序，首命中即最优），
+        总量封顶 5 只防池膨胀；补回票打标 capital_floor_restored=True，
+        不豁免后续轮次 3/4/5。
+        """
+        TIER_A_STRENGTH = 90.0
+        CAPITAL_FLOOR_MAX = 5
+        top_sectors = {c.get("sector") for c in top_pool}
+        top_codes = {c["code"] for c in top_pool}
+        tier_a_by_sector: Dict[str, float] = {}
+        for c in candidates:
+            if (
+                c.get("sector_type") == "active_mainline"
+                and c.get("sector")
+                and (c.get("sector_score") or 0) >= TIER_A_STRENGTH
+            ):
+                tier_a_by_sector[c["sector"]] = max(
+                    tier_a_by_sector.get(c["sector"], 0.0), c.get("sector_score") or 0.0
+                )
+        restored_floor = []
+        for sector in sorted(tier_a_by_sector, key=tier_a_by_sector.get, reverse=True):
+            if sector in top_sectors or len(restored_floor) >= CAPITAL_FLOOR_MAX:
+                continue
+            pick = next(
+                (c for c in dropped_pool
+                 if c.get("sector") == sector and c["code"] not in top_codes),
+                None,
+            )
+            if pick:
+                pick["capital_floor_restored"] = True
+                restored_floor.append(pick)
+        if restored_floor:
+            restored_desc = ", ".join(
+                f"{c.get('code')}({c.get('sector')})" for c in restored_floor
+            )
+            logger.info(
+                f"轮次 2: {len(top_pool) + len(restored_floor)} 只（资金面 Top 20，"
+                f"Tier A 主线保底补回 {len(restored_floor)} 只: {restored_desc}）"
+            )
+            return top_pool + restored_floor
+        logger.info(f"轮次 2: {len(top_pool)} 只（资金面 Top 20）")
+        return top_pool
 
     @staticmethod
     def _parse_sector_flow(capital_ctx: dict) -> Dict[str, float]:
@@ -2830,10 +3003,14 @@ verdict 含义：
             logger.error(f"[GOT选股] 保存结果失败: {e}")
 
     def _get_stock_name(self, code: str, fetcher_manager) -> str:
-        """获取股票名称"""
+        """获取股票名称（审核修复 S1：失败路径加 warning，避免裸代码静默混入产物）"""
         try:
-            return fetcher_manager.get_stock_name(code) or code
-        except Exception:
+            name = fetcher_manager.get_stock_name(code) or code
+            if name == code:
+                logger.warning(f"[名称缺失] {code} 查名返回空，保留裸代码")
+            return name
+        except Exception as e:
+            logger.warning(f"[名称缺失] {code} 查名异常，保留裸代码: {e}")
             return code
 
     def _calc_rsi(self, prices, period: int = 14) -> float:

@@ -16,6 +16,7 @@ from datetime import datetime, date
 from typing import Optional
 
 from src.got.schemas import UnifiedContext
+from src.got.archive import _is_bar_complete
 from src.got.nodes.market_analysis import MarketAnalysisNode
 from src.got.nodes.sector_analysis import SectorAnalysisNode
 from src.got.nodes.capital_analysis import CapitalAnalysisNode
@@ -69,9 +70,14 @@ class GOTOrchestrator:
         logger.info(f"[GOT] 开始执行 — 日期: {target_date}, mock: {self.use_mock}")
         start_time = datetime.now()
 
+        # Q4 audit: bar_complete 全流程只计算一次（与 Phase 2 同源），
+        # 同步透传给 Node 4 催化剂链路，避免 P6 forward 记录恒为默认 True
+        bar_complete = _is_bar_complete(target_date, datetime.now())
+        logger.info(f"[GOT] bar_complete={bar_complete}")
+
         # Step 2: 并行执行两路
         tech_path_task = self._run_tech_path()
-        data_path_task = self._run_data_path()
+        data_path_task = self._run_data_path(bar_complete)
 
         tech_result, data_result = await asyncio.gather(
             tech_path_task,
@@ -136,6 +142,7 @@ class GOTOrchestrator:
                     capital_context=capital_ctx,
                     news_context=news_ctx,
                     sentiment_context=sentiment_ctx,
+                    bar_complete=bar_complete,
                 )
 
                 logger.info(
@@ -148,13 +155,43 @@ class GOTOrchestrator:
 
                     archive_phase2(decision, run_date=target_date)
                 except Exception as archive_exc:
-                    logger.warning(
-                        "[GOT] Phase 2 决策存档失败（已忽略）: %s", archive_exc
+                    logger.error(
+                        "[GOT] Phase 2 决策存档失败: %s", archive_exc
                     )
 
             except Exception as exc:
-                # Phase 2 失败不应阻断 Phase 1
-                logger.warning("[GOT] Phase 2 失败（已忽略）: %s", exc)
+                # Phase 2 失败不应阻断 Phase 1，但必须留下 status="failed" 占位产物，
+                # 保证"跑过就有文件"，回测/影子线可区分"停牌无数据"与"节点崩了"
+                logger.error("[GOT] Phase 2 失败: %s", exc)
+                try:
+                    from src.got.archive import archive_phase2
+                    from src.got.schemas import (
+                        DataQuality,
+                        PortfolioDecision,
+                        PortfolioRiskAssessment,
+                    )
+
+                    fallback = PortfolioDecision(
+                        status="failed",
+                        risk_assessment=PortfolioRiskAssessment(
+                            position_limit=0.0,
+                            current_position_ratio=0.0,
+                            constraint_reasoning=f"Phase 2 执行失败，未产生约束: {exc}",
+                        ),
+                        unified_scoring=[],
+                        allocation=[],
+                        summary="Phase 2 执行失败，当日无交易建议",
+                        warnings=[f"Phase 2 失败: {exc}"],
+                        reasoning=f"[failed] Phase 2 决策流水线异常: {exc}",
+                        data_quality=DataQuality(
+                            missing_fields=["phase2"],
+                            degradation_summary=f"Phase 2 失败: {exc}",
+                        ),
+                    )
+                    archive_phase2(fallback, run_date=target_date)
+                    logger.info("[GOT] Phase 2 失败占位产物已落盘 (status=failed)")
+                except Exception as fb_exc:
+                    logger.error("[GOT] Phase 2 失败占位产物落盘也失败: %s", fb_exc)
 
             # P6: 催化剂兑现检测（每日运行，记录过期事件的兑现结果）
             try:
@@ -191,12 +228,12 @@ class GOTOrchestrator:
 
         return market_ctx, sector_ctx, capital_ctx
 
-    async def _run_data_path(self) -> tuple:
+    async def _run_data_path(self, bar_complete: bool = True) -> tuple:
         """独立数据路：并行（消息面 ‖ 情绪面）"""
         logger.info("[GOT] 独立数据路：开始（并行）")
 
         news_ctx, sentiment_ctx = await asyncio.gather(
-            self.news_node.run(),
+            self.news_node.run(bar_complete=bar_complete),
             self.sentiment_node.run(),
         )
 

@@ -33,6 +33,21 @@ from src.got.persistence import list_archive_dirs, load_regime_raw_segment_days 
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_nan(obj):
+    """递归将 float nan/inf 替换为 None（allow_nan=False 落盘前清洗）"""
+    import math
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nan(v) for v in obj]
+    if isinstance(obj, set):
+        # 自定义 serializer 可能绕过 Pydantic 的 set→list 转换，防 NaN 漏网
+        return [_sanitize_nan(v) for v in obj]
+    return obj
+
 # 节点键 → 存档文件名
 CONTEXT_FILES = {
     "market": "market.json",
@@ -110,6 +125,14 @@ def archive_daily_run(
         if glue_src.exists():
             glue_dst = tmp_dir / "agent_glue.json"
             shutil.move(str(glue_src), str(glue_dst))
+        # Q1 audit: 搬运 degraded 取证文件（forensics 例外，不受 Q6-A 按日去重约束）
+        # 文件名含 HHMMSS 字典序即时间序；同日多次失败仅保留最新 5 份，防止无限堆积
+        _degraded_files = sorted(archive_dir.glob("agent_glue_degraded_*.json"), reverse=True)
+        for degraded_file in _degraded_files[:5]:
+            degraded_dst = tmp_dir / degraded_file.name
+            shutil.move(str(degraded_file), str(degraded_dst))
+        for stale_degraded in _degraded_files[5:]:
+            stale_degraded.unlink(missing_ok=True)
         replay_src = archive_dir / "_replay"
         if replay_src.exists():
             replay_dst = tmp_dir / "_replay"
@@ -908,18 +931,39 @@ def archive_phase2(
     output_dir = base_dir / date_str
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 写入 portfolio_decision.json（全量 model_dump）
+    # 1. 写入 portfolio_decision.json（全量 model_dump，原子写 + 回读自检）
     output_path = output_dir / "portfolio_decision.json"
-    output_path.write_text(
-        json.dumps(
-            decision.model_dump(mode="json"), ensure_ascii=False, indent=2
-        ),
-        encoding="utf-8",
-    )
+    payload = decision.model_dump(mode="json")
+    try:
+        text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+    except ValueError:
+        logger.warning("[archive] 决策数据含 NaN/Inf 字段，已清洗为 null 后落盘")
+        text = json.dumps(_sanitize_nan(payload), ensure_ascii=False, indent=2, allow_nan=False)
+    tmp_path = output_path.with_suffix(".json.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    # 回读自检：先验 tmp 再原子替换，正式文件永不被半截 JSON 污染
+    try:
+        json.loads(tmp_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        corrupt_path = output_path.with_suffix(".json.corrupt")
+        try:
+            os.replace(tmp_path, corrupt_path)
+        except OSError:
+            pass
+        logger.error(
+            f"[archive] portfolio_decision.json 回读自检失败，"
+            f"坏文件保留为 {corrupt_path.name}: {e}"
+        )
+        raise
+    os.replace(tmp_path, output_path)
 
     # 2. 生成独立的交易建议 MD 文档
     trading_md_path = output_dir / "trading_recommendations.md"
     with open(trading_md_path, "w", encoding="utf-8") as f:
+        # Q4-D audit: 盘中快照警告（bar_complete=false 时）
+        if any(a.intraday_snapshot for a in decision.allocation):
+            f.write(f"## ⚠️ 盘中快照警告\n\n")
+            f.write(f"**价格与止损基于盘中快照（bar_complete=false），非收盘价，仅供参考**\n\n")
         f.write(f"# Phase 2 交易建议 — {run_date}\n\n")
         f.write(f"## 风险评估\n\n")
         f.write(f"- **仓位上限:** {decision.risk_assessment.position_limit:.0%}\n")

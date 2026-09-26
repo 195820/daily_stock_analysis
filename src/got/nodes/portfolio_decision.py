@@ -17,12 +17,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.got.schemas import (
     CapitalContext,
+    DataQuality,
     MarketContext,
     NewsContext,
     PortfolioDecision,
@@ -54,6 +56,11 @@ class PortfolioDecisionNode:
         # 两条线的「跑没跑 / 为什么没跑 / 跑了得到什么」都记在这里，run() 末尾落盘。
         self._shadow_t1: Dict[str, Any] = {}
         self._shadow_t1h: Dict[str, Any] = {}
+        # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
+        self._sector_verify_degraded = False
+        self._sector_verify_pending_count = 0
+        self._stock_name_cache: Dict[str, str] = {}
+        self._bypass_ambush_sectors: set = set()
 
     async def run(
         self,
@@ -63,6 +70,7 @@ class PortfolioDecisionNode:
         capital_context: CapitalContext,
         news_context: NewsContext,
         sentiment_context: SentimentContext,
+        bar_complete: bool = True,
     ) -> PortfolioDecision:
         """
         主入口：统一决策流水线
@@ -116,16 +124,27 @@ class PortfolioDecisionNode:
         )
 
         # Step 2.5: T1-H 持仓审查（§15.4，Agent 降档权）
-        holdings_scores = await self._agent_holding_review(
-            holdings_scores, unified_context, news_context, portfolio,
-        )
+        # 审核修复 1.2：定向降级——审查失败保留原评分，不击穿整条流水线
+        degraded_steps: list[str] = []
+        try:
+            holdings_scores = await self._agent_holding_review(
+                holdings_scores, unified_context, news_context, portfolio,
+            )
+        except Exception as e:
+            logger.warning(f"[Phase 2] Step 2.5 持仓审查失败（保留原评分）: {e}")
+            degraded_steps.append(f"Step2.5 持仓审查: {e}")
         # 重新组装（持仓评分可能因降档而变化）
         unified_scoring = holdings_scores + candidates_scores
         unified_scoring.sort(key=lambda x: x.composite_score, reverse=True)
 
         # Step 3: 组合优化（规则 + LLM 混合）
-        logger.info("[Phase 2] Step 3: 组合优化")
-        allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio, unified_context)
+        # 审核修复 1.2：失败时降级为空 allocation + status=partial，保证产物落盘
+        try:
+            allocation, vetoed_candidates = self._allocate(unified_scoring, risk_assessment, portfolio, unified_context, bar_complete=bar_complete)
+        except Exception as e:
+            logger.error(f"[Phase 2] Step 3 组合优化失败，降级为空 allocation: {e}")
+            allocation, vetoed_candidates = [], []
+            degraded_steps.append(f"Step3 组合优化: {e}")
 
         # Step 4: 轮动时机检测 + 家族拥挤检查（吃鱼身+高切低策略）
         logger.info("[Phase 2] Step 4: 轮动检测 + 拥挤检查")
@@ -169,16 +188,33 @@ class PortfolioDecisionNode:
         self._close_thesis_snapshots(allocation, portfolio)
 
         # LLM 精炼（生成可追溯的推理总结）
-        reasoning = await self._llm_refinement(
-            risk_assessment, unified_scoring, allocation, unified_context, portfolio,
-            vetoed_candidates=vetoed_candidates,
-        )
+        # 审核修复 1.2：精炼失败不阻断产物，回退规则摘要
+        try:
+            reasoning = await self._llm_refinement(
+                risk_assessment, unified_scoring, allocation, unified_context, portfolio,
+                vetoed_candidates=vetoed_candidates,
+            )
+        except Exception as e:
+            logger.warning(f"[Phase 2] LLM 精炼失败，回退规则摘要: {e}")
+            reasoning = f"[LLM 精炼不可用: {e}] 当日决策以规则链路结果为准，见 summary 与 unified_scoring。"
+            degraded_steps.append(f"LLM 精炼: {e}")
 
         # 生成操作总结
         summary = self._generate_summary(allocation, risk_assessment, vetoed_candidates)
 
         # 生成风险提示
         warnings = self._generate_warnings(allocation, risk_assessment, unified_context)
+        
+        # Q4 audit: 盘中快照警告（bar_complete=False 时追加）
+        # 审核修复 S3：append 到末尾，不再 insert(0) 顶掉既有 warnings[0] 的位置契约
+        if not bar_complete:
+            intraday_count = sum(1 for a in allocation if a.intraday_snapshot)
+            if intraday_count > 0:
+                warnings.append(f"⚠️ 盘中快照警告：{intraday_count} 条交易建议基于盘中数据（bar_complete=false），价格与止损可能失真")
+
+        # 审核修复 1.2：降级步骤透出到 warnings，状态标记 partial
+        if degraded_steps:
+            warnings.extend(f"⚠️ 降级：{step}" for step in degraded_steps)
 
         # D-P12: 落盘板块暴露绑定信息（口径声明 + 绑定次数）
         sector_limits = risk_assessment.sector_exposure_limits
@@ -191,8 +227,20 @@ class PortfolioDecisionNode:
             "note": "确信度乘数非敞口上限，只乘不除，与板块数无关",
         }
 
+        # 审核修复 W9/3.3：决策审计字段（回测据此识别口径断点与降级日）
+        data_quality = DataQuality(
+            sector_available_false_count=sum(
+                1 for s in unified_scoring if not getattr(s, "sector_available", True)
+            ),
+            sector_vetoed_count=sum(
+                1 for v in vetoed_candidates if not getattr(v, "sector_available", True)
+            ),
+            sector_verify_degraded=True if self._sector_verify_degraded else None,
+            sector_verify_pending_count=self._sector_verify_pending_count or None,
+        )
+
         decision = PortfolioDecision(
-            status="normal",
+            status="partial" if degraded_steps else "normal",
             risk_assessment=risk_assessment,
             unified_scoring=unified_scoring,
             allocation=allocation,
@@ -204,6 +252,7 @@ class PortfolioDecisionNode:
             ambush_exit_signals=ambush_exit_signals,
             mainline_endurance=getattr(unified_context, "mainline_endurance", []),
             sector_exposure_binding=sector_exposure_binding,
+            data_quality=data_quality,
         )
 
         # 影子观测落盘（A5 的 agent_glue.json 由 Node 6 自行落盘，此处补 T1 / T1-H 两条线）
@@ -1122,6 +1171,28 @@ class PortfolioDecisionNode:
         new_lines = lines[:start_idx] + [replacement] + (lines[end_idx:] if end_idx is not None else [])
         return "\n".join(new_lines)
 
+    def _resolve_missing_name(self, code: str, name: str) -> str:
+        """审核修复 S1：name 退化为裸代码时回退查名（进程内缓存）。
+
+        上游 _get_stock_name 查名失败会返回代码，裸代码混入决策产物
+        （如 0908 name="600250"）；回退后仍无名称则告警并保留代码。
+        """
+        if not re.fullmatch(r"\d{6}", str(name or "")):
+            return name or code
+        if code in self._stock_name_cache:
+            return self._stock_name_cache[code]
+        resolved = ""
+        try:
+            from data_provider.base import DataFetcherManager
+            resolved = DataFetcherManager().get_stock_name(code) or ""
+        except Exception as e:
+            logger.warning(f"[name兜底] {code} 查名异常: {e}")
+        if resolved:
+            self._stock_name_cache[code] = resolved
+            return resolved
+        logger.warning(f"[name兜底] {code} 名称缺失，产物保留裸代码")
+        return name or code
+
     async def _verify_candidate_sectors(
         self,
         finalists: list,
@@ -1136,7 +1207,8 @@ class PortfolioDecisionNode:
         1. 对每只候选股，调用 efinance 获取其实际所属板块列表
         2. L1 别名归一化匹配：处理跨口径命名差异（如"券商" vs "券商概念"）
         3. L2 LLM 仲裁：L1 未命中时批量交由 LLM 判断是否同一概念，
-           LLM 不可用时降级为信任问财（保留标签）
+           LLM 不可用时改走保守分支（审核修复 3.3：清空标签 +
+           sector_available=False，进入 unknown 保守预算路径）
         4. 两者都未命中，清空板块标签（sector 维度按缺失处理，权重归一化剔除）
 
         注意：只在候选股数量较少时（≤15）执行，避免过多 API 调用。
@@ -1224,11 +1296,28 @@ class PortfolioDecisionNode:
             arbitration = await self._llm_arbitrate_sector_match(unique_cases)
 
             if arbitration is None:
-                # LLM 不可用 → 降级为信任问财，全部保留标签
+                # 审核修复 3.3：LLM 不可用时不再静默信任问财——蹭概念票会绕过
+                # sector_available 全套守卫直接 BUY（0922 新亚制程教训）；改走保守
+                # 分支：清空板块标签 → 维度权重归一剔除 + action 强制 watch +
+                # unknown 保守预算；降级态显式透出到产物 data_quality
                 logger.warning(
-                    f"[板块验证] LLM 仲裁不可用，{len(pending)} 只待验证股保留问财标签"
+                    f"[板块验证] LLM 仲裁不可用，{len(pending)} 只待验证股改走保守处理"
+                    f"（清空板块标签，禁入买入池，data_quality 标记降级）"
                 )
-                verified.extend(item["stock"] for item in pending)
+                self._sector_verify_degraded = True
+                self._sector_verify_pending_count = len(pending)
+                for item in pending:
+                    stock = item["stock"]
+                    if hasattr(stock, 'sector'):
+                        stock.sector = ""
+                    if hasattr(stock, 'sector_name'):
+                        stock.sector_name = ""
+                    stock.sector_available = False
+                    if hasattr(stock, 'ai_reasoning'):
+                        stock.ai_reasoning = self._strip_sector_reasoning(
+                            getattr(stock, 'ai_reasoning', '') or ''
+                        )
+                    verified.append(stock)
             else:
                 for item in pending:
                     case_idx = case_index[(item["tagged"], tuple(item["boards"]))]
@@ -1278,7 +1367,7 @@ class PortfolioDecisionNode:
 
         Returns:
             {case 索引: 命中的板块名或 None}；LLM 不可用/解析失败时返回 None，
-            由调用方降级为信任问财。
+            由调用方改走保守分支（审核修复 3.3，不再信任问财）。
         """
         if not cases:
             return {}
@@ -3345,6 +3434,7 @@ verdict 含义：
         # strength_score 从 Node 2 的 strength_lookup 查表（升格消费专用字段）
         strength_lookup = getattr(sector_context, "strength_lookup", {}) or {}
         existing_ambush_names = {s.get("name") for s in sector_ctx_dict["ambush"]}
+        self._bypass_ambush_sectors = set()
         for candidate in unified_context.ambush_pool:
             if candidate.sector_name not in existing_ambush_names:
                 sector_ctx_dict["ambush"].append({
@@ -3352,6 +3442,8 @@ verdict 含义：
                     "strength_score": strength_lookup.get(candidate.sector_name, 0.0),
                 })
                 existing_ambush_names.add(candidate.sector_name)
+                # 审核修复 S2：旁路注入打标，供下游按来源分层回测
+                self._bypass_ambush_sectors.add(candidate.sector_name)
                 logger.info(
                     f"[Phase 2] 埋伏池板块补入选股池: {candidate.sector_name} "
                     f"(不在 Node 2 当日 ambush 名单，catalyst_score={candidate.catalyst_score})"
@@ -3491,6 +3583,16 @@ verdict 含义：
                     f"(资金{intel['capital_check']}/消息{intel['news_check']}/情绪{intel['sentiment_check']})"
                 )
 
+            # Q9 连带修复（audit_20260922）：板块维度被剔除时同步重写分数行，
+            # 消除 screener 旧分（69.0）与 Phase 2 重算分（67.2）双轨透传
+            base_reasoning = stock.ai_reasoning or f"综合评分 {adjusted_composite:.1f}"
+            if not getattr(stock, "sector_available", True):
+                base_reasoning = re.sub(
+                    r"\*\*综合评分\*\*:\s*[\d.]+/100",
+                    f"**综合评分**: {adjusted_composite:.1f}/100（板块维度已剔除后归一）",
+                    base_reasoning,
+                )
+
             # 动作建议：基于生命周期优先级
             # 资金确认闸门（Step 3）：capital < 35 时降级为 watch（不禁止入选，只禁止激进买入建议）
             # 依据：9月失败股 capital 18-56 仍获 buy_trend（湘佳股份 capital=18.2 → T+3 -7.92%）
@@ -3517,6 +3619,11 @@ verdict 含义：
                 else:
                     action = "watch"
 
+            # Q9-B（audit_20260922）：板块验证失败候选保留在 unified_scoring 供观察，
+            # 但 action 强制标 watch（身份不可信 → 禁止任何 buy* 建议）
+            if not getattr(stock, "sector_available", True) and action.startswith("buy"):
+                action = "watch"
+
             # 板块分类（用于输出可观测性）
             sector_classification = None
             if stock_sector and stock_sector in sector_intel_map:
@@ -3525,7 +3632,7 @@ verdict 含义：
             results.append(
                 UnifiedScoringResult(
                     symbol=stock.code,
-                    name=stock.name,
+                    name=self._resolve_missing_name(stock.code, stock.name),
                     is_holding=False,
                     composite_score=adjusted_composite,
                     dimension_scores={
@@ -3538,7 +3645,7 @@ verdict 含义：
                     action_recommendation=action,
                     confidence=0.7,
                     reasoning=(
-                        (stock.ai_reasoning or f"综合评分 {adjusted_composite:.1f}")
+                        (base_reasoning)
                         + sector_intel_info
                     ),
                     sector_name=stock_sector or None,
@@ -3546,6 +3653,14 @@ verdict 含义：
                     lifecycle_phase=lifecycle_phase,
                     lifecycle_day=lifecycle_day,
                     family_name=family_name,
+                    sector_available=getattr(stock, 'sector_available', True),
+                    # 审核修复 W10/S2：候选来源可观测性透传
+                    dde_degraded=getattr(stock, "dde_degraded", False),
+                    pool_source=(
+                        "bypass_ambush"
+                        if stock_sector and stock_sector in self._bypass_ambush_sectors
+                        else ""
+                    ),
                 )
             )
 
@@ -3564,6 +3679,7 @@ verdict 含义：
         risk: PortfolioRiskAssessment,
         portfolio: Dict[str, Any],
         unified_context: UnifiedContext = None,
+        bar_complete: bool = True,
     ) -> tuple[list[TradeAllocation], list[UnifiedScoringResult]]:
         """规则驱动的仓位分配（支持高切低轮动策略）。
 
@@ -3681,12 +3797,20 @@ verdict 含义：
 
         # ── Step 3: 生成买入建议 ──
         # 预收集 BUY 候选（无论预算是否充足），预算不足时显式透出被否决信号
+        # Q9-B: 板块验证失败的候选不进 allocation（拆分为两组，剔除可追溯）
         buy_candidates = [
             s
             for s in unified_scoring
-            if not s.is_holding and s.action_recommendation.startswith("buy")
+            if not s.is_holding and s.action_recommendation.startswith("buy") and s.sector_available
         ]
         buy_candidates.sort(key=lambda x: x.composite_score, reverse=True)
+        # Q9-B 可追溯性（审核 W10 修复）：sector 失效的 buy* 候选既不进 allocation
+        # 也不该静默消失 → 并入否决列表（附否决原因，与“预算不足显式透出”契约对齐）
+        sector_vetoed = [
+            s
+            for s in unified_scoring
+            if not s.is_holding and s.action_recommendation.startswith("buy") and not s.sector_available
+        ]
 
         if buy_budget > 0:
             candidates = buy_candidates
@@ -3774,11 +3898,22 @@ verdict 含义：
                         confidence=score.confidence,
                         reasoning=score.reasoning,
                         sector_limit_detail=sector_limit_detail,
+                        intraday_snapshot=not bar_complete,  # Q4 audit: 盘中快照标记
                     )
                 )
 
         # 预算不足时，全部 BUY 候选被约束否决 → 显式透出（消除"高分候选 vs 0 交易"静默矛盾）
         vetoed_candidates = buy_candidates if buy_budget <= 0 else []
+        # Q9-B：板块验证失败被禁入的候选同样显式透出（按综合分降序并入，避免与预算否决重复列示）
+        if sector_vetoed:
+            logger.info(
+                "[Phase 2] Q9-B 板块验证失败禁入买入池: %s",
+                "、".join(f"{s.name}({s.composite_score:.1f})" for s in sector_vetoed[:5]),
+            )
+            vetoed_candidates = sorted(
+                list(vetoed_candidates) + list(sector_vetoed),
+                key=lambda x: x.composite_score, reverse=True,
+            )
 
         return allocations, vetoed_candidates
 

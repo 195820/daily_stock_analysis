@@ -151,6 +151,9 @@ CATALYST_RESERVOIR_WEEKS = 4        # [遗留] 已被 RESERVOIR_EXPIRY_DAYS=10 �
 RESERVOIR_EXPIRY_DAYS = 10           # 蓄水池驻留 ≥N 交易日 → 自动除名（与催化前瞻窗口14日≈10交易日对齐）
 RESERVOIR_PROMOTION_MIN_DAYS = 2     # TODO: 待校准 — 升格最低驻留天数（太短无意义）
 RESERVOIR_MAX_SIZE = 15              # 蓄水池容量上限（超出按优先级驱逐最老条目）
+# Q3 (audit_20260922)：驱逐保护参数，与 RESERVOIR_PROMOTION_MIN_DAYS 一起校准
+RESERVOIR_NEW_ENTRY_PROTECTION_DAYS = 3  # 新入保护：days_in_reservoir < N 的条目容量驱逐豁免
+RESERVOIR_DAILY_NEW_ENTRY_MAX = 5        # TODO: 待校准 — 当日新入上限（实测日均新入 9-16 ≫ 容量，超出按入池强度降序截断）
 
 # D-P3: 正式池水位目标（用于归档落盘，使偏差可见；不改任何阈值）
 AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 天 0–2，下界 2 为略高于现状的最小要求）

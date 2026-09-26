@@ -140,8 +140,12 @@ class NewsAnalysisNode:
     def __init__(self, use_mock: bool = True):
         self.use_mock = use_mock
 
-    async def run(self) -> NewsContext:
-        """执行消息面分析"""
+    async def run(self, bar_complete: bool = True) -> NewsContext:
+        """执行消息面分析
+        
+        Args:
+            bar_complete: 数据完整性标记（True=收盘后数据, False=盘中快照）
+        """
         if self.use_mock:
             logger.info("[Node 4] 使用 mock 数据")
             return self._mock_output()
@@ -184,7 +188,7 @@ class NewsAnalysisNode:
         # Step 3: 多源确认
         events = self._apply_source_count(events, raw_news)
 
-        # 过滤 low-impact 事件（不参与 major_events 输出）
+        # 过滤 low-impact 的事件（不参与 major_events 输出）
         events = [e for e in events if e.impact_level != "low"]
 
         # Step 3.5: 事件持久化（跨日记忆）
@@ -216,11 +220,11 @@ class NewsAnalysisNode:
         try:
             from src.got.catalyst_calendar import CatalystCalendarBuilder
             builder = CatalystCalendarBuilder()
-            calendar = await builder.build_calendar()
+            calendar = await builder.build_calendar(bar_complete=bar_complete)
             result.catalyst_calendar = calendar
             logger.info(
-                "[Node 4] 催化剂日历: %d 事件, mode=%s",
-                len(calendar.events), calendar.refresh_mode,
+                "[Node 4] 催化剂日历: %d 事件, mode=%s, bar_complete=%s",
+                len(calendar.events), calendar.refresh_mode, bar_complete,
             )
         except Exception as exc:
             logger.warning("[Node 4] 催化剂日历构建失败（已降级）: %s", exc)

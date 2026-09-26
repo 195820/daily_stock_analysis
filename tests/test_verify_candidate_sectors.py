@@ -4,7 +4,7 @@
 覆盖 2026-09-01 升级后的验证链路：
 - L1 别名归一化匹配（"券商" ↔ "券商概念"），命中时不触发 LLM
 - L2 LLM 仲裁：命中保留 / 未命中清空
-- LLM 不可用时降级为信任问财（保留标签）
+- LLM 不可用时改走保守分支（审核修复 3.3：清空标签 + sector_available=False）
 - efinance 获取失败时保留标签
 """
 
@@ -100,15 +100,21 @@ class TestVerifyCandidateSectors(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result[0].sector, "")
 
-    async def test_llm_failure_falls_back_to_keep_tag(self):
-        """LLM 异常 → 降级为信任问财，保留标签"""
+    async def test_llm_failure_falls_back_to_conservative(self):
+        """LLM 异常 → 审核修复 3.3 保守分支：清空标签 + sector_available=False，
+        杜绝蹭概念票绕过守卫直接 BUY（0922 新亚制程教训）"""
         stock = _stock()
+        stock.sector_available = True
         result, _ = await self._run(
             [stock],
             {"600030": [{"name": "机械设备"}]},
             llm_raises=True,
         )
-        self.assertEqual(result[0].sector, "券商")
+        self.assertEqual(result[0].sector, "")
+        self.assertEqual(result[0].sector_name, "")
+        self.assertFalse(result[0].sector_available)
+        self.assertTrue(self.node._sector_verify_degraded)
+        self.assertEqual(self.node._sector_verify_pending_count, 1)
 
     async def test_efinance_empty_keeps_tag(self):
         """efinance 获取失败（空列表）→ 保留问财标签"""

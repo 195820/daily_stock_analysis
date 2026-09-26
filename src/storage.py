@@ -1341,6 +1341,8 @@ class CatalystRealizationRecord(Base):
     resolution = Column(String(16))                          # None / "resolved" / "unresolvable"
     # 备注
     notes = Column(Text, default='')
+    # Q4-D audit: 数据完整性标记（盘中快照 vs 收盘后数据）
+    bar_complete = Column(Boolean, default=True)             # True=收盘后数据, False=盘中快照
     # 时间戳
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
@@ -1705,6 +1707,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             # A1 三态列：存量库必须补列，否则 P6 的 SELECT/INSERT 抛 OperationalError
             # 被上层静默吞掉（违反 R3），清理脚本跑之前 P6 整体瘫痪
             "resolution": "VARCHAR(16)",
+            # Q4-A/P6 盘中快照标记（audit_20260922）：同理缺列会使 register_event
+            # 的 INSERT 报错并被 _save_events 吞掉，整批 forward 注册静默瘫痪
+            "bar_complete": "BOOLEAN DEFAULT 1",
         }
         try:
             with self._SessionLocal() as session:

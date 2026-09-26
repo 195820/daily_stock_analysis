@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.got.schemas import CatalystEvent, CatalystCalendar, NewsEvent
@@ -104,6 +104,10 @@ class CatalystCalendarBuilder:
         self._concept_set: Optional[Set[str]] = None
         self._stock_board_cache: Dict[str, List[str]] = {}
         self._llm = None
+        # T2 批判者判 DROP 的 event_id 集合（影子模式下 events 仍原样返回上层，
+        # 但 _save_events 落库/注册 P6 前必须过滤——audit_20260922 Q6-C①：
+        # Run 3 孤儿行成因正是「影子 DROP 后仍写盘」）
+        self._critic_drop_ids: Set[str] = set()
 
     @property
     def concept_set(self) -> Set[str]:
@@ -123,11 +127,12 @@ class CatalystCalendarBuilder:
     # =================================================================
 
     async def build_calendar(
-        self, target_date: Optional[date] = None, force_full: bool = False
+        self, target_date: Optional[date] = None, force_full: bool = False, bar_complete: bool = True
     ) -> CatalystCalendar:
         """构建催化剂日历（全量或增量）
 
         force_full=True 跳过刷新节奏判断强制全量重建（守卫修复验证/残留清理场景）。
+        bar_complete: 数据完整性标记（True=收盘后数据, False=盘中快照）
         """
         target_date = target_date or date.today()
         end_date = target_date + timedelta(days=CATALYST_WINDOW_DAYS)
@@ -147,7 +152,7 @@ class CatalystCalendarBuilder:
             # 持久化（全量模式先清理本次未再生成的残留记录）
             if full_refresh:
                 self._cleanup_stale_events(events, target_date)
-            self._save_events(events, target_date)
+            self._save_events(events, target_date, bar_complete=bar_complete)
             self._update_refresh_tracker(mode, target_date)
 
             # 统计
@@ -1299,6 +1304,7 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
             # 建立 event_id → verdict 映射
             drop_ids: set = set()
+            self._critic_drop_ids = drop_ids
             for v in verdicts:
                 if v.get("verdict") == "drop":
                     drop_ids.add(v.get("event_id", ""))
@@ -1410,65 +1416,100 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
     # 持久化
     # =================================================================
 
-    def _save_events(self, events: List[CatalystEvent], target_date: date) -> None:
-        """UPSERT 事件到 catalyst_events 表"""
+    def _save_events(self, events: List[CatalystEvent], target_date: date, bar_complete: bool = True) -> None:
+        """UPSERT 事件到 catalyst_events 表
+
+        落库口径：T2 批判者判 DROP 的事件（含影子模式）一律不写盘、不注册 P6，
+        避免「影子校验只记日志不拦截」产生孤儿行（audit_20260922 Q6-C①）。
+        """
         if not events:
             return
 
         from src.storage import DatabaseManager, CatalystEventRecord
+        from src.got.catalyst_config import NARRATIVE_CRITIC_SHADOW
+
         db = DatabaseManager()
         expires = target_date + timedelta(days=CATALYST_WINDOW_DAYS)
 
+        # Q6-C①：DROP 联动——无论影子与否，写盘集合都遵循批判者裁决
+        drop_ids = self._critic_drop_ids
+        if drop_ids:
+            persisted = [e for e in events if e.event_id not in drop_ids]
+            blocked = len(events) - len(persisted)
+            if blocked:
+                logger.info(
+                    "[CatalystCalendar] T2 DROP 落库拦截: %d/%d 个事件不写盘（影子=%s）",
+                    blocked, len(events), NARRATIVE_CRITIC_SHADOW,
+                )
+        else:
+            persisted = events
+        if not persisted:
+            return
+
         with db.get_session() as session:
-            for event in events:
+            for event in persisted:
                 # T5 扇出序列化（空列表 → NULL，表示未对齐）
                 sectors_payload = (
                     json.dumps(event.affected_sectors, ensure_ascii=False)
                     if event.affected_sectors else None
                 )
-                existing = session.get(CatalystEventRecord, event.event_id)
+                # 查询是否已存在
+                existing = (
+                    session.query(CatalystEventRecord)
+                    .filter(CatalystEventRecord.event_id == event.event_id)
+                    .first()
+                )
+
                 if existing:
-                    # 更新已有记录
-                    existing.event_date = event.event_date
+                    # 更新现有记录（同日重跑幂等刷新）
+                    existing.event_type = event.event_type
+                    existing.source = event.source
+                    existing.sector = event.sector
                     existing.title = event.title
+                    existing.event_date = event.event_date
+                    existing.category_tag = event.category_tag
                     existing.impact_level = event.impact_level
-                    existing.confidence = event.confidence
                     existing.consensus_expectation = event.consensus_expectation
+                    existing.direction = event.direction
+                    existing.confidence = event.confidence
+                    existing.is_global = event.is_global
                     existing.source_news = event.source_news
                     existing.affected_sectors = sectors_payload
                     existing.expires_at = expires
+                    existing.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 else:
-                    record = CatalystEventRecord(
+                    # 创建新记录
+                    new_record = CatalystEventRecord(
                         event_id=event.event_id,
-                        event_date=event.event_date,
                         event_type=event.event_type,
-                        title=event.title,
+                        source=event.source,
                         sector=event.sector,
+                        title=event.title,
+                        event_date=event.event_date,
+                        category_tag=event.category_tag,
                         impact_level=event.impact_level,
+                        consensus_expectation=event.consensus_expectation,
                         direction=event.direction,
                         confidence=event.confidence,
-                        consensus_expectation=event.consensus_expectation,
-                        source=event.source,
-                        category_tag=event.category_tag,
                         is_global=event.is_global,
                         source_news=event.source_news,
                         affected_sectors=sectors_payload,
                         expires_at=expires,
                     )
-                    session.add(record)
+                    session.add(new_record)
 
             session.commit()
 
-        logger.debug("[CatalystCalendar] 持久化 %d 事件", len(events))
+        logger.debug("[CatalystCalendar] 持久化 %d 事件", len(persisted))
 
-        # P6: 同步注册到兑现归档表
+        # P6: 同步注册到兑现归档表（与落库同口径，DROP 事件不注册）
         try:
             from src.got.catalyst_realization import CatalystRealizationTracker
             tracker = CatalystRealizationTracker()
-            for event in events:
-                tracker.register_event(event, source_type="forward")
+            for event in persisted:
+                tracker.register_event(event, source_type="forward", bar_complete=bar_complete)
         except Exception as exc:
-            logger.debug("[CatalystCalendar] P6 注册失败（已降级）: %s", exc)
+            logger.warning("[CatalystCalendar] P6 注册失败（已降级）: %s", exc)
 
     def _cleanup_stale_events(self, events: List[CatalystEvent], target_date: date) -> None:
         """全量重建清理：删除过期记录 + 本次未再生成的 global_map/llm_narrative 残留

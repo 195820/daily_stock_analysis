@@ -681,6 +681,11 @@ def save_monitoring(
     - node5.contrarian_alert_count_30d > 10 → 🟡 反向信号过频繁（30 日窗口滚动）
     - cross_node.signal_count_30d 全 0 → 🟡 跨节点共振未触发
     - last_successful_run > 3 交易日 → 🔴 系统中断
+
+    Q5-3（audit_20260922）口径：
+    - anomalies = 本轮（当日）触发的告警，节点 status 只看当日异常；
+    - anomaly_dates = 30 日累积历史（按 date+source+message 去重，保留最新），
+      供取证回看，不再参与 status 判定（修复历史告警被次日清空 + status 粘滞）。
     """
     from datetime import timedelta
     _ensure_monitoring_dir()
@@ -689,18 +694,31 @@ def save_monitoring(
     today_str = date.today().isoformat()
     today = date.today()
 
-    # 追加历史（保持最近 30 条）
-    dwell_history = (prev.get("node1", {}).get("regime_dwell_days_history", []) + [regime_dwell])[-30:]
-    persistence_history = (
-        prev.get("node5", {}).get("persistence_regime_history", [])
-        + ([persistence_regime] if persistence_regime else [])
-    )[-30:]
+    # Q6-A: 按日去重 append — 照抄 signal_dates 范式（cutoff + 剔当日 + 追加）
+    # 防止同日重跑污染历史列表（审计 9/22: 3 次运行占 30 窗口 3 席）
+    cutoff_30d = (today - timedelta(days=30)).isoformat()
+
+    # dwell_history: 存 {date, value} 对，同日覆盖
+    prev_dwell_dates = prev.get("node1", {}).get("regime_dwell_dates", [])
+    prev_dwell_dates = [
+        d for d in prev_dwell_dates
+        if d.get("date", "") >= cutoff_30d and d.get("date") != today_str
+    ]
+    prev_dwell_dates.append({"date": today_str, "value": regime_dwell})
+    dwell_history = [d["value"] for d in prev_dwell_dates[-30:]]
+
+    # persistence_history: 存 {date, value} 对，同日覆盖
+    prev_persistence_dates = prev.get("node5", {}).get("persistence_regime_dates", [])
+    prev_persistence_dates = [
+        d for d in prev_persistence_dates
+        if d.get("date", "") >= cutoff_30d and d.get("date") != today_str
+    ]
+    if persistence_regime:
+        prev_persistence_dates.append({"date": today_str, "value": persistence_regime})
+    persistence_history = [d["value"] for d in prev_persistence_dates[-30:]]
 
     # 合并 cross_node 信号计数（30 日窗口由日期驱动衰减）
-    prev_signal_counts = prev.get("cross_node", {}).get("signal_count_30d", {})
-    # 清理超过 30 天的信号日期记录 + 剔除当天既有条目（防止重复）
     prev_signal_dates = prev.get("cross_node", {}).get("signal_dates", [])
-    cutoff_30d = (today - timedelta(days=30)).isoformat()
     prev_signal_dates = [
         d for d in prev_signal_dates
         if d.get("date", "") >= cutoff_30d and d.get("date") != today_str
@@ -726,20 +744,32 @@ def save_monitoring(
         prev_alert_dates.append(today_str)
     contrarian_alert_count_30d = len(prev_alert_dates)
 
-    # ── 异常检测 ──
-    anomalies: list[dict] = []
+    # ── 异常检测（Q5-3: 按日累积，30 日窗口滚动）──
+    # 去重键 = date + source + message 前 40 字（纯 date 去重会合并不同 anomaly 类型）
+    prev_anomaly_dates = prev.get("anomaly_dates", [])
+    prev_anomaly_dates = [
+        a for a in prev_anomaly_dates
+        if a.get("date", "") >= cutoff_30d and a.get("date") != today_str
+    ]
+
+    def _anomaly_dedup_key(source: str, message: str) -> str:
+        return f"{source}|{message[:40]}"
+
+    # Q5-1a/1b: formula_version 标签，区分口径变更
+    FLOW_5D_FORMULA_VERSION = "v2_intersection"
 
     # 冷启动保护：归档不足时 non_null_rate 恒为 0 → 跳过告警
     if flow_5d_total_boards >= 10 and flow_5d_non_null_rate < 0.8:
-        anomalies.append({
+        prev_anomaly_dates.append({
             "level": "critical",
             "source": "node3",
             "message": f"资金流 5d 数据缺失率过高（非空率 {flow_5d_non_null_rate:.0%} < 80%）",
             "date": today_str,
+            "formula_version": FLOW_5D_FORMULA_VERSION,
         })
 
     if regime_switch_count_20d > 8:
-        anomalies.append({
+        prev_anomaly_dates.append({
             "level": "warning",
             "source": "node1",
             "message": f"regime 20 日切换 {regime_switch_count_20d} 次 > 8，确认窗口可能过短",
@@ -747,7 +777,7 @@ def save_monitoring(
         })
 
     if contrarian_alert_count_30d > 10:
-        anomalies.append({
+        prev_anomaly_dates.append({
             "level": "warning",
             "source": "node5",
             "message": f"30 日反向信号 {contrarian_alert_count_30d} 次 > 10，阈值可能过松",
@@ -755,12 +785,28 @@ def save_monitoring(
         })
 
     if all(v == 0 for v in merged_signal_counts.values()) and merged_signal_counts:
-        anomalies.append({
+        prev_anomaly_dates.append({
             "level": "warning",
             "source": "cross_node",
             "message": "跨节点共振 30 日内从未触发，检查条件是否过严",
             "date": today_str,
         })
+
+    # 去重（同 key 只保留最新一条：先倒序扫描再反转，避免 anomalies[].date 越滚越旧）
+    seen_keys: set[str] = set()
+    deduped_dates: list[dict] = []
+    for a in reversed(prev_anomaly_dates):
+        key = _anomaly_dedup_key(a.get("source", ""), a.get("message", ""))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduped_dates.append(a)
+    deduped_dates.reverse()
+    prev_anomaly_dates = deduped_dates
+
+    # 当前态 vs 历史分离（Q5-3）：anomalies/status 只反映当日触发的告警，
+    # 30 日累积列表另存 anomaly_dates 供取证（早期误修：status 直读累积列表
+    # 会导致一条早已恢复的 critical 在 30 日窗口内持续粘滞）
+    anomalies: list[dict] = [a for a in prev_anomaly_dates if a.get("date") == today_str]
 
     # 构建各节点状态
     def _status_for(anomaly_source: str) -> str:
@@ -774,11 +820,14 @@ def save_monitoring(
         "last_successful_run": today_str,
         "node1": {
             "regime_dwell_days_history": dwell_history,
+            "regime_dwell_dates": prev_dwell_dates,
             "regime_switch_count_20d": regime_switch_count_20d,
             "status": _status_for("node1"),
         },
         "node3": {
             "flow_5d_non_null_rate_20d": round(flow_5d_non_null_rate, 3),
+            # Q5-1a/1b：口径断点标记落在指标本身（异常条目级标签不足以让时序消费方定位断点）
+            "flow_5d_formula_version": FLOW_5D_FORMULA_VERSION,
             "mainline_consistency_avg": round(mainline_consistency_avg, 2),
             "status": _status_for("node3"),
         },
@@ -786,6 +835,7 @@ def save_monitoring(
             "contrarian_alert_count_30d": contrarian_alert_count_30d,
             "contrarian_alert_dates": prev_alert_dates,
             "persistence_regime_history": persistence_history,
+            "persistence_regime_dates": prev_persistence_dates,
             "status": _status_for("node5"),
         },
         "cross_node": {
@@ -794,12 +844,13 @@ def save_monitoring(
             "status": _status_for("cross_node"),
         },
         "anomalies": anomalies,
+        "anomaly_dates": prev_anomaly_dates,
     }
 
     _atomic_write_json(_MONITORING_FILE, monitoring)
     if anomalies:
-        logger.warning(f"[monitoring] {len(anomalies)} 个异常: {[a['message'][:50] for a in anomalies]}")
+        logger.warning(f"[monitoring] 本轮 {len(anomalies)} 个异常: {[a['message'][:50] for a in anomalies]}")
     else:
-        logger.info("[monitoring] 所有指标正常")
+        logger.info("[monitoring] 本轮指标正常（30 日历史异常 %d 条见 anomaly_dates）", len(prev_anomaly_dates))
 
     return monitoring

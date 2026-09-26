@@ -177,24 +177,35 @@ class CatalystRealizationTracker:
 
         return realized_count
 
-    def register_event(self, event: CatalystEvent, source_type: str = "forward") -> None:
+    def register_event(self, event: CatalystEvent, source_type: str = "forward", bar_complete: bool = True) -> None:
         """注册新催化剂事件到归档表
 
         在催化剂日历构建时调用，为每个事件创建一条归档记录。
 
         Args:
             event: 催化剂事件
-            source_type: forward / reverse_discovery / veto / reservoir
+            source_type: 来源类型（forward/reverse_discovery/veto/reservoir）
+            bar_complete: 数据完整性标记（True=收盘后数据, False=盘中快照）
         """
         with self.db.get_session() as session:
             # 检查是否已存在
             existing = (
                 session.query(CatalystRealizationRecord)
-                .filter_by(event_id=event.event_id)
+                .filter(CatalystRealizationRecord.event_id == event.event_id)
                 .first()
             )
             if existing:
-                logger.debug(f"[P6注册] {event.event_id} 已存在，跳过")
+                # Q4 audit: 盘中快照先注册后，收盘重跑需修正 bar_complete，
+                # 否则 P6 兑现追踪永久停留在盘中口径
+                if existing.bar_complete != bar_complete:
+                    existing.bar_complete = bar_complete
+                    session.commit()
+                    logger.debug(
+                        f"[P6注册] {event.event_id} 已存在，bar_complete "
+                        f"修正为 {bar_complete}"
+                    )
+                else:
+                    logger.debug(f"[P6注册] {event.event_id} 已存在，跳过")
                 return
 
             record = CatalystRealizationRecord(
@@ -211,10 +222,11 @@ class CatalystRealizationTracker:
                 direction=event.direction,
                 confidence=event.confidence,
                 is_realized=False,
+                bar_complete=bar_complete,
             )
             session.add(record)
             session.commit()
-            logger.debug(f"[P6注册] {event.event_id} ({event.event_type}/{event.sector})")
+            logger.debug(f"[P6注册] {event.event_id} ({event.event_type}/{event.sector}) bar_complete={bar_complete}")
 
     # =================================================================
     # 统计方法

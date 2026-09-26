@@ -868,7 +868,22 @@ class AggregatorNode:
 
 ## 任务
 
-### 任务1: relations — 事件→板块归属
+### 任务1: strengths — 板块强度评估
+对每个候选板块给出综合强度评估。要求：
+- strength: 综合强度 (0-1)。**此字段替代的是综合评分（技术面+资金面+消息面+情绪面）**，不是只替代技术面。0=极弱，1=极强
+- capital_read: 资金面判据 ("high"/"medium"/"low"/"unknown")。引用资金流数据时标注窗口（1d/3d/5d），例如"3d 净流入"
+- news_read: 消息面判据 ("high"/"medium"/"low"/"unknown")
+- sentiment_read: 情绪面判据 ("high"/"medium"/"low"/"unknown")
+- confidence: 你对这个评估的置信度 (0-1)
+- evidence: 一句话说明判断依据
+- 没有判据的维度必须写 "unknown"（不要写 "neutral"）
+
+### 任务2: families — 家族归属（仅对落「其他」的板块）
+以下家族名称是受控词表，你只能从中选择：
+AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消费 / 智能驾驶 / 金融 / 机器人 / 生态环保
+如果某板块不属于任何家族，family 写 "无归属"。
+
+### 任务3: relations — 事件→板块归属
 对每条有把握的事件，判断它影响哪个**候选板块**。要求：
 - board_code 必须从上方候选列表中选择
 - propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
@@ -877,32 +892,17 @@ class AggregatorNode:
 - 没把握的事件不要输出（不要编造）
 - **去重**：每个 (event_id, board_code) 组合只输出 1 条 relation，选最强的传播路径。禁止同一事件对同一板块输出多条不同 propagation_path
 
-### 任务2: strengths — 板块强度评估
-对每个候选板块给出综合强度评估。要求：
-- strength: 综合强度 (0-1)。**此字段替代的是综合评分（技术面+资金面+消息面+情绪面）**，不是只替代技术面。0=极弱，1=极强
-- capital_read: 资金面判据 ("high"/"medium"/"low"/"unknown")
-- news_read: 消息面判据 ("high"/"medium"/"low"/"unknown")
-- sentiment_read: 情绪面判据 ("high"/"medium"/"low"/"unknown")
-- confidence: 你对这个评估的置信度 (0-1)
-- evidence: 一句话说明判断依据
-- 没有判据的维度必须写 "unknown"（不要写 "neutral"）
-
-### 任务3: families — 家族归属（仅对落「其他」的板块）
-以下家族名称是受控词表，你只能从中选择：
-AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消费 / 智能驾驶 / 金融 / 机器人 / 生态环保
-如果某板块不属于任何家族，family 写 "无归属"。
-
 ## 输出格式（严格 JSON）
 ```json
 {{
-  "relations": [
-    {{"event_id": "...", "board_code": "...", "strength": 0.8, "direction": "positive", "propagation_path": ["实体A", "实体B"], "confidence": 0.9}}
-  ],
   "strengths": [
     {{"board_code": "...", "strength": 0.7, "confidence": 0.8, "evidence": "...", "capital_read": "medium", "news_read": "high", "sentiment_read": "low"}}
   ],
   "families": [
     {{"board_code": "...", "family": "AI软件"}}
+  ],
+  "relations": [
+    {{"event_id": "...", "board_code": "...", "strength": 0.8, "direction": "positive", "propagation_path": ["实体A", "实体B"], "confidence": 0.9}}
   ]
 }}
 ```
@@ -1020,7 +1020,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         missing_codes = all_codes - seen_codes - {""}
         degraded_sectors = [code_to_name.get(c, c) for c in missing_codes]
         if missing_codes:
-            warnings.append(f"S3 覆盖不全: {len(missing_codes)} 板块缺失 → 逐板块 F1")
+            warnings.append(f"S3 覆盖不全: {len(missing_codes)} 板块缺失 → 逐板块 F1 ({', '.join(degraded_sectors)})")
             # 补充缺失板块的 F1 降级条目
             for name, detail, _ in candidates:
                 code = getattr(detail, "code", "") or ""
@@ -1093,6 +1093,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         # ── LLM 调用（C1: temperature=0，D9 甲: 单次全量）──
         # max_tokens=16000: 周末事件堆积时 8000 不够（0921 截断导致 S2_parse_failed）
+        # max_retries=3: 仅对网络错误/空响应重试；finish_reason="length" 立即失败（Q1 audit）
         try:
             raw = await self._call_llm_async(
                 prompt,
@@ -1160,8 +1161,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         logger.info(
             f"[Node 6] glue 完成: {len(result.relations)} 关系, "
             f"{len(result.strengths)} 强度, {len(result.families)} 家族"
-            f"{', degraded=' + str(len(result.degraded_sectors)) if result.degraded else ''}"
-            f"{' [SHADOW]' if AGENT_SEMANTIC_GLUE_SHADOW else ''}"
+            + (
+                f", degraded={len(result.degraded_sectors)} ({', '.join(result.degraded_sectors[:10])})"
+                if result.degraded else ""
+            )
+            + f"{' [SHADOW]' if AGENT_SEMANTIC_GLUE_SHADOW else ''}"
         )
 
         return result
@@ -1175,15 +1179,32 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         replay_mode 下写入 _replay/ 子目录，避免污染真实归档（A1「不写归档」契约）。
         C-P2: 使用 _run_date 替代 date.today()，回放时日期正确。
+        
+        Q1 audit: status != "ok" 时写入 agent_glue_degraded_HHMMSS_毫秒.json，
+        不覆盖主文件（保留现场供事后分析）。
         """
         import os
+        from datetime import datetime
         replay = getattr(self, '_replay_mode', False)
         # C-P2: 优先使用 _run_date（回放模式），否则 date.today()
         run_date = getattr(self, '_run_date', None) or date.today()
         today_str = run_date.strftime("%Y%m%d")
         base = GLUE_ARCHIVE_ROOT / today_str / ("_replay" if replay else "")
         os.makedirs(base, exist_ok=True)
-        path = base / "agent_glue.json"
+        
+        # Q1 audit: LLM 失败态（含截断）写独立取证文件 agent_glue_degraded_HHMMSS.json，
+        # 不覆盖主文件；良性跳过态（replay_mode/no_candidates）仍写主文件，
+        # 避免下游消费方（verify_glue_metrics、影子报告 _render_shadow_a5）对非失败态误报缺失
+        _FORENSICS_STATUSES = {
+            "S1_call_failed", "S1_empty", "S2_parse_failed", "S2_validate_failed", "S3_truncated",
+        }
+        if result.status in _FORENSICS_STATUSES:
+            # Q1 audit: 毫秒精度后缀，避免同秒两次失败互相覆盖取证样本
+            timestamp = datetime.now().strftime("%H%M%S_%f")[:-3]
+            path = base / f"agent_glue_degraded_{timestamp}.json"
+        else:
+            path = base / "agent_glue.json"
+        
         data = result.model_dump()
         # C-P1: 仅在降级态（status != "ok"）时保留 raw_response 供复盘
         if result.status != "ok":
@@ -1232,7 +1253,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         capital_flows = self._parse_capital_flows(capital)
         capital_flow_map = self._parse_sector_level_flows(capital)  # A4: 全量 464 板块
         news_keywords = self._extract_news_keywords(news)
-        hot_sectors = self._extract_hot_sectors(sentiment)
+        # Q2 audit: 补传 SectorContext，优先消费 ths_hot_sectors（associated_sectors 恒空）
+        hot_sectors = self._extract_hot_sectors(sentiment, sector)
 
         # ── Pass 1: 计算所有板块的 composite score 和验证数据 ──
         # 不创建 SectorIntel，先收集原始数据用于批量分类
@@ -1373,6 +1395,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             new_sentiment = self._glue_map_sentiment_read(st.sentiment_read)
             new_confidence = float(st.confidence)
             other = dict(other)
+            # Q8-A1（audit_20260922）：替换前留存规则侧（Node 3）资金判定证据，
+            # 供矛盾检测对账；注意 capital_detail 此处仍是规则侧原文（下方才被覆写）；
+            # ⚠️ 实施顺序第 5 步删除规则评分模式后本字段永久为空，届时同步清理
+            other["_rule_capital_check"] = capital_check
+            other["_rule_capital_detail"] = other.get("capital_detail", "")
             other["capital_detail"] = f"[glue] {st.evidence or st.capital_read}"
             other["news_detail"] = f"[glue] {st.news_read}"
             other["sentiment_check"] = new_sentiment
@@ -1634,6 +1661,9 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             tech_detail=other["tech_detail"],
             capital_check=capital_check,
             capital_detail=other["capital_detail"],
+            # Q8-A1：透传规则侧证据（仅在 glue 直替时由 Pass 1.5 写入 other）
+            rule_capital_check=other.get("_rule_capital_check"),
+            rule_capital_detail=other.get("_rule_capital_detail", ""),
             news_check=news_check,
             news_detail=other["news_detail"],
             sentiment_check=other["sentiment_check"],
@@ -2433,11 +2463,37 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         D-P2（2026-09-11）：返回 (merged_list, overflow_info)，overflow_info 记录
         被容量驱逐的条目（板块名/驻留天数/驱逐原因），供 unified.json 落盘。
+
+        Q3（audit_20260922）：新增当日新入上限（超出按入池强度降序截断，不落盘驱逐记录），
+        驱逐保护改为「新入保护 ∪ 升格临近(days==PROMOTION_MIN)」单 or 条件（防未来校准后死分支）。
         """
-        from src.got.catalyst_config import RESERVOIR_MAX_SIZE
+        from src.got.catalyst_config import (
+            RESERVOIR_MAX_SIZE,
+            RESERVOIR_DAILY_NEW_ENTRY_MAX,
+            RESERVOIR_NEW_ENTRY_PROTECTION_DAYS,
+            RESERVOIR_PROMOTION_MIN_DAYS,
+        )
 
         merged: dict[str, AmbushReservoirEntry] = {}
         overflow_info: list[dict] = []  # D-P2: 容量驱逐记录
+
+        # Q3: 当日新入上限——日均新入 9-16 ≫ 容量 15，任何驱逐方向都会被新入冲垮；
+        # 超限按入池强度降序保留，被截断的新入不写驱逐记录（未入池非驱逐），仅日志留痕
+        prev_names = set(prev_reservoir_map)
+        today_new = [e for e in today_reservoir if e.sector_name not in prev_names]
+        if len(today_new) > RESERVOIR_DAILY_NEW_ENTRY_MAX:
+            today_new.sort(key=lambda e: e.entered_strength, reverse=True)
+            dropped_names = {
+                e.sector_name for e in today_new[RESERVOIR_DAILY_NEW_ENTRY_MAX:]
+            }
+            today_reservoir = [
+                e for e in today_reservoir if e.sector_name not in dropped_names
+            ]
+            logger.info(
+                f"[Node 6] 蓄水池当日新入上限: {len(today_new)} → "
+                f"{RESERVOIR_DAILY_NEW_ENTRY_MAX}，截断强度靠后的新入 "
+                f"{len(dropped_names)} 条 ({', '.join(sorted(dropped_names))})"
+            )
 
         # 今日新入 + 前日续存
         for entry in today_reservoir:
@@ -2483,14 +2539,36 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 entered_strength=prev.get("entered_strength", 0.0),
             )
 
-        # 容量上限：超出时按 days_in_reservoir 降序驱逐最老条目
+        # Q3-A audit: 容量上限驱逐逻辑（新入保护 + 升格临近豁免）
         if len(merged) > RESERVOIR_MAX_SIZE:
-            sorted_entries = sorted(
-                merged.values(),
-                key=lambda e: e.days_in_reservoir,
-                reverse=True,
-            )
-            evicted = sorted_entries[:len(merged) - RESERVOIR_MAX_SIZE]
+            # 标记受保护条目。单 or 条件而非 if/elif：当前取值下 days==PROMOTION_MIN(2)
+            # 已被 days<PROTECTION(3) 覆盖，但两常量未来一同校准，若出现
+            # PROTECTION ≤ PROMOTION_MIN 则 elif 式写法会变死分支（audit 审核 S13）
+            protected = set()
+            for name, entry in merged.items():
+                days = entry.days_in_reservoir
+                if (
+                    days < RESERVOIR_NEW_ENTRY_PROTECTION_DAYS
+                    or days == RESERVOIR_PROMOTION_MIN_DAYS
+                ):
+                    protected.add(name)
+            
+            # 只驱逐未受保护的条目
+            unprotected = [e for e in merged.values() if e.sector_name not in protected]
+            unprotected.sort(key=lambda e: e.days_in_reservoir, reverse=True)
+            
+            overflow_count = len(merged) - RESERVOIR_MAX_SIZE
+            if len(unprotected) >= overflow_count:
+                # 有足够的未保护条目可驱逐
+                evicted = unprotected[:overflow_count]
+            else:
+                # 兜底：全部受保护时，强制驱逐最老的（防死锁）
+                all_sorted = sorted(merged.values(), key=lambda e: e.days_in_reservoir, reverse=True)
+                evicted = all_sorted[:overflow_count]
+                logger.warning(
+                    f"[Node 6] 蓄水池全池受保护，强制驱逐最老 {len(evicted)} 条"
+                )
+            
             evicted_names = {e.sector_name for e in evicted}
             merged = {k: v for k, v in merged.items() if k not in evicted_names}
 
@@ -2499,12 +2577,14 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 overflow_info.append({
                     "sector": e.sector_name,
                     "days_in_reservoir": e.days_in_reservoir,
-                    "reason": "FIFO 容量驱逐",
+                    "reason": "容量驱逐",
+                    "was_protected": e.sector_name in protected,
                 })
 
             logger.info(
                 f"[Node 6] 蓄水池容量驱逐: {len(evicted)} 条 "
-                f"(上限 {RESERVOIR_MAX_SIZE}, 被驱逐: {', '.join(evicted_names)})"
+                f"(上限 {RESERVOIR_MAX_SIZE}, 受保护 {len(protected)} 条, "
+                f"被驱逐: {', '.join(evicted_names)})"
             )
 
         return list(merged.values()), overflow_info
@@ -2530,7 +2610,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         calendar = getattr(news_ctx, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
         events_by_sector = self._group_events_by_sector(all_events)
-        hot_sectors = self._extract_hot_sectors(sentiment_ctx)
+        # Q2 audit: 补传 sector_ctx，蓄水池升格的情绪面验证同样走 THS 热度口径
+        hot_sectors = self._extract_hot_sectors(sentiment_ctx, sector_ctx)
 
         # A2 可观测性：蓄水池板块的催化事件覆盖率
         covered = sum(
@@ -2647,28 +2728,34 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             (ambush_pool, ambush_reservoir, veto_log)
         """
         # 预提取数据（即使 ambush 为空也处理 near_miss）
-        hot_sectors = self._extract_hot_sectors(sentiment)
+        # Q2 audit: G2/G3 闸门修复 — 从 SectorContext.ths_hot_sectors 获取热度数据
+        # 替代原 sentiment.hot_stocks[].associated_sectors（恒空导致闸门失效）
+        ths_hot_map = getattr(sector, 'ths_hot_sectors', {}) or {}
+        hot_sectors = list(ths_hot_map.keys())  # 板块名列表，供 G2/G3 闸门使用
         calendar = getattr(news, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
         events_by_sector = self._group_events_by_sector(all_events)
         today = date.today()
-
+        
         pool: list[AmbushCandidate] = []
         reservoir: list[AmbushReservoirEntry] = []
         veto_log: list[str] = []
         nomination_queue: list[dict] = []  # 决策 21: 仅被吸筹拦下的候选，待 Agent 批量评审
         missing_count = 0  # 资金流数据缺失候选数（轨道三熔断统计）
-
+        
         # D-P2: 闸门漏斗追踪（初始化）
-        # 注：G2 注意力子闸 + G3 拥挤度黑名单依赖 hot_sectors 恒空 ⇒ 结构性不可达
+        # Q2 audit: G2/G3 闸门已修复，使用 THS 板块热度数据
         gate_funnel = {
             "initial_candidates": 0,
             "G1_利空": {"evaluated": 0, "rejected": 0},
-            "G2_防买顶": {"evaluated": 0, "rejected": 0, "structurally_dead_subgate": "注意力子闸（依赖 hot_sectors 恒空）"},
-            "G3_拥挤度": {"evaluated": 0, "rejected": 0, "structurally_dead": True, "reason": "依赖 hot_sectors 恒空 ⇒ 循环零次 ⇒ 恒 False"},
+            "G2_防买顶": {"evaluated": 0, "rejected": 0, "data_source": "THS板块热度" if hot_sectors else "无数据"},
+            "G3_拥挤度": {"evaluated": 0, "rejected": 0, "data_source": "THS板块热度" if hot_sectors else "无数据"},
             "G4_吸筹": {"evaluated": 0, "rejected": 0, "accepted": 0},
             "final_pool": 0,
         }
+        
+        if hot_sectors:
+            logger.info(f"[Node 6] G2/G3 闸门启用: {len(hot_sectors)} 个 THS 热度板块")
 
         # ── 近失板块直接入蓄水池（差 1 条闸门，观察）──
         near_miss_list = getattr(sector, "near_miss_ambush", []) or []
@@ -3268,15 +3355,13 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
     ) -> tuple[bool, str]:
         """防买顶双闸：注意力闸 + 已发酵检查
 
-        D-P5 诚实化：注意力闸（检查板块多只个股上热榜）因 associated_sectors
-        无数据源而未启用（hot_sectors 恒空，注意力闸恒通过）。
-        已发酵子闸不依赖 associated_sectors，仍活。
+        Q2 audit (2026-09-23): 注意力闸已修复 — 使用 SectorContext.ths_hot_sectors 替代恒空的 associated_sectors
         已发酵检查：同类催化剂已在过去 7 天内出现过 → 行情可能已提前走完
 
-        文献：Kargarzadeh et al. 2026 — "等确认再进 = 买在顶上"
+        文献：Kargarzaseh et al. 2026 — "等确认再进 = 买在顶上"
         """
         # 注意力闸：3+ 只关联个股上热榜 → 太热了
-        # D-P5: 因 associated_sectors 恒空，hot_sectors 恒空，此闸恒通过
+        # Q2 audit: 现在使用 THS 板块热度数据，闸门已激活
         match_count = sum(
             1 for hot in hot_sectors
             if self._fuzzy_match(sector_name, hot)
@@ -3306,12 +3391,12 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
     ) -> bool:
         """拥挤度黑名单：板块名或子词直接出现在热榜关联板块中
 
-        D-P5 诚实化：因 associated_sectors 无数据源（恒空），hot_sectors 恒空，
-        此闸门未启用（恒返回 False）。
+        Q2 audit (2026-09-23): 已修复 — 使用 SectorContext.ths_hot_sectors 替代恒空的 associated_sectors
+        闸门已激活，可正常拦截高拥挤度板块。
 
         与防买顶的注意力闸互补：
-        - 注意力闸：模糊匹配 3+ 只 → 否决（渐进式）【未启用】
-        - 拥挤黑名单：精确匹配板块名 → 否决（硬闸）【未启用】
+        - 注意力闸：模糊匹配 3+ 只 → 否决（渐进式）【已启用】
+        - 拥挤黑名单：精确匹配板块名 → 否决（硬闸）【已启用】
 
         逻辑：低关注度才是埋伏的利润来源，已被全网关注 = 来晚了
         """
@@ -3731,14 +3816,21 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                     "impact_level": "low",
                     "source_count": 1,
                     "event_type": "industry",
-                    "lifecycle_state": None,
                 }))
-
+        
         return keywords
 
     @staticmethod
-    def _extract_hot_sectors(sentiment: SentimentContext) -> list[str]:
-        """提取热榜关联板块"""
+    def _extract_hot_sectors(sentiment: SentimentContext, sector_ctx: Optional[SectorContext] = None) -> list[str]:
+        """提取热榜关联板块
+        
+        Q2 audit (2026-09-23): 优先使用 SectorContext.ths_hot_sectors（THS 板块热度），
+        降级到 sentiment.hot_stocks[].associated_sectors（恒空，历史遗留）。
+        """
+        # Q2 audit: 优先使用 THS 板块热度数据
+        if sector_ctx and getattr(sector_ctx, 'ths_hot_sectors', None):
+            return list(sector_ctx.ths_hot_sectors.keys())
+        # 降级：旧逻辑（associated_sectors 恒空）
         sectors = []
         for stock in sentiment.hot_stocks:
             sectors.extend(stock.associated_sectors)
@@ -4517,6 +4609,8 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         2. 主线家族 vs 资金流向错位（板块级比对，2026-08-18）
         3. 技术分排名 vs 综合分排名落差（口径分裂的可读化信号，2026-08-18）
         4. 资金强流入 vs 情绪中性/恐惧（跨维背离，2026-08-18）
+        5. Regime 刚切换低置信（dwell < 2）
+        6. glue 口径 vs Node 3 规则口径矛盾（Q8-A2，audit_20260922，只标记不排除）
         """
         contradictions = []
 
@@ -4596,7 +4690,72 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                 resolution="regime 处于过渡期，信号不稳定，建议降低仓位或观望",
             ))
 
+        # ── 矛盾 6: glue vs Node 3 资金口径对账（Q8-A2，audit_20260922）──
+        contradictions.extend(AggregatorNode._detect_glue_capital_mismatch(sectors))
+
         return contradictions
+
+    # Q8-A2: 规则侧大额流出阈值（亿）——glue 判 medium/unknown（映射后 neutral）
+    # 而 Node 3 实测流出超过该值时记口径矛盾（9/22 半导体 -31.96 亿无告警的实锤场景）
+    _CAPITAL_GLUE_OUTFLOW_WARN_YI = 20.0
+
+    @classmethod
+    def _detect_glue_capital_mismatch(cls, sectors: list[SectorIntel]) -> list[Contradiction]:
+        """Q8-A2（audit_20260922）：glue 覆盖后的资金判定 vs 规则侧证据对账
+
+        仅标记不排除：命中时产出 severity=warning(medium) 的 contradiction，
+        保留人工/下游感知通道。规则侧证据来自 Pass 1.5 写入 SectorIntel 的
+        rule_capital_check/rule_capital_detail 留存（Q8-A1；实施顺序第 5 步删除
+        规则评分模式后该字段恒空，本检测自然退出，届时随字段一并清理）。
+        """
+        out: list[Contradiction] = []
+        for s in sectors:
+            rule_check = getattr(s, "rule_capital_check", None)
+            if not rule_check:
+                continue
+            rule_detail = str(getattr(s, "rule_capital_detail", "") or "")
+            # 兼容规则侧文案：「净流出X亿」（neutral/divergent 分支主流格式）与
+            # 「净流入±X亿」（带符号）；多窗口拼接时用 finditer 取最弱值，
+            # 防 re.search 首命中非 1d 窗口数字；原正则只认带符号形式，
+            # 导致「流出」取反分支同样不可达（审核修复轮 P1 连带发现）
+            amounts: list[float] = []
+            for m in re.finditer(r"(净流入?)\s*(-?\d+(?:\.\d+)?)亿|(净流出?)\s*(\d+(?:\.\d+)?)亿", rule_detail):
+                if m.group(2) is not None:
+                    val = float(m.group(2))
+                    amounts.append(-val if "流出" in m.group(1) else val)
+                else:
+                    val = float(m.group(4))
+                    amounts.append(-val if "流出" in m.group(3) else val)
+            amount = min(amounts) if amounts else None
+            # 双方同为 neutral 但规则侧实测大额流出 → 口径矛盾；
+            # 必须在大额流出判定之前不做同值 skip，否则本分支永不可达
+            # （9/22 半导体 -31.96 亿无告警的实锤场景，审核修复轮 P1）
+            big_outflow = (
+                rule_check == "neutral"
+                and s.capital_check == "neutral"
+                and amount is not None
+                and amount <= -cls._CAPITAL_GLUE_OUTFLOW_WARN_YI
+            )
+            if rule_check == s.capital_check and not big_outflow:
+                continue
+            opposite = (
+                (rule_check == "divergent" and s.capital_check == "aligned")
+                or (rule_check == "aligned" and s.capital_check == "divergent")
+            )
+            if not (opposite or big_outflow):
+                continue
+            out.append(Contradiction(
+                pair="glue_vs_node3_capital",
+                timeframe="cross_dimension",
+                description=(
+                    f"「{s.sector_name}」glue 资金口径({s.capital_check}) 与 "
+                    f"Node 3 规则口径({rule_check}) 不一致: {rule_detail[:40]}"
+                ),
+                severity="medium",
+                conflict_type="factual",
+                resolution="保留 glue 判定（A6 直替契约），仅标记口径矛盾供复核",
+            ))
+        return out
 
     @staticmethod
     def _detect_family_capital_mismatch(
@@ -4908,6 +5067,10 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                     timeout=effective_timeout,
                 )
                 content = response.content or ""
+                finish_reason = getattr(response, "finish_reason", None)
+                # Q1 audit: record finish_reason for observability
+                if finish_reason:
+                    logger.debug(f"[Node 6] LLM finish_reason={finish_reason} (attempt {attempt + 1})")
                 # 逐 attempt 落库：每次重试都是一次真实计费调用（含空响应也消耗 token），
                 # 故每个 attempt 各写一行以准确反映 token 花费；下游看板按 call_type 分组过滤
                 # （storage.get_llm_usage_summary 的 by_call_type），不会与既有口径混淆。
@@ -4920,9 +5083,14 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                     )
                 except Exception as persist_exc:
                     logger.debug("[Node 6] persist_llm_usage 失败（已忽略）: %s", persist_exc)
-                if content.strip():
+                # Q1 audit: finish_reason="length" means truncated output — fail fast, no retry
+                if finish_reason == "length":
+                    logger.warning(f"[Node 6] LLM 输出被截断 (finish_reason=length) — 立即失败，不重试")
+                    return ""  # Fail fast: same prompt + same max_tokens = deterministic truncation
+                elif content.strip():
                     return content.strip()
-                logger.warning(f"[Node 6] LLM 空响应 (attempt {attempt + 1})")
+                else:
+                    logger.warning(f"[Node 6] LLM 空响应 (attempt {attempt + 1})")
             except Exception as e:
                 logger.warning(f"[Node 6] LLM 调用失败 (attempt {attempt + 1}): {e}")
 
@@ -4971,13 +5139,16 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         except Exception:
             switch_count = getattr(regime, "transition_count", 0)
 
-        # Node 3: 资金流非空率
+        # Node 3: 资金流非空率（Q5-1: 分母改为交集，删除 v!=0 误判）
         evidence = getattr(capital, "evidence", None)
         sector_flow = getattr(evidence, "sector_flow", None) or {}
         flow_5d_map = sector_flow.get("sector_flow_all_5d", {})
         flow_1d_map = sector_flow.get("sector_flow_all", {})
-        total_boards = max(len(flow_1d_map), 1)
-        non_null_5d = sum(1 for v in flow_5d_map.values() if v is not None and v != 0)
+        # Q5-1a: 分母用交集（排除 5d 独有的盲区板块虚增合格数）
+        common_keys = set(flow_5d_map.keys()) & set(flow_1d_map.keys())
+        total_boards = max(len(common_keys), 1)
+        # Q5-1b: 只检查 None，不检查 v!=0（真实零流板块不应被当缺失）
+        non_null_5d = sum(1 for k in common_keys if flow_5d_map.get(k) is not None)
         flow_5d_rate = non_null_5d / total_boards
 
         # Node 3: 主线板块连续正流入天数平均值

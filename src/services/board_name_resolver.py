@@ -43,6 +43,10 @@ THS_BOARD_CACHE_PATH = _PROJECT_ROOT / "data" / "ths_concept_boards.json"
 # L2 模糊匹配置信度阈值（低于该值不产出候选）
 FUZZY_THRESHOLD = 0.68
 
+# 审核修复 3.2：Q7-B 自愈（L3）相似度下限——字符相近不等于资金语义相同，
+# 低于阈值宁可不自愈，避免把无关板块配成最近名后永久固化
+SELF_HEAL_SIM_THRESHOLD = 0.6
+
 # 取列优先级：akshare 不同版本列名可能不同
 _NAME_COLUMNS = ("name", "名称", "概念名称", "板块名称")
 
@@ -71,6 +75,10 @@ class BoardNameResolver:
         self._aliases: Optional[Dict[str, dict]] = None
         self._ths_concept_names: Optional[List[str]] = None
         self._ths_industry_names: Optional[List[str]] = None
+        # Q7-B（audit_20260922）：双语法全空失败名的当日负缓存
+        # （进程内存活，跨日自动失效；已知永久失败名同日不再重试，避免每日白烧 8 次查询）
+        self._failed_today: set = set()
+        self._failed_date: Optional[date] = None
 
     # ── L1: 静态别名表 ──
 
@@ -267,12 +275,25 @@ class BoardNameResolver:
         with self._lock:
             aliases = self._load_aliases()
             entry = aliases.get(cleaned)
+            if entry and entry.get("source") == "auto_lowconf":
+                # 审核修复 3.2：自愈回写的低置信别名只留痕不消费，
+                # 人工把 source 改为 manual/auto 后才生效
+                logger.info(
+                    f"[板块名解析] 跳过低置信别名(auto_lowconf): "
+                    f"{cleaned} → {entry['target']}（需人工升级后生效）"
+                )
+                entry = None
             if entry:
                 target = entry["target"]
                 kind = entry.get("kind")
                 if target != cleaned:
                     logger.info(f"[板块名解析] 别名映射(L1): {cleaned} → {target} (kind={kind})")
                 return target, kind
+            # 当日负缓存（Q7-B）：L1 别名表优先（自愈回写的别名可解锁），
+            # 未命中别名且已判失败 → 短路，不再进入 L2/查询重试
+            if self._in_failed_cache_locked(cleaned):
+                logger.info(f"[板块名解析] 当日负缓存命中，短路跳过: {cleaned}")
+                return cleaned, None
 
         # L2 模糊匹配：先概念列表，再行业列表
         concept_names, industry_names = self._load_ths_board_names()
@@ -287,10 +308,79 @@ class BoardNameResolver:
 
         return cleaned, None
 
-    def confirm(self, sector_name: str, resolved_name: str, kind: Optional[str] = None) -> None:
+    def aggressive_match(self, sector_name: str) -> Optional[str]:
+        """Q7-B 自愈闭环：双语法全空后的候选推荐（仅取概念列表）
+
+        与 L2 的区别：不要求达到 FUZZY_THRESHOLD，但受 SELF_HEAL_SIM_THRESHOLD
+        下限约束（审核修复 3.2：无阈值取最高分会把语义无关板块配成最近名）；
+        候选与原解析名相同时返回 None（重试同词无意义）。
+        """
+        cleaned = clean_board_name(sector_name)
+        if not cleaned:
+            return None
+        concept_names, _ = self._load_ths_board_names()
+        if not concept_names:
+            return None
+        best_name, best_score = None, 0.0
+        for cand in concept_names:
+            if cand == cleaned:
+                return None  # 官方列表里有同名概念，失败非名字问题，不自愈
+            score = difflib.SequenceMatcher(None, cleaned, cand).ratio()
+            if score > best_score:
+                best_name, best_score = cand, score
+        if best_name and best_score < SELF_HEAL_SIM_THRESHOLD:
+            logger.info(
+                f"[板块名解析] 自愈候选低于阈值，放弃: {cleaned} → {best_name} "
+                f"(相似度 {best_score:.2f} < {SELF_HEAL_SIM_THRESHOLD})"
+            )
+            return None
+        if best_name and best_name != cleaned:
+            logger.info(
+                f"[板块名解析] 自愈候选(L3): {cleaned} → {best_name} (相似度 {best_score:.2f})"
+            )
+            return best_name
+        return None
+
+    # ── Q7-B：当日负缓存 ──
+
+    def _in_failed_cache_locked(self, cleaned: str) -> bool:
+        """检查当日负缓存（调用方需已持锁）；跨日自动清空"""
+        today = date.today()
+        if self._failed_date != today:
+            self._failed_today = set()
+            self._failed_date = today
+        return cleaned in self._failed_today
+
+    def mark_failed(self, sector_name: str) -> None:
+        """登记当日失败名（双语法全空且自愈未挽回时调用），同日不再重试"""
+        cleaned = clean_board_name(sector_name)
+        if not cleaned:
+            return
+        with self._lock:
+            self._in_failed_cache_locked(cleaned)  # 顺带跨日清理
+            self._failed_today.add(cleaned)
+        logger.info(f"[板块名解析] 登记当日负缓存: {cleaned}（同日不再重试）")
+
+    def is_failed_today(self, sector_name: str) -> bool:
+        """查询入口预检：该原始名当日是否已判失败"""
+        cleaned = clean_board_name(sector_name)
+        if not cleaned:
+            return False
+        with self._lock:
+            return self._in_failed_cache_locked(cleaned)
+
+    def confirm(
+        self,
+        sector_name: str,
+        resolved_name: str,
+        kind: Optional[str] = None,
+        source: str = "auto",
+    ) -> None:
         """问财查询命中后调用：映射回写别名表（含 kind）
 
-        已在别名表中的映射不重复写入。
+        source="auto_lowconf"（审核修复 3.2）：自愈路径回写，L1 解析不消费，
+        仅留痕供人工审核后升级为 manual/auto。
+        已在别名表中的同源映射不重复写入。
         """
         cleaned = clean_board_name(sector_name)
         target = clean_board_name(resolved_name)
@@ -299,15 +389,29 @@ class BoardNameResolver:
         with self._lock:
             aliases = self._load_aliases()
             existing = aliases.get(cleaned)
-            if existing and existing["target"] == target and existing.get("kind") == kind:
+            if (
+                existing
+                and source == "auto_lowconf"
+                and existing.get("source", "manual") in ("manual", "auto")
+            ):
+                return  # 低置信回写不得覆盖已验证别名
+            if (
+                existing
+                and existing["target"] == target
+                and existing.get("kind") == kind
+                and existing.get("source", "manual") == source
+            ):
                 return
             aliases[cleaned] = {
                 "target": target,
-                "source": "auto",
+                "source": source,
                 "kind": kind,
             }
             self._save_aliases()
-            logger.info(f"[板块名解析] 已确认并回写: {cleaned} → {target} (kind={kind})")
+            logger.info(
+                f"[板块名解析] 已确认并回写: {cleaned} → {target} "
+                f"(kind={kind}, source={source})"
+            )
 
 
 _resolver_instance: Optional[BoardNameResolver] = None

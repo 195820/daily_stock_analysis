@@ -93,3 +93,14 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# 审查/调试过程产物（audit_20260922 第二轮审核修复：防 git add . 误入库）
+.review_tmp/
+_rev_*.diff
+_review_diff*.txt
+/co.txt
+/output.txt
+/backtest_september.py
+/run_phase2_only.py
+/持仓板块漂移_PLAN.md
+/文档更新执行报告.md

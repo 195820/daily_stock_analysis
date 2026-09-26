@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.services.board_name_resolver import (
+    SELF_HEAL_SIM_THRESHOLD,
     BoardNameResolver,
     _is_dirty_cache,
     clean_board_name,
@@ -230,3 +231,68 @@ def test_resolve_via_official_list(tmp_path: Path):
     resolver.confirm("生物制药", "生物医药", kind="concept")
     saved = json.loads(alias_file.read_text(encoding="utf-8"))
     assert len(saved["aliases"]) == 1
+
+
+# ── 审核修复 3.2：自愈阈值 + auto_lowconf 隔离 ──
+
+def test_aggressive_match_below_threshold_returns_none():
+    """最高相似度 < 0.6 → 宁可不自愈，返回 None"""
+    resolver = BoardNameResolver(alias_path=Path("unused.json"))
+    resolver._ths_concept_names = ["白酒概念", "煤炭开采"]
+    resolver._ths_industry_names = []
+    assert resolver.aggressive_match("量子纠缠计算") is None
+
+
+def test_aggressive_match_above_threshold_returns_best():
+    resolver = BoardNameResolver(alias_path=Path("unused.json"))
+    resolver._ths_concept_names = ["生物医药", "白酒概念"]
+    resolver._ths_industry_names = []
+    result = resolver.aggressive_match("生物制药")
+    assert result == "生物医药"
+
+
+def test_aggressive_match_same_name_in_list_returns_none():
+    """官方列表里有同名概念 → 失败非名字问题，不自愈"""
+    resolver = BoardNameResolver(alias_path=Path("unused.json"))
+    resolver._ths_concept_names = ["创新药"]
+    resolver._ths_industry_names = []
+    assert resolver.aggressive_match("创新药") is None
+
+
+def test_confirm_auto_lowconf_written_but_not_consumed(tmp_path: Path):
+    """自愈回写 source=auto_lowconf → L1 解析跳过，留痕不自动生效"""
+    alias_file = tmp_path / "aliases.json"
+    resolver = BoardNameResolver(alias_path=alias_file)
+    resolver._ths_concept_names = []
+    resolver._ths_industry_names = []
+
+    resolver.confirm("生物制药", "生物医药", kind="concept", source="auto_lowconf")
+    saved = json.loads(alias_file.read_text(encoding="utf-8"))
+    assert saved["aliases"]["生物制药"]["source"] == "auto_lowconf"
+
+    # L1 不消费：无模糊匹配候选时原样返回
+    assert resolver.resolve("生物制药") == "生物制药"
+
+
+def test_auto_lowconf_upgraded_to_manual_takes_effect(tmp_path: Path):
+    """人工把 source 改为 manual 后生效"""
+    alias_file = tmp_path / "aliases.json"
+    alias_file.write_text(json.dumps({
+        "aliases": {"生物制药": {"target": "生物医药", "source": "manual"}}
+    }), encoding="utf-8")
+    resolver = BoardNameResolver(alias_path=alias_file)
+    resolver._ths_concept_names = []
+    resolver._ths_industry_names = []
+    assert resolver.resolve("生物制药") == "生物医药"
+
+
+def test_confirm_lowconf_does_not_override_verified_alias(tmp_path: Path):
+    """低置信回写不得覆盖已验证（manual/auto）别名"""
+    alias_file = tmp_path / "aliases.json"
+    resolver = BoardNameResolver(alias_path=alias_file)
+
+    resolver.confirm("生物制药", "生物医药", kind="concept", source="auto")
+    resolver.confirm("生物制药", "化学制药", kind="concept", source="auto_lowconf")
+    saved = json.loads(alias_file.read_text(encoding="utf-8"))
+    assert saved["aliases"]["生物制药"]["target"] == "生物医药"
+    assert saved["aliases"]["生物制药"]["source"] == "auto"

@@ -23,6 +23,13 @@ R-D1 的子计数（同文档 §6 表格，作为过程指标，不计入达标�
 | `dead_signal_count` | 「存在但未启用」的字段/形参/配置项（附录 C.3 形状 1） | **4**（E4 / E5 / E10 / E11） |
 | `dead_branch_count` | 可证不可达的分支数（附录 C.4） | **1**（E3 的埋伏买入分支） |
 
+> 基线时效性（audit_20260922 Q2-A2）：E3 死分支的结构性根因——G2/G3 闸门因
+> sentiment 热度数据恒空而「恒不可过」——已由 THS 板块热度直喂修复；归档
+> `gate_funnel` 已移除 `structurally_dead*` 标记、改由 `data_source` 采集口径。
+> 本脚本 `dead_branch_count` 为全归档 `is_ambush_entry` 派生（历史日包含在内），
+> 会随闸门激活后的新归档自然衰减；文档基线 **1** 仅为 0911 快照，非永久值，
+> 对照复算时须先查 `_detail.ambush_gate_data_source` 确认闸门已激活。
+
 手具要求（同文档 §5.3 D-P9）：
 
     「扫描指定文档（默认 0902 报告 + 本文件附录 A）中所有『已修复 / 已修 / 已解决 / 已生效』
@@ -116,7 +123,15 @@ def _latest_day_with(filename: str) -> Path | None:
 
 
 def _load(day: Path | None, filename: str) -> dict | None:
-    return read_json(day / filename) if day else None
+    if not day:
+        return None
+    try:
+        return read_json(day / filename)
+    except Exception as exc:
+        # 个别损坏归档（如 20260917 portfolio_decision.json 写盘截断）
+        # 告警并跳过，不阻断全量复算
+        print(f"[WARN] 损坏归档跳过: {day / filename} ({exc})")
+        return None
 
 
 def _latest_json(filename: str) -> tuple[Path | None, dict | None]:
@@ -567,12 +582,25 @@ def compute_sub_counts() -> dict:
         dead["E11"] = "Node 5 failed 列表初始化后从无 append ⇒ has_partial_failure/status 恒为正常"
 
     # ④ dead_branch_count：可证不可达分支（E3 埋伏买入分支）
+    # audit_20260922 Q2-A2：G2/G3 结构性死闸已由 THS 直喂修复，本计数为全归档
+    # is_ambush_entry 派生（含修复前的历史日），随激活后的新归档自然衰减
     total_alloc, ambush_alloc = 0, 0
     for day in _days_with("portfolio_decision.json"):
         decision = _load(day, "portfolio_decision.json") or {}
         for allocation in decision.get("allocation", []):
             total_alloc += 1
             ambush_alloc += int(bool(allocation.get("is_ambush_entry")))
+
+    # gate_funnel 采集派生：最新归档日 G2/G3 的 data_source（THS 直喂 vs 无数据），
+    # 用于区分「埋伏买入为 0」是死闸未激活还是单纯无近失候选（防止误读上方衰减）
+    ambush_gate_data_source: dict[str, str] = {}
+    _day_un, unified_latest = _latest_json("unified.json")
+    if unified_latest:
+        gf = unified_latest.get("ambush_gate_funnel") or {}
+        for gate in ("G2_防买顶", "G3_拥挤度"):
+            cell = gf.get(gate)
+            if isinstance(cell, dict) and cell.get("data_source"):
+                ambush_gate_data_source[gate] = str(cell["data_source"])
 
     return {
         "divergent_trigger_days": len(divergent),
@@ -586,6 +614,7 @@ def compute_sub_counts() -> dict:
             "at_cap_total_days": len(at_cap),
             "archived_days": len(unified_days),
             "dead_signals": dead,
+            "ambush_gate_data_source": ambush_gate_data_source or None,
             "allocation_total": total_alloc,
             "allocation_ambush": ambush_alloc,
         },
@@ -730,7 +759,8 @@ def run(as_json: bool) -> int:
           f"顶格日共 {detail['at_cap_total_days']} 天 {detail['saturated_days']}")
     print(f"  · dead_signal_count 明细：{detail['dead_signals'] or '四项均已接线'}")
     print(f"  · dead_branch_count 明细：{detail['allocation_total']} 笔 allocation 中 "
-          f"is_ambush_entry=真 的笔数 = {detail['allocation_ambush']}")
+          f"is_ambush_entry=真 的笔数 = {detail['allocation_ambush']}；"
+          f"最新归档闸门 data_source = {detail.get('ambush_gate_data_source') or '（无 gate_funnel 字段，早于 Q2-A2 修复）'}")
 
     doc_summary = parse_doc_appendix_summary()
     actual_summary = {

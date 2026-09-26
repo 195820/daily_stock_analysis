@@ -789,6 +789,9 @@ class SectorAnalysisNode:
             result.strength_lookup = {
                 s.name: s.strength_score for s in analyzed if s.name
             }
+            # Q2 audit: THS 板块热度归档（供 Node 6 G2/G3 闸门消费）
+            result.ths_hot_sectors = ths_hot_sectors
+
 
             # Step 3.6: 板块趋势持久化（跨日记忆）
             self._save_sector_trends(analyzed)
