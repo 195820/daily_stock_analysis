@@ -97,6 +97,8 @@
 | [got/decision_brief_20260926.md](got/decision_brief_20260926.md) | 2026-09-26 决策简报（三类未结项分诊的待拍板项：选项/影响面/实测证据/建议，对应 backlog §7） |
 | [got/cp12_prompt_variants_draft_20260926.md](got/cp12_prompt_variants_draft_20260926.md) | C-P12 prompt A/B 两版文案草案 + 拍板结果 + M2×M3 对照矩阵运行结论（含 0902 max_tokens 不对称披露） |
 | [got/cp12_m3_audit_20260926.md](got/cp12_m3_audit_20260926.md) | C-P12 M3 误配率分层抽样预审表（两变体各 10 条 relation，待负责人终审划勾） |
+| [got/cp12_event_level_ab_20260926.md](got/cp12_event_level_ab_20260926.md) | C-P12 事件级 A/B 覆盖对照表（逐日覆盖汇总 + 能源/油价类明细 + 覆盖分歧明细；暴露 0902 A 版退化循环与 B 版过度归属两项质量发现） |
+| [got/cp13_grounding_pipeline_research_20260926.md](got/cp13_grounding_pipeline_research_20260926.md) | C-P13 设计笔记：基于外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）的事件→板块「接地式召回-验证」5 层管线方案（A/B 单旋钮架构天花板的整合修正，待拍板） |
 | [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动，待实施） |
 
 ---
