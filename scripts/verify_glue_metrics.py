@@ -360,7 +360,8 @@ def run_compare(variants: list[str], as_json: bool, audit_path: Path | None) -> 
             if row["glue_status"] != "ok":
                 trace_issues.append(f"{v}@{d}: status={row['glue_status']} 非 ok，读数不计入均值")
             # 双保险校验：产物内 prompt_variant 留痕必须与目录变体尾缀一致（防错跑）
-            expected_tail = v.split("_")[-1]  # variant_a -> a
+            # C-P13 接地管线变体（pipeline_*）留痕固定为 "p"（计划 §3），不适用尾缀口径
+            expected_tail = "p" if v.startswith("pipeline_") else v.split("_")[-1]  # variant_a -> a
             if row["prompt_variant"] and row["prompt_variant"] != expected_tail:
                 trace_issues.append(
                     f"{v}@{d}: prompt_variant 留痕={row['prompt_variant']!r} 与目录尾缀 {expected_tail!r} 不一致——疑似错跑"

@@ -19,6 +19,8 @@ M3 无法自动化的原因见 §8.1「为何 M2/M3 无法完全自动化」：�
 用法：
     python scripts/export_glue_family_audit.py
     python scripts/export_glue_family_audit.py --days 20260909 20260914
+    # C-P13：读回放变体目录的 glue 产物（unified/news 仍取生产归档）
+    python scripts/export_glue_family_audit.py --variant pipeline_l1l3
 """
 from __future__ import annotations
 
@@ -51,7 +53,14 @@ PROMPT_VOCAB = [
 ]
 
 
-def discover_days(explicit: list[str] | None) -> list[str]:
+def _glue_path(day: str, variant: str = "") -> Path:
+    """glue 产物路径：默认生产归档；variant 非空时取 _replay/<variant>/（C-P12/C-P13 变体隔离）。"""
+    if variant:
+        return ARCHIVE_ROOT / day / "_replay" / variant / GLUE_FILE
+    return ARCHIVE_ROOT / day / GLUE_FILE
+
+
+def discover_days(explicit: list[str] | None, variant: str = "") -> list[str]:
     """默认取所有「同时有 unified.json 与 agent_glue.json」的归档日，按日期升序。"""
     if explicit:
         return sorted(explicit)
@@ -59,7 +68,7 @@ def discover_days(explicit: list[str] | None) -> list[str]:
         day.name
         for day in sorted(ARCHIVE_ROOT.iterdir())
         if day.is_dir()
-        and (day / GLUE_FILE).exists()
+        and _glue_path(day.name, variant).exists()
         and (day / UNIFIED_FILE).exists()
         and (day / NEWS_FILE).exists()
     ]
@@ -83,9 +92,9 @@ def classify(rule_family: str | None, glue_family: str | None) -> str:
     return "same" if rule_family == glue_family else "overridden"
 
 
-def load_day(day: str) -> list[dict]:
+def load_day(day: str, variant: str = "") -> list[dict]:
     unified = json.loads((ARCHIVE_ROOT / day / UNIFIED_FILE).read_text(encoding="utf-8"))
-    glue = json.loads((ARCHIVE_ROOT / day / GLUE_FILE).read_text(encoding="utf-8"))
+    glue = json.loads(_glue_path(day, variant).read_text(encoding="utf-8"))
     news = json.loads((ARCHIVE_ROOT / day / NEWS_FILE).read_text(encoding="utf-8"))
 
     glue_family_by_code = {
@@ -673,26 +682,36 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="导出 M3 家族误配率人工抽查表")
     parser.add_argument("--days", nargs="*", help="归档日 YYYYMMDD，默认自动发现")
     parser.add_argument("--out", help="输出 HTML 路径")
+    parser.add_argument("--variant", default="",
+                        help="C-P12/C-P13 回放变体目录名（如 pipeline_l1l3）：glue 改读 "
+                             "{date}/_replay/<variant>/agent_glue.json，unified/news 仍取生产归档；默认空=现行为不变")
     args = parser.parse_args()
 
-    days = discover_days(args.days)
+    days = discover_days(args.days, args.variant)
     if not days:
-        print("[FAIL] 未找到同时含 unified.json 与 agent_glue.json 的归档日", file=sys.stderr)
+        print("[FAIL] 未找到同时含 unified.json 与 agent_glue.json 的归档日"
+              + (f"（variant={args.variant}）" if args.variant else ""), file=sys.stderr)
         return 1
 
     all_rows: list[dict] = []
     for day in days:
-        all_rows.extend(load_day(day))
+        all_rows.extend(load_day(day, args.variant))
     flag_cross_day_instability(all_rows)
 
-    output_path = Path(args.out) if args.out else OUTPUT_DIR / "family_audit.html"
+    if args.out:
+        output_path = Path(args.out)
+    elif args.variant:
+        output_path = OUTPUT_DIR / f"family_audit_{args.variant}.html"
+    else:
+        output_path = OUTPUT_DIR / "family_audit.html"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_page(all_rows, days), encoding="utf-8")
 
     counts: dict[str, int] = {}
     for row in all_rows:
         counts[row["category"]] = counts.get(row["category"], 0) + 1
-    print(f"归档日 {len(days)} 天（{'、'.join(days)}），候选 {len(all_rows)} 行")
+    print(f"归档日 {len(days)} 天（{'、'.join(days)}），候选 {len(all_rows)} 行"
+          + (f"，variant={args.variant}" if args.variant else ""))
     print("类别分布：" + "、".join(f"{k}={v}" for k, v in sorted(counts.items())))
     print(f"已写入 {output_path}")
     return 0

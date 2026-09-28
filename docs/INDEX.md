@@ -99,6 +99,7 @@
 | [got/cp12_m3_audit_20260926.md](got/cp12_m3_audit_20260926.md) | C-P12 M3 误配率分层抽样预审表（两变体各 10 条 relation，待负责人终审划勾） |
 | [got/cp12_event_level_ab_20260926.md](got/cp12_event_level_ab_20260926.md) | C-P12 事件级 A/B 覆盖对照表（逐日覆盖汇总 + 能源/油价类明细 + 覆盖分歧明细；暴露 0902 A 版退化循环与 B 版过度归属两项质量发现） |
 | [got/cp13_grounding_pipeline_research_20260926.md](got/cp13_grounding_pipeline_research_20260926.md) | C-P13 设计笔记：基于外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）的事件→板块「接地式召回-验证」5 层管线方案（A/B 单旋钮架构天花板的整合修正，待拍板） |
+| [got/cp13_stage1_matrix_20260927.md](got/cp13_stage1_matrix_20260927.md) | C-P13 阶段1（L1+L2+L3）落地结论：L1 冒烟 K 标定（12→8）+ 9 天矩阵 M2×M3 读数 + 验收六条对照（点 2 未达归因摊派极端日，判读归负责人）+ 调用成本实测（OPEN-C7 回填） |
 | [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动，待实施） |
 
 ---

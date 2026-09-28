@@ -67,9 +67,11 @@ from src.got.catalyst_config import (
     AGENT_SEMANTIC_GLUE_IN_REPLAY,
     GLUE_PROMPT_VARIANT,
     GLUE_MAX_TOKENS,
+    GLUE_PIPELINE_ENABLED,
     GOT_A6_ENABLED,
     LLM_CALL_TIMEOUT_S,
 )
+from src.got import glue_pipeline as _glue_pipeline_mod
 from src.got.catalyst_calendar import _count_trade_days
 from src.got.persistence import (
     load_previous_context,
@@ -1165,6 +1167,28 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             warnings=warnings,
         )
 
+    def _collect_pipeline_events(self, news: NewsContext) -> list[dict]:
+        """C-P13 管线事件集：catalyst 事件（_glue_strip_event 去冗余）+ major_events 合成条目。
+
+        与 base prompt 的事件输入同源（任务3 只消费 catalyst 事件，但 major_events 同样
+        可驱动板块归属，管线一并纳入）；合成 event_id 前缀 "major_" 防与真实事件冲突。
+        """
+        events: list[dict] = []
+        cal = getattr(news, "catalyst_calendar", None)
+        if cal and cal.events:
+            events.extend(self._glue_strip_event(ev) for ev in cal.events)
+        for i, me in enumerate(getattr(news, "major_events", None) or []):
+            events.append({
+                "event_id": f"major_{i}_{getattr(me, 'event_type', '') or 'evt'}",
+                "event_type": getattr(me, "event_type", ""),
+                "title": getattr(me, "title", ""),
+                "impact_level": getattr(me, "impact_level", ""),
+                "sentiment": getattr(me, "sentiment", ""),
+                "affected_sectors": list(getattr(me, "affected_sectors", None) or []),
+                "source_news": "",
+            })
+        return events
+
     async def _agent_semantic_glue(
         self,
         candidates: list[tuple[str, Optional[SectorDetail], dict]],
@@ -1204,10 +1228,18 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         # ── 组装 prompt ──
         # C-P12: 变体文案仅在 replay 生效（GLUE_PROMPT_VARIANT=a|b，catalyst_config 读取），
         # 生产链路强制现行默认 ""——守 D-C6「拿到曲线前不改生产 prompt」；未知取值回退默认。
+        # C-P13 阶段1: GLUE_PIPELINE_ENABLED 同样仅 replay 生效（双保险门控同 C-P12）；
+        # 开启时 base 调用仍用现行默认 prompt 产 strengths/families，relations 由接地管线替换，
+        # 留痕 prompt_variant="p"（与 a/b 互斥，管线优先）。
+        pipeline_on = GLUE_PIPELINE_ENABLED and getattr(self, '_replay_mode', False)
         prompt_variant = (
-            GLUE_PROMPT_VARIANT if (GLUE_PROMPT_VARIANT in ("a", "b") and getattr(self, '_replay_mode', False)) else ""
+            "p" if pipeline_on else
+            (GLUE_PROMPT_VARIANT if (GLUE_PROMPT_VARIANT in ("a", "b") and getattr(self, '_replay_mode', False)) else "")
         )
-        prompt = self._build_glue_prompt(candidates, news, capital, sentiment, variant=prompt_variant)
+        prompt = self._build_glue_prompt(
+            candidates, news, capital, sentiment,
+            variant=("" if pipeline_on else prompt_variant),
+        )
 
         # ── LLM 调用（C1: temperature=0，D9 甲: 单次全量）──
         # max_tokens=GLUE_MAX_TOKENS（默认 16000）: 周末事件堆积时 8000 不够（0921 截断导致 S2_parse_failed）；
@@ -1270,11 +1302,37 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         # C-P12 留痕：成功/失败态均记录本次调用实际使用的变体文案（生产恒为空）
         result.prompt_variant = prompt_variant
 
+        # ── C-P13 阶段1：接地管线替换 relations（仅 replay + 开关；任何失败保留 base relations）──
+        pipeline_trace: Optional[dict] = None
+        if pipeline_on:
+            pipeline_events = self._collect_pipeline_events(news)
+            pipe = await _glue_pipeline_mod.run_relations_pipeline(
+                self, candidates, pipeline_events,
+                getattr(self, '_run_date', None) or date.today(),
+            )
+            pipeline_trace = pipe.trace
+            result.pipeline_status = pipe.status
+            if pipe.status == "ok":
+                result.relations = [GlueRelation(**r) for r in pipe.relations]
+                logger.info(
+                    f"[Node 6] C-P13 管线替换 relations: {len(result.relations)} 条"
+                    f"（事件 {len(pipeline_events)} 个）"
+                )
+            else:
+                result.warnings.append(
+                    f"C-P13 管线未替换 relations（status={pipe.status}），保留 base 产出"
+                )
+                logger.warning(f"[Node 6] C-P13 管线降级: status={pipe.status}")
+            for w in pipe.warnings:
+                result.warnings.append(w)
+                logger.warning(f"[Node 6] C-P13 管线: {w}")
+
         for w in result.warnings:
             logger.warning(f"[Node 6] glue 校验: {w}")
 
         # ── C2: 结果落盘 ──
-        self._save_glue_result(result, prompt_bytes=len(prompt.encode("utf-8")))
+        self._save_glue_result(result, prompt_bytes=len(prompt.encode("utf-8")),
+                               pipeline_trace=pipeline_trace)
 
         # ── 影子模式日志（A5：glue 照跑、结果只归档不生效）──
         if AGENT_SEMANTIC_GLUE_SHADOW:
@@ -1299,6 +1357,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         self,
         result: SemanticGlueResult,
         prompt_bytes: Optional[int] = None,
+        pipeline_trace: Optional[dict] = None,
     ) -> None:
         """C2: glue 结果落盘 → data/got_daily/{date}/agent_glue.json
 
@@ -1307,6 +1366,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         C-P12: 环境变量 GLUE_REPLAY_VARIANT（仅 replay_mode 生效）→ 落 _replay/<variant>/，
                使 A/B 两版 prompt 的回放产物各自隔离，不再同写 {date}/_replay/agent_glue.json 互相覆盖；
                默认空 = 现路径（不改变 C-P11 单跑回填行为）。
+        C-P13: pipeline_trace 非空且 replay 时，额外落同目录 glue_pipeline_trace.json
+               （L1 top-K / L2 逐事件 / L3 剪枝 / 护栏全链路留痕）。
 
         Q1 audit: status != "ok" 时写入 agent_glue_degraded_HHMMSS_毫秒.json，
         不覆盖主文件（保留现场供事后分析）。
@@ -1353,6 +1414,15 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             logger.warning(f"[Node 6] glue 结果偏大: {path} ({size:,} B > 90KB)")
         else:
             logger.info(f"[Node 6] glue 结果已写入: {path} ({size:,} B)")
+
+        # C-P13: 管线 trace 落盘（仅 replay；与 agent_glue.json 同目录，随变体隔离）
+        if pipeline_trace is not None and replay:
+            trace_path = base / "glue_pipeline_trace.json"
+            trace_payload = dict(pipeline_trace)
+            trace_payload["pipeline_status"] = result.pipeline_status
+            with open(trace_path, "w", encoding="utf-8") as f:
+                json.dump(trace_payload, f, ensure_ascii=False, indent=2, default=str)
+            logger.info(f"[Node 6] C-P13 管线 trace 已写入: {trace_path}")
 
     def _build_sector_intel(
         self,

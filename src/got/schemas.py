@@ -1187,5 +1187,8 @@ class SemanticGlueResult(BaseModel):
     status: str = Field(default="ok", description="状态标记：ok / no_candidates / S1_call_failed / S1_empty / S2_parse_failed / S2_validate_failed / S6_disabled / replay_mode")
     # C-P12 prompt A/B 留痕：本次 glue 调用所用的变体文案（""=现行默认 / a=保守版 / b=全量归属版），
     # 仅 replay_mode 下会非空（生产链路忽略 GLUE_PROMPT_VARIANT），供 R-C6 对照矩阵溯源防错跑。
-    prompt_variant: str = Field(default="", description="C-P12 变体留痕：空=现行默认，a=保守版，b=全量归属版（仅回放生效）")
+    prompt_variant: str = Field(default="", description="C-P12 变体留痕：空=现行默认，a=保守版，b=全量归属版，p=C-P13 接地管线（仅回放生效）")
+    # C-P13 阶段1 留痕：接地管线状态（空=未走管线 / ok / embedding_unavailable / day_void / l2_failed / l2_partial / pipeline_error），
+    # 仅 replay_mode + GLUE_PIPELINE_ENABLED 下非空；trace 详情落 glue_pipeline_trace.json。
+    pipeline_status: str = Field(default="", description="C-P13 管线留痕：空=未走管线，ok/embedding_unavailable/day_void/l2_failed/l2_partial/pipeline_error（仅回放生效）")
     raw_response: str = Field(default="", exclude=True)

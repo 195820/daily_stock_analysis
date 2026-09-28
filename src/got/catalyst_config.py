@@ -200,6 +200,25 @@ GLUE_MAX_TOKENS = int(os.environ.get("GLUE_MAX_TOKENS", "16000"))
 GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"
 
 # =============================================================================
+# C-P13 阶段1：事件→板块「接地式召回-验证」管线（L1 检索接地 + L2 逐事件生成 + L3 CoVe 剪枝）
+# 依据 docs/got/cp13_grounding_pipeline_research_20260926.md §3/§5.3。
+# ⚠️ 仅 replay_mode 下生效（aggregator 调用点强制），生产链路永远忽略这些变量；
+# 落盘用 GLUE_REPLAY_VARIANT=pipeline_l1l3 隔离，与 variant_a/variant_b 互不覆盖。
+# =============================================================================
+
+GLUE_PIPELINE_ENABLED = os.environ.get("GLUE_PIPELINE_ENABLED", "false").lower() == "true"
+# L1 embedding（dashscope compatible-mode，OpenAI 协议）；未配 key 时管线降级不替换 base relations
+GLUE_EMBEDDING_MODEL = os.environ.get("GLUE_EMBEDDING_MODEL", "text-embedding-v3")
+GLUE_EMBEDDING_BASE_URL = os.environ.get(
+    "GLUE_EMBEDDING_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+GLUE_EMBEDDING_API_KEY = os.environ.get("GLUE_EMBEDDING_API_KEY", "")
+GLUE_L1_TOP_K = int(os.environ.get("GLUE_L1_TOP_K", "8"))            # OPEN-1：冒烟标定 8（K=12 时 0903 房贷病例 top-K 混入 0.251 噪声「短剧游戏」，K=8 两病例全过）；矩阵跑批后终标
+GLUE_EVENT_RELATION_CAP = int(os.environ.get("GLUE_EVENT_RELATION_CAP", "6"))  # 笔记 §4 单事件硬上限
+GLUE_VERIFY_BATCH = int(os.environ.get("GLUE_VERIFY_BATCH", "10"))   # L3 CoVe 每批验证条数
+GLUE_L2_CONCURRENCY = int(os.environ.get("GLUE_L2_CONCURRENCY", "4"))  # L2 逐事件调用并发上限
+
+# =============================================================================
 # §15 审查层配置（T1 候选股终审 + T1-H 持仓审查）
 # =============================================================================
 
