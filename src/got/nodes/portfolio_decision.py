@@ -489,6 +489,26 @@ class PortfolioDecisionNode:
 
     # ── Step 2: 统一打分 ──
 
+    @staticmethod
+    def _resolve_holding_name(symbol: str, raw_name: Any) -> str:
+        """P1-1 小尾巴（backlog §2）：持仓名缺失/等于代码时的消费侧兜底。
+
+        上游个别持仓（如 600250/605566）的 `name` 为空串或直接等于代码，
+        导致归档/日志展示成裸码。仅在 GOT 消费侧兜底（不动 `PortfolioService` 源头，
+        源头被 webui 共享）：name 无计算副作用（仅展示/日志/归档），故只做显示回退。
+        兜底源为离线股票索引 `get_index_stock_name`（进程内 lazy 缓存、无网络）；
+        不可用时回退原行为（返回 symbol）。
+        """
+        name = (raw_name or "").strip() if isinstance(raw_name, str) else ""
+        if name and name != symbol:
+            return name
+        try:
+            from src.data.stock_index_loader import get_index_stock_name
+            indexed = get_index_stock_name(symbol)
+        except Exception:  # 兜底不得引入新异常路径
+            indexed = None
+        return indexed or name or symbol
+
     def _score_holdings(
         self,
         portfolio: Dict[str, Any],
@@ -547,7 +567,7 @@ class PortfolioDecisionNode:
         holding_candidates = []
         for position in positions:
             symbol = position.get("symbol", "")
-            name = position.get("name", symbol)
+            name = self._resolve_holding_name(symbol, position.get("name", symbol))
             stock_sector_info = self._find_stock_sector(
                 symbol, unified,
                 sector_strength_map=sector_strength_map,
@@ -578,7 +598,7 @@ class PortfolioDecisionNode:
 
         for position in positions:
             symbol = position.get("symbol", "")
-            name = position.get("name", symbol)
+            name = self._resolve_holding_name(symbol, position.get("name", symbol))
             pnl_pct = position.get("unrealized_pnl_pct", 0.0) or 0.0
             pnl_pct_decimal = pnl_pct / 100.0
 

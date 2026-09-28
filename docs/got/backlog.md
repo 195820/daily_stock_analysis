@@ -144,9 +144,9 @@
 | **P0-3** | 立即 | 粮食概念 -4.26% 仍 `active_mainline` A 档 | ✅ **已生效** | — |
 | **P0-4** | 立即 | 液冷服务 tier=S 却标 exhausted | **不修（行为正确）** | 走 exhausted→active 回归路径，弱反弹不触发是正确行为 |
 | **P0-5** | 1 周内 | `ambush_pool` 全被闸门拦死（8 个埋伏板块 → 池空） | ✅ **已自愈**（2026-09-26 复算，待负责人确认了结） | 原归因「闸门判据即 §6.1 #10/#11，随退役消失」已作废——接线后重判 T5 对齐层**保留**（§4.2）。实际走势：近 12 归档日池规模 0–5（0914=3、0915=5、0921=1、0923=1、0924=1），「池空」症状不可复现；归因是上游候选质量改善还是运气，不追认 |
-| **P1-1** | 1 周内 | 持仓股 `name == symbol`（600250 / 605566） | **明确延后** | OPEN-D8：排在下一批 |
+| **P1-1** | 1 周内 | 持仓股 `name == symbol`（600250 / 605566） | ✅ **已补（2026-09-28，搭批 5 后小尾巴）** | OPEN-D8 结：`portfolio_decision.py` 新增 `_resolve_holding_name`（静态方法），在 `_score_holdings` 两处消费点（L567/L598）兜底——`name` 为空串或等于 `symbol` 时走离线股票索引 `src.data.stock_index_loader.get_index_stock_name`（进程内 lazy 缓存、无网络，实测 600250→南京商旅 / 605566→福莱蒽特）；不可用则回退原行为返回 symbol。**仅消费侧兜底、不动 `PortfolioService` 源头**（源头被 webui 共享）；`name` 无计算副作用（仅展示/日志/归档），R-C3 锤点逐位不变（verify 20260910：0 FAIL）、`test_holding_name_fallback.py` 5 例绿。❗ 计划原写“查 `a_share_codes.json` 代码→名称映射”不成立（该文件为纯代码清单无名称），改用现存离线索引 |
 | **P1-2** | 1 周内 | reasoning 中同一板块出现 ×3 | ✅ **已生效** | `portfolio_decision.py:1526-1535` `seen_canons` set 去重（D-P7）；⚠️ 原「代码未去重」的记载已过期 |
-| **P1-3** | 2 周内 | 50 只热股 `mention_count` 极差 <3%，无区分度 | **降级口径** | D-P8：加 `mention_source` 标注字段，**数值不动** |
+| **P1-3** | 2 周内 | 50 只热股 `mention_count` 极差 <3%，无区分度 | ✅ **已落地（2026-09-28 核实）** | D-P8：`mention_source` 标注字段已写入生产端——`sentiment_analysis.py:805` eastmoney / `:836` xueqiu（常量 `MENTION_SOURCE_EASTMONEY/XUEQIU` L50-51），展示侧 `_format_mention_display`（L843-847）按源分支渲染；**数值不动**（仅口径标注） |
 | **P1-4** | 2 周内 | `associated_sectors` 50/50 全空 | **重判：闲置口径，非待查**（2026-09-28） | OPEN-D2：原「是否真无可靠数据源」重判为「字段仍空但闸门已旁路」——G2 注意力闸已于 audit_20260922 Q2（09-23）改用 `SectorContext.ths_hot_sectors`（`aggregator.py:3136/3172`），生产端 `sentiment_analysis.py:804/835` 仍写空列表；口径标注已落（schemas `HotStock.associated_sectors`），字段保留仅为归档兼容 |
 | **P1-5** | 2 周内 | `reasoning.md` 中 Node 7 段出现 ×2 | ✅ **已生效**（见下注） | D-P6 → 并入 A-P0-8；`archive.py:642` 覆盖写 |
 | **P2-1** | 按需 | `affected_sectors` 不区分正负面 | ✅ **已拍板 #8a（2026-09-28）：不升级 `list[dict]`，明示「不区分正负面」为长期口径** | 口径声明已落三处：`schemas.CatalystEvent.affected_sectors` 描述 + `aggregator._group_events_by_sector` docstring + `catalyst_calendar._align_events_to_sectors` docstring（翻案需同步改这三处，见 §7 #8） |
@@ -170,8 +170,8 @@
 >
 > **2026-09-26 收口复算**：A6 阶段 2 落地后重跑，脚本 `unverified = 7`（P0-1 为退役后形状消失的残留计数，见 §2 表）。剩余 6 项均有归属（见 §2），R-D1 作为 burndown 已从 10 降到 7，本身不再阻塞任何验收。
 
-**统计**（2026-09-28 拍板轮后）：已生效 6（P0-3 / P1-2 / P2-4 / P2-5 + 随退役消解 P0-1 / P0-2）+ 不修 1（P0-4）+ 症状消失 1（P2-2）+ 自愈待确认 1（P0-5）+ 已拍板结案 1（P2-1 #8a）= **10 项了结**；
-降级口径 1（P1-3）+ 挂起 2（P1-4 重判闲置口径 / P2-3）+ 延后 1（P1-1）= **4 项各有归属**；**真·未排期 = 0**。
+**统计**（2026-09-28 小尾巴轮后）：已生效 8（P0-3 / P1-2 / P2-4 / P2-5 + 随退役消解 P0-1 / P0-2 + **P1-1 已补** / **P1-3 已落地**）+ 不修 1（P0-4）+ 症状消失 1（P2-2）+ 自愈待确认 1（P0-5）+ 已拍板结案 1（P2-1 #8a）= **12 项了结**；
+挂起 2（P1-4 重判闲置口径 / P2-3）= **2 项各有归属**；**真·未排期 = 0**。（本轮回改：P1-1 搭批 5 后补上消费侧兜底、P1-3 核实 `mention_source` 生产者早已在位——两项转「已生效/已落地」。）
 
 ---
 
@@ -210,7 +210,7 @@
 
 ### 3.4 D 层（`archive/got_layer_d_plan_0911.md` §7.2）
 
-OPEN-D1（P2-2 界点归因）、OPEN-D2（`associated_sectors` 是否真无可靠数据源）、OPEN-D3（`CATALYST_CONFIDENCE_GATE` 校准样本）、OPEN-D4（`AMBUSH_SCORE_FLOOR=0.30` 来源与带宽）、OPEN-D5（蓄水池驱逐规则 FIFO vs 质量）、OPEN-D6（P2-3 `raw_position > 1.0` 语义）、OPEN-D7（正式池水位目标取值，暂定 `(2,6)`）、OPEN-D8（P1-1 新归属，排在下一批）、OPEN-D9（`current_position_ratio` 截断不可证伪，建议落盘 `raw_position`）
+OPEN-D1（P2-2 界点归因）、OPEN-D2（`associated_sectors` 是否真无可靠数据源）、OPEN-D3（`CATALYST_CONFIDENCE_GATE` 校准样本）、OPEN-D4（`AMBUSH_SCORE_FLOOR=0.30` 来源与带宽）、OPEN-D5（蓄水池驱逐规则 FIFO vs 质量）、OPEN-D6（P2-3 `raw_position > 1.0` 语义）、OPEN-D7（正式池水位目标取值，暂定 `(2,6)`）、OPEN-D8（P1-1 新归属，排在下一批）→ ✅ **已结（2026-09-28 小尾巴轮：`_resolve_holding_name` 消费侧兜底落地）**、OPEN-D9（`current_position_ratio` 截断不可证伪，建议落盘 `raw_position`）
 
 ### 3.5 B 层（`archive/got_layer_b_plan_0911.md` §7.2）
 
