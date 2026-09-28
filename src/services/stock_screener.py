@@ -120,6 +120,8 @@ class ScreenerRunResult:
     error: Optional[str] = None                # 错误信息
     elapsed_seconds: float = 0.0               # 执行耗时
     query: str = ""                            # 问财查询语句
+    # 4d/D-3 前置：候选池归零率基线观测（仅留痕、不进任何判定，排期批 5 §4.1）
+    funnel_stats: Optional[dict] = None        # {actionable_sector_count, zero_pick_sectors, round_survival_counts}
 
 
 # ============================================================
@@ -956,6 +958,12 @@ class StockScreenerPipeline:
             result.matched_count = len(finalists)
             logger.info(f"[GOT选股] 精选出 {len(finalists)} 只股票")
 
+            # 3b. 4d/D-3 前置：候选池归零率基线观测（纯留痕，不进任何判定）
+            try:
+                result.funnel_stats = self._compute_funnel_stats(universe, finalists)
+            except Exception as fe:  # noqa: BLE001 - 观测失败不影响选股主流程
+                logger.warning(f"[GOT选股] funnel_stats 观测计算失败（已忽略）: {fe}")
+
             # 4. 构建输出
             result.stocks = finalists
 
@@ -971,6 +979,35 @@ class StockScreenerPipeline:
             logger.exception(f"[GOT选股] 执行失败: {e}")
 
         return result
+
+    def _compute_funnel_stats(self, universe: List[Dict], finalists: List[ScreenerStock]) -> dict:
+        """4d/D-3 前置：从 universe(入) vs finalists(出) 算板块级归零率（仅留痕）。
+
+        “actionable 板块 → 0 只入选”的归零事件在此首次可观测，供 D-3 基线重标。
+        round_survival_counts 取自 _filter_got_finalists 逐轮出口 trace（未初始化则缺）。
+        """
+        entering: Dict[str, str] = {}
+        for c in universe:
+            sec = c.get("sector") or ""
+            if sec:
+                entering.setdefault(sec, c.get("sector_type", ""))
+        picked: Dict[str, int] = {}
+        for s in finalists:
+            sec = getattr(s, "sector_name", "") or ""
+            if sec:
+                picked[sec] = picked.get(sec, 0) + 1
+        actionable = set(entering.keys())
+        zero_pick = sorted(sec for sec in actionable if picked.get(sec, 0) == 0)
+        trace = dict(getattr(self, "_last_funnel_trace", {}) or {})
+        trace["final_out"] = len(finalists)
+        return {
+            "actionable_sector_count": len(actionable),
+            "picked_sector_count": len(picked),
+            "zero_pick_sectors": zero_pick,
+            "zero_pick_rate": round(len(zero_pick) / len(actionable), 3) if actionable else 0.0,
+            "round_survival_counts": trace,
+            "note": "4d/D-3 基线观测，攒 ≥10 交易日后固化归零率基线值（不进选股判定）",
+        }
 
     def _load_got_context(self, got_date: date) -> Optional[dict]:
         """动态加载 GOT 上下文
@@ -1502,6 +1539,9 @@ class StockScreenerPipeline:
         fetcher_manager = DataFetcherManager()
 
         candidates = universe.copy()
+        # 4d/D-3 前置：逐轮出口存活计数留痕（纯观测，不进判定；run_got_mode 消费后落盘）
+        funnel_trace: Dict[str, int] = {"r0_in": len(candidates)}
+        self._last_funnel_trace = funnel_trace
 
         # 轮次 0: 剔除涨停股（当日无法买入）
         def _is_limit_up(c: dict) -> bool:
@@ -1516,6 +1556,7 @@ class StockScreenerPipeline:
         limit_up_count = sum(1 for c in candidates if _is_limit_up(c))
         candidates = [c for c in candidates if not _is_limit_up(c)]
         logger.info(f"轮次 0: {len(candidates)} 只（剔除 {limit_up_count} 只涨停）")
+        funnel_trace["r0"] = len(candidates)
 
         # 轮次 0b: 软过滤——涨 ≥8% 不参与买入排序（P0-3 新增）
         # 非涨停但涨幅过大，追高风险极高（创业板涨10%不算涨停但风险同样大）
@@ -1569,6 +1610,8 @@ class StockScreenerPipeline:
         # 轮次 1.5: 横盘过滤（排除多窗口小涨幅的停滞票）
         candidates = self._filter_stagnation(candidates, fetcher_manager)
         logger.info(f"轮次 1.5: {len(candidates)} 只（横盘过滤后）")
+        funnel_trace["r1"] = len(normal_pool)
+        funnel_trace["r1_5"] = len(candidates)
 
         # 轮次 2: 资金面评分 Top 20
         capital_ctx = got_context.get("capital_context", {})
@@ -1599,6 +1642,7 @@ class StockScreenerPipeline:
         candidates.sort(key=lambda x: x["tech_wave_score"], reverse=True)
         candidates = candidates[:15]
         logger.info(f"轮次 3: {len(candidates)} 只（波段技术 Top 15）")
+        funnel_trace["r3"] = len(candidates)
 
         # ── 轮次 4: 风险排雷（主通道 Top 6 + 软保底至多 2）──
         risk_scores = self._score_risk(candidates, fetcher_manager)
@@ -1606,6 +1650,7 @@ class StockScreenerPipeline:
             c["risk_score_safe"] = risk_scores.get(c["code"], 0)
         candidates = self._apply_r4_filter(candidates, got_context)
         logger.info(f"轮次 4: {len(candidates)} 只（风险排雷后）")
+        funnel_trace["r4"] = len(candidates)
 
         # 消息面评分（全量候选，不排序但记录分数）
         news_ctx = got_context.get("news_context", {})
@@ -2971,6 +3016,7 @@ verdict 含义：
                 "total_scanned": result.total_scanned,
                 "matched_count": result.matched_count,
                 "elapsed_seconds": result.elapsed_seconds,
+                "funnel_stats": result.funnel_stats,  # 4d/D-3 归零率基线观测（仅留痕）
                 "top_stocks": [],
             }
 

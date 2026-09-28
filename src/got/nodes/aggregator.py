@@ -318,6 +318,27 @@ class AggregatorNode:
         temporal = self._adaptive_temporal_check(regime)
         override = await self._simplified_news_override(news, market) if not replay_mode else None
 
+        # ── Phase 3b：分歧摘要（三态开关，批次 5 §3.2，矛盾检测段旁挂）──
+        # shadow（默认开）=只算 11 类冲突分类、落 conflict_summary_shadow 观测，
+        #   现有硬编码矛盾对检测 + LLM 仲裁一字不动；
+        # enabled=额外把 decision_path_hint 注入 T3 仲裁 prompt（改 LLM 输入=行为变更，
+        #   转正需影子期读数 + 负责人判定，见计划 §9.3）；两者皆关=不进。
+        _dg_shadow_on = os.getenv("GOT_DISAGREEMENT_SHADOW", "1") == "1"
+        _dg_enabled_on = os.getenv("GOT_DISAGREEMENT_ENABLED", "0") == "1"
+        conflict_summary_shadow_dict = None
+        _decision_path_hint = ""
+        if _dg_shadow_on or _dg_enabled_on:
+            try:
+                conflict_summary_shadow_dict = self._build_conflict_summary_shadow(
+                    regime, sector_intels, sector, capital, sentiment,
+                )
+                if _dg_enabled_on and conflict_summary_shadow_dict:
+                    _decision_path_hint = conflict_summary_shadow_dict.get("decision_path_hint", "")
+            except Exception as exc:  # 观测旁路：任何异常降级为 None，绝不阻塞主流程
+                logger.warning("[Node 6] 3b 分歧摘要计算失败（已忽略，影子字段置空）: %s", exc)
+                conflict_summary_shadow_dict = None
+                _decision_path_hint = ""
+
         # ── 跨节点时间线共振（v2.1 Phase 6）──
         # Rollback 开关：DISABLE_CROSS_NODE_SIGNALS=true 跳过共振检测；
         # 检测异常降级为空信号，不阻塞 Node 6 主流程
@@ -345,6 +366,7 @@ class AggregatorNode:
         else:
             contradictions = await self._arbitrate_contradictions(
                 contradictions, regime, sector, capital, news, sentiment, cross_node_signals,
+                decision_path_hint=_decision_path_hint,
             )
 
         key_risks = self._collect_key_risks(news, sentiment, temporal)
@@ -368,10 +390,33 @@ class AggregatorNode:
                 f"[Node 6] 数据质量告警: missing_fields={data_quality.missing_fields} "
                 f"（护栏可能空转，详见 docs/got/archive/agent_glue_plan_0903.md §9）"
             )
+
+        # ── Phase 4b：市场结构上下文消费（三态开关，批次 5 §2.2）──
+        # shadow（默认开）=每日真跑读 get_market_theme_context() 落观测、零决策改动；
+        # enabled=额外对 overall_confidence 施一致性因子并填 market_theme 真值；两者皆关=不进。
+        _mt_shadow_on = os.getenv("GOT_MARKET_THEME_SHADOW", "1") == "1"
+        _mt_enabled_on = os.getenv("GOT_MARKET_THEME_ENABLED", "0") == "1"
+        market_theme_shadow_dict = None
+        market_theme_ctx = None
+        _overall_confidence = self._compute_overall_confidence(regime, sector_intels)
+        if _mt_shadow_on or _mt_enabled_on:
+            from src.got.market_theme import get_market_theme_context
+            _theme_ctx = get_market_theme_context()
+            if _mt_shadow_on:
+                market_theme_shadow_dict = self._build_theme_shadow_dict(_theme_ctx)
+            if _mt_enabled_on:
+                market_theme_ctx = _theme_ctx
+                _factor = self._theme_confidence_factor(_theme_ctx, sector)
+                if _factor < 1.0:
+                    _overall_confidence = clip(_overall_confidence * _factor, 0.0, 1.0)
+                    logger.info(
+                        "[Node 6] 4b enabled：题材阶段与主线状态不一致 → confidence ×%.1f", _factor
+                    )
+
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
             unified_signal=unified_signal,
-            overall_confidence=self._compute_overall_confidence(regime, sector_intels),
+            overall_confidence=_overall_confidence,
             final_position_limit=clip(final_position, 0.0, 1.0),
             contradictions=contradictions,
             common_root_cause=None,
@@ -400,6 +445,9 @@ class AggregatorNode:
             # A6 接线可观测性：glue 实际是否进入 SectorIntel 下游，供归档回溯
             glue_consumed=any(getattr(s, "reasoning", "").find("[A6-glue") >= 0 for s in sector_intels),
             glue_status=glue.status,
+            market_theme_shadow=market_theme_shadow_dict,
+            market_theme=market_theme_ctx,
+            conflict_summary_shadow=conflict_summary_shadow_dict,
         )
 
         # 持久化（回放模式跳过）
@@ -3524,6 +3572,58 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         return clip(avg_conf * 0.8 + regime_bonus + 0.2, 0.0, 1.0)
 
+    @staticmethod
+    def _build_theme_shadow_dict(theme_ctx) -> dict:
+        """Phase 4b 影子留痕：把 MarketThemeContext 压成观测 dict（不进判定）。"""
+        top5 = [
+            {"name": c.name, "rank": c.rank, "change_pct": round(c.change_pct, 2)}
+            for c in (theme_ctx.leading_concepts or [])[:5]
+        ]
+        status = theme_ctx.status
+        note = (
+            "unknown/未构造：上游未调 build_theme_context 或取数失败（零行为）"
+            if status == "unknown" else
+            f"active={len(theme_ctx.active_themes)} leading={len(theme_ctx.leading_concepts)}"
+        )
+        return {
+            "status": status,
+            "source": theme_ctx.data_quality.source,
+            "top5_concepts": top5,
+            "breadth": theme_ctx.theme_breadth.model_dump(),
+            "note": note,
+        }
+
+    @staticmethod
+    def _theme_confidence_factor(theme_ctx, sector) -> float:
+        """enabled-only：题材阶段 vs 板块主线状态一致性因子（§5.4 近似）。
+
+        用 active_mainline 是否非空近似 RRG 'leading' 象限（aggregator 组装点不直接持有
+        逐板块 rrg.quadrant，此为可行近似，enabled 转正前需影子读数校准）：
+        题材宽度偏多（accelerating+warming > cooling）与是否存在 leading 主线不一致
+        → 返回 0.9；一致或数据不可用→ 1.0。
+        """
+        if getattr(theme_ctx, "status", "unknown") != "ok":
+            return 1.0
+        b = theme_ctx.theme_breadth
+        theme_bullish = (b.accelerating_count + b.warming_count) > b.cooling_count
+        has_leading_mainline = bool(getattr(sector, "active_mainline", None))
+        return 1.0 if theme_bullish == has_leading_mainline else 0.9
+
+    @staticmethod
+    def _build_conflict_summary_shadow(regime, sector_intels, sector, capital, sentiment) -> dict:
+        """Phase 3b 影子留痕：把节点信号→AgentOpinion[]→11 类冲突分类，产观测 dict（不进判定）。
+
+        aggregator 侧无组合层 sell_source（那是 Phase 2 产物），故 risk_override_present
+        在此恒 False（真风控否决在 PD 侧派生）；memory=None → 退化等权。
+        """
+        from src.got.disagreement import build_disagreement_summary, build_opinions
+
+        opinions = build_opinions(
+            regime=regime, sector=sector, sector_intels=sector_intels,
+            capital=capital, sentiment=sentiment, sell_source=None,
+        )
+        return build_disagreement_summary(opinions, risk_override_present=False, memory=None)
+
     # =========================================================================
     # 辅助方法
     # =========================================================================
@@ -4181,6 +4281,7 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         news: Optional[NewsContext],
         sentiment: Optional[SentimentContext],
         cross_node_signals: list,
+        decision_path_hint: str = "",
     ) -> list[Contradiction]:
         """T3: 矛盾仲裁者 — 对 medium/high 矛盾调用 LLM 做语义裁决
 
@@ -4265,6 +4366,13 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                     evidence_text=evidence_text,
                     cross_node_signals_text=signals_text,
                 )
+                # 3b enabled：注入跨节点分歧摘要的决策路径提示（decision_path_hint="" 时
+                # prompt 逐字节不变——shadow/off 走此空串分支，确保影子期零 LLM 输入变更）
+                if decision_path_hint:
+                    prompt += (
+                        "\n\n## 跨节点分歧摘要（仅供参考，不改变仲裁规则）\n"
+                        f"当前分歧类型决策路径提示：{decision_path_hint}\n"
+                    )
 
                 response_text = None
                 for attempt in range(3):

@@ -443,6 +443,38 @@ SKIP 提示内的 ①②③ —— **本次已按该步骤产出 `data/_run1` / 
 
 ---
 
+## 7. TickFlow 能力探测结论（2026-09-28，批次 5 §1 / Phase 5b）
+
+key 已就位（`TICKFLOW_API_KEY`，len=35），SDK 实测版本 **0.1.25**（文档旧记 0.1.18 已过期）。一次性只读探测脚本 `.review_tmp/tf_capability_probe{,2,3}.py`（不入库），输出 `tf_probe*.txt`。**结论：TickFlow 不能作 4b 板块排名源，维持 mootdx 先行（与拍板②一致）。**
+
+| 探测项 | 结果 | 对批次 5 的影响 |
+|---|---|---|
+| 概念/主题 universe | **0 个** | universe 全是申万行业 SW1/SW2/SW3（各 335）+ 零星 ETF/index/bond，**无任何概念板块**（880xxx 通达信概念 / 同花顺 / 东财概念一律没有）→ 4b 需要的「概念排名」TickFlow 结构性缺失 |
+| `quotes.get_by_universes` | **PermissionError** | 当前套餐不放行 universe 级批量行情 → 无法用成分股聚合出板块涨跌幅，排名源的候选通路封死 |
+| `klines.batch` | **PermissionError** | 板块日线批量自算同样被封；单标的 `klines.get` 可用（dict OHLCV+amount）但 600+ 板块逐个拉不可接受 |
+| `universes.get(id)` | OK | 返回成分股 symbol 列表（如 SW1电子 22 只）——仅成员表，无排名 |
+| `quotes.get_by_symbols` | OK | 单/少标的实时（含 `change_pct`），≤5 标的/请求——4b 排名用不上，但 **5c/Phase 6 个股实时可用** |
+| `realtime` | QuoteStream（WebSocket subscribe） | 非 REST，窄面 P0 之外无现成板块流 |
+
+**后续动作登记**：① 4b 排名源**确定 mootdx 自算**（`get_board_quick_change` 批量，见 §2），TickFlow 切换议题在本套餐权限下**关闭**，除非升级套餐重新探测放行 `get_by_universes`；② 4d 快照 fallback 若依赖 TickFlow universe 批量预取——同样被 `get_by_universes` 权限卡住，§4.2 取证需据此标注降级；③ Phase 6 盘中闸门 OPEN-I2 重估：TickFlow 个股实时 `get_by_symbols` 可用，但五档/竞价权限未探（本批未测，留 Phase 6 触发时）。
+
+### 7.1 4d 快照源连通性取证（2026-09-28，批次 5 §4.2 / Phase 4d）
+
+一次性只读脚本 `.review_tmp/cp4d_snapshot_connectivity.py`（不入库），复刻 `alphasift_service.DsaEastMoneyHotspotProvider._fetch_board_names`（L1487）的生产请求打 `79.push2.eastmoney.com/api/qt/clist/get`。
+
+**结论：该直取通路当前可达、未被封 → 4d hotspot 因子无需标注降级，§7 注②/§1 申请清单联动不触发。**
+
+| fs 用例 | HTTP | 耗时 | json | `data.diff` 行数 | 采样（f14/f3/f12） |
+|---|---|---|---|---|---|
+| `m:90 t:3 f:!50`（概念） | 200 | 0.37s | OK | 100 | 光刻胶 −4.61 BK1753 / 2026中报预减 −1.30 BK1752 |
+| `m:90 t:2 f:!50`（行业） | 200 | 0.31s | OK | 100 | 综合Ⅲ −1.16 BK1627 / 稀土 −5.15 BK1626 / 钨 −6.15 BK1625 |
+
+**判定口径与边界**：
+- 79.push2 是 hotspot 因子的**最后一层 fallback**（链路：akshare `stock_board_change_em` → DSA fetcher rankings → 本直取）；本探测证实最坏情况下兜底通路仍活，影子期 snapshot 源可用。
+- ⚠️ 单次探测=瞬时读数，非 SLA 保证；4d 影子正式接线（§4.3）时仍须在 `screening_shadow.json` 里**按日记 snapshot 源实际命中层级**（沿用 missing_fields/告警惯例），若后续交易日转 `BLOCKED_*` 再触发降级标注 + §1 申请清单联动。计划 §9.4「快照源再次被封致影子空转」风险的缓解手段即此按日可见性。
+
+---
+
 ## 8. 复现命令
 
 ```bash

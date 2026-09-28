@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 
 # B2 词表同源：CONTROLLED_FAMILIES 从单一权威源导入
 from src.got.family_keywords import CONTROLLED_FAMILIES  # noqa: E402
+# Phase 4b：市场结构上下文模型（market_theme 不反向依赖 schemas，无循环）
+from src.got.market_theme import MarketThemeContext  # noqa: E402
 
 
 # =============================================================================
@@ -993,6 +995,31 @@ class UnifiedContext(BaseModel):
         description="蓄水池容量驱逐记录（被驱逐板块/驻留天数/驱逐原因）",
     )
 
+    # ── Phase 4b / MarketThemeContext Step 2 观测留痕（批次 5 §2，2026-09-28）──
+    market_theme_shadow: Optional[dict] = Field(
+        default=None,
+        description="市场结构（题材阶段）影子观测留痕: {status, source, "
+                    "top5_concepts:[{name,rank,change_pct}], breadth, note}。"
+                    "影子模式（GOT_MARKET_THEME_SHADOW=1 默认）只落此字段、不改任何决策；"
+                    "仅留痕，不参与判定。【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    market_theme: Optional[MarketThemeContext] = Field(
+        default=None,
+        description="市场结构上下文真值（仅 GOT_MARKET_THEME_ENABLED=1 生效时填）；"
+                    "影子期保持 None，避免把未生效数据伪装成已接入。不参与既有评分链，"
+                    "仅在 enabled 时对 overall_confidence 施加一致性因子。",
+    )
+
+    # ── Phase 3b / 分歧摘要观测留痕（批次 5 §3.2，2026-09-28）──
+    conflict_summary_shadow: Optional[dict] = Field(
+        default=None,
+        description="分歧摘要影子观测留痕（remote §8.2 build_agent_disagreement_summary 形状）: "
+                    "{conflict_type, decision_path_hint, bullish/bearish/neutral_agents, "
+                    "consensus, risk_control, risk_override_present, weights_equal}。"
+                    "影子模式（GOT_DISAGREEMENT_SHADOW=1 默认）只落此字段、不改既有矛盾检测/LLM 仲裁；"
+                    "仅留痕，不参与判定。【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+
 
 # ── Phase 2: 统一决策节点 Schema ──
 
@@ -1157,6 +1184,15 @@ class PortfolioDecision(BaseModel):
                     "mode=shadow 时不落任何决策（仅记录超限将削谁/是否撞家族宽限）；"
                     "mode=enabled 时同步已写入 allocation。仅留痕，不参与判定。"
                     "【按 #5a 先例：新增观测字段应移出 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── Phase 3b / RiskOverridePlan 观测留痕（批次 5 §3.3，2026-09-28）──
+    risk_override_shadow: Optional[dict] = Field(
+        default=None,
+        description="风控覆盖计划留痕: {mode, conflict_type, plan, note}（plan=RiskOverridePlan "
+                    "{veto_buy, adjustment, target_signal, reason}）。"
+                    "mode=shadow 时只算不落决策（buy_budget 不变）；mode=enabled 且 veto_buy 时"
+                    "与 over_limit_forced 并列把 buy_budget 归零（风控优先于既有降级规则）。"
+                    "仅留痕，不参与判定。【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
 
 

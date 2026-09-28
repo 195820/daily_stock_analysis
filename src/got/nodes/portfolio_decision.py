@@ -271,6 +271,9 @@ class PortfolioDecisionNode:
             # P1-4/OPEN-1 W2 卖出来源观测留痕（批 4.1）：影子/生效模式由 _allocate 落 self，
             # 仅留痕不参与决策（shadow 模式 allocation 本身零改动）
             sell_source_shadow=getattr(self, "_sell_source_shadow", None),
+            # Phase 3b / RiskOverridePlan 观测留痕（批 5 §3.3）：shadow 不改 buy_budget，
+            # enabled+veto_buy 时与 over_limit_forced 并列归零预算；由 _allocate 落 self。
+            risk_override_shadow=getattr(self, "_risk_override_shadow", None),
             data_quality=data_quality,
         )
 
@@ -3931,6 +3934,54 @@ verdict 含义：
         new_market_value = total_market_value - sell_proceeds
         position_gap = target_position_value - new_market_value
 
+        # ── Phase 3b：RiskOverridePlan 注入（批次 5 §3.3，Step 5 LLM 精炼前的预算闸门）──
+        # 三态开关（与 4b/5c 同惯例）：shadow（默认）=只算 RiskOverridePlan 落
+        #   self._risk_override_shadow 观测、**不改 buy_budget**（旧路径逐字节不变）；
+        #   enabled 且 veto_buy → 与 over_limit_forced 并列把 buy_budget 归零（风控优先于既有降级规则）。
+        # 真风控否决源 = Step 1.5 卖出来源确已 enabled 强平（sell_source mode=enabled 且有减仓）；
+        #   默认两者皆影子 → _ro_veto_buy 恒 False → 决策零改动。
+        self._risk_override_shadow = None
+        _ro_veto_buy = False
+        _dg_shadow_on = os.getenv("GOT_DISAGREEMENT_SHADOW", "1") == "1"
+        _dg_enabled_on = os.getenv("GOT_DISAGREEMENT_ENABLED", "0") == "1"
+        if _dg_shadow_on or _dg_enabled_on:
+            try:
+                from src.got.disagreement import build_disagreement_summary, build_opinions
+
+                _ss = getattr(self, "_sell_source_shadow", None) or {}
+                _ro_present = _ss.get("mode") == "enabled" and bool(_ss.get("planned_trims"))
+                _dg_opinions = build_opinions(
+                    regime=getattr(unified_context, "market_regime", None),
+                    sector=None,
+                    sector_intels=getattr(unified_context, "confirmed_sectors", None),
+                    capital=None,
+                    sentiment=None,
+                    sell_source=_ss or None,
+                )
+                _dg_summary = build_disagreement_summary(
+                    _dg_opinions, risk_override_present=_ro_present, memory=None
+                )
+                _ro_plan = _dg_summary.get("risk_control", {})
+                self._risk_override_shadow = {
+                    "mode": "enabled" if _dg_enabled_on else "shadow",
+                    "conflict_type": _dg_summary.get("conflict_type", ""),
+                    "decision_path_hint": _dg_summary.get("decision_path_hint", ""),
+                    "plan": _ro_plan,
+                    "note": (
+                        "3b 风控覆盖留痕：shadow 模式不改 buy_budget（仅记录冲突分类/计划）；"
+                        "enabled 且 veto_buy 时与 over_limit_forced 并列使预算归零"
+                    ),
+                }
+                if _dg_enabled_on and _ro_plan.get("veto_buy"):
+                    _ro_veto_buy = True
+                    logger.info(
+                        "[Phase 2] 3b enabled：RiskOverridePlan.veto_buy → 买入预算归零"
+                    )
+            except Exception as exc:  # 观测旁路：异常降级为 None，绝不阻塞 Phase 2 主流程
+                logger.warning("[Phase 2] 3b 风控覆盖计算失败（已忽略，影子字段置空）: %s", exc)
+                self._risk_override_shadow = None
+                _ro_veto_buy = False
+
         # 买入预算 = min(仓位缺口, 可用资金)
         # 评审修复#3：over_limit_forced 提为前置短路——Step 1.5 整手向上取整常态会留下
         # 小正 gap（削过头），若让 position_gap>0 抢先，就会拿减仓款回补，违背 W1
@@ -3942,6 +3993,13 @@ verdict 含义：
             logger.info(
                 f"[Phase 2] W1 超限处置：仓位已压至上限 {target_position_value:,.0f} 附近，"
                 f"减仓款 ¥{sell_proceeds:,.0f} 不回补（本轮暂停买入）"
+            )
+        elif _ro_veto_buy:
+            # 3b 风控否决（enabled 且 RiskOverridePlan.veto_buy）：与 over_limit_forced 并列，
+            # 预算归零。_ro_veto_buy 在影子/全关恒 False → 此分支不触发 → 旧路径逐字节不变。
+            buy_budget = 0.0
+            logger.info(
+                f"[Phase 2] 3b 风控否决：本轮暂停买入（buy_budget=0，¥{available_cash:,.0f} 可用不回补）"
             )
         elif position_gap > 0:
             buy_budget = min(position_gap, available_cash)

@@ -254,6 +254,32 @@ def _write_reasoning_md(
             lines.append(f"- **宏观摘要:** {regime.macro_overlay}")
             lines.append("")
 
+        # 🧭 市场结构（Phase 4b，影子留痕）——未启用/数据不可达时必带原因
+        theme_shadow = getattr(unified_ctx, "market_theme_shadow", None)
+        if theme_shadow is not None:
+            lines.append("## 🧭 市场结构（Phase 4b，题材阶段）")
+            lines.append("")
+            status = theme_shadow.get("status", "unknown")
+            lines.append(f"- **状态:** {status}（源: {theme_shadow.get('source', '')}）")
+            if status == "unknown":
+                lines.append(f"- ⚠️ 未启用/数据不可达: {theme_shadow.get('note', '')}")
+            else:
+                top5 = theme_shadow.get("top5_concepts") or []
+                if top5:
+                    lines.append("- **领先概念:** " + "、".join(
+                        f"{t.get('name')}(#{t.get('rank')} {t.get('change_pct'):+.1f}%)"
+                        for t in top5
+                    ))
+                breadth = theme_shadow.get("breadth") or {}
+                lines.append(
+                    f"- **宽度:** accelerating={breadth.get('accelerating_count', 0)} "
+                    f"warming={breadth.get('warming_count', 0)} "
+                    f"cooling={breadth.get('cooling_count', 0)} "
+                    f"total={breadth.get('total_count', 0)}"
+                )
+            lines.append("_（仅留痕，影子期不参与评分）_")
+            lines.append("")
+
         confirmed = getattr(unified_ctx, "confirmed_sectors", [])
         actionable_list = [s for s in confirmed if s.classification == "actionable"]
         caution_list = sorted(

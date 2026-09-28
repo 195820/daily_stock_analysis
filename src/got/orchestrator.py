@@ -12,6 +12,7 @@ GOT 编排器
 
 import asyncio
 import logging
+import os
 from datetime import datetime, date
 from typing import Optional
 
@@ -95,6 +96,18 @@ class GOTOrchestrator:
 
         market_ctx, sector_ctx, capital_ctx = tech_result
         news_ctx, sentiment_ctx = data_result
+
+        # Step 2.5: Phase 4b 市场结构上下文构造（影子默认开，写入全局供 Node 6 只读消费）
+        # 独立于 Node 2 再拉一次 mootdx 快筛（方案 A 的“独立信号”前提）；取数失败目回退 unknown。
+        if not self.use_mock and (
+            os.getenv("GOT_MARKET_THEME_SHADOW", "1") == "1"
+            or os.getenv("GOT_MARKET_THEME_ENABLED", "0") == "1"
+        ):
+            try:
+                from src.got.market_theme import build_theme_context
+                await asyncio.to_thread(build_theme_context, self.sector_node.fetcher)
+            except Exception as exc:  # noqa: BLE001 - 构造失败不阻断 GOT 主流程
+                logger.warning("[GOT] 4b 市场结构构造失败（已忽略，下游回退 unknown）: %s", exc)
 
         # Step 3: 聚合
         logger.info("[GOT] 两路完成，开始聚合")
