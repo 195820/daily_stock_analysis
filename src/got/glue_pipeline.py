@@ -727,6 +727,13 @@ async def _run_relations_pipeline_impl(
     # ── L3 CoVe 独立验证剪枝 ──
     cove_dropped_keys: set[str] = set()
     cove_warnings: list[str] = []
+    # C-P13 阶段2 反事实标定留痕：逐条记录进入 L3 的关系特征 + CoVe 判定，
+    # 使 kept/dropped 两支都能回溯到 realized（仅 replay trace 落盘，不进 GlueRelation）。
+    cove_detail: list[dict] = []
+    topk_rank_sim = {
+        eid: {str(c): (rank + 1, s) for rank, (c, s) in enumerate(tk)}
+        for eid, tk in index.topk_by_event.items()
+    }
     if relations:
         for i in range(0, len(relations), max(1, verify_batch)):
             batch = relations[i:i + max(1, verify_batch)]
@@ -761,6 +768,20 @@ async def _run_relations_pipeline_impl(
             for j, rel in enumerate(batch):
                 v = verdicts.get(str(j))
                 t = event_trace.get(rel["event_id"])
+                _verdict = ("no" if (v is not None and v.verdict == "no")
+                            else ("yes" if v is not None else "missing"))
+                _rs = topk_rank_sim.get(rel["event_id"], {}).get(str(rel["board_code"]))
+                cove_detail.append({
+                    "relation_key": relation_key(rel),
+                    "event_id": rel["event_id"],
+                    "board_code": rel["board_code"],
+                    "direction": rel.get("direction", ""),
+                    "confidence": rel.get("confidence"),
+                    "strength": rel.get("strength"),
+                    "topk_rank": _rs[0] if _rs else None,
+                    "topk_sim": _rs[1] if _rs else None,
+                    "cove_verdict": _verdict,
+                })
                 if v is not None:
                     if t is not None:
                         t["cove"]["verified"] += 1
@@ -786,6 +807,12 @@ async def _run_relations_pipeline_impl(
     # evidence_span 是管线内部证据字段，不进 GlueRelation（schema 不变）
     for r in relations:
         r.pop("evidence_span", None)
+
+    # C-P13 阶段2 反事实标定：标注每条进入 L3 的关系是否最终进入产出（护栏/day_void 后）
+    final_keys = {relation_key(r) for r in relations}
+    for d in cove_detail:
+        d["survived"] = d.pop("relation_key") in final_keys
+    trace["cove_detail"] = cove_detail
 
     warnings = cove_warnings + guard_warnings
     trace["events"] = list(event_trace.values())

@@ -100,6 +100,7 @@
 | [got/cp12_event_level_ab_20260926.md](got/cp12_event_level_ab_20260926.md) | C-P12 事件级 A/B 覆盖对照表（逐日覆盖汇总 + 能源/油价类明细 + 覆盖分歧明细；暴露 0902 A 版退化循环与 B 版过度归属两项质量发现） |
 | [got/cp13_grounding_pipeline_research_20260926.md](got/cp13_grounding_pipeline_research_20260926.md) | C-P13 设计笔记：基于外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）的事件→板块「接地式召回-验证」5 层管线方案（A/B 单旋钮架构天花板的整合修正，待拍板） |
 | [got/cp13_stage1_matrix_20260927.md](got/cp13_stage1_matrix_20260927.md) | C-P13 阶段1（L1+L2+L3）落地结论：L1 冒烟 K 标定（12→8）+ 9 天矩阵 M2×M3 读数 + 验收六条对照（点 2 未达归因摊派极端日，判读归负责人）+ 调用成本实测（OPEN-C7 回填） |
+| [got/cp13_phase2_closeout_20260928.md](got/cp13_phase2_closeout_20260928.md) | **C-P13 阶段2 收口决策**：realized 收益率标定 confidence 红线证伪（19 天池+反事实扩样到 1521，alpha≈0/conf rho−0.06/CoVe kept−dropped 仅 0.04pp）→ 阶段2 关闭、阶段1 接地管线休眠；关键纠偏：confidence 在 M3 归属口径有效（≠收益率），勿误记为无用 |
 | [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动，待实施） |
 
 ---
