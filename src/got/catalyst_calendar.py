@@ -1086,6 +1086,9 @@ class CatalystCalendarBuilder:
 
         仅处理 source in (llm_narrative, global_map) 的事件。
         结构化/宏观事件走既有规则映射，不受影响。
+
+        【P2-1 长期口径（裁决 #8，2026-09-28）】对齐 prompt 不要求区分正/负面
+        （只输出板块名列表，无方向字段）——已明示接受为长期口径，见 schemas.CatalystEvent.affected_sectors。
         """
         from src.got.catalyst_config import SECTOR_ALIGN_SHADOW
 

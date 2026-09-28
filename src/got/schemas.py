@@ -427,7 +427,8 @@ class SectorContext(BaseModel):
     )
     crowded_families: list[str] = Field(
         default_factory=list,
-        description="拥挤家族名称列表（家族内 >=3 板块 severity>0.3），用于追加降权",
+        description="拥挤家族名称列表（家族内 >=3 板块 severity>0.3），用于追加降权；"
+                    "口径为工程启发式（B3 裁决 2026-09-28：维持现状+口径标注，不停产不新增接线）",
     )
     frame_group_lookup: dict[str, str] = Field(
         default_factory=dict,
@@ -502,7 +503,12 @@ class CatalystEvent(BaseModel):
     category_tag: str = Field(default="", description="drift / fade / binary（退出策略分型依据）")
     is_global: bool = Field(default=False, description="是否来自全球事件映射")
     source_news: Optional[str] = Field(default=None, description="来源新闻标题（LLM 叙事事件用于回声检测）")
-    affected_sectors: list[str] = Field(default_factory=list, description="T5: LLM 语义对齐后的受影响板块列表（叙事/global 事件多板块扇出）")
+    affected_sectors: list[str] = Field(
+        default_factory=list,
+        description="T5: LLM 语义对齐后的受影响板块列表（叙事/global 事件多板块扇出）。"
+                    "【P2-1 长期口径（裁决 #8，2026-09-28）】不区分正负面：扇出与加分对正/负面事件同向处理，"
+                    "已明示接受为长期口径，不升级 list[dict]",
+    )
     created_at: Optional[date] = None
 
 
@@ -540,9 +546,15 @@ class HotStock(BaseModel):
     stock_name: str
     mention_count: int
     sentiment: str = Field(default="positive")
-    associated_sectors: list[str] = Field(default_factory=list)
+    associated_sectors: list[str] = Field(
+        default_factory=list,
+        description="【闲置口径（2026-09-28 核，OPEN-D2 重判）】生产端恒空（sentiment_analysis.py 两写入点均 []）；"
+                    "原消费方 Node 6 G2 注意力闸已于 audit_20260922 Q2（09-23）改用 "
+                    "SectorContext.ths_hot_sectors，字段保留仅为归档兼容",
+    )
     mention_source: str = "unknown"  # D-P8: 口径声明。当前生产者仅 eastmoney_attention_index / xueqiu_attention 两个（sentiment_analysis.py）；
-    # nga_mention 为预留值，当前无生产者（A6 退役后 NGAS 源不在链路）——是否接线需先定语义，见 backlog §7 裁决 #2
+    # nga_mention 为预留值，当前无生产者（A6 退役后 NGAS 源不在链路）——**已拍板不接线、维持预留**
+    # （裁决 #2，2026-09-28：接无源枚举=死代码，属 backlog §9 缺陷谱系）
 
 
 class SentimentStageState(BaseModel):
@@ -948,7 +960,8 @@ class UnifiedContext(BaseModel):
     # ── 过热降权（Part 1: 家族拥挤信号透传）──
     crowded_families: list[str] = Field(
         default_factory=list,
-        description="拥挤家族名称列表（来自 Node 2，用于 Phase 2 追加降权）",
+        description="拥挤家族名称列表（来自 Node 2，用于 Phase 2 追加降权）；"
+                    "B3 裁决 2026-09-28：维持现状+口径标注（启发式阈值，不停产不新增接线）",
     )
     # ── 主线续航评估（v3.5 S4：信号展示 + 降权提示，不触发强制卖出）──
     mainline_endurance: list[MainlineEndurance] = Field(
@@ -987,7 +1000,13 @@ class UnifiedContext(BaseModel):
 class PortfolioRiskAssessment(BaseModel):
     """Phase 2 Step 1: 风险评估（约束设定）"""
     position_limit: float = Field(..., ge=0.0, le=1.0, description="仓位上限（来自 Phase 1）")
-    current_position_ratio: float = Field(..., ge=0.0, le=1.0, description="当前仓位比例")
+    current_position_ratio: float = Field(..., ge=0.0, le=1.0, description="当前仓位比例（经 min(1.0, raw) 截断后）")
+    raw_position_ratio: Optional[float] = Field(
+        default=None,
+        description="【OPEN-D9 / P2-3 观测留痕（排期批 3.1，2026-09-28）】未截断的原始仓位比（pre-clip）。"
+                    "current_position_ratio 被 min(1.0, raw) 截断后，13 天 buy_budget=0 不可证伪——"
+                    "本字段落盘截断前真值以供离线诊断。**不参与任何决策/仓位计算**，仅留痕",
+    )
     stop_loss_threshold: float = Field(default=-0.07, description="止损阈值（-7%）")
     sector_exposure_limits: dict[str, float] = Field(default_factory=dict, description="板块暴露上限")
     risk_budget: float = Field(default=0.05, description="风险预算（单笔最大亏损占总资产比例）。**派生自 `MarketRegime.risk_budget`，当前无消费者**")
@@ -1129,6 +1148,15 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="板块暴露绑定信息: {sum_limits, position_limit, ratio, "
                     "buy_allocation_count, binding_count, note}（binding_count 仅可观测留痕，不参与决策）",
+    )
+    # ── P1-4 / OPEN-1 W2 卖出来源观测留痕（排期批 4.1，2026-09-28）──
+    sell_source_shadow: Optional[dict] = Field(
+        default=None,
+        description="组合层超限减仓观测留痕: {mode, excess_value, target_position_value, "
+                    "projected_trim_value, planned_trims, grace_skipped_symbols, note}。"
+                    "mode=shadow 时不落任何决策（仅记录超限将削谁/是否撞家族宽限）；"
+                    "mode=enabled 时同步已写入 allocation。仅留痕，不参与判定。"
+                    "【按 #5a 先例：新增观测字段应移出 R-B8/幂等不变组，按设计 SKIP】",
     )
 
 

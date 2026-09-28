@@ -16,6 +16,7 @@ Phase 2: 统一决策节点（FINCON 风格的 Manager 角色）
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from datetime import date
@@ -267,6 +268,9 @@ class PortfolioDecisionNode:
             ambush_exit_signals=ambush_exit_signals,
             mainline_endurance=getattr(unified_context, "mainline_endurance", []),
             sector_exposure_binding=sector_exposure_binding,
+            # P1-4/OPEN-1 W2 卖出来源观测留痕（批 4.1）：影子/生效模式由 _allocate 落 self，
+            # 仅留痕不参与决策（shadow 模式 allocation 本身零改动）
+            sell_source_shadow=getattr(self, "_sell_source_shadow", None),
             data_quality=data_quality,
         )
 
@@ -389,6 +393,8 @@ class PortfolioDecisionNode:
         return PortfolioRiskAssessment(
             position_limit=position_limit,
             current_position_ratio=min(1.0, current_position),  # 限制在 0-1
+            # OPEN-D9/P2-3 观测留痕（批 3.1）：落盘 pre-clip 原值，不参与任何判定
+            raw_position_ratio=round(current_position, 4),
             stop_loss_threshold=stop_loss,
             sector_exposure_limits=sector_limits,
             risk_budget=risk_budget,
@@ -3721,6 +3727,12 @@ verdict 含义：
 
         # ── Step 1: 生成卖出建议并计算释放资金 ──
         sell_proceeds = 0.0  # 卖出释放的资金
+        # 评审修复#1（2026-09-28）：Step 1 同步维护「处理后的剩余股数」真相，供 Step 1.5 按
+        # 剩余敞口计算削减——杜绝重复卖单（sell 标的二次按原始股数开卖）与 sell_proceeds 虚增。
+        remaining_qty = {
+            s.symbol: int(holdings_map.get(s.symbol, {}).get("quantity", 0))
+            for s in unified_scoring if s.is_holding
+        }
 
         for score in unified_scoring:
             if not score.is_holding:
@@ -3739,6 +3751,7 @@ verdict 含义：
                 # 强制卖出（止损/衰竭/过热/板块踢出）
                 sell_value = quantity * last_price
                 sell_proceeds += sell_value
+                remaining_qty[score.symbol] = 0  # 评审修复#1：全清 → Step 1.5 不再触及
 
                 allocations.append(
                     TradeAllocation(
@@ -3766,6 +3779,8 @@ verdict 含义：
                 if reduce_quantity > 0:
                     sell_value = reduce_quantity * last_price
                     sell_proceeds += sell_value
+                    # 评审修复#1：扣减剩余敞口真相，Step 1.5 只可再削未处理部分
+                    remaining_qty[score.symbol] = quantity - reduce_quantity
 
                     allocations.append(
                         TradeAllocation(
@@ -3788,6 +3803,125 @@ verdict 含义：
                         )
                     )
 
+        # ── Step 1.5: 组合层超限减仓·卖出来源（P1-4 / OPEN-1 W2，排期批 4.1，2026-09-28）──
+        # 缺口（W1/W2）：Step 1 只由个股 action_recommendation 驱动卖出；当「个股未触发卖出、
+        # 但组合市值仍超目标仓位上限」时无任何减仓路径（Step 2 反而用释放资金回补 → 不减反买）。
+        # 本步补齐「卖出来源」：Step 1 卖出后若仍超限，按综合分升序削最弱持仓，直到回落至上限。
+        # 复用 Fix 3 宽限：sector_drift_grace=True 的持仓（板块漂移但家族仍强、已降级观察）不纳入
+        #   减仓候选，防 688598 式误卖——直接消费打分阶段落盘的宽限标记，不解析 reasoning 字符串
+        #   （规避 W4 脆弱耦合，W4 明确不在本批）。
+        # 三态开关（仿 ENABLED+SHADOW 双开关惯例，本项风险最高，先观察再转正）：
+        #   GOT_SELL_SOURCE_ENABLED=1 → 生效：真减仓（写 allocations + 累加 sell_proceeds + over_limit_forced）
+        #   ENABLED=0 & GOT_SELL_SOURCE_SHADOW=1（默认）→ 影子观察：只算「会削谁/多少/是否撞宽限」落
+        #       self._sell_source_shadow 留痕，**不写 allocations、不改 sell_proceeds/over_limit_forced**
+        #       → Step 2/3 决策逐字节不变（仅新增归档观测字段，按 raw_position_ratio/#5a 先例移出不变组）
+        #   两者皆 0 → 完全不进（逐字节还原改动前）
+        over_limit_forced = False
+        self._sell_source_shadow = None
+        _ss_enabled = os.getenv("GOT_SELL_SOURCE_ENABLED", "0") == "1"
+        _ss_shadow = os.getenv("GOT_SELL_SOURCE_SHADOW", "1") == "1"
+        if _ss_enabled or _ss_shadow:
+            post_sell_value = total_market_value - sell_proceeds
+            excess_value = post_sell_value - target_position_value
+            if excess_value > 0:
+                # 评审修复#1：候选与削减量一律基于 remaining_qty（Step 1 真相）——
+                # 已被 sell/reduce 处理过的标的只剩「未处理余量」可削，杜绝重复卖单。
+                trimmables = [
+                    s for s in unified_scoring
+                    if s.is_holding and not s.sector_drift_grace
+                    and remaining_qty.get(s.symbol, 0) > 0
+                ]
+                trimmables.sort(key=lambda x: x.composite_score)  # 先削最弱
+                grace_skipped = [
+                    s.symbol for s in unified_scoring
+                    if s.is_holding and s.sector_drift_grace
+                ]
+                # 先算「减仓计划」（生效/影子共用同一算法，影子模式只算不落决策）
+                plan = []  # [(score, quantity, last_price, reduce_quantity, sell_value)]
+                projected_value = 0.0
+                for score in trimmables:
+                    remaining_gap = excess_value - projected_value
+                    if remaining_gap <= 0:
+                        break
+                    position = holdings_map.get(score.symbol, {})
+                    quantity = remaining_qty.get(score.symbol, 0)  # 评审修复#1：剩余敞口而非原始股数
+                    last_price = position.get("last_price", 0.0)
+                    if quantity <= 0 or last_price <= 0:
+                        continue
+                    # 需削减股数：覆盖 remaining_gap 的最小整手（向上取整到 100），封顶清仓。
+                    # 评审修复#2：去掉 max(100,…)——零股（<100）按整笔清仓处理，
+                    # 不再被抬回一手导致负 target_quantity（逆仓内「不足一手不留负数」惯例）。
+                    reduce_quantity = min(math.ceil(remaining_gap / last_price / 100) * 100, quantity)
+                    if reduce_quantity <= 0:
+                        continue
+                    sell_value = reduce_quantity * last_price
+                    projected_value += sell_value
+                    plan.append((score, quantity, last_price, reduce_quantity, sell_value))
+                # 留痕（生效与影子都记，供归档复核「超限将削谁、是否撞宽限」）
+                self._sell_source_shadow = {
+                    "mode": "enabled" if _ss_enabled else "shadow",
+                    "excess_value": round(excess_value, 2),
+                    "target_position_value": round(target_position_value, 2),
+                    "projected_trim_value": round(projected_value, 2),
+                    "planned_trims": [
+                        {
+                            "symbol": s.symbol,
+                            "name": s.name,
+                            "reduce_quantity": rq,
+                            "sell_value": round(sv, 2),
+                        }
+                        for (s, _q, _lp, rq, sv) in plan
+                    ],
+                    "grace_skipped_symbols": grace_skipped,
+                    "note": (
+                        "W2 卖出来源留痕：shadow 模式不写 allocation/不改决策，"
+                        "仅观测超限将削谁、是否撞家族宽限；enabled 模式方落实减仓"
+                    ),
+                }
+                if _ss_enabled:
+                    over_limit_forced = True
+                    for (score, quantity, last_price, reduce_quantity, sell_value) in plan:
+                        pnl_pct = holdings_map.get(score.symbol, {}).get(
+                            "unrealized_pnl_pct", 0.0
+                        ) or 0.0
+                        sell_proceeds += sell_value
+                        allocations.append(
+                            TradeAllocation(
+                                symbol=score.symbol,
+                                name=score.name,
+                                action="sell",
+                                target_quantity=quantity - reduce_quantity,
+                                target_value=(quantity - reduce_quantity) * last_price,
+                                current_quantity=quantity,
+                                quantity_delta=-reduce_quantity,
+                                price_range=(last_price * 0.98, last_price),
+                                expected_return=pnl_pct / 100.0,
+                                stop_loss=round(last_price * 0.93, 2),
+                                risk_reward_ratio=0.0,
+                                confidence=0.7,
+                                reasoning=(
+                                    f"{score.reasoning}, "
+                                    f"[组合超限减仓: 削 ¥{sell_value:,.0f} 使仓位回落至上限]"
+                                ),
+                            )
+                        )
+                        logger.info(
+                            f"[Phase 2] W2 超限减仓：{score.name}({score.symbol}) 削 "
+                            f"{reduce_quantity} 股（¥{sell_value:,.0f}），"
+                            f"累计减仓 ¥{projected_value:,.0f} / 缺口 ¥{excess_value:,.0f}"
+                        )
+                    if not plan:
+                        logger.info(
+                            "[Phase 2] W2 超限但持仓均获家族宽限/无可削 → 不强卖（仅抑制回补）"
+                        )
+                else:
+                    # 影子：不改 sell_proceeds/over_limit_forced，Step 2/3 逐字节走旧逻辑
+                    logger.info(
+                        f"[Phase 2] W2 卖出来源·影子观察：超限 ¥{excess_value:,.0f}，"
+                        f"本会削 {len(plan)} 只（累计 ¥{projected_value:,.0f}），"
+                        f"家族宽限跳过 {len(grace_skipped)} 只——不落决策"
+                    )
+
         # ── Step 2: 计算买入预算（包括卖出释放的资金）──
         # 可用资金 = 现有现金 + 卖出释放的资金
         available_cash = total_cash + sell_proceeds
@@ -3798,7 +3932,18 @@ verdict 含义：
         position_gap = target_position_value - new_market_value
 
         # 买入预算 = min(仓位缺口, 可用资金)
-        if position_gap > 0:
+        # 评审修复#3：over_limit_forced 提为前置短路——Step 1.5 整手向上取整常态会留下
+        # 小正 gap（削过头），若让 position_gap>0 抢先，就会拿减仓款回补，违背 W1
+        # 「本轮暂停买入」承诺。仅 enabled 且确曾超限时为 True；影子/全关恒 False，旧路径逐字节不变。
+        if over_limit_forced:
+            # W1「超限反而继续买入」闭环：Step 1.5 减仓是为把仓位压回上限，属风控强平、
+            # 非「卖弱买强」的轮动信号 → 不得立刻用减仓款回补。预算归零。
+            buy_budget = 0.0
+            logger.info(
+                f"[Phase 2] W1 超限处置：仓位已压至上限 {target_position_value:,.0f} 附近，"
+                f"减仓款 ¥{sell_proceeds:,.0f} 不回补（本轮暂停买入）"
+            )
+        elif position_gap > 0:
             buy_budget = min(position_gap, available_cash)
         else:
             # 即使仓位已达标，如果有卖出操作，也应该用释放的资金买入新股

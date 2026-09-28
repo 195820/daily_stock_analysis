@@ -43,7 +43,7 @@
 | 项 | 说明 | 状态出处 |
 |---|---|---|
 | **A-P0-1 三处绕过** | `_list_archive_dirs` 统一入口未消灭全部 `iterdir()` 自排序 | R2.1 记为 ✅ 已修（三个 `iterdir()` 全消）；若需确认请复跑 `scripts/verify_same_day_idempotency.py` |
-| **A-P0-5** | Node 2 三处派生计数器补 `tracking_date < today` 过滤 | 首轮记为"部分"；第二轮未单列 |
+| **A-P0-5** | Node 2 三处派生计数器补 `tracking_date < today` 过滤 | ✅ **已落地（排期批 3.3，2026-09-28 复核）**——三个派生计数器（dwell/exit_pressure/wave）的 `prev_*` 均来自 `_load_all_sector_trends`（`sector_analysis.py:3934`）与 `_compute_wave_progress`（`:4340`），均已带 `tracking_date < today`；波函数 docstring（`:101`）亦明记 prev_record `< today`。首轮「部分」已补齐 |
 | **A-P0-6** | `ambush_position_snapshots` 改自然键 upsert + 收窄静默 `except` | 首轮解包 bug（P0-1）已修；DB 实测该表仍 **0 行**（见下条） |
 | **A-P0-9** | 归档侧快照标签 `snapshot_time` / `bar_complete`，只落 `meta.json` | 首轮 ⚠️（伴随 P1-6）；P1-6 已在 R2.1 修，是否收口待确认 |
 | **P4 快照路径解析** | `:1933` 仍用 `_extract_sector_from_reasoning` 解析候选 reasoning ⇒ 恒 `""` ⇒ `continue`；**DB 实测 `ambush_position_snapshots` 0 行** | R2.7(A) §8-4 记为"已修"（改 `scoring.sector_name`），副产物 `_extract_sector_from_reasoning` 成死代码。**0 行 ≠ 修复失效，见下注** |
@@ -97,9 +97,9 @@
 
 | 项 | 说明 | 状态 |
 |---|---|---|
-| **D-P1** | `divergent` 阈值与分位可观测（样本数 / 5% 分位 / `min()` 后最终阈值 / 每确认板块落盘） | 部分——缺分位落盘 |
+| **D-P1** | `divergent` 阈值与分位可观测（样本数 / 5% 分位 / `min()` 后最终阈值 / 每确认板块落盘） | ✅ **改判：随 A6 阶段 2 退役消解（排期批 3.2，2026-09-28 实测）**——原目标 `_divergent_threshold`/`_cross_check_capital` 已删（§4.2 动作 1），现 `divergent` 纯由 glue `capital_read=low` 经 `_GLUE_CAPITAL_READ_MAP`（`aggregator.py:1520-1523`）分类映射产出，**无阈值/分位可观测**；为其加分位落盘会制造新死代码（§9 缺陷谱系），故不改代码、只账本改判。历史基线（§8 #8 divergent_trigger_days=6）口径已换为 glue 时代 |
 | **D-P2** | 埋伏闸门逐层漏斗 `ambush_gate_funnel`（含 `evaluated` / `skipped_reason`） | ✅ **已落地（2026-09-26）**——`aggregator.py:2386-2397` gate_funnel 各闸补 `skipped`/`skipped_reason` + `_gate_stat` 计数唯一入口；死闸（`hot_sectors` 空 ⇒ G2/G3）与资金流缺失（`accum_strength=="missing"` ⇒ G4）改记 `skipped` + reason，不再虚计 `evaluated`；**不改 `_run_ambush_gates` 判定逻辑**；单测 `tests/test_node6_ambush_funnel.py`（空 hot_sectors→skipped、决策路径快照不变、同日重跑逐字节幂等） |
-| **D-P3** | 定义并落盘「正式池水位」目标 `AMBUSH_POOL_TARGET_RANGE` | 部分——常量双源（`archive.py` 仍硬编码 `(2,6)` + 过期 TODO）；`AMBUSH_POOL_MIN_DAYS` 零消费者（R2.9 #3 记为已删） |
+| **D-P3** | 定义并落盘「正式池水位」目标 `AMBUSH_POOL_TARGET_RANGE` | ✅ **已收口（2026-09-28 复核实测）**——双源已消解：常量单源 `catalyst_config.py:159`，`archive.py:454` 已改 import 读取（不再硬编码 `(2,6)`）；原记「常量双源 + 过期 TODO」作废，TODO 注释已同日更正。取值本身仍归 OPEN-D7（暂定 `(2,6)`） |
 | **D-P5** | 闸门文档诚实化（「4 层闸门」→ 标注 G2 注意力闸 / G3 未启用 + 加「未评估」留痕） | ✅ **已承接（2026-09-26）**——`architecture.md:506-509` 已标注 G2 注意力子闸 / G3「结构性不可达」（09-26 更新）；剩余「未评估」留痕由 D-P2 的 `skipped_reason` 承接（真正的载体在 `architecture.md`，非 `CLAUDE.md`），无单独动作 |
 | **D-P9** | `scripts/check_audit_claims.py` | 已建并入版本控制；实跑 `unverified = 9`（**2026-09-26 收口复算：`unverified = 7`**，差异均可归因，见 §2 注） |
 | **D-P10** | 附录 A 的可复算性（与 R-D2 对齐） | ✗——实算 4 项中 2 项与文档不一致 |
@@ -147,11 +147,11 @@
 | **P1-1** | 1 周内 | 持仓股 `name == symbol`（600250 / 605566） | **明确延后** | OPEN-D8：排在下一批 |
 | **P1-2** | 1 周内 | reasoning 中同一板块出现 ×3 | ✅ **已生效** | `portfolio_decision.py:1526-1535` `seen_canons` set 去重（D-P7）；⚠️ 原「代码未去重」的记载已过期 |
 | **P1-3** | 2 周内 | 50 只热股 `mention_count` 极差 <3%，无区分度 | **降级口径** | D-P8：加 `mention_source` 标注字段，**数值不动** |
-| **P1-4** | 2 周内 | `associated_sectors` 50/50 全空 | **挂起待查** | OPEN-D2：是否真无可靠数据源 |
+| **P1-4** | 2 周内 | `associated_sectors` 50/50 全空 | **重判：闲置口径，非待查**（2026-09-28） | OPEN-D2：原「是否真无可靠数据源」重判为「字段仍空但闸门已旁路」——G2 注意力闸已于 audit_20260922 Q2（09-23）改用 `SectorContext.ths_hot_sectors`（`aggregator.py:3136/3172`），生产端 `sentiment_analysis.py:804/835` 仍写空列表；口径标注已落（schemas `HotStock.associated_sectors`），字段保留仅为归档兼容 |
 | **P1-5** | 2 周内 | `reasoning.md` 中 Node 7 段出现 ×2 | ✅ **已生效**（见下注） | D-P6 → 并入 A-P0-8；`archive.py:642` 覆盖写 |
-| **P2-1** | 按需 | `affected_sectors` 不区分正负面 | **挂起待裁决**（原「待退役」作废，2026-09-26） | 原预期「随 §6.1 #10/#11 退役消失」不成立：T5 对齐层接线后重判**保留**，该字段仍被 `_group_events_by_sector` 扇出与 `portfolio_decision.py` 新闻加分活消费（`list[str]` 类型不变）。是否升级 `list[dict]` 转 §7 裁决 #8 |
+| **P2-1** | 按需 | `affected_sectors` 不区分正负面 | ✅ **已拍板 #8a（2026-09-28）：不升级 `list[dict]`，明示「不区分正负面」为长期口径** | 口径声明已落三处：`schemas.CatalystEvent.affected_sectors` 描述 + `aggregator._group_events_by_sector` docstring + `catalyst_calendar._align_events_to_sectors` docstring（翻案需同步改这三处，见 §7 #8） |
 | **P2-2** | 按需 | 催化剂日历膨胀至 92 个事件 | **症状消失，无归因** | — |
-| **P2-3** | 按需 | `current_position_ratio` 被 `min(1.0, raw)` 截断 ⇒ 26 个归档日中 **13 天 `buy_budget = 0`**，一笔都买不了 | **挂起待查** | OPEN-D9：截断不可证伪，建议落盘 `raw_position` |
+| **P2-3** | 按需 | `current_position_ratio` 被 `min(1.0, raw)` 截断 ⇒ 26 个归档日中 **13 天 `buy_budget = 0`**，一笔都买不了 | ✅ **已落盘 `raw_position_ratio`（排期批 3.1，2026-09-28）** | OPEN-D9：截断不可证伪已解——`portfolio_decision.py:392` 旁落 pre-clip 原值（`schemas.PortfolioRiskAssessment.raw_position_ratio`，Optional）。**仅留痕不参与判定**（单测 `TestRawPositionRatio` 3 例锁定：截断日 raw=1.3/current=1.0、未截断日 raw==current、raw 不影响 position_limit/stop_loss）；新字段按 #5a 先例应移出 R-B8 不变组。历史 13 天无法回填（旧归档无该字段），自下一次生产起可证伪 |
 | **P2-4** | 按需 | "其他"家族成垃圾箱 | ✅ **已生效** | "其他"占比 40.0% → 34.4% |
 | **P2-5** | 按需 | 破位信号不落盘，状态机决策无法离线复现 | ✅ **已生效** | 09-14 落 `break_signals` 83 条 |
 
@@ -170,8 +170,8 @@
 >
 > **2026-09-26 收口复算**：A6 阶段 2 落地后重跑，脚本 `unverified = 7`（P0-1 为退役后形状消失的残留计数，见 §2 表）。剩余 6 项均有归属（见 §2），R-D1 作为 burndown 已从 10 降到 7，本身不再阻塞任何验收。
 
-**统计**（2026-09-26 收口后）：已生效 6（P0-3 / P1-2 / P2-4 / P2-5 + 随退役消解 P0-1 / P0-2）+ 不修 1（P0-4）+ 症状消失 1（P2-2）+ 自愈待确认 1（P0-5）= **9 项了结**；
-降级口径 1 + 挂起 3（P1-4 / P2-3 / P2-1）+ 延后 1 = **5 项各有归属**；**真·未排期 = 0**。
+**统计**（2026-09-28 拍板轮后）：已生效 6（P0-3 / P1-2 / P2-4 / P2-5 + 随退役消解 P0-1 / P0-2）+ 不修 1（P0-4）+ 症状消失 1（P2-2）+ 自愈待确认 1（P0-5）+ 已拍板结案 1（P2-1 #8a）= **10 项了结**；
+降级口径 1（P1-3）+ 挂起 2（P1-4 重判闲置口径 / P2-3）+ 延后 1（P1-1）= **4 项各有归属**；**真·未排期 = 0**。
 
 ---
 
@@ -181,7 +181,7 @@
 
 | # | 项 | 要点 |
 |---|---|---|
-| OPEN-1 | 仓位链路 | 4 条已验证事实：W1 仓位超限无减仓路径（不减仓反而继续买入）；W2 两阶段结构已存在，只需给 Step 1 补卖出来源；W3 `total_equity` 与 `accounts[0]` 口径不一致（5 处）；W4 从 `reasoning` 字符串解析板块名的脆弱耦合 |
+| OPEN-1 | 仓位链路 | 4 条已验证事实：W1 仓位超限无减仓路径（不减仓反而继续买入）；W2 两阶段结构已存在，只需给 Step 1 补卖出来源；W3 `total_equity` 与 `accounts[0]` 口径不一致（5 处）；W4 从 `reasoning` 字符串解析板块名的脆弱耦合。**〔排期批 4.1 已实施 W2/W1（2026-09-28）〕**：`portfolio_decision.py::_allocate` 新增 **Step 1.5 组合层超限强制减仓**——Step 1 卖出后仍超 `position_limit` 时按综合分升序削最弱持仓回落至上限，**复用 Fix 3 宽限**（消费 `UnifiedScoringResult.sector_drift_grace` 标记跳过宽限持仓，不解析 reasoning 串→不触 W4，防 688598 式误卖）；W1「超限反续买」闭环（`over_limit_forced` 时 Step 2 `buy_budget=0`）。**三态开关**（仿 `ENABLED`+`SHADOW` 双开关惯例，本项风险最高，先观察再转正）：**`GOT_SELL_SOURCE_ENABLED`（生效，默认关）=真减仓**；**`GOT_SELL_SOURCE_SHADOW`（影子，默认开）=每日跑减仓检测、结果落 `PortfolioDecision.sell_source_shadow` 观测字段（`{mode, excess_value, planned_trims, grace_skipped_symbols…}`）但不写 allocation/不改 `sell_proceeds`/`over_limit_forced`→ 决策逐字节零改动**（新增观测字段按 raw_position_ratio/#5a 先例移出 R-B8/幂等不变组、按设计 SKIP）；两者皆关时 Step 1.5 整体跳过。（2026-09-28 修正：初版误将「默认关」当作「影子观察」，实为整步不进=零观察零作用，属写了不跑的死分支，违反本仓对产而不用字段的清理口径→ 改为真影子默认开。）单测 `tests/test_sell_source_over_limit.py` **11 例**（生效 3 + 评审边界 4 + 影子 2 + 全关 1 + 默认影子 1）全绿。**〔评审后修复 2026-09-28，CodeReview 实证〕**：①Critical——Step 1.5 候选未排除 Step 1 已 sell/reduce 标的且取原始股数 → 重复卖单 + sell_proceeds 虚增（污染 enabled 决策与 shadow 读数双向）→ Step 1 现维护 `remaining_qty` 真相，Step 1.5 削减量一律按剩余敞口计；②零股（<100 股）被 `max(100,…)` 抬回一手致负 target_quantity → 去掉 max，按 `min(ceil(…), remaining)` 整笔清仓；③W1 回补抑制被整手向上取整尾差击穿（`position_gap>0` 抢先，elif 永不进）→ `over_limit_forced` 提为 Step 2 前置短路。**转正门槛**：上述修复仅为计算正确性；多账户/外币口径（W3）仍为 `GOT_SELL_SOURCE_ENABLED=1` 的硬前置（现仍用聚合 excess 削 `accounts[0]`）；修复前影子期读数的 planned_trims 含重复标的，不可作标定输入。**W3/W4 仍单独立项（不在本批）** |
 | OPEN-1b | `REFINE_MAX_SECTORS` 混合口径 | `REFINE_MAX_SECTORS=20` < 0903 confirmed 24 ⇒ 至少 4 个板块从未进入 LLM 视野；D5 后 glue 视野=全部候选，混合口径自动消失，但 narrative 分支仍用该上限 |
 | OPEN-2 | 情绪面信号只到展示层 | `contrarian_signal` / `trading_signal` 不进入仓位公式也不进入准入判定，纯展示态 |
 | OPEN-3 | exhausted 判定与当日涨幅 | 原依据的 `one_day_drop` 已于 0902 P0-3 移除，需按现行 4 条判据重新评估 |
@@ -199,7 +199,7 @@
 
 - **OPEN-C1** `transition_count` 时间炸弹（约 2026-09-25）—— ✅ 语义缺陷已随 §7.1 实施修复（改统确认切换事件，不再依赖输出值存量）；阈值 5 未重标（原建议③），继续观察。**【已拍板 OPEN-C1a（2026-09-26）】**：接受「不区分正负面/暂不重标」风险并维持阈值 5，待 C-P12 样本齐后与 C-P13 同批重标（当前样本 <40 交易日，重标无数学依据）。**【样本更新（2026-09-26）】**：C-P12 A/B 各 9 天矩阵已齐，可作为重标输入；但 glue 样本窗（0901–0914）仍 <40 交易日，OPEN-C1a「暂不重标、继续观察」判定不变
 - **OPEN-C2** M3 人工流程未定义
-- **OPEN-C3** `persistence_regime == "low"` 也是 11/11 恒真 → 与 OPEN-C1 同批排查
+- **OPEN-C3** ~~`persistence_regime == "low"` 恒真~~ → **更正（2026-09-28 实测）：是永不触发死分支，非恒真**——`aggregator.py:3452` 要求 `persistence_regime == "low"`，但生产端 `sentiment_analysis.py` 从不写该字段，`getattr(..., None)` 恒 None ⇒ 「高震荡+低持续性」惩罚分支自接线以来零触发（属 §9 死分支缺陷谱系）。处置未决：接线/删分支/保留三选一，**决策简报已由排期批 2.2 产出**（见 `.review_tmp` 取证结论），本项转待拍板
 - **OPEN-C4** M1 的信息量到底多大 → 由 C-P12 曲线回答，**不预设**——✅ 曲线已产出（2026-09-26）：M1′ A 均值 43.6% vs B 均值 39.0%（B 反低，因任务1 强制 low 垫底拉低均摊）；具体信息量判读归负责人
 - **OPEN-C5** `agent_glue.json` 的当日覆盖语义与回填产物是否同语义
 - **OPEN-C6**（C-P13 阶段1 登记，2026-09-27）L1 的 K 值与 L5 的 τ 需在回放矩阵上联合网格标定（cp13 笔记 OPEN-1）——阶段1 初值 `GLUE_L1_TOP_K=12` 待矩阵标定；τ 标定属阶段2（L5 校准置信度），C-P13 红线 0.6 在阶段1 仍无真实概率可标
@@ -336,8 +336,8 @@ OPEN-B1…B7 —— 见 §1.B。
 | **Phase 4b** | remote §5 MarketThemeContext Step 2（mootdx 板块排名接入） | **A6 之后**；Step 1（模型定义）已完成 |
 | **Phase 4d** | remote §7 AlphaSift 选股引擎 | **A6 之后**（归零率基线重标 D-3） |
 | **Phase 5b** | remote §10 TickFlow 数据源 | **需申请 API Key** |
-| **Phase 5c** | glue P1 调参 + OPEN-1 家族仓位 | A6 转正 |
-| **P0-B B3** | `crowded_families` 处置（Node 2 停产 vs 修正口径） | **需与 Node 2 协商**（独立决策） |
+| **Phase 5c** | glue P1 调参 + OPEN-1 家族仓位 | **✅ 已拍板为本批主线（2026-09-28 排期）**，规格见 `archive/agent_glue_plan_0903.md` §P1（P1-1…P1-4）；⚠️ P1-1 分位重标需转正后 ≥10 交易日样本（预计 ~10-05 解锁），W3/W4 单独立项不在本批。**〔排期批 4 实施进度的2026-09-28〕**：✅ **4.1 W2/W1 卖出来源已落**（三态开关：`GOT_SELL_SOURCE_ENABLED` 生效默认关 + `GOT_SELL_SOURCE_SHADOW` 影子默认开·跑检测落 `sell_source_shadow` 观测字段不改决策；单测 7 绿，详 §3.1 OPEN-1）；✅ **4.5 zip 金丝雀已落**（`aggregator.py` 家族梯队 `zip(members, member_details)` 长度错配显式留痕，OPEN-4 X1 同型防御）；⏸️ **4.2 P1-1 分位重标 DEFER**（批 2.3 实测 `glue_consumed` 样本仅 **6<10** 交易日，按 gating 顺延至解锁日）；✅ **4.3 P1-2 护栏复核=验证性无代码**（OVERHEAT/top_n/_wave_coeff 本体不动）；⏳ **4.4 P1-3 `CATALYST_CONFIDENCE_GATE=0.7` 真校准=数值判定归负责人**（§0 性质约束，本批不擅自设值） |
+| **P0-B B3** | `crowded_families` 处置（Node 2 停产 vs 修正口径） | ✅ **已拍板（2026-09-28）：维持现状+加口径标注**，不停产不新增接线。注：旧「无消费者」记载过期——实有 3 处活消费（Node 6 续航 crowded 标记 / Phase 2 追加降权 ×0.90 / 埋伏 G3 输入，2026-09-28 grep 实测）；标注已落（`sector_analysis.py` 产出处 + schemas 两处字段描述） |
 
 ### 5.1 remote 中未被主文档承接的模块
 
@@ -379,13 +379,13 @@ OPEN-B1…B7 —— 见 §1.B。
 | # | 项 | 性质 |
 |---|---|---|
 | 1 | `sector_role_map` 的 fallback 是 `"mainline"`（**放大风险**而非保守侧） | ✅ **已拍板 #1a（2026-09-26）：保持 `"mainline"` 不变**。理由：实测归档侧显式未命中样本 = 0，修一个疑似无害的分支只有理论收益，且改取值会使全部历史回放基线漂移。注：「板块名非空但查不到→mainline 1.0×」与「验证清空→unknown 0.55×」两处口径不一致为**已知并被接受**，再翻案需新证据 |
-| 2 | ~~`GlueStrength.basis` 无生产者~~ ✅ **已结**（`basis` 是常量口径声明，语义落在 prompt `aggregator.py:824`，见 §1.C C-P9）；**仅剩** `HotStock.mention_source` 的 `nga_mention` 值无生产者（实测只有 `sentiment_analysis.py:805` eastmoney / `:836` xueqiu 两个生产者）。**【2026-09-26 半结】**注释层已落：`schemas.py:544` 声明 `nga_mention` 为预留值、当前无生产者（A6 退役后 NGAS 源不在链路）；是否接线需先定语义（下表） | 口径声明类，接线需先定语义 |
+| 2 | ~~`GlueStrength.basis` 无生产者~~ ✅ **已结**（`basis` 是常量口径声明，语义落在 prompt `aggregator.py:824`，见 §1.C C-P9）；**仅剩** `HotStock.mention_source` 的 `nga_mention` 值无生产者（实测只有 `sentiment_analysis.py:805` eastmoney / `:836` xueqiu 两个生产者）。**【2026-09-26 半结】**注释层已落：`schemas.py:544` 声明 `nga_mention` 为预留值、当前无生产者。**【已拍板 #2a（2026-09-28）：不接线、维持预留】**——A6 退役后 NGAS 源不在链路，接无源枚举=死代码（属 §9 缺陷谱系）；注释已同日更新标拍板，本项**结项** | ✅ **已拍板 #2a，结项（2026-09-28）** |
 | 3 | `signal_dates` 的口径：「**按次**」还是「**按日**」 | ✅ **已拍板 #3a 并实施（2026-09-26）：按日去重**——`persistence.py` 每种信号类型每日最多记 1 条，`signal_count_30d` 语义由「30 日次数」变为「30 日天数」（逐板块明细仍在 unified.json cross_node_signals 可取证）；单测 2 例（同日多板块共振 / 同日重跑幂等）。存量历史条目不改写，随 30 日窗口自然衰减；R5 复测仍按原计划 10-11 后跑 `verify_same_day_idempotency.py` 确认归零（详见 §9 #5） |
 | 4 | 存量的 **4 份测试污染归档产物**是否清理（`data/got_daily/20260911/agent_glue.json`、`20260912/agent_glue.json` 及各自 `_replay/` 一份） | ✅ **已拍板 #4b 并执行（2026-09-26）：备份后删除**——4 份已移入 `data/got_daily_backup_20260926_1700/`（留档清单含 md5 与 verification.md §2.2/§4.1 互证），原目录仅剩空 `_replay/` 子目录（盘点按文件存在性判定，无影响）；现场证据以备份 + verification.md 文字记载形式保留 |
 | 5 | **R-B8 的 `market_regime.*` 字段去留**（2026-09-14 干跑发现） | ✅ **已拍板 #5a 并实施（2026-09-26）：移出「应不变」清单**——`verify_layer_b_consistency.py` 的 `_collect_state_fields` 不再提取 regime/dwell_days/previous_regime/transition_count/transition_pending 五字段；`check_r_b8_r_b9` 对该子集单独比对并在证据行列「按设计 SKIP，不计 FAIL」；零生产代码改动，verification.md §4/§5.1 同步 |
 | 6 | **R-B8 / R-B9 / R-C7 在现工器下是否继续推进** | ✅ **已拍板 #6a（2026-09-26）：维持「仅归档」边界，不扩 `--got-replay` 链路**——§1.F.b 已自愈后主要痛点解除，扩链路成本/风险与收益不对等；§1.F.a 继续按设计文档记录限制 |
 | 7 | **regime 状态机切换计数器停摆根因分析**（2026-09-26 新增并经归档实测定根因，自 A6 阶段 2 条件 3 移出时登记）：见下方「§7.1 停摆根因实测」 | ✅ **已实施**（2026-09-26）：迟滞豁免（`pinned_days≥3`）解确认死锁 + `transition_events` 事件列表修正 `transition_count` 语义 + 应急回退开关 `DISABLE_REGIME_OSCILLATION_FIX`，详见 §7.1 实施记录 |
-| 8 | **P2-1 `affected_sectors` 是否升级 `list[dict]`（区分正负面）**（2026-09-26 收口时登记）：原预期随 T5 对齐层退役消失，接线后重判该层保留、字段活消费，「待退役」归属作废（见 §2 表） | 待定范围：若做，需同步改 `catalyst_calendar` 对齐 prompt、`_group_events_by_sector` 扇出与 `portfolio_decision` 加分三处；若不做，明示接受「不区分正负面」为长期口径 |
+| 8 | **P2-1 `affected_sectors` 是否升级 `list[dict]`（区分正负面）**（2026-09-26 收口时登记）：原预期随 T5 对齐层退役消失，接线后重判该层保留、字段活消费，「待退役」归属作废（见 §2 表） | ✅ **已拍板 #8a（2026-09-28）：不升级，明示「不区分正负面」为长期口径**。理由：需同步改 3 处且漂移历史回放基线，当前无「负面被当正面加分」的实证病例。口径声明已落三处（schemas 字段描述 / `_group_events_by_sector` / `_align_events_to_sectors`），翻案需新证据并同步改这三处 |
 
 ### 7.1 停摆根因实测（2026-09-26，逐日扫 `data/got_daily/*/unified.json` 的 `market_regime`）
 
@@ -495,3 +495,11 @@ python scripts/export_glue_family_audit.py                                      
 *修订：2026-09-26（C-P12 本体执行轮——prompt A/B 双版回放 + M2×M3 矩阵）—— **前置改造**：`GLUE_PROMPT_VARIANT`（a/b，仅 replay 生效、未知值回退默认）+ `GLUE_MAX_TOKENS`（默认 16000=现行生产值）双 env 落 `catalyst_config.py`；`aggregator._build_glue_prompt` 加 `variant` 形参 + 变体文案分支（A=现行+澄清句，B=任务1禁 unknown+任务3全量归属低置信保留+禁止编造护栏）；`agent_glue.json` 增 `prompt_variant` 留痕（`schemas.py`，schema 增量不改形状）。**--compare**：`verify_glue_metrics.py` 新增按变体逐日盘点 M1′/M2/低置信占比/放弃事件 + A/B ΔM2 矩阵 + 目录尾缀一致性校验 + `--m3-audit` 分层抽样预审表（种子=42）。**跑批**：A/B 各回放 0901/02/03/04/07/08/09/10/14 共 9 日，均 `status=ok`、`prompt_variant` 正确、md5 互异。矩阵实测：A 均值 M2=35.5%/低置信 6.8%、B 均值 M2=46.3%/低置信 40.8%（印证 §2.6 M2↔M3 拉锯；ΔM2 非单调）。⚠️ 0902 B 版撞 16000 截断（S1_empty），临时 24000(A)/32000(B) 重跑，该日与其他日不对称、破坏单日对照同参，已在 §1.C 行与草案披露。新增 `tests/test_glue_prompt_variant.py`（变体文案选择 + 共用区块锁死 + replay 门控 + 生产忽略 env + 未知值回退）。**R-C6 对照矩阵完整**（两版各 9 天 ≥8），达标判读归负责人；`--date 20260910` R-C3 锚点 PASS、R-C6 按设计 SKIP（无曲线判读即 SKIP）。回归：test_node6_glue + prompt_variant + replay_variant + a6_wiring 46 passed。C-P13/OPEN-C1 标定输入已解锁，数值标定归负责人。*
 
 *修订：2026-09-27（C-P12 事件级复核 + C-P13 架构调研登记）—— 事件级 A/B 对照表 `cp12_event_level_ab_20260926.md`（脚本 `.review_tmp/cp12_ab_event_table.py`，不入库）实测：A relation=336 / B=428，同事件同板块交集 168 / B 补挂 229 / A 有 B 无 104。**两项质量发现登记**：① **0902 A 版为退化重复循环**（191 条 relation 仅 28 命中事件，属生成/解码故障非 prompt 内容问题，该日应在 C-P13 标定中**整日作废**而非降权）；② **B 版存在真·过度归属幻觉**（0903 房贷→24 板含减肥药/短剧游戏、金价→短剧游戏）→ 现有 10 行分层预审样本抽不到高扇出病态事件、**M3_B 会被低估**，若终审需补「单事件 relation≥8 高扇出过采样」专项表。**架构结论与修正方案**：A/B 是同一生成架构在召回/精确单旋钮上的两端（§2.6 拉锯为结构性），外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）一致指向**转向「接地式召回-验证」5 层管线**（检索接地候选有界化 + CAD 受约束生成 + CoVe 精筛 + 图谱衰减传播 + 校准置信度），红线 0.6 应标在校准后置信度上——详见 `cp13_grounding_pipeline_research_20260926.md`（待拍板）。§1.C C-P13 行同步追加复核注。本轮纯文档登记，零代码/行为变更。*
+
+*修订：2026-09-28（非冻结项排期轮 · 第二批拍板 + 账本修正）—— **四项拍板登记**：§7 #2 `nga_mention` 结项（#2a 不接线维持预留）；§7 #8 P2-1 结项（#8a 不升级 list[dict]，长期口径，声明落三处：schemas/`_group_events_by_sector`/`_align_events_to_sectors`）；§5 B3 定方向（维持现状+口径标注，并更正旧「无消费者」过期记载——实有 3 处活消费）；§5 Phase 5c 拍板为本批主线（P1-1 需转正后 ≥10 交易日，预计 ~10-05 解锁）。**三处账本过期修正**：§1.D D-P3 → ✅ 已收口（双源已消解，`catalyst_config.py:159` 单源 + `archive.py:454` import）；§2 P1-4（OPEN-D2）→ 重判「闲置口径非待查」（G2 已改 ths_hot_sectors）；§3.3 OPEN-C3 → 更正为**永不触发死分支非恒真**（生产端从不写 persistence_regime），处置转决策简报。§2 统计同步（了结 9→10，归属 5→4）。同轮代码注记：`catalyst_config.py` D-P3 TODO 更正、B3/P2-1/OPEN-D2/#2a 四处口径注释——**均零行为变更**（注释/docstring/字段描述，不进任何计算路径）。*
+
+*修订：2026-09-28（非冻结项排期轮 · 批 2–4 执行）—— **批 2（取证）**：`.review_tmp/sched28_forensics.py` 扫 48 归档日只读取证（mention_count 分布 / OPEN-C3 触发面 / `glue_consumed` 样本计数 / P2-3 截断抽查）；OPEN-C3 死分支三选一决策简报 `docs/got/decision_brief_openc3_20260928.md`（建议删死分支，待负责人拍板）；5c 样本实测 **6<10** 交易日→锁定批 4.2 DEFER。**批 3（观测落盘）**：P2-3/OPEN-D9 `raw_position_ratio` pre-clip 原值已落（schemas 新字段 + `_assess_risk` 返回体，单测 `TestRawPositionRatio` 3 绿）；D-P1 divergent 分位落盘→改判随 A6 退役消解（零代码，避免造新死代码）；A-P0-5 核实已落地（`tracking_date < today`，幂等静态检查 A4 PASS 佐证）。**批 4（Phase 5c 行为变更）**：4.1 W2/W1 卖出来源已落（`_allocate` Step 1.5 + W1 回补抑制，`GOT_SELL_SOURCE_ENABLED` 默认关，宽限走 `sector_drift_grace`）+ 单测 `test_sell_source_over_limit.py` 5 绿；4.5 zip 金丝雀已落；4.2 DEFER（样本 6<10）/ 4.3 验证性无代码 / 4.4 数值判定归负责人。**回归**：got/portfolio/sell_source/winrate/glue 域 421 passed；5 例失败均判环境/既有（3×`exchange-calendars` 未装→交易日检查禁用、2×node6_glue 批量跑跨用例全局态污染但隔离跑均绿）；R-C3 十锚点逐位一致 PASS（glue 口径未触）；幂等静态形状 A1–A6 全 PASS（R1/R3/R4/R6 需实跑双快照 SKIP、R2/R5 为数据态预存 FAIL，均非本批代码所动）。验收红线判读归负责人。*
+
+*修订：2026-09-28（批 4.1 CodeReview 后修复①②③）—— 三视角评审实证三项计算缺陷并修复：①Critical 重复卖单（Step 1.5 候选未排除 Step 1 已 sell/reduce 标的且取原始股数 → 同一 symbol 二次开卖 + proceeds 虚增，双向污染 enabled 与 shadow 读数）→ Step 1 维护 `remaining_qty` 真相；②零股负股数（`max(100,min(…))` 对 <100 股抬回一手）→ 去 max 改整笔清仓；③W1 抑制被整手尾差击穿（`position_gap>0` 抢先于 `elif`，实测同轮 sell+buy 并存）→ `over_limit_forced` 提为前置短路。单测 7→**11 例**（新增重复削减/reduce 余量/零股/取整超配 4 边界），关联回归 48+11 全绿。未修登记：Warning④ `.env.example` 开关区未录入、Warning⑤ W3 聚合口径削 `accounts[0]`（标为 enabled 转正硬前置）；建议项（`__init__` 初始化影子态/金丝雀补测/字段改名）及「R-B8 移出组」表述校准（校验脚本按显式字段清单取数，新字段本不在清单内）归负责人。**修复前影子读数不可作标定输入**。*
+
+*修订：2026-09-28（批 4.1 设计修正·默认关→真影子）—— 负责人指出「影子开关关了不跑，写它干啥」：初版 `GOT_SELL_SOURCE_ENABLED` 默认 OFF 使 Step 1.5 整段 `if` 不进，等于**零观察零作用**，与仓内 `_SHADOW` 惯例（跑但不生效，如 `AGENT_SEMANTIC_GLUE_SHADOW`）不符，属写了不跑的死分支。→ 重构为**三态**：新增 `GOT_SELL_SOURCE_SHADOW`（默认开）每日跑减仓检测、将「本会削谁/多少/是否撞家族宽限」落新增观测字段 `PortfolioDecision.sell_source_shadow`，**但不写 allocation、不改 `sell_proceeds`/`over_limit_forced`→ 决策逐字节零改动**；`GOT_SELL_SOURCE_ENABLED`（默认关）作为后续「转正」才开的生效开关。新增字段按 raw_position_ratio/#5a 先例标注移出 R-B8/幂等不变组。单测扩至 **7 例**（生效 3 + 影子 2 + 全关 1 + 默认影子 1）全绿；`test_phase2_audit_fixes.py`+`test_portfolio_decision_lot_rejection.py` 27 绿（含构造完整 decision 的路径，验证新字段接线无碍）。*

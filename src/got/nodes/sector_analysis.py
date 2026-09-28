@@ -3373,6 +3373,9 @@ class SectorAnalysisNode:
         }
         # crowded_families: 家族内 >=3 板块 severity>0.3 → 列入拥挤名单；
         # frame_group_lookup: 板块名→家族名全量表，供 Node 6 合成 detail 回退时查表（同 overheat_lookup 口径）
+        # 【B3 口径标注（2026-09-28 裁决：维持现状）】≥3/>0.3 为工程启发式（未外部标定），
+        # 随过热 severity 同源派生；活消费方：Node 6 续航 crowded 标记 / Phase 2 家族追加降权 ×0.90 /
+        # 埋伏 G3 黑名单输入。非无消费者字段（旧 OPEN-5 Y2 记载已过期，见 backlog §7 B3）。
         _family_overheat_count: dict[str, int] = {}
         frame_group_lookup: dict[str, str] = {}
         for s in analyzed:

@@ -2899,6 +2899,10 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         若事件有 affected_sectors（T5 多板块扇出），一条事件进入多个桶；
         否则按 event.sector 单键分组。
+
+        【P2-1 长期口径（裁决 #8，2026-09-28）】扇出不区分正负面——
+        负面事件与正面事件同样进桶并参与下游加分，已明示接受为长期口径，
+        affected_sectors 不升级 list[dict]（若翻案需同步改对齐 prompt/本扇出/portfolio 加分三处）。
         """
         from src.got.board_aliases import normalize_sector_name
         grouped: dict[str, list[CatalystEvent]] = {}
@@ -3805,6 +3809,16 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
             # 梯队分层（波次口径：wave_days ≥6 veteran / 3-5 mid / ≤2 new）
             tiers = {"veteran": [], "mid": [], "new": []}
+            # P1-1 尾巴 / OPEN-4 X1 同型防御（排期批 4.5，2026-09-28）：
+            # member_details 现由上方列表推导按 members 1:1 生成，长度恒等 → zip 不会截断。
+            # 此处仅设「金丝雀」：一旦未来改动破坏该不变式（两列表错长），zip 的静默截断
+            # 会丢成员而不报错，故显式校验并留痕（不抛异常、不改变现有行为）。
+            if len(members) != len(member_details):
+                logger.error(
+                    "[OPEN-4/X1 防御] 家族 %s members(%d) 与 member_details(%d) 长度错配，"
+                    "下方 zip 将静默截断——请核查 member_details 构造处是否仍与 members 1:1",
+                    family_name, len(members), len(member_details),
+                )
             for m, d in zip(members, member_details):
                 w = getattr(d, "wave_days", 0) or 0 if d is not None else 0
                 if w >= 6:

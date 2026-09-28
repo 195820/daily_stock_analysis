@@ -403,5 +403,48 @@ class TestReplay0924(unittest.TestCase):
                              {normalize_sector_name(k) for k in flow_all})
 
 
+# ─────────────────── OPEN-D9/P2-3 raw_position_ratio 观测留痕 ───────────────────
+
+class TestRawPositionRatio(unittest.TestCase):
+    """排期批 3.1（2026-09-28）：current_position_ratio 被 min(1.0, raw) 截断后，
+    新增 raw_position_ratio 落盘 pre-clip 真值供离线证伪 13 天 buy_budget=0。
+    红线：仅留痕，不得参与任何决策/仓位计算。"""
+
+    def _node_and_ctx(self):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode()
+        ctx = SimpleNamespace(
+            final_position_limit=0.5, market_regime=None,
+            confirmed_sectors=[], ambush_pool=[],
+        )
+        return node, ctx
+
+    def test_raw_value_preserved_when_clipped(self):
+        """仓位 130% → current 截为 1.0，但 raw 落盘 1.3（证伪截断）"""
+        node, ctx = self._node_and_ctx()
+        portfolio = {"total_equity": 100_000.0, "total_market_value": 130_000.0}
+        risk = node._assess_risk(ctx, portfolio)
+        self.assertEqual(risk.current_position_ratio, 1.0)  # 截断后不变
+        self.assertAlmostEqual(risk.raw_position_ratio, 1.3, places=4)  # pre-clip 真值
+
+    def test_raw_equals_current_when_not_clipped(self):
+        """仓位 20%（未触顶）→ raw == current"""
+        node, ctx = self._node_and_ctx()
+        portfolio = {"total_equity": 100_000.0, "total_market_value": 20_000.0}
+        risk = node._assess_risk(ctx, portfolio)
+        self.assertAlmostEqual(risk.current_position_ratio, 0.2, places=4)
+        self.assertAlmostEqual(risk.raw_position_ratio, 0.2, places=4)
+
+    def test_raw_position_not_consumed_by_constraint(self):
+        """raw 不影响 position_limit / stop_loss 等任何判定输出
+        （截断前后两套仓位给出不受 raw 影响的相同约束）"""
+        node, ctx = self._node_and_ctx()
+        clipped = node._assess_risk(ctx, {"total_equity": 100_000.0, "total_market_value": 130_000.0})
+        normal = node._assess_risk(ctx, {"total_equity": 100_000.0, "total_market_value": 50_000.0})
+        # 两者 position_limit / stop_loss 一致（不因 raw 差异而变）
+        self.assertEqual(clipped.position_limit, normal.position_limit)
+        self.assertEqual(clipped.stop_loss_threshold, normal.stop_loss_threshold)
+
+
 if __name__ == "__main__":
     unittest.main()
