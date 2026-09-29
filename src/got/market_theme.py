@@ -115,15 +115,14 @@ def _classify_phase(change_1d: float, change_3d: float, change_5d: float) -> str
     - accelerating：三时框全部 >0（近-中-长同向向上 = 主升加速）
     - warming：5 日 >0 但未全面加速（中期升温，短期动能不齐）
     - cooling：5 日 <=0（走弱/退潮；5 日负而 3 日正为典型退潮）
-    - unknown：无有效数据
+    无效数据（板块缺失/取数失败）不经此函数——由 build_theme_context 的
+    unknown() 兜底路径整体承担（审查修复 #3：原穷尽分支后的 unknown 返回不可达，删除）。
     """
     if change_5d > 0 and change_3d > 0 and change_1d > 0:
         return "accelerating"
     if change_5d > 0:
         return "warming"
-    if change_5d <= 0:
-        return "cooling"
-    return "unknown"
+    return "cooling"
 
 
 def _strength_score(change_5d: float, all_changes: List[float]) -> int:

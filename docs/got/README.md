@@ -17,7 +17,7 @@
 | 1 | **A6 阶段 2 · 退役**（backlog §4.2） | ✅ **已完工**（2026-09-26：规则评分模式三件套退役；负责人裁决放弃逐板块兜底（漏命中改 neutral 垫底）+ 提前跨过条件 2，单 commit 可回退） | —（已执行，详见 backlog §4.2「已执行动作」） |
 | 2 | [`plans/win_rate_optimization_plan.md`](plans/win_rate_optimization_plan.md) — 选股胜率优化 4 步（9 月回测驱动） | **已实施**（2026-09-17：4 步入码 + `GOT_WINRATE_*` 开关 + `tests/test_winrate_optimization.py` 16 测试，回归 309 passed；待 9 月后回测复验胜率改善） | 无（每步独立开关、独立可验证） |
 | 3 | [`plans/ambush_split_plan.md`](plans/ambush_split_plan.md) — 埋伏分支拆分 | 设计收口（18 项决策落定），待实施 | 注意其 P1/P2 子项已在 CHANGELOG 记为完成，实施前先对账 |
-| 4 | Phase 3b / 4b / 4d / 5b / 5c（backlog §5） | 排期未定 | 全部 **A6 之后**；5b 需 TickFlow API Key |
+| 4 | Phase 3b / 4b / 4d / 5b / 5c（backlog §5 排期轮） | **影子态落地**（2026-09-28 批次 5：5b TickFlow 探测证伪其作板块排名源→mootdx 先行定案；4b `market_theme.py` Step 2 / 3b `disagreement.py` 分歧摘要+RiskOverridePlan / 4d 前置 funnel_stats，均默认影子零决策改动；4.1 超限减仓三态开关已落，批 2 取证判 5c 样本 6<10 → DEFER） | enabled 转正归负责人 + 需影子期读数；相关性验收脚本 `.review_tmp/cp4b_correlation_acceptance.py` 为 4b 转正前置 |
 | 5 | Phase 6 盘中 0→1 确认闸门（[`archive/intraday_gate_plan_0907.md`](archive/intraday_gate_plan_0907.md)） | 草案 | 硬前置 Phase 6-0 数据地基（五档量/分时/竞价/盘中调度），地基未验收前不开影子期 |
 
 **需裁决事项**入口：[`backlog.md` §7](backlog.md)（6 条开放裁决）。

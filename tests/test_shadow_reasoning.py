@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""影子模式观测段（reasoning.md 末尾）的渲染测试。
+"""影子模式观测段（reasoning.md 末尾）与 A6 转正子块的渲染测试。
 
-覆盖三条影子线（A5 glue / T1 候选股终审 / T1-H 持仓审查）各自的：
+覆盖五条影子线（4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 /
+T1-H 持仓审查）各自的：
 - 有内容时的叙述 + 明细
-- **未执行时的原因留痕**（用户要求：没有就说一句没有，且要说明为什么）
+- **未执行/无产物时的原因留痕**（用户要求：没有就说一句没有，且要说明为什么）
 - 产物缺失时的降级
+并覆盖 A6 glue 转正后的 Node 6 正文子块（叙述 + 全量语义表）。
 """
 from __future__ import annotations
 
@@ -17,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.got.archive import (  # noqa: E402
     _render_shadow_section,
+    _render_a6_glue_formal,
     SHADOW_SECTION_TITLE,
+    A6_FORMAL_SECTION_TITLE,
 )
 
 CODE_TO_NAME = {"880754": "培育钻石", "880550": "PCB概念"}
@@ -68,8 +72,51 @@ def _glue_ok() -> dict:
     }
 
 
-def test_all_three_lines_present() -> None:
-    """三条线都有内容时，各自成段。"""
+def _unified_with_shadow() -> dict:
+    """unified.json 影子字段样本（4b market_theme_shadow + 3b conflict_summary_shadow）。"""
+    return {
+        "confirmed_sectors": [
+            {"sector_code": "880754", "sector_name": "培育钻石"},
+            {"sector_code": "880550", "sector_name": "PCB概念"},
+        ],
+        "contradictions": [{"a": 1}, {"b": 2}],
+        "market_theme_shadow": {
+            "status": "ok",
+            "source": "mootdx_quick_change",
+            "top5_concepts": [
+                {"name": "红黄酒", "rank": 1, "change_pct": 4.03},
+                {"name": "房产服务", "rank": 2, "change_pct": 0.57},
+            ],
+            "breadth": {"accelerating_count": 11, "warming_count": 55,
+                        "cooling_count": 586, "total_count": 652},
+            "note": "active=15 leading=10",
+        },
+        "conflict_summary_shadow": {
+            "bullish_agents": [{"agent_name": "family_rank", "signal": "buy", "confidence": 1.0}],
+            "bearish_agents": [{"agent_name": "capital", "signal": "sell", "confidence": 0.8}],
+            "neutral_agents": [{"agent_name": "regime", "signal": "hold", "confidence": 0.5}],
+            "conflict_type": "bull_bear_split",
+            "decision_path_hint": "多空分歧，降仓观察",
+            "risk_control": {"veto_buy": True, "reason": "极端分歧触发否决"},
+        },
+    }
+
+
+def _sell_source_shadow() -> dict:
+    """portfolio_decision.json 的 4.1 超限减仓影子样本。"""
+    return {
+        "mode": "shadow",
+        "excess_value": 12000.0,
+        "projected_trim_value": 9000.0,
+        "planned_trims": [
+            {"symbol": "600189", "name": "泉阳泉", "reduce_quantity": 500, "sell_value": 9000.0},
+        ],
+        "grace_skipped_symbols": ["603716"],
+    }
+
+
+def test_all_five_shadow_lines_present() -> None:
+    """五条线都有内容时，各自成段（A5 已移出影子段，仅剩降级观测）。"""
     text = "\n".join(
         _render_shadow_section(
             glue=_glue_ok(),
@@ -81,31 +128,86 @@ def test_all_three_lines_present() -> None:
                                "verdict": "reduce", "confidence": 0.7,
                                "reasoning": "浮亏触及止损线"}]},
             code_to_name=CODE_TO_NAME,
+            unified=_unified_with_shadow(),
+            sell_source_shadow=_sell_source_shadow(),
         )
     )
     assert SHADOW_SECTION_TITLE in text
-    assert "A5 语义粘合层" in text
+    assert "4b 市场结构" in text
+    assert "3b 分歧摘要" in text
+    assert "4.1 超限减仓" in text
     assert "T1 候选股终审" in text
     assert "T1-H 持仓审查" in text
+    # A5 已转正，正常态不再出现在影子段
+    assert "A5 语义粘合层" not in text
     # 明细被展开
     assert "000520" in text and "凤凰航运" in text
-    assert "600250" in text
-    assert "reduce" in text
+    assert "600250" in text and "reduce" in text
 
 
-def test_a5_renders_table_with_board_name() -> None:
-    """A5 段出表，board_code 映射为中文板块名。"""
-    text = "\n".join(_render_shadow_section(glue=_glue_ok(), t1=None, t1h=None,
-                                            code_to_name=CODE_TO_NAME))
+def test_a6_formal_renders_table_with_board_name() -> None:
+    """A6 转正子块出表，board_code 映射为中文板块名，措辞为已转正。"""
+    text = "\n".join(_render_a6_glue_formal(
+        _glue_ok(), glue_consumed=True, glue_status="ok", code_to_name=CODE_TO_NAME))
+    assert A6_FORMAL_SECTION_TITLE in text
+    assert "已转正" in text
     assert "| 板块 |" in text          # 表头
     assert "培育钻石" in text           # 名字映射成功
     assert "PCB概念" in text
     assert "AI硬件" in text             # 家族列
     assert "苹果折叠屏" in text          # 传导路径
-    # 表内用中文板块名，不出现裸 board_code（映射失败才回退为代码）
-    assert "880754" not in text
-    # 计数正确
-    assert "2 个候选板块" in text or "2 个" in text
+    assert "880754" not in text         # 表内用中文名，不出现裸 board_code
+    assert "2 个候选板块" in text or "2 条强度判定" in text
+
+
+def test_a6_formal_consumed_vs_not() -> None:
+    """glue_consumed 决定措辞：已消费替换四件套 / 未消费保留规则侧。"""
+    consumed = "\n".join(_render_a6_glue_formal(
+        _glue_ok(), glue_consumed=True, glue_status="ok", code_to_name=CODE_TO_NAME))
+    not_consumed = "\n".join(_render_a6_glue_formal(
+        _glue_ok(), glue_consumed=False, glue_status="S1_call_failed", code_to_name=CODE_TO_NAME))
+    assert "已消费" in consumed
+    assert "未消费" in not_consumed
+
+
+def test_market_theme_shadow_render_and_missing() -> None:
+    """4b 影子线：有 market_theme_shadow 时展开读数，无时明说开关/不可达。"""
+    has = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}, unified=_unified_with_shadow()))
+    assert "4b 市场结构" in has and "红黄酒" in has and "accelerating=11" in has
+    missing = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}, unified={}))
+    assert "4b 市场结构" in missing and "无产物" in missing
+
+
+def test_disagreement_shadow_render_counts_and_diff() -> None:
+    """3b 影子线：分类计数 + 与现行 contradictions[] 差异 + veto_buy。"""
+    text = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}, unified=_unified_with_shadow()))
+    assert "3b 分歧摘要" in text
+    assert "bull_bear_split" in text
+    assert "看多 1 / 看空 1 / 中性 1" in text
+    assert "veto_buy" in text
+    assert "差异" in text
+
+
+def test_sell_source_shadow_render_and_missing() -> None:
+    """4.1 影子线：展示缺口/计划减仓/宽限跳过；无产物时明说未超限。"""
+    has = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}, sell_source_shadow=_sell_source_shadow()))
+    assert "4.1 超限减仓" in has
+    assert "600189" in has and "泉阳泉" in has
+    assert "603716" in has  # 宽限跳过
+    missing = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}, sell_source_shadow=None))
+    assert "4.1 超限减仓" in missing and "无产物" in missing
+
+
+def test_baseline_warning_note_present() -> None:
+    """影子段头注必须标明 2026-09-29 前读数无效（P0 #1 修复前 run() 崩）。"""
+    text = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}))
+    assert "2026-09-29" in text and "import os" in text
 
 
 def test_t1_not_executed_states_reason() -> None:
@@ -195,10 +297,19 @@ def _write_artifacts(day_dir: Path) -> None:
         json.dumps({"line": "t1h", "executed": False, "reason": "当前无持仓"},
                    ensure_ascii=False), encoding="utf-8")
     (day_dir / "unified.json").write_text(
-        json.dumps({"confirmed_sectors": [
-            {"sector_code": "880754", "sector_name": "培育钻石"},
-            {"sector_code": "880550", "sector_name": "PCB概念"},
-        ]}, ensure_ascii=False), encoding="utf-8")
+        json.dumps({
+            "confirmed_sectors": [
+                {"sector_code": "880754", "sector_name": "培育钻石"},
+                {"sector_code": "880550", "sector_name": "PCB概念"},
+            ],
+            "market_theme_shadow": {"status": "ok", "source": "mootdx_quick_change",
+                                   "top5_concepts": [], "breadth": {"total_count": 3}},
+            "conflict_summary_shadow": {"conflict_type": "none",
+                                        "bullish_agents": [], "bearish_agents": [],
+                                        "neutral_agents": []},
+        }, ensure_ascii=False), encoding="utf-8")
+    (day_dir / "portfolio_decision.json").write_text(
+        json.dumps({"sell_source_shadow": None}, ensure_ascii=False), encoding="utf-8")
 
 
 def test_shadow_section_appended_and_not_duplicated(tmp_path: Path) -> None:
@@ -224,8 +335,63 @@ def test_shadow_section_appended_and_not_duplicated(tmp_path: Path) -> None:
     assert "## Node 6 聚合研判" in second
     # 末版为准：第二次的 Node 7 内容生效，第一次的消失
     assert "第二次运行。" in second and "本次不做调整。" not in second
-    # 至少三条线的标题都在（均为"未执行+原因"路径）
-    assert "A5 语义粘合层" in second and "无候选进入终审" in second
+    # 五条影子线标题均在（4b/3b/4.1/T1/T1-H），且 A5 已移出影子段
+    for line in ("4b 市场结构", "3b 分歧摘要", "4.1 超限减仓",
+                 "T1 候选股终审", "T1-H 持仓审查"):
+        assert line in second
+    assert "A5 语义粘合层" not in second
+    # 重跑后各线也只留一份（不堆积）
+    assert second.count("4b 市场结构") == 1 and second.count("T1-H 持仓审查") == 1
+    assert "无候选进入终审" in second
+
+
+def test_write_reasoning_md_inserts_a6_formal_and_defers_theme(tmp_path: Path) -> None:
+    """Phase 1 主正文：A6 转正子块固定出现；4b 影子态不进 🧭（收编 🧪）。
+
+    直接跑 _write_reasoning_md（无现存集成测试覆盖 Phase 1 渲染），
+    确保新增的 A6 子块与 🧭 只显已用态的改动不破坏主正文生成。
+    """
+    import json
+    from datetime import date
+    from types import SimpleNamespace
+
+    from src.got.archive import _write_reasoning_md, GLUE_ARTIFACT
+
+    empty = SimpleNamespace(reasoning="")
+    confirmed = [SimpleNamespace(
+        sector_code="880754", sector_name="培育钻石", classification="actionable",
+        composite_score=70.0, capital_check="aligned", news_check="catalyzed",
+        sentiment_check="high", sector_role="mainline", mainline_tier="T1", confidence=0.8,
+    )]
+    unified = SimpleNamespace(
+        market_regime=None, market_theme=None,
+        market_theme_shadow={"status": "ok", "source": "mootdx", "top5_concepts": [],
+                             "breadth": {}, "note": "x"},
+        confirmed_sectors=confirmed, ambush_pool=[], ambush_reservoir=[],
+        ambush_veto_log=[], cross_node_signals=[], reasoning="聚合结论",
+        glue_consumed=True, glue_status="ok",
+    )
+    glue = {
+        "status": "ok", "degraded": False,
+        "strengths": [{"board_code": "880754", "strength": 0.6, "news_read": "high",
+                       "capital_read": "low", "sentiment_read": "medium"}],
+        "relations": [{"board_code": "880754", "propagation_path": ["事件", "板块"]}],
+        "families": [{"board_code": "880754", "family": "消费"}],
+    }
+    (tmp_path / GLUE_ARTIFACT).write_text(
+        json.dumps(glue, ensure_ascii=False), encoding="utf-8")
+    ctx = {"market": empty, "sector": empty, "capital": empty,
+           "news": empty, "sentiment": empty, "unified": unified}
+
+    out_path = tmp_path / "reasoning.md"
+    _write_reasoning_md(out_path, ctx, date(2026, 9, 28))
+    out = out_path.read_text(encoding="utf-8")
+
+    assert A6_FORMAL_SECTION_TITLE in out
+    assert "已消费（glue 直接替换四件套）" in out
+    assert "培育钻石" in out and "消费" in out
+    # 影子态 4b 不在主正文（已由 🧪 承载）；仅 market_theme 非 None 才升格
+    assert "市场结构" not in out
 
 
 # ══════════════════════════════════════════════════════════════════════

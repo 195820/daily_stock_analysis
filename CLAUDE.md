@@ -8,9 +8,9 @@
 
 ### GOT 运行规范
 
-- **影子模式输出总结**：当 GOT 运行包含影子模式内容（如 A6 glue 影子模式）时，运行完成后必须在终端输出总结，包括：
+- **影子模式输出总结**：当 GOT 运行包含影子模式内容（如 4.1 超限减仓 `sell_source_shadow`、4b 市场结构、3b 分歧摘要、T1/T1-H 审查层）时，运行完成后必须在终端输出总结，包括：
   - Phase 1 各节点核心结论（大盘/板块/资金/消息/情绪/聚合）
-  - 影子模式输出内容（如 `agent_glue.json` 的关系/强度/家族统计）
+  - 影子模式输出内容（`reasoning.md` 末尾「🧪 影子模式观测」段承载五条线：4b/3b/4.1/T1/T1-H；A6 glue 已转正，其关系/强度/家族统计改在 Node 6 正文「🧬 A6 语义粘合（已转正）」子块展示）
   - Phase 2 交易建议（持仓分析/候选股/操作建议）
   - 关键风险提示和主线续航评估
 - **长时间运行命令必须加 `timeout: 0`**：执行 `python main.py --got`、`python main.py --screener` 等命令时，必须在 bash 工具调用中设置 `timeout: 0` 参数，禁止使用默认超时。
@@ -79,16 +79,18 @@ daily_stock_analysis/
 │   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向永久豁免/降级机制）
 │   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化/原始新闻跨日检测）
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数/时序动量）
-│   │   │   ├── aggregator.py         # Node 6: 聚合（A5匹配/A6语义粘合接线/T3仲裁/埋伏通道/跨节点共振）
-│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+埋伏退出+T1-H持仓审查）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（A6 glue 直读·规则评分模式已退役/regime 状态机迟滞豁免/T3仲裁/埋伏通道/跨节点共振/分歧摘要影子）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+Step 1.5超限强制减仓+埋伏退出+T1-H持仓审查）
 │   │   ├── catalyst_calendar.py   # 催化剂日历（D1回声/D2周末/D3过期/D4置信守卫/T5对齐/T2校验）
 │   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/影子模式开关/A6与§15审查层开关/可调参数集中管理）
 │   │   ├── catalyst_realization.py # P6: 催化兑现追踪（A1三级解析/PEAD多窗口/故事寿命/resolution三态）
 │   │   ├── index_registry.py      # 指数注册表 + 身份解析（裸码→股票/带后缀→指数，消除 000001 双身份歧义）
 │   │   ├── intelligence_service.py # 情报服务
+│   │   ├── market_theme.py      # 市场结构主题上下文（Step 2：mootdx 板块排名→MarketThemeContext，影子观测）
+│   │   ├── disagreement.py      # 分歧摘要（Phase 3b：11 类冲突分类学 + RiskOverridePlan，影子观测）
+│   │   ├── glue_pipeline.py     # C-P13 阶段1 事件→板块接地式召回-验证管线（L1 embedding 检索→L2 受约束生成→L3 CoVe 验证；仅 --got-replay + GLUE_PIPELINE_ENABLED，生产休眠）
 │   │   ├── family_keywords.py     # 主线家族关键词（受控词表 12+1，glue 家族归属）
 │   │   ├── board_aliases.py       # 板块别名表
-│   │   ├── market_theme.py        # 市场主题
 │   │   ├── schemas.py           # 节点输入输出 Pydantic Schema（~45 模型）
 │   │   ├── orchestrator.py      # GOT 编排器（并行/串行调度/use_mock主控）
 │   │   ├── indicators.py        # 纯规则指标函数（ADX/MACD/A-D线/截面百分位/RRG）
@@ -144,7 +146,7 @@ daily_stock_analysis/
 │   └── got_timeseries/               # 时序数据（monitoring.json）
 │
 ├── strategies/custom/           # 自定义选股策略（YAML）
-├── tests/                       # 212 个测试文件
+├── tests/                       # 224 个测试文件
 └── docs/                        # 文档（2026-09-17 三区重排，导航见 docs/INDEX.md）
     ├── AGENTS.md                     # AI 协作规则（真源）
     ├── CLAUDE.md                     # 重定向页（历史正文已归档）
@@ -216,11 +218,12 @@ daily_stock_analysis/
                     │                          │                          │
                     │  L0: MarketRegime状态机    │                          │
                     │   (regime+dwell_days+     │                          │
-                    │    transition_pending)     │                          │
+                    │    迟滞豁免pinned_days+   │                          │
+                    │    确认事件transition_events)│                        │
                     │                          │                          │
                     │  L1: 板块 mini-GOT        │                          │
                     │   (4维交叉验证+A5匹配     │                          │
-                    │    +A6泛化词护栏)          │                          │
+                    │    +A6 glue 直读·规则模式已退役)│                    │
                     │                          │                          │
                     │  L1': 埋伏通道 (P3)       │◄── catalyst_calendar    │
                     │   (6维评分+B公式排序      │                          │
@@ -239,6 +242,8 @@ daily_stock_analysis/
                     │                          │                          │
                     │  Step 1: 风险评估         │                          │
                     │   (仓位上限/止损/板块限)   │                          │
+                    │  Step 1.5: 组合层超限强制  │                          │
+                    │   减仓（三态开关·默认影子） │                          │
                     │                          │                          │
                     │  Step 2: 统一打分         │                          │
                     │   (持仓+候选 5维评分)      │                          │
@@ -287,6 +292,8 @@ run(use_mock=False)
 
 **催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（D1回声守卫+D2周末守卫+T5语义对齐+T2叙事校验）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排（P5）→ P6 兑现追踪（PEAD多窗口验证）
 
+**影子观测旁挂**（2026-09-28 排期轮批 5，默认开·零决策改动，转正归负责人）：`GOT_MARKET_THEME_SHADOW` 市场结构落归档「🧭」段；`GOT_DISAGREEMENT_SHADOW` 分歧摘要落 `conflict_summary_shadow`；`GOT_SELL_SOURCE_SHADOW` 超限减仓检测落 `sell_source_shadow`；`funnel_stats` 漏斗归零率留痕
+
 ### 节点 Schema 数据流
 
 | 节点 | 输入 | 输出 Schema | 关键输出字段 | 持久化 |
@@ -296,8 +303,8 @@ run(use_mock=False)
 | **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound(永久豁免)`, `status`, `confidence_multiplier` | — |
 | **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
 | **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
-| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/transition_count/transition_pending), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
-| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]` | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
+| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/pinned_days/transition_events/transition_count), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档）, `conflict_summary_shadow`/`decision_path_hint`（Phase 3b 分歧摘要） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测） | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
 
 ### 持久化层总览
 
@@ -318,7 +325,7 @@ run(use_mock=False)
 
 | 路径 | 写入方 | 内容 |
 |------|--------|------|
-| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总，末尾含🧪影子模式观测段）+ `meta.json` + `portfolio_decision.json` + `trading_recommendations.md` + `agent_glue.json` / `shadow_t1.json` / `shadow_t1h.json`（影子/审查产物） |
+| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总；含 Node 6 正文「🧬 A6 语义粘合（已转正）」子块；末尾「🧪 影子模式观测」段承载五条线 4b/3b/4.1/T1/T1-H；🧭 市场结构段仅 4b 转正后升格主正文，影子态收编入 🧪）+ `meta.json`（含 `funnel_stats`） + `portfolio_decision.json` + `trading_recommendations.md` + `agent_glue.json` / `shadow_t1.json` / `shadow_t1h.json`（影子/审查产物） |
 | `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准 + 跨日记忆读取） |
 | `data/aggregator_contexts/ema_baseline.json` | `persistence.py` | EMA 基线（α=0.3, regime_score + 滚动标准差, 冷启动 5 日预热） |
 | `data/got_timeseries/monitoring.json` | `persistence.py` | 生产监控指标（运行耗时/数据质量/LLM调用次数/降级事件） |
@@ -344,8 +351,11 @@ run(use_mock=False)
 | 矛盾仲裁 | 规则检测 + LLM 语义裁决（T3, 仅 medium/high）| 规则层可能过度悲观/遗漏风险，LLM 补充语义判断但权限受限（不可 exclude） |
 | Agent 终审 | 只有否决权（reject→降级展示），默认关闭 | 防止 Agent 幻觉误删合格候选；影子模式验证准确率后再开写权限 |
 | 审查层（T1/T1-H） | 独立 profile + 独立词表（confirm/warn/reject 与 hold/add/reduce/exit），默认关闭 + 影子 | T1 候选终审在选股漏斗末尾；T1-H 持仓审查在 Node 7 Step 2.5（埋伏持仓 > P4 退出 > 低分浮亏，reduce/exit 施加降档惩罚） |
-| A6 glue 接线 | 阶段 1 已转正（2026-09-17）：`GOT_A6_ENABLED` 默认 true，glue status=ok 时直接替换板块评分四件套；glue 运行本身仍需 `AGENT_SEMANTIC_GLUE_ENABLED=true` | 8 交易日影子实测 M1 +25.5pp / M6 +31.4pp；单环境变量即回影子期行为，零代码回退 |
-| 影子先行 | Track B 全部 `SHADOW=true` 默认，积累数据后转正（A6 已于 2026-09-17 转正，SHADOW 默认翻 false） | 避免"一上来就 agent 化"掩盖管道 bug；用归档数据验证准确率 |
+| A6 glue 直读 | 阶段 1 转正（2026-09-17）：`GOT_A6_ENABLED` 默认 true，glue status=ok 时直接替换板块评分四件套；阶段 2 退役（2026-09-26）：规则评分模式与僵尸三件套 `_cross_check_*` 删除，漏命中/降级板块改 neutral 中性垫底（放弃逐板块规则兜底） | 8 交易日影子实测 M1 +25.5pp / M6 +31.4pp；`GOT_A6_ENABLED=false` 为 fail-fast（glue 不可用直接 raise），不再回退规则评分 |
+| 影子先行 | Track B 全部 `SHADOW=true` 默认，积累数据后转正（A6 已于 2026-09-17 转正，SHADOW 默认翻 false；排期轮批 5 的 4b/3b/4.1 同样影子先行，2026-09-28） | 避免"一上来就 agent 化"掩盖管道 bug；用归档数据验证准确率 |
+| regime 振荡修复 | 迟滞豁免（连续钉住 3 日直接确认当日 raw）+ `transition_count` 改统确认切换事件（`transition_events` 落盘、20 日窗口、同日幂等） | 0910 起 bull↔bear 日日交替致确认死锁，输出被永久钉死 `transition`，×0.8 震荡惩罚建立在失效输入上；回滚 `DISABLE_REGIME_OSCILLATION_FIX=true` |
+| 组合层超限减仓 | Step 1.5：个股无卖出但组合仍超 `position_limit` 时按 composite_score 升序削最弱持仓（三态开关 `GOT_SELL_SOURCE_*`，默认影子） | 补 W1「超限无减仓路径/不减反买」；复用板块漂移宽限防 688598 式误卖；影子态落 `sell_source_shadow` 观测、零决策改动 |
+| C-P13 接地管线 | L1 embedding 检索接地（K=8）→ L2 受约束生成（board_code 白名单+证据 span 硬护栏）→ L3 CoVe 验证剪枝；仅 `--got-replay` + `GLUE_PIPELINE_ENABLED` 双与门 | 阶段 1 六条验收全过（2026-09-27 结项，M3=0%）；阶段 2 realized 收益率标定证伪关闭（2026-09-28）→ 管线休眠不解禁不删除；conf≥0.70 全真/牵强全≤0.50，重标定须用 M3 口径 |
 | 北向资金 | 永久豁免维度（`EXEMPT_DIMENSIONS`） | 2024-08 起官方停披，不计入 missing_dimensions 和 confidence 分母 |
 
 ### GOT 驱动选股流水线
@@ -392,6 +402,7 @@ source D:/ProgramData/miniconda3/etc/profile.d/conda.sh && conda activate daily_
 python main.py --got               # 全流程 GOT（Phase 1 + Phase 2）
 python main.py                     # 常规分析
 python main.py --screener          # 选股
+python main.py --got-replay        # GOT 回放（glue/C-P13 管线变体实验入口，生产链路零影响）
 python main.py --schedule          # 定时模式
 ```
 

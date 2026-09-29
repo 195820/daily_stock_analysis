@@ -3,7 +3,8 @@
 
 > **版本**: v2.0（2026-08-31）  
 > **基于代码实际实现**（反映 2026-08-31 代码状态）  
-> **架构**: 半 GOTT 前半段图结构并行 + 后半段线性流水线决策 + 催化剂前瞻系统
+> **架构**: 半 GOTT 前半段图结构并行 + 后半段线性流水线决策 + 催化剂前瞻系统  
+> **时效注记（2026-09-29）**：本文正文基线为 0831 快照，未覆盖其后变更：A6 glue 转正与接线（0917）、规则评分模式退役（0926，`_cross_check_*` 三件套已删，漏命中改 neutral 垫底）、§7.1 regime 振荡修复（0926，迟滞豁免 + `transition_events`）、选股胜率优化 4 步（0917）、audit_20260922 两轮审核修复、排期轮批 1–5 影子态落地（0928：`market_theme.py` Step 2 / `disagreement.py` / Step 1.5 超限减仓 / `funnel_stats`）、C-P12/C-P13（`glue_pipeline.py` 休眠）。上述现状速览见根 `CLAUDE.md`，逐条实施记录见 `docs/CHANGELOG.md` [Unreleased] 与 `backlog.md`。
 
 ---
 

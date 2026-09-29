@@ -254,30 +254,32 @@ def _write_reasoning_md(
             lines.append(f"- **宏观摘要:** {regime.macro_overlay}")
             lines.append("")
 
-        # 🧭 市场结构（Phase 4b，影子留痕）——未启用/数据不可达时必带原因
-        theme_shadow = getattr(unified_ctx, "market_theme_shadow", None)
-        if theme_shadow is not None:
-            lines.append("## 🧭 市场结构（Phase 4b，题材阶段）")
+        # 🧭 市场结构（Phase 4b）：转正后升格主正文；影子态改由 🧪 段承载，避免双处重复。
+        # 仅当启用真值（market_theme 非 None）才在此渲染，影子留痕（market_theme_shadow）
+        # 交给 _render_shadow_market_theme 统一收口到「影子模式观测」段。
+        theme_ctx = getattr(unified_ctx, "market_theme", None)
+        if theme_ctx is not None:
+            lines.append("## 🧭 市场结构（Phase 4b，已启用）")
             lines.append("")
-            status = theme_shadow.get("status", "unknown")
-            lines.append(f"- **状态:** {status}（源: {theme_shadow.get('source', '')}）")
-            if status == "unknown":
-                lines.append(f"- ⚠️ 未启用/数据不可达: {theme_shadow.get('note', '')}")
-            else:
-                top5 = theme_shadow.get("top5_concepts") or []
-                if top5:
-                    lines.append("- **领先概念:** " + "、".join(
-                        f"{t.get('name')}(#{t.get('rank')} {t.get('change_pct'):+.1f}%)"
-                        for t in top5
-                    ))
-                breadth = theme_shadow.get("breadth") or {}
+            status = getattr(theme_ctx, "status", "unknown")
+            dq = getattr(theme_ctx, "data_quality", None)
+            src = getattr(dq, "source", "") if dq else ""
+            lines.append(f"- **状态:** {status}（源: {src}）")
+            lead = getattr(theme_ctx, "leading_concepts", []) or []
+            if lead:
+                lines.append("- **领先概念:** " + "、".join(
+                    f"{t.name}(#{t.rank} {t.change_pct:+.1f}%)"
+                    for t in lead[:5]
+                ))
+            breadth = getattr(theme_ctx, "theme_breadth", None)
+            if breadth is not None:
                 lines.append(
-                    f"- **宽度:** accelerating={breadth.get('accelerating_count', 0)} "
-                    f"warming={breadth.get('warming_count', 0)} "
-                    f"cooling={breadth.get('cooling_count', 0)} "
-                    f"total={breadth.get('total_count', 0)}"
+                    f"- **宽度:** accelerating={getattr(breadth, 'accelerating_count', 0)} "
+                    f"warming={getattr(breadth, 'warming_count', 0)} "
+                    f"cooling={getattr(breadth, 'cooling_count', 0)} "
+                    f"total={getattr(breadth, 'total_count', 0)}"
                 )
-            lines.append("_（仅留痕，影子期不参与评分）_")
+            lines.append("_（4b 已启用，参与 Node 6 置信度一致性因子）_")
             lines.append("")
 
         confirmed = getattr(unified_ctx, "confirmed_sectors", [])
@@ -571,6 +573,22 @@ def _write_reasoning_md(
                 lines.append(f"  - {sig.reasoning}")
             lines.append("")
 
+    # ── A6 语义粘合（已转正，Node 6 正文固定子块）──
+    # 产物 agent_glue.json 已在 archive_daily_run 搬入当日 tmp 目录（与 reasoning.md 同级）；
+    # glue_consumed/glue_status 直接读 unified_ctx，不依赖 json 落盘顺序。
+    _a6_uc = contexts.get("unified")
+    _a6_code_to_name = {
+        s.sector_code: s.sector_name
+        for s in (getattr(_a6_uc, "confirmed_sectors", []) if _a6_uc else [])
+        if getattr(s, "sector_code", None)
+    }
+    lines += _render_a6_glue_formal(
+        _read_json_quiet(path.parent / GLUE_ARTIFACT),
+        glue_consumed=bool(getattr(_a6_uc, "glue_consumed", False)) if _a6_uc else False,
+        glue_status=(getattr(_a6_uc, "glue_status", None) or "unknown") if _a6_uc else "unknown",
+        code_to_name=_a6_code_to_name,
+    )
+
     for key in NODE_ORDER:
         ctx = contexts[key]
         title = REASONING_NODE_TITLES[key]
@@ -690,6 +708,17 @@ def _is_bar_complete(run_date: date, now: datetime) -> bool:
 
 SHADOW_SECTION_TITLE = "## 🧪 影子模式观测"
 
+# A6 glue 转正后在 Node 6 正文的固定子块标题（不再是影子）
+A6_FORMAL_SECTION_TITLE = "## 🧬 A6 语义粘合（已转正）"
+
+# 影子读数起算注：P0 #1 修复前 aggregator.run() 缺 import os 必崩，
+# 4b/3b/4.1 影子观测从未真正执行——修复提交日（2026-09-29）前的读数全部无效。
+SHADOW_READING_BASELINE_NOTE = (
+    "> ⚠️ **读数起算注**：2026-09-29 前的 4b/3b/4.1 影子读数无效"
+    "（P0 #1 修复前 `aggregator.run()` 缺 `import os` 崩溃，影子观测从未真正执行）；"
+    "有效读数自该修复提交日重新起算。"
+)
+
 # 影子产物文件名（与 A5 既有的 agent_glue.json 对称，均落在 data/got_daily/{date}/）
 GLUE_ARTIFACT = "agent_glue.json"
 SHADOW_T1_ARTIFACT = "shadow_t1.json"
@@ -706,29 +735,48 @@ def _shadow_display_name(name: str, symbol: str) -> str:
     return f"{text}（{symbol}）" if text and text != symbol else (symbol or text)
 
 
-def _render_shadow_a5(glue: "dict | None", code_to_name: dict) -> list[str]:
-    """A5 语义粘合层：叙述一段 + 全量语义表（板块/家族/强度/三维读数/传导路径）。"""
+def _render_a6_glue_formal(
+    glue: "dict | None",
+    *,
+    glue_consumed: bool,
+    glue_status: str,
+    code_to_name: dict,
+) -> list[str]:
+    """A6 glue（已转正）：Node 6 正文固定子块——叙述 + 全量语义表。
+
+    阶段 1 转正（2026-09-17）后 glue 不再是影子：status=ok 时直接替换板块评分四件套，
+    degraded 板块保留规则侧评分。措辞与转正前的「影子，不影响决策」对称可比。
+    """
+    lines = [A6_FORMAL_SECTION_TITLE, ""]
     if not glue:
-        return [f"**A5 语义粘合层**（影子，不影响决策）：本次无产物（`{GLUE_ARTIFACT}` 缺失）。", ""]
+        lines += [
+            f"**A6 glue**（已转正）：本次无产物（`{GLUE_ARTIFACT}` 缺失），"
+            "板块评分保留规则侧。",
+            "",
+        ]
+        return lines
 
     strengths = glue.get("strengths") or []
     relations = glue.get("relations") or []
     families = glue.get("families") or []
     degraded = bool(glue.get("degraded"))
-    status = glue.get("status") or "unknown"
-
-    family_by_code = {f.get("board_code"): f.get("family") for f in families}
-    path_by_code = {r.get("board_code"): (r.get("propagation_path") or []) for r in relations}
-
-    state = f"**已降级（status={status}）**" if degraded else "状态正常、未降级"
-    lines = [
-        f"**A5 语义粘合层**（影子，不影响决策）：本次对 {len(strengths)} 个候选板块做语义粘合，"
-        f"产出 {len(relations)} 条事件→板块关系、{len(strengths)} 条强度判定、{len(families)} 个家族归属，"
-        f"{state}。下表是 Agent 粘合出的全部语义——「家族」列是 glue 的归属，"
-        f"消息/资金/情绪是它对三个维度的独立读数（`low` 表示该维度无支撑）。",
+    consumed_note = (
+        "已消费（glue 直接替换四件套）" if glue_consumed
+        else "未消费（降级/门控未过，保留规则侧）"
+    )
+    lines += [
+        f"**A6 glue**（已转正，status=`{glue_status}`，{consumed_note}）："
+        f"本次对 {len(strengths)} 个候选板块做语义粘合，"
+        f"产出 {len(relations)} 条事件→板块关系、{len(strengths)} 条强度判定、"
+        f"{len(families)} 个家族归属"
+        + ("，degraded 板块保留规则侧评分" if degraded else "")
+        + "。下表是 Agent 粘合出的全部语义——「家族」列是 glue 的归属，"
+        "消息/资金/情绪是它对三个维度的独立读数（`low` 表示该维度无支撑）。",
         "",
     ]
     if strengths:
+        family_by_code = {f.get("board_code"): f.get("family") for f in families}
+        path_by_code = {r.get("board_code"): (r.get("propagation_path") or []) for r in relations}
         lines.append("| 板块 | 家族 | 强度 | 消息 | 资金 | 情绪 | 关联事件（传导路径） |")
         lines.append("|---|---|---|---|---|---|---|")
         for item in strengths:
@@ -742,13 +790,29 @@ def _render_shadow_a5(glue: "dict | None", code_to_name: dict) -> list[str]:
                 f"| {' → '.join(path) if path else '—'} |"
             )
         lines.append("")
+    return lines
 
-    if degraded:
-        sectors = glue.get("degraded_sectors") or []
-        if sectors:
-            lines.append(f"受影响板块（{len(sectors)} 个）：{'、'.join(sectors)}")
-        lines += [f"- ⚠️ {w}" for w in (glue.get("warnings") or [])]
-        lines.append("")
+
+def _render_glue_degraded_note(glue: "dict | None") -> list[str]:
+    """A6 glue 已转正进 Node 6 正文；仅降级时在 🧪 影子段留一条降级观测行。
+
+    转正前 A5 整段都在影子段；转正后正常态不再进影子段，只有 degraded（保留规则侧）
+    需在此显式观测，供审阅降级面。
+    """
+    if not glue:
+        return []
+    status = glue.get("status") or "unknown"
+    if status == "ok" and not glue.get("degraded"):
+        return []
+    sectors = glue.get("degraded_sectors") or []
+    lines = [
+        f"**A6 glue（已转正）降级观测**：本次 status=`{status}`，"
+        "degraded 板块已回退规则侧评分"
+        + (f"（{len(sectors)} 个：{'、'.join(sectors)}）" if sectors else "")
+        + "。"
+    ]
+    lines += [f"- ⚠️ {w}" for w in (glue.get("warnings") or [])]
+    lines.append("")
     return lines
 
 
@@ -825,16 +889,110 @@ def _render_shadow_t1h(t1h: "dict | None") -> list[str]:
     return lines
 
 
+def _render_shadow_market_theme(unified: "dict | None") -> list[str]:
+    """4b 市场结构（影子态）：从主正文 🧭 收编至此，读 unified.json 的 market_theme_shadow。"""
+    shadow = (unified or {}).get("market_theme_shadow")
+    if not shadow:
+        if (unified or {}).get("market_theme"):
+            return ["**4b 市场结构**（已启用）：本运行 4b 已转正，读数见主正文「市场结构（Phase 4b，已启用）」段。", ""]
+        return ["**4b 市场结构**（影子，不参与评分）：本次无产物（`unified.json` 未落 `market_theme_shadow`，多为开关关闭或数据不可达）。", ""]
+    status = shadow.get("status", "unknown")
+    lines = [f"**4b 市场结构**（影子，不参与评分）：状态 `{status}`（源: {shadow.get('source', '')}）。"]
+    if status == "unknown":
+        lines.append(f"- ⚠️ 数据不可达: {shadow.get('note', '')}")
+    else:
+        top5 = shadow.get("top5_concepts") or []
+        if top5:
+            lines.append("- **领先概念:** " + "、".join(
+                f"{t.get('name')}(#{t.get('rank')} {t.get('change_pct'):+.1f}%)" for t in top5))
+        breadth = shadow.get("breadth") or {}
+        lines.append(
+            f"- **宽度:** accelerating={breadth.get('accelerating_count', 0)} "
+            f"warming={breadth.get('warming_count', 0)} "
+            f"cooling={breadth.get('cooling_count', 0)} "
+            f"total={breadth.get('total_count', 0)}"
+        )
+        if shadow.get("note"):
+            lines.append(f"- **备注:** {shadow.get('note')}")
+    lines.append("")
+    return lines
+
+
+def _render_shadow_disagreement(unified: "dict | None") -> list[str]:
+    """3b 分歧摘要（影子）：冲突分类计数 + 与现行 contradictions[] 的差异行数。"""
+    cs = (unified or {}).get("conflict_summary_shadow")
+    if not cs:
+        return ["**3b 分歧摘要**（影子，不参与仲裁）：本次无产物（`unified.json` 未落 `conflict_summary_shadow`，多为开关关闭）。", ""]
+    bullish = cs.get("bullish_agents") or []
+    bearish = cs.get("bearish_agents") or []
+    neutral = cs.get("neutral_agents") or []
+    contradictions = (unified or {}).get("contradictions") or []
+    rc = cs.get("risk_control") or {}
+    diverged = len(bullish) + len(bearish)
+    lines = [
+        f"**3b 分歧摘要**（影子，不参与仲裁）：分类 `{cs.get('conflict_type', 'unknown')}`——"
+        f"看多 {len(bullish)} / 看空 {len(bearish)} / 中性 {len(neutral)} 个 Agent。"
+    ]
+    if cs.get("decision_path_hint"):
+        lines.append(f"- **决策路径提示:** {cs.get('decision_path_hint')}")
+    if rc.get("veto_buy"):
+        lines.append(f"- 🚫 **风控覆盖:** veto_buy（{rc.get('reason', '')}）")
+    else:
+        lines.append("- 风控覆盖: 无（veto_buy=false）")
+    lines.append(
+        f"- **与现行矛盾对比:** 本摘要识别分歧方 {diverged} 个 vs "
+        f"`contradictions[]` {len(contradictions)} 条（差异 {abs(diverged - len(contradictions))}，影子期仅供对照）"
+    )
+    lines.append("")
+    return lines
+
+
+def _render_shadow_sell_source(shadow: "dict | None") -> list[str]:
+    """4.1 组合层超限减仓（影子）：mode/缺口/计划减仓/宽限跳过。"""
+    if not shadow:
+        return ["**4.1 超限减仓**（影子，不落减仓）：本次无产物（`portfolio_decision.json` 未落 `sell_source_shadow`，多为仓位未超限）。", ""]
+    excess = shadow.get("excess_value", 0) or 0
+    projected = shadow.get("projected_trim_value", 0) or 0
+    trims = shadow.get("planned_trims") or []
+    grace = shadow.get("grace_skipped_symbols") or []
+    lines = [
+        f"**4.1 超限减仓**（影子，不落减仓）：mode=`{shadow.get('mode', 'shadow')}`，"
+        f"超限缺口 ¥{excess:,.0f}，计划削 {len(trims)} 只"
+        f"（预计减仓 ¥{projected:,.0f}），家族宽限跳过 {len(grace)} 只。"
+    ]
+    if trims:
+        lines += [
+            f"- **{_shadow_display_name(t.get('name'), t.get('symbol'))}**: "
+            f"减 {t.get('reduce_quantity')} 股 / ¥{(t.get('sell_value') or 0):,.0f}"
+            for t in trims]
+    else:
+        lines.append("- 本次无可削标的（或均撞家族宽限）。")
+    if grace:
+        lines.append(f"- 宽限跳过：{', '.join(grace)}")
+    lines.append("")
+    return lines
+
+
 def _render_shadow_section(
     *,
     glue: "dict | None",
     t1: "dict | None",
     t1h: "dict | None",
     code_to_name: dict,
+    unified: "dict | None" = None,
+    sell_source_shadow: "dict | None" = None,
 ) -> list[str]:
-    """渲染「影子模式观测」段（reasoning.md 末尾，三条影子线各一段）。"""
-    lines = [SHADOW_SECTION_TITLE, ""]
-    lines += _render_shadow_a5(glue, code_to_name)
+    """渲染「影子模式观测」段（reasoning.md 末尾，五条影子线各一段）。
+
+    五条线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查。
+    A5 语义粘合层已转正（A6），改由 Node 6 正文子块 `_render_a6_glue_formal` 承载；
+    仅当 glue 降级时才在本段留一条降级观测行。code_to_name 保留签名位（已转正线不再用）。
+    """
+    lines = [SHADOW_SECTION_TITLE, "", SHADOW_READING_BASELINE_NOTE, ""]
+    lines += _render_shadow_market_theme(unified)
+    lines += _render_shadow_disagreement(unified)
+    lines += _render_shadow_sell_source(sell_source_shadow)
+    lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _render_shadow_t1h(t1h)
     return lines
@@ -849,16 +1007,6 @@ def _read_json_quiet(path: Path) -> "dict | None":
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("[Archive] 影子产物读取失败 %s: %s", path.name, exc)
         return None
-
-
-def _load_board_code_to_name(unified_path: Path) -> dict:
-    """从 unified.json 取 board_code → 板块名 映射（影子表用中文名，不用裸代码）。"""
-    unified = _read_json_quiet(unified_path) or {}
-    return {
-        s.get("sector_code"): s.get("sector_name")
-        for s in (unified.get("confirmed_sectors") or [])
-        if s.get("sector_code")
-    }
 
 
 def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
@@ -923,13 +1071,22 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
             )
         lines.append("")
 
-    # 影子模式观测（三条影子线）——挂在 Node 7 之后，同日重跑时随 Node 7 段一并被丢弃重建
+    # 影子模式观测（五条影子线）——挂在 Node 7 之后，同日重跑时随 Node 7 段一并被丢弃重建
     day_dir = reasoning_path.parent
+    _unified_json = _read_json_quiet(day_dir / "unified.json") or {}
+    _pd_json = _read_json_quiet(day_dir / "portfolio_decision.json") or {}
+    _code_to_name = {
+        s.get("sector_code"): s.get("sector_name")
+        for s in (_unified_json.get("confirmed_sectors") or [])
+        if s.get("sector_code")
+    }
     lines += _render_shadow_section(
         glue=_read_json_quiet(day_dir / GLUE_ARTIFACT),
         t1=_read_json_quiet(day_dir / SHADOW_T1_ARTIFACT),
         t1h=_read_json_quiet(day_dir / SHADOW_T1H_ARTIFACT),
-        code_to_name=_load_board_code_to_name(day_dir / "unified.json"),
+        code_to_name=_code_to_name,
+        unified=_unified_json,
+        sell_source_shadow=_pd_json.get("sell_source_shadow"),
     )
 
     reasoning_path.write_text("\n".join(lines), encoding="utf-8")

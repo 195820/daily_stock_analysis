@@ -1634,6 +1634,7 @@ class StockScreenerPipeline:
         # 审核修复 2.1：Tier A 主线保底（抽取为独立方法供单测）
         top_pool = self._apply_capital_floor(top_pool, dropped_pool, candidates)
         candidates = top_pool
+        funnel_trace["r2"] = len(candidates)
 
         # 轮次 3: 波段技术确认 Top 15
         tech_scores = self._score_technical_wave(candidates, fetcher_manager)
