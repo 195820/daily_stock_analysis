@@ -19,6 +19,7 @@
 | 3 | [`plans/ambush_split_plan.md`](plans/ambush_split_plan.md) — 埋伏分支拆分 | 设计收口（18 项决策落定），待实施 | 注意其 P1/P2 子项已在 CHANGELOG 记为完成，实施前先对账 |
 | 4 | Phase 3b / 4b / 4d / 5b / 5c（backlog §5 排期轮） | **影子态落地**（2026-09-28 批次 5：5b TickFlow 探测证伪其作板块排名源→mootdx 先行定案；4b `market_theme.py` Step 2 / 3b `disagreement.py` 分歧摘要+RiskOverridePlan / 4d 前置 funnel_stats，均默认影子零决策改动；4.1 超限减仓三态开关已落，批 2 取证判 5c 样本 6<10 → DEFER） | enabled 转正归负责人 + 需影子期读数；相关性验收脚本 `.review_tmp/cp4b_correlation_acceptance.py` 为 4b 转正前置 |
 | 5 | Phase 6 盘中 0→1 确认闸门（[`archive/intraday_gate_plan_0907.md`](archive/intraday_gate_plan_0907.md)） | 草案 | 硬前置 Phase 6-0 数据地基（五档量/分时/竞价/盘中调度），地基未验收前不开影子期 |
+| 6 | [`plans/architecture_optimization_implementation_20260929.md`](plans/architecture_optimization_implementation_20260929.md) — GOT 架构优化明细实施报告（2 GATE + 26 WI） | **已审核修订**（2026-09-29：CodeReview 逐条核验 10 组代码事实断言，9 组属实；更正 `sector_strength_map`"死代码"误判（1 Critical）+ P2-8 漏 Node6 / P0-3↔P0-4 confidence 隔离（2 Warning）。关联分析蓝图：`.qoder/plans/GOT架构漏洞分析_33e2c2de.md`） | **GATE-1** 卖出侧可成交性投影层（C1）/ **GATE-2** 最优停止 pooled 分层标定；两者为 P0 系退出引擎的地基，须先落地 |
 
 **需裁决事项**入口：[`backlog.md` §7](backlog.md)（6 条开放裁决）。
 
