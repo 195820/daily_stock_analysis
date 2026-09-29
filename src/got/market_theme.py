@@ -23,6 +23,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from src.got.board_filter import is_noise_board
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,7 +186,14 @@ def build_theme_context(fetcher_manager, *, use_cache: bool = True) -> MarketThe
     try:
         concepts = fetcher_manager.get_all_concept_boards() or []
         industries = fetcher_manager.get_all_industry_boards() or []
-        concept_map = {b["code"]: b["name"] for b in concepts if b.get("code") and b.get("name")}
+        # 源头净化概念域：剔除统计指数/行情事件/财务标签等非可交易噪声板块
+        # （昨ST连板/昨日涨停等影子线污染根因，缺陷①）。行业域不动。
+        # 过滤后概念可能为空 → status 自然翻 partial（既有逻辑覆盖）。
+        concept_map = {
+            b["code"]: b["name"]
+            for b in concepts
+            if b.get("code") and b.get("name") and not is_noise_board(b["name"])
+        }
         industry_map = {b["code"]: b["name"] for b in industries if b.get("code") and b.get("name")}
         all_codes = list(concept_map.keys() | industry_map.keys())
         if not all_codes:
