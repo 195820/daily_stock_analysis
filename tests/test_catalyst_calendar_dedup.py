@@ -269,5 +269,66 @@ class TestCleanupStaleEvents(unittest.TestCase):
         self.assertEqual(fake_session.commit.call_count, 1)
 
 
+class TestSaveEventsExpiryAnchoring(unittest.TestCase):
+    """缺陷②：到期锤定首传日 + drift 尾巴 3 交易日，UPDATE 不续期"""
+
+    def _event(self, eid: str, category_tag: str) -> CatalystEvent:
+        return CatalystEvent(
+            event_id=eid,
+            event_date=date(2026, 9, 1),
+            event_type="global",
+            title="[全球] 测试事件",
+            sector="CPO",
+            source="global_map",
+            category_tag=category_tag,
+        )
+
+    def _fake_db_first_is_none(self):
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.first.return_value = None
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+        return fake_db, fake_session
+
+    def test_insert_drift_uses_3_trade_day_tail(self):
+        from src.got.catalyst_calendar import _trade_days_offset
+        builder = CatalystCalendarBuilder()
+        target = date(2026, 8, 28)
+        fake_db, fake_session = self._fake_db_first_is_none()
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_realization.CatalystRealizationTracker"):
+            builder._save_events([self._event("drift_id", "drift")], target)
+        added = fake_session.add.call_args[0][0]
+        self.assertEqual(added.expires_at, _trade_days_offset(target, 3))
+
+    def test_insert_non_drift_uses_14_day_window(self):
+        from datetime import timedelta
+        builder = CatalystCalendarBuilder()
+        target = date(2026, 8, 28)
+        fake_db, fake_session = self._fake_db_first_is_none()
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_realization.CatalystRealizationTracker"):
+            builder._save_events([self._event("bin_id", "binary")], target)
+        added = fake_session.add.call_args[0][0]
+        self.assertEqual(added.expires_at, target + timedelta(days=14))
+
+    def test_update_does_not_refresh_expiry(self):
+        """已存在事件走 UPDATE 分支：expires_at 保留首次入库值，不被续期。"""
+        builder = CatalystCalendarBuilder()
+        target = date(2026, 9, 25)
+        original_expiry = date(2026, 9, 2)  # 首传时锤定的旧到期日
+        existing = MagicMock()
+        existing.expires_at = original_expiry
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.first.return_value = existing
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_realization.CatalystRealizationTracker"):
+            builder._save_events([self._event("drift_id", "drift")], target)
+        self.assertEqual(existing.expires_at, original_expiry)  # 未被刷新
+        fake_session.add.assert_not_called()  # 走 UPDATE、不新建
+
+
 if __name__ == "__main__":
     unittest.main()

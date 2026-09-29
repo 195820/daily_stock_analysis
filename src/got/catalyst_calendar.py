@@ -19,6 +19,7 @@ from src.got.schemas import CatalystEvent, CatalystCalendar, NewsEvent
 from src.got.catalyst_config import (
     GLOBAL_TO_A_SHARE_MAP,
     CATALYST_WINDOW_DAYS,
+    CATALYST_DRIFT_TAIL_TRADE_DAYS,
     CATALYST_CONFIDENCE_GATE,
     CATALYST_FULL_REFRESH_INTERVAL,
     IMPACT_WEIGHT,
@@ -1432,7 +1433,14 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
         from src.got.catalyst_config import NARRATIVE_CRITIC_SHADOW
 
         db = DatabaseManager()
-        expires = target_date + timedelta(days=CATALYST_WINDOW_DAYS)
+
+        # 缺陷②：到期锤定到"首次入库日"（anchor），增量重跑命中的 UPDATE 分支不再续期，
+        # 否则旧传导每日被刷新 expires_at → 霸屏不退出。drift 型（个股/全球传导类）
+        # 额外把尾巴压到 3 交易日，其余沿用 14 日历日窗口。
+        def _expiry_for(event: CatalystEvent, anchor: date) -> date:
+            if event.category_tag == "drift":
+                return _trade_days_offset(anchor, CATALYST_DRIFT_TAIL_TRADE_DAYS)
+            return anchor + timedelta(days=CATALYST_WINDOW_DAYS)
 
         # Q6-C①：DROP 联动——无论影子与否，写盘集合都遵循批判者裁决
         drop_ids = self._critic_drop_ids
@@ -1478,7 +1486,8 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                     existing.is_global = event.is_global
                     existing.source_news = event.source_news
                     existing.affected_sectors = sectors_payload
-                    existing.expires_at = expires
+                    # 缺陷②：不再刷新 expires_at——保留首次入库时的到期日，
+                    # 使旧事件按原窗口自然过期（仅靠 INSERT 设定到期日）。
                     existing.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 else:
                     # 创建新记录
@@ -1497,7 +1506,7 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                         is_global=event.is_global,
                         source_news=event.source_news,
                         affected_sectors=sectors_payload,
-                        expires_at=expires,
+                        expires_at=_expiry_for(event, target_date),
                     )
                     session.add(new_record)
 

@@ -144,6 +144,8 @@ GLOBAL_TO_A_SHARE_MAP = [
 # =============================================================================
 
 CATALYST_WINDOW_DAYS = 14           # 前瞻窗口（日历日，约 10 交易日）
+CATALYST_DRIFT_TAIL_TRADE_DAYS = 3  # 缺陷②：drift 型（个股/全球传导类）到期尾巴
+                                     # 压到 3 交易日（以首次入库日为锚），旧传导不再霸屏
 CATALYST_CONFIDENCE_GATE = 0.7      # TODO: 待校准 (当前样本量: 0) — 低于此值不入评分（只进日历展示标"参考"）
 CATALYST_FULL_REFRESH_INTERVAL = 5  # 全量刷新间隔（交易日）
 CATALYST_MAX_POOL_SIZE = 10         # 正式池上限（宁缺毋滥）
