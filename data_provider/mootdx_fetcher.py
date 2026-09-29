@@ -161,17 +161,33 @@ class MootdxFetcher(BaseFetcher):
 
     @staticmethod
     def _probe_client(client) -> bool:
-        """真实取数验活——故障节点会静默回空表，只测 TCP 通不通会误判。"""
+        """真实取数验活——故障节点会静默回空表，只测 TCP 通不通会误判。
+
+        异常分类（缺陷③B：可观测性，failover 行为不变，均 return False）：
+          - 网络/超时异常 → 瞬态，节点未必坏，warn 后换台；
+          - 空表 → 节点静默失效（真该作废），info 后换台；
+          - 其它（mootdx 库内确定性异常，如 'month must be 1..12'）→ 非节点
+            健康信号，打全栈 exc_info 以便区分，不谎报为"验活失败/节点失效"。
+        """
         try:
             bars = client.bars(
                 symbol=_TDX_PROBE_SYMBOL,
                 frequency=_TDX_PROBE_FREQUENCY,
                 offset=_TDX_PROBE_COUNT,
             )
-        except Exception as exc:
-            logger.warning("mootdx 验活异常: %s", exc)
+        except (OSError, TimeoutError) as exc:  # socket.timeout / ConnectionError 等瞬态
+            logger.warning("mootdx 验活网络异常（瞬态，换台）: %r", exc)
             return False
-        return bars is not None and not bars.empty
+        except Exception as exc:  # 库内确定性异常 ≠ 节点失效，打全栈供诊断
+            logger.warning(
+                "mootdx 验活抛出非网络异常（疑似库内缺陷，非节点失效）: %r",
+                exc, exc_info=True,
+            )
+            return False
+        if bars is None or bars.empty:
+            logger.info("mootdx 验活回空表（节点静默失效，换台）")
+            return False
+        return True
 
     def _scan_servers(self, Quotes) -> Optional[Tuple[str, int]]:
         """按池序扫描，返回第一台能真取到 K 线的节点；全败返回 None。"""
@@ -180,7 +196,7 @@ class MootdxFetcher(BaseFetcher):
             if client is None:
                 continue
             if not self._probe_client(client):
-                logger.warning("mootdx 节点 %s:%s 验活失败（回空表），换下一台", *server)
+                logger.warning("mootdx 节点 %s:%s 验活未通过，换下一台", *server)
                 continue
             logger.info("mootdx 选定行情主站 %s:%s", *server)
             return server
