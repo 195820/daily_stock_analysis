@@ -227,13 +227,11 @@ class TechnicalIndicatorService:
         result = TechnicalAnalysisResult(fetched_at=datetime.now())
 
         try:
-            # 获取 DDE 数据（复用已有服务，可选）
-            dde_map = self._get_dde_map()
-
             # 逐只股票分析（直接从K线数据获取，不依赖实时行情）
+            # 缺陷③A：DDE 取数（_get_dde_map）随东财 push2 封锁失效已摘除
             for code in codes:
                 try:
-                    signals = self._analyze_single(code, dde_map)
+                    signals = self._analyze_single(code)
                     if signals:
                         result.signals[code] = signals
                 except Exception as e:
@@ -261,7 +259,6 @@ class TechnicalIndicatorService:
     def _analyze_single(
         self,
         code: str,
-        dde_map: Dict[str, float],
     ) -> Optional[TechnicalSignals]:
         """分析单只股票（从K线数据获取所有信息）"""
         # 获取历史K线
@@ -296,10 +293,7 @@ class TechnicalIndicatorService:
             amount=float(latest.get('amount', 0)) / 10000,
         )
 
-        # DDE
-        signals.dde_big_order = dde_map.get(code, 0.0)
-
-        # 从K线计算技术指标（MA、RSI、布林带等）
+        # 从 K 线计算技术指标（MA、RSI、布林带等）
         if hist_df is not None and len(hist_df) >= 5:
             self._calc_history_indicators(signals, hist_df)
 
@@ -348,19 +342,16 @@ class TechnicalIndicatorService:
         """
         计算短线技术评分（0-100）
 
-        权重分配：
-        - DDE大单净量: 25%
-        - 量比: 20%
-        - 换手率: 15%
-        - RSI(6): 15%
-        - MA排列: 10%
-        - 布林带位置: 5%
-        - 突破信号: 10%
+        权重分配（缺陷③A：DDE 大单净量随东财 push2 封锁失效，该 25% 权重已
+        按比例摊给其余 6 维，原 0.75 归一化至 1.0）：
+        - 量比: 26.7%
+        - 换手率: 20%
+        - RSI(6): 20%
+        - MA排列: 13.3%
+        - 布林带位置: 6.7%
+        - 突破信号: 13.3%
         """
-        # 1. DDE 评分: -5%→0, 0%→50, +5%→100
-        dde_score = max(0, min(100, (s.dde_big_order + 5) / 10 * 100))
-
-        # 2. 量比评分: 0.5→0, 1.0→30, 2.0→70, 3.0→100
+        # 1. 量比评分: 0.5→0, 1.0→30, 2.0→70, 3.0→100
         if s.volume_ratio <= 0.5:
             vr_score = 0
         elif s.volume_ratio <= 1.0:
@@ -411,15 +402,14 @@ class TechnicalIndicatorService:
         # 7. 突破评分
         breakout_score = 100 if s.breakout_5d else 30
 
-        # 加权求和
+        # 加权求和（六维，0.75 归一化至 1.0）
         score = (
-            dde_score * 0.25 +
-            vr_score * 0.20 +
-            tr_score * 0.15 +
-            rsi_score * 0.15 +
-            ma_score * 0.10 +
-            boll_score * 0.05 +
-            breakout_score * 0.10
+            vr_score * (0.20 / 0.75) +
+            tr_score * (0.15 / 0.75) +
+            rsi_score * (0.15 / 0.75) +
+            ma_score * (0.10 / 0.75) +
+            boll_score * (0.05 / 0.75) +
+            breakout_score * (0.10 / 0.75)
         )
 
         return round(max(0, min(100, score)), 1)
@@ -427,14 +417,6 @@ class TechnicalIndicatorService:
     def _generate_signal_tags(self, s: TechnicalSignals) -> List[str]:
         """生成信号标签"""
         tags = []
-
-        # 资金信号
-        if s.dde_big_order > 1.0:
-            tags.append("主力强攻")
-        elif s.dde_big_order > 0.3:
-            tags.append("资金流入")
-        elif s.dde_big_order < -1.0:
-            tags.append("主力出逃")
 
         # 量价信号
         if s.volume_ratio > 2.5 and s.change_pct > 2:
@@ -584,21 +566,6 @@ class TechnicalIndicatorService:
             logger.debug(f"获取 {code} 历史数据失败: {e}")
 
         return None
-
-    def _get_dde_map(self) -> Dict[str, float]:
-        """获取 DDE 数据映射"""
-        try:
-            from src.services.dde_fetcher import DdeFetcher
-            fetcher = DdeFetcher(self._config)
-            result = fetcher.fetch_market_dde(use_cache=True)
-            if not result.error:
-                return {
-                    code: snap.dde_big_order
-                    for code, snap in result.snapshots.items()
-                }
-        except Exception as e:
-            logger.debug(f"获取 DDE 失败: {e}")
-        return {}
 
     # ============================================================
     # 缓存

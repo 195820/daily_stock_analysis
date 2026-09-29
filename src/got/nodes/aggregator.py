@@ -605,9 +605,10 @@ class AggregatorNode:
         risk_budget = clip(risk_budget, 0.2, 0.8)
 
         # 宏观判断文本
-        # 机构态度维度口径标注（盘中单维模式：数值口径不变，仅文本显式标注证据维度）
+        # 机构态度维度口径标注（缺陷③A：DDE 摘除后不再靠 confidence≤0.5 触发，
+        # 改用 Node 3 显式置位的 single_dimension——仅剩 sector_flow 一维时诚实标注）
         cal_note = ""
-        if capital.confidence_multiplier <= 0.5:
+        if getattr(capital, "single_dimension", False):
             cal_note = "（单维资金口径）"
         macro_overlay = (
             f"regime_score={regime_score:.2f}, ADX={adx_value:.0f}, "

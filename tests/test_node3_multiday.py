@@ -5,9 +5,10 @@ Phase 1 单元测试：Node 3 资金面多窗口 + 吸筹闸门三档 + Schema �
 覆盖：
 1. load_capital_flow_series 归档回读
 2. _score_sector_flow 多窗口扩展字段
-3. _score_dde 累计/连续字段
-4. _check_accumulation_gate 四档判定
-5. AmbushCandidate accum_strength 向后兼容
+3. _check_accumulation_gate 四档判定
+4. AmbushCandidate accum_strength 向后兼容
+
+（缺陷③A：原 _score_dde 测试类已随 DDE 维度摘除删除）
 """
 
 import os
@@ -104,38 +105,6 @@ class TestScoreSectorFlowMultiday(unittest.TestCase):
         node = CapitalAnalysisNode()
         _, ev = node._score_sector_flow(self._make_data(), sector_context=None)
         self.assertEqual(ev["mainline_consistency_days"], {})
-
-
-class TestScoreDdeMultiday(unittest.TestCase):
-    """测试 _score_dde 累计/连续字段。"""
-
-    def _make_dde_data(self, total_net=-1.04e8):
-        return {
-            "total_net_amount": total_net,
-            "stock_count": 5000,
-            "snapshots": [
-                {"code": "000001", "big_net_amount": 1e7, "dde_big_order": 0.5},
-                {"code": "000002", "big_net_amount": -2e7, "dde_big_order": -1.0},
-            ],
-            "timestamp": "mock",
-        }
-
-    def test_returns_cumulative_fields(self):
-        """返回 dict 包含 cumulative_3d / cumulative_5d / consecutive_positive_days。"""
-        from src.got.nodes.capital_analysis import CapitalAnalysisNode
-        node = CapitalAnalysisNode()
-        _, ev = node._score_dde(self._make_dde_data())
-        self.assertIn("cumulative_3d", ev)
-        self.assertIn("cumulative_5d", ev)
-        self.assertIn("consecutive_positive_days", ev)
-
-    def test_consecutive_positive_days_is_int(self):
-        """consecutive_positive_days 为非负整数。"""
-        from src.got.nodes.capital_analysis import CapitalAnalysisNode
-        node = CapitalAnalysisNode()
-        _, ev = node._score_dde(self._make_dde_data())
-        self.assertIsInstance(ev["consecutive_positive_days"], int)
-        self.assertGreaterEqual(ev["consecutive_positive_days"], 0)
 
 
 class TestAccumulationGateTiers(unittest.TestCase):

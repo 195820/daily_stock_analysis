@@ -224,7 +224,14 @@ class StockScreenerPipeline:
             if data_source == "ths":
                 self._run_ths_screener(result, top_n)
             else:
-                self._run_eastmoney_screener(result, strategy_name, top_n)
+                # 缺陷③A：东财 DDE 选股支路（_run_eastmoney_screener）随 push2
+                # 整域封锁失效已摘除；非 ths 数据源不再受支持。
+                result.error = (
+                    f"数据源 '{data_source}' 已停用（东财 DDE 选股支路随数据源失效移除），"
+                    "请使用 data_source='ths'（问财）"
+                )
+                logger.error(f"[选股] {result.error}")
+                return result
 
             # 补充技术指标评分（短线评分核心）
             if not result.error and result.stocks:
@@ -298,63 +305,6 @@ class StockScreenerPipeline:
         ]
 
         logger.info(f"[选股-问财] 获取到 {ths_result.total_count} 只股票")
-
-    def _run_eastmoney_screener(
-        self,
-        result: ScreenerRunResult,
-        strategy_name: str,
-        top_n: int
-    ) -> None:
-        """使用东方财富数据选股"""
-        from src.services.dde_fetcher import DdeFetcher
-        from src.services.strategy_filter import StrategyFilterService
-        from src.repositories.dde_repository import DdeRepository
-        from datetime import date as date_type
-
-        dde_fetcher = DdeFetcher(self.config)
-        filter_service = StrategyFilterService(self.config)
-        dde_repo = DdeRepository()
-
-        # 加载策略
-        yaml_path = f"strategies/custom/{strategy_name}.yaml"
-        filter_service.load_strategy(yaml_path)
-
-        # 全市场扫描
-        matches, total_scanned = filter_service.scan_market(
-            strategy_name=strategy_name,
-            min_score=0,
-        )
-        result.total_scanned = total_scanned
-        result.matched_count = len(matches)
-
-        # 保存 DDE 快照
-        dde_result = dde_fetcher.fetch_market_dde(use_cache=True)
-        if not dde_result.error:
-            trade_date = date_type.fromisoformat(result.run_date)
-            records = [
-                {
-                    'code': s.code,
-                    'dde_big_order': s.dde_big_order,
-                    'dde_big_order_buy': s.dde_big_order_buy,
-                    'dde_big_order_sell': s.dde_big_order_sell,
-                    'dde_mid_order': s.dde_mid_order,
-                    'dde_small_order': s.dde_small_order,
-                }
-                for s in dde_result.snapshots.values()
-            ]
-            dde_repo.batch_save_dde(records, trade_date)
-
-        # 转换结果
-        result.stocks = [
-            ScreenerStock(
-                code=m.stock_code,
-                name=m.stock_name,
-                score=m.score,
-                dde_big_order=m.dde_big_order,
-                source="eastmoney"
-            )
-            for m in matches[:top_n]
-        ]
 
     def _enrich_technical_scores(self, result: ScreenerRunResult) -> None:
         """

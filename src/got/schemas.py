@@ -452,7 +452,7 @@ class CapitalEvidence(BaseModel):
     """资金面证据（实时 T+0 维度）"""
     sector_flow: Optional[dict] = None        # 概念/行业板块资金流
     northbound_realtime: Optional[dict] = None  # 北向资金分钟级实时（备用，停披后全 0 自动降级）
-    dde: Optional[dict] = None                # 大单净流入（DDE，全市场）
+    dde: Optional[dict] = None                # 已废弃（缺陷③A：DDE 随东财封锁失效摘除，仅为向后兼容保留字段，不再填充）
     individual_main_force: Optional[dict] = None  # 个股主力聚流（T-1 备用）
 
 
@@ -462,6 +462,10 @@ class CapitalContext(BaseModel):
     institutional_attitude: str = Field(..., description="bullish / bearish / neutral")
     institutional_score: float = Field(..., ge=-1.0, le=1.0)
     confidence_multiplier: float = Field(..., ge=0.0, le=1.0)
+    single_dimension: bool = Field(
+        default=False,
+        description="机构态度仅由单一可用资金维度支撑（证据维度单薄，报告需诚实标注单维口径）",
+    )
     evidence: CapitalEvidence = Field(default_factory=CapitalEvidence)
     missing_dimensions: list[str] = Field(default_factory=list)
     reasoning: Optional[str] = None

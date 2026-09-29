@@ -4,13 +4,13 @@ Node 3: 资金面分析节点（实时版）
 职责：追踪盘中实时资金流向，为其他节点提供辅助验证信号。
 
 设计理念：
-- 3 实时维度：板块资金流 / DDE 大单净流入 / 北向资金分钟级（备用）
+- 实时维度：板块资金流（主）/ 北向资金分钟级（备用，已停披豁免）
+  （DDE 大单净流入维度随东财 push2 整域封锁长期失效，缺陷③A 已摘除）
 - 降级机制：某维度缺失时权重归一化 + 置信度下调
-- 盘中 T+0：概念/行业资金流和 DDE 均为盘中实时数据
+- 盘中 T+0：概念/行业资金流为盘中实时数据
 
 数据源：
 - 板块资金流: akshare stock_fund_flow_concept/industry("即时") — 实时概念/行业净流入
-- DDE 大单: DdeFetcher (Playwright → push2.eastmoney.com) — 全市场大单净流入
 - 北向资金: akshare stock_hsgt_fund_min_em — 分钟级实时（2024-08 后全 0，自动降级）
 """
 
@@ -41,12 +41,11 @@ logger = logging.getLogger(__name__)
 # 常量配置
 # =============================================================================
 
-# 3 维度权重（总分母 = 1.0）
-# 注意：northbound_realtime 自 2024-08 起官方停披，已永久豁免
-# 缺失时不拖低 confidence_multiplier，权重自动归一化到 sector_flow + dde
+# 维度权重（缺陷③A：DDE 随东财 push2 整域封锁长期失效，已摘除死维度）
+# northbound_realtime 自 2024-08 起官方停披，永久豁免、不进置信度分母。
+# 实际参与评分的非豁免维度当前仅 sector_flow 一维（单维资金口径）。
 DIMENSION_WEIGHTS: dict[str, float] = {
-    "sector_flow": 0.50,
-    "dde": 0.35,
+    "sector_flow": 0.85,
     "northbound_realtime": 0.15,
 }
 
@@ -56,7 +55,6 @@ EXEMPT_DIMENSIONS: set[str] = {"northbound_realtime"}
 # 维度中文名称
 DIMENSION_LABELS: dict[str, str] = {
     "sector_flow": "板块资金流",
-    "dde": "大单净流入(DDE)",
     "northbound_realtime": "北向资金(实时)",
 }
 
@@ -69,9 +67,6 @@ _CONCEPT_TOP_N = 20          # 取净流入 Top N 概念板块
 _INDUSTRY_TOP_N = 10         # 取净流入 Top N 行业板块
 _CONCEPT_WEIGHT = 0.65       # 概念板块在 sector_flow 中的权重
 _INDUSTRY_WEIGHT = 0.35      # 行业板块权重
-
-# DDE 评分参数
-_DDE_NET_INFLOW_SCALE = 1e8  # DDE 净流入额归一化基数（元）
 
 
 # =============================================================================
@@ -186,11 +181,10 @@ class CapitalAnalysisNode:
     async def _fetch_all_dimensions(
         self, quality: DataQuality,
     ) -> dict[str, Any]:
-        """并发获取 3 维度数据。"""
-        dimension_keys = ["sector_flow", "dde", "northbound_realtime"]
+        """并发获取可用维度数据（缺陷③A：DDE 已摘除）。"""
+        dimension_keys = ["sector_flow", "northbound_realtime"]
         dimension_fetchers = [
             self._fetch_sector_fund_flow(quality),
-            self._fetch_dde(quality),
             self._fetch_northbound_realtime(quality),
         ]
 
@@ -220,41 +214,6 @@ class CapitalAnalysisNode:
                 "industry": industry_df,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
-
-        return await asyncio.to_thread(_fetch)
-
-    async def _fetch_dde(self, quality: DataQuality) -> Optional[dict]:
-        """获取 DDE 大单净流入数据。复用已有的 DdeFetcher。"""
-        def _fetch():
-            try:
-                from src.services.dde_fetcher import DdeFetcher
-                from src.config import get_config
-                config = get_config()
-                dde = DdeFetcher(config)
-                result = dde.fetch_market_dde()
-                if not result or result.error or not result.snapshots:
-                    return None
-
-                # 将 snapshots dict 转为 list of dicts 以便评分
-                snapshot_list = []
-                total_net = 0.0
-                for code, snap in result.snapshots.items():
-                    snapshot_list.append({
-                        "code": snap.code,
-                        "dde_big_order": snap.dde_big_order,
-                        "big_net_amount": snap.big_net_amount,
-                    })
-                    total_net += snap.big_net_amount
-
-                return {
-                    "snapshots": snapshot_list,
-                    "total_net_amount": total_net,
-                    "stock_count": len(snapshot_list),
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            except Exception as e:
-                logger.warning(f"DDE 获取失败: {e}")
-            return None
 
         return await asyncio.to_thread(_fetch)
 
@@ -315,19 +274,8 @@ class CapitalAnalysisNode:
             missing_dimensions.append(DIMENSION_LABELS["sector_flow"])
             quality.fetch_failed_fields.append("sector_flow")
 
-        # --- 维度 2：DDE 大单净流入（权重 0.35）---
-        dde_score = self._score_dde(raw_data.get("dde"))
-        if dde_score is not None:
-            score, ev_dict = dde_score
-            evidence.dde = ev_dict
-            available_scores.append(score)
-            available_weights.append(DIMENSION_WEIGHTS["dde"])
-            quality.available_fields.append("dde")
-        else:
-            missing_dimensions.append(DIMENSION_LABELS["dde"])
-            quality.fetch_failed_fields.append("dde")
-
-        # --- 维度 3：北向资金实时（永久豁免 — 2024-08 起官方停披，不计入缺失）---
+        # --- 维度 2：北向资金实时（永久豁免 — 2024-08 起官方停披，不计入缺失）---
+        # 注：原 DDE 维度（大单净流入）随东财 push2 整域封锁长期失效，缺陷③A 已摘除。
         nb_score = self._score_northbound_realtime(raw_data.get("northbound_realtime"))
         if nb_score is not None:
             score, ev_dict = nb_score
@@ -358,9 +306,15 @@ class CapitalAnalysisNode:
         )
         institutional_score = clip(institutional_score, -1.0, 1.0)
 
-        # 置信度 = 可用维度数 / 有效维度总数（排除永久豁免维度）
+        # 置信度 = 可用维度数 / 有效维度总数（排除永久豁免维度，上限 1.0）
+        # 摘除 DDE 后 effective_total=1；北向豁免维度若偶发可用属加分，
+        # 故对 confidence_multiplier 做 min(1.0, ·) 夹逼，避免越出 schema le=1.0。
         effective_total = len(DIMENSION_WEIGHTS) - len(EXEMPT_DIMENSIONS & set(DIMENSION_WEIGHTS.keys()))
-        confidence_multiplier = len(available_scores) / max(1, effective_total)
+        confidence_multiplier = min(1.0, len(available_scores) / max(1, effective_total))
+
+        # 缺陷③A 诚实标注：机构态度仅由单一可用维度支撑时置位
+        # （摘除 DDE 后 effective_total=1，sector_flow 可用即单维口径）
+        single_dimension = len(available_scores) == 1
 
         # 态度判定
         if institutional_score > _BULLISH_THRESHOLD:
@@ -377,6 +331,7 @@ class CapitalAnalysisNode:
             institutional_attitude=attitude,
             institutional_score=round(institutional_score, 4),
             confidence_multiplier=round(confidence_multiplier, 2),
+            single_dimension=single_dimension,
             evidence=evidence,
             missing_dimensions=missing_dimensions,
             data_quality=quality,
@@ -588,70 +543,6 @@ class CapitalAnalysisNode:
         }
 
     @staticmethod
-    def _score_dde(data: Optional[dict]) -> Optional[tuple[float, dict]]:
-        """DDE 大单净流入评分。
-
-        逻辑：全市场大单净流入金额合计 / 归一化基数 → clip(-1, 1)
-        数据源：DdeFetcher (Playwright → push2.eastmoney.com)
-        v2.1 扩展：从归档回读 DDE 序列，计算累计值和连续正流入天数
-        """
-        if data is None:
-            return None
-
-        total_net = data.get("total_net_amount")
-        if total_net is None:
-            return None
-
-        total_net = float(total_net)
-        stock_count = data.get("stock_count", 0)
-
-        # 归一化：1000 亿（1e11 元）→ score 1.0
-        dde_score = clip(total_net / 1e11, -1.0, 1.0)
-
-        # 统计流入/流出股票数
-        snapshots = data.get("snapshots", [])
-        inflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) > 0)
-        outflow_count = sum(1 for s in snapshots if s.get("big_net_amount", 0) < 0)
-
-        # === v2.1 DDE 序列归档回查 ===
-        cumulative_3d: Optional[float] = None
-        cumulative_5d: Optional[float] = None
-        consecutive_positive_days = 0
-
-        try:
-            from src.got.persistence import load_capital_flow_series
-            _, dde_series = load_capital_flow_series(days=5)
-        except Exception as e:
-            logger.warning(f"[Node 3] DDE 归档回读失败: {e}")
-            dde_series = []
-
-        if dde_series:
-            # 累计值（最近 3d/5d 之和）
-            flows = [flow for _, flow in dde_series]
-            if len(flows) >= 3:
-                cumulative_3d = round(sum(flows[-3:]), 2)
-            if len(flows) >= 5:
-                cumulative_5d = round(sum(flows[-5:]), 2)
-
-            # 连续正流入天数（从最近一天往前数）
-            for _, flow in reversed(dde_series):
-                if flow > 0:
-                    consecutive_positive_days += 1
-                else:
-                    break
-
-        return dde_score, {
-            "score": round(dde_score, 4),
-            "total_net_inflow": round(total_net / 1e8, 2),  # 亿元
-            "inflow_stock_count": inflow_count,
-            "outflow_stock_count": outflow_count,
-            "cumulative_3d": cumulative_3d,
-            "cumulative_5d": cumulative_5d,
-            "consecutive_positive_days": consecutive_positive_days,
-            "timestamp": data.get("timestamp"),
-        }
-
-    @staticmethod
     def _score_northbound_realtime(
         df: Optional[pd.DataFrame],
     ) -> Optional[tuple[float, dict]]:
@@ -712,13 +603,6 @@ class CapitalAnalysisNode:
             )
             if sf.get("mainline_bonus"):
                 evidence_parts.append("  → 主线板块资金确认（额外加分）")
-        if ctx.evidence.dde:
-            dde = ctx.evidence.dde
-            evidence_parts.append(
-                f"- 大单净流入(DDE)：全市场净{'流入' if dde['total_net_inflow'] > 0 else '流出'} "
-                f"{abs(dde['total_net_inflow'])}亿，"
-                f"流入股 {dde['inflow_stock_count']} / 流出股 {dde['outflow_stock_count']}"
-            )
         if ctx.evidence.northbound_realtime:
             nb = ctx.evidence.northbound_realtime
             evidence_parts.append(
@@ -756,7 +640,7 @@ class CapitalAnalysisNode:
                 "严禁使用“强烈看多”“坚决做多”等强绝对化措辞，改用“资金维度强流入”等限定表述。"
             )
         else:
-            dim_note = "三维资金数据完整（板块资金流/大单/北向），证据充分。"
+            dim_note = "资金面基于板块资金流单维口径（DDE 数据源已随东财封锁失效摘除、北向官方停披豁免），证据维度有限，请注意结论强度。"
 
         prompt = (
             f"你是一个专业的资金流分析师。根据以下{time_context}资金数据，撰写简洁分析报告。\n\n"
@@ -795,10 +679,6 @@ class CapitalAnalysisNode:
             sf = ctx.evidence.sector_flow
             concepts = "、".join(sf.get("top_concepts", [])[:3]) or "无"
             parts.append(f"板块资金流净流入：{concepts}。")
-        if ctx.evidence.dde:
-            dde = ctx.evidence.dde
-            direction = "流入" if dde["total_net_inflow"] > 0 else "流出"
-            parts.append(f"大单净{direction} {abs(dde['total_net_inflow'])}亿。")
         if ctx.evidence.northbound_realtime:
             nb = ctx.evidence.northbound_realtime
             parts.append(f"北向资金累计 {nb['cumulative_inflow']}亿。")
@@ -815,10 +695,11 @@ class CapitalAnalysisNode:
     def _mock_output(self) -> CapitalContext:
         """Mock 输出"""
         return CapitalContext(
-            status="normal",  # 北向豁免后，仅 sector_flow + dde 两维即为正常
+            status="normal",  # 北向豁免后，仅 sector_flow 单维即为正常
             institutional_attitude="neutral",
             institutional_score=0.05,
-            confidence_multiplier=1.0,  # 2/2 有效维度（北向已豁免）
+            confidence_multiplier=1.0,  # 1/1 有效维度（北向已豁免、DDE 已摘除）
+            single_dimension=True,  # 缺陷③A：仅剩 sector_flow 单维口径
             evidence=CapitalEvidence(
                 sector_flow={
                     "score": 0.15,
@@ -827,18 +708,11 @@ class CapitalAnalysisNode:
                     "mainline_bonus": False,
                     "timestamp": "mock",
                 },
-                dde={
-                    "score": -0.10,
-                    "total_net_inflow": -15.0,
-                    "inflow_stock_count": 2200,
-                    "outflow_stock_count": 2800,
-                    "timestamp": "mock",
-                },
             ),
             missing_dimensions=["北向资金(实时)"],
-            reasoning="[Mock] 板块资金小幅流入，大单净流出15亿。整体中性。",
+            reasoning="[Mock] 板块资金小幅流入（单维口径）。整体中性。",
             data_quality=DataQuality(
-                available_fields=["sector_flow", "dde"],
+                available_fields=["sector_flow"],
                 missing_fields=["northbound_realtime"],
                 fetch_failed_fields=["northbound_realtime"],
             ),
