@@ -18,6 +18,7 @@ Node 5: 情绪面分析节点
 import asyncio
 import logging
 import pathlib
+import re
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 XUEQIU_TOP_N = 50  # 过滤后取前 50 只热门股（覆盖全行业主要板块）
 XUEQIU_TIMEOUT = 90  # 雪球 API 较慢，单次超时 90 秒
+
+# 缺陷③C：akshare 雪球三榜全崩时，走 newsnow-xueqiu 低保真单维备份（独立网络路径）
+NEWSNOW_XUEQIU_TIMEOUT = 20  # 备份通道独立超时（秒）
+# newsnow-xueqiu item.url 形如 https://xueqiu.com/S/SH600519 → 提取 6 位代码
+_XUEQIU_CODE_RE = re.compile(r"/S/(?:SH|SZ|BJ)?(\d{6})", re.IGNORECASE)
 
 # 东财关注指数存储缩放（历史遗留：原值约 0~100，存储时 ×1000）
 EM_ATTENTION_SCALE = 1000
@@ -353,12 +359,85 @@ class SentimentAnalysisNode:
             logger.warning("[Node 5] 雪球热榜整体超时 (%ds)，返回空", XUEQIU_TIMEOUT)
             follow, deal, tweet = [], [], []
 
-        return {
+        result = {
             "follow": follow,
             "deal": deal,
             "tweet": tweet,
             "total_count": len(follow) + len(deal) + len(tweet),
         }
+
+        # 缺陷③C：akshare 雪球三榜全崩（total_count==0）时，
+        # 用 newsnow-xueqiu 低保真单维备份兜底，使 Node 5 降级路径不至于全空。
+        if result["total_count"] == 0:
+            fallback = await self._fetch_xueqiu_newsnow_fallback()
+            if fallback:
+                result["tweet"] = fallback
+                result["total_count"] = len(fallback)
+                result["fallback_source"] = "newsnow-xueqiu"
+
+        return result
+
+    async def _fetch_xueqiu_newsnow_fallback(self) -> List[Dict]:
+        """缺陷③C：akshare 雪球三榜全崩时，从 newsnow-xueqiu 热榜扒低保真单维备份。
+
+        newsnow-xueqiu 走 IntelligenceService 的独立网络路径（非 push2/雪球 Web API，
+        本代理下仍活）。其 item 仅 {title,url,summary,extra.hot_score}，无结构化
+        股票代码/价/三维关注数，故为「低保真单维」：
+          - stock_code: url 正则 `/S/SH600519` → 600519（取不到则跳过）
+          - stock_name: title
+          - attention:  extra.hot_score（热度代理，口径异于 akshare 关注数）
+          - dimension:  固定 "tweet"（单维归并，不污染 follow/deal）
+        不做情绪/价格推断；下游 _extract_hot_stocks/_calculate_retail_attention
+        仅在 em_data 也缺失时按雪球降级路径消费（mention_source=XUEQIU, sentiment=neutral）。
+        """
+        from src.got.intelligence_service import _fetch_newsnow_template
+
+        def _collect():
+            return _fetch_newsnow_template("xueqiu-hotstock")
+
+        try:
+            items = await asyncio.wait_for(
+                asyncio.to_thread(_collect),
+                timeout=NEWSNOW_XUEQIU_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("[Node 5] newsnow-xueqiu 备份采集失败: %s", exc)
+            return []
+
+        records: List[Dict] = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("title", "")).strip()
+            if not name:
+                continue
+            # 与主源一致的科技成长宽松过滤
+            if not any(kw in name for kw in TECH_GROWTH_KEYWORDS):
+                continue
+            m = _XUEQIU_CODE_RE.search(str(it.get("url", "")))
+            if not m:
+                continue
+            try:
+                hot = int((it.get("extra") or {}).get("hot_score", 0) or 0)
+            except (TypeError, ValueError):
+                hot = 0
+            records.append({
+                "stock_code": m.group(1),
+                "stock_name": name,
+                "attention": hot,
+                "price": 0.0,
+                "dimension": "tweet",
+            })
+
+        # 按热度降序取 top N，对齐主源语义
+        records.sort(key=lambda r: r["attention"], reverse=True)
+        top = records[:XUEQIU_TOP_N]
+        if top:
+            logger.info(
+                "[Node 5] newsnow-xueqiu 低保真备份命中 %d 只（akshare 雪球全崩兜底）",
+                len(top),
+            )
+        return top
 
     async def _fetch_eastmoney_comment(self) -> Dict[str, Any]:
         """获取东财千股千评全市场数据（datacenter-web 端点，非 push2）。
