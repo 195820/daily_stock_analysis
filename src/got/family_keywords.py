@@ -8,7 +8,17 @@ schemas.py 与 sector_analysis.py 均从此模块 import。
 - AI软件族：移除 "OLED", "MiniLED", "折叠屏"（转至 AI硬件族）
 - AI硬件族：添加 "OLED", "MiniLED", "折叠屏"；"光刻" 曾移除后回归（受控词表无「设备」族）
 - 周期资源族：添加 "航运"（从军工族移入）
+
+修正记录（2026-09-29，WI-P1-7(a) 家族词表歧义治理）：
+- 新能源族：移除 "换电"（与智能驾驶族重叠，声明序首命中使新能源侧条目成为死配置；
+  显式归智能驾驶，与现网实际分类结果一致，零行为变更仅消除歧义）
+- 新增模块加载期跨族重叠自检（logger.warning 留痕，不改变首命中裁决），
+  重叠清单可由 scripts/audit_family_keyword_overlap.py 离线审计。
 """
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 主线家族关键词（Node 2 v2：替代旧的 CONCEPT_UNIVERSE + _FRAME_GROUP_KEYWORDS）
 # ~14 个家族，每个板块名命中首个匹配的家族，未命中 → "其他"
@@ -54,7 +64,8 @@ FAMILY_KEYWORDS: list[tuple[str, list[str]]] = [
         "核电", "绿色电力",
         # 电池技术
         "BC电池", "钙钛矿电", "TOPCon电", "钠电池", "固态电池",
-        "麒麟电池", "刀片电池", "动力电池回收", "换电",
+        "麒麟电池", "刀片电池", "动力电池回收",
+        # WI-P1-7(a)：移除 "换电"（与智能驾驶族重叠且永不生效，显式归智能驾驶）
     ]),
     # 2026-09-02 P2-4 新增：终结"其他"家族垃圾箱
     # 农业族必须早于医药族（"转基因"夺占检测）
@@ -117,3 +128,28 @@ CONTROLLED_FAMILIES: list[str] = [name for name, _ in FAMILY_KEYWORDS]
 
 # 派生：家族名集合（sector_analysis.py 内部快速查找用）
 FAMILY_NAMES: set[str] = {name for name, _ in FAMILY_KEYWORDS}
+
+
+def _audit_keyword_overlaps() -> list[tuple[str, list[str]]]:
+    """跨族关键词重叠自检（WI-P1-7(a)）。
+
+    返回 [(keyword, [族名...])]；声明序首命中仍是裁决规则（不改行为），
+    本自检只做留痕：后续族内的重叠词实为死配置，应显式去重或调整声明序。
+    """
+    seen: dict[str, str] = {}
+    overlaps: list[tuple[str, list[str]]] = []
+    for family, keywords in FAMILY_KEYWORDS:
+        for kw in keywords:
+            if kw in seen:
+                overlaps.append((kw, [seen[kw], family]))
+            else:
+                seen[kw] = family
+    return overlaps
+
+
+for _kw, _fams in _audit_keyword_overlaps():
+    logger.warning(
+        "[family_keywords] WI-P1-7(a) 跨族重叠词: '%s' 同时登记于 %s → "
+        "首命中 '%s' 生效，后者为死配置（请去重或显式调整声明序）",
+        _kw, "、".join(_fams), _fams[0],
+    )
