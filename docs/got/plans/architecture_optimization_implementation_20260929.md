@@ -315,5 +315,38 @@
 - **不新增多条件 AND 硬闸**：一律评分 + 排名截断（P1-6/P2-7）。
 - **暂缓项**：P2 全部依赖 P0/GATE 读数达标后启动；未达前置前不进入 enabled。
 
+## 11. 实施进展（2026-09-29 落地）
+
+> 原则：能纯观测/离线、不碰在线决策的先做（shadow/off 态逐字节不变红线已过），
+> 依赖上游读数或需维护者裁决口径的归入延后。
+
+### 11.1 已落地（均含测试，开关缺省 off/shadow）
+- **GATE-1 卖出侧可成交性投影层**：新增 `src/got/tradability.py`（纯函数 + 行情获取 + T+1 建仓日）；
+  `_allocate` 三处接线（Step1 sell/reduce 打标顺延、Step1.5 W2 削单、Step3 买入涨停拦截）；
+  schema 加 `pending_exit`/`blocked_reason`/`tradability_shadow`。降级红线：行情缺失绝不拦截，仅落 `quote_unavailable`。
+  开关 `GOT_TRADABILITY_GATE`（off 缺省）。测试 `tests/test_gate1_tradability_wiring.py`。
+- **WI-P0-3 敞口执行接线 shadow**：`GOT_EXPOSURE_ENFORCE`（缺省 shadow）记录"若强制会截断多少"，纯观测不改决策；schema 加 `exposure_enforce_shadow`。
+- **WI-P0-4 sizing 信号强度连续缩放 shadow**：`GOT_SIGNAL_SIZE`（缺省 shadow）对比等分 vs `score^γ` 加权仓位差（γ=0.5），纯观测；schema 加 `signal_size_shadow`。
+- **WI-P0-5 阈值回归校准闭环**：离线脚本 `scripts/recalibrate_thresholds.py` 产出 `data/threshold_calibration.json`（lifecycle day 建议、drift/binary 附 Wilson 区间与 `insufficient_sample` 标注）。
+- **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
+- **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检（b embedding 兜底延后）。
+- **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
+
+### 11.2 延后裁决
+- **WI-P1-4 Node2 二波识别**：核心已由 v3.5 `decide_wave_days`（`sector_analysis.py:70`）覆盖——冷却期冻结继承、真洗盘（间隙≥2 交易日 + 自出框前平台回撤≥10 分）重置 wave_days=1。`fresh momentum 豁免老化`残留分支需维护者用真实样本裁决，本轮不动。
+- **WI-P2-7 / P2-10 / P2-12**（漏斗分数化 / 轮动换手惩罚 / 蓄水池自适应）：均改在线选股·轮动·池容量判据，触候选池归零红线（§0.1-3）且新阈值须先经 P0-5 标定（§0.1-6）；当前标定样本尚 `insufficient_sample`，先延后待读数。
+- **WI-P2-1/2/3/4/5/6/8/11**：硬依赖 P0-1/P1-3/P1-8/GATE-2 尚未落地，按 §6 排期属第 2–4 批，本轮不启动。
+
+### 11.3 代码审查修复（2026-09-30 CR 轮）
+对 §11.1 已落地项发起代码审查（无 Critical），7 项 Warning/Suggestion 全部修复：
+- **CR#1（WI-P1-9）**：`_is_cn_trading_day` 叠加 `weekday()>=5` 硬约束先短路——exchange-calendars 缺失时 `is_market_open` fail-open 恒返 True，修正前周末被误计为交易日；降级契约改为绝不会把周末判为交易日。
+- **CR#2（GATE-1）**：`check_tradability` 将 T+1 判定提到行情充分性检查之前——T+1 仅依赖建仓日，修正前行情缺失走 `quote_unavailable` 放行会旁路当日建仓卖单拦截。
+- **CR#3（GATE-1）**：`quote_unavailable` 降级放行时不再置 `pending_exit=True`（sell/reduce/buy/W2 四处统一），仅留 `blocked_reason` 观测标签，消除“已放行却标顺延”的语义矛盾。
+- **CR#4（GATE-1）**：`_tradability_check` 加 `_entry_cache` 日内缓存，同标的 entry_date 仅一次查库 IO。
+- **CR#5（GATE-1）**：enabled 卖/减顺延时回写 `remaining_qty[symbol]=0`，防 Step 1.5 重复削减同一标的。
+- **CR#6（WI-P0-5）**：`recalibrate_thresholds.py` docstring 产出文件名对齐实际 `threshold_calibration.json`；三处统计函数加 `n==0` 早退，空箱不再 `days[-1]`/`mean([])` 崩溃。
+- **CR#7（GATE-1）**：`tradability.py` 模块 docstring 封板口径对齐实现（跌停看当日最高价是否全天贴住跌停、涨停看最低价，high/low 双界）。
+测试同步：新增 `test_t_plus_1_blocked_even_when_quote_missing`（CR#2 回归）、重写 `test_calendar_library_unavailable_never_counts_weekend`（CR#1 真实 fail-open 口径）、修正 `test_quote_unavailable_never_blocks_enabled`（CR#3 新语义：`pending_exit is False` 且不进顺延集合）。回归：`test_gate1_tradability_wiring.py` + `test_p2_9_context_consistency.py` 36 passed；portfolio/node6/aggregator 相关 11 文件组合 162 passed（开关全关旧路径无扰动）。
+
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
