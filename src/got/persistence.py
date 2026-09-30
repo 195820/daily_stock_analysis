@@ -105,6 +105,57 @@ def list_saved_contexts() -> list[tuple[date, Path]]:
 
 
 # =============================================================================
+# WI-P2-9 · 跨日一致性断言（O4，shadow 只报警不改写）
+# =============================================================================
+
+def cross_day_consistency_diff(
+    json_sector_names: list[str],
+    db_sector_names: list[str],
+) -> dict[str, list[str]]:
+    """纯函数：JSON 上下文板块名 vs Node2 DB 板块名，归一化后取双向差。
+
+    口径（WI-P2-9 a 部分，plan §5）：仅断言「JSON 记为 actionable 的板块在 DB
+    主线族当日记录中缺席」这类跨存储分裂；不判定业务语义差异（actionable 与
+    active_mainline 状态机不同维度，j_only 只作观测读数不作错误）。
+    名称先经 normalize_sector_name 归一，避免别名/后缀误报。
+
+    Returns:
+        {"j_only": [...], "db_only": [...]}：板块名列表（以 JSON 侧原名为展示名，
+        db_only 以 DB 侧原名为展示名），升序。
+    """
+    from src.got.board_aliases import normalize_sector_name
+
+    j_norm = {normalize_sector_name(n): n for n in json_sector_names if n}
+    db_norm = {normalize_sector_name(n): n for n in db_sector_names if n}
+    j_only = sorted(j_norm[k] for k in j_norm.keys() - db_norm.keys())
+    db_only = sorted(db_norm[k] for k in db_norm.keys() - j_norm.keys())
+    return {"j_only": j_only, "db_only": db_only}
+
+
+def query_db_mainline_family_sector_names(trading_date: date) -> list[str]:
+    """查当日 Node2 DB 中主线族状态（active/降温/衰竭）的板块名。
+
+    DB 访问失败直接抛出（由调用方 shadow 化兑底），本函数不吞异常，
+    以便接线层区分「无记录」与「查库失败」。
+    """
+    from src.storage import DatabaseManager, Node2SectorTrendRecord
+
+    db = DatabaseManager()
+    with db.get_session() as session:
+        rows = (
+            session.query(Node2SectorTrendRecord.sector_name)
+            .filter(
+                Node2SectorTrendRecord.tracking_date == trading_date,
+                Node2SectorTrendRecord.state.in_(
+                    ("active_mainline", "high_position_cooling", "exhausted_mainline")
+                ),
+            )
+            .all()
+        )
+    return [r[0] for r in rows if r[0]]
+
+
+# =============================================================================
 # EMA 基线（时间一致性自适应阈值）
 # =============================================================================
 

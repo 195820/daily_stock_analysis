@@ -4776,6 +4776,11 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         }
         try:
             save_current_context(context_dict, today)
+            # WI-P2-9 跨日一致性断言（GOT_CONTEXT_CONSISTENCY，缺省 off）：
+            # shadow/enabled 仅在此处追加观测，off 态不进入该分支 → 旧路径逐字节不变。
+            _cc_mode = os.environ.get("GOT_CONTEXT_CONSISTENCY", "off").strip().lower()
+            if _cc_mode in ("shadow", "enabled"):
+                self._shadow_context_consistency(context_dict, today)
         except Exception as e:
             logger.warning(f"[Node 6] 上下文持久化失败: {e}")
 
@@ -4819,6 +4824,33 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
             save_ema_baseline(new_baseline)
         except Exception as e:
             logger.warning(f"[Node 6] EMA 基线更新失败: {e}")
+
+    @staticmethod
+    def _shadow_context_consistency(context_dict: dict, today: date) -> None:
+        """WI-P2-9 shadow：JSON 上下文 actionable 板块 vs Node2 DB 主线族当日记录。
+
+        只报警不改写（enabled 同 shadow；「统一真相源 + 冲突拦截」属后续批次，
+        需维护者裁决口径）。任何异常内部兑底，绝不向外抛出——不得把 shadow
+        观测变成 save_current_context 之后新的失败面。
+        """
+        try:
+            from src.got.persistence import (
+                cross_day_consistency_diff,
+                query_db_mainline_family_sector_names,
+            )
+
+            db_names = query_db_mainline_family_sector_names(today)
+            diff = cross_day_consistency_diff(
+                list(context_dict.get("confirmed_sectors") or []), db_names,
+            )
+            if diff["j_only"] or diff["db_only"]:
+                logger.warning(
+                    "[Node 6][P2-9 shadow] 跨日一致性差异: "
+                    f"JSON有/DB主线族无={diff['j_only']}, "
+                    f"DB主线族有/JSON无={diff['db_only']}"
+                )
+        except Exception as e:
+            logger.warning(f"[Node 6][P2-9 shadow] 一致性断言异常（已吞）: {e}")
 
     # =========================================================================
     # LLM 调用工具
