@@ -1149,6 +1149,16 @@ class TradeAllocation(BaseModel):
         default=False,
         description="Q4 audit: True if based on intraday data (bar_complete=false)",
     )
+    # ── GATE-1: 卖出侧可成交性投影层（shadow 打标不改决策 / enabled 转顺延）──
+    pending_exit: bool = Field(
+        default=False,
+        description="GATE-1: True=卖单被可成交性拦截（跌停封板/T+1），待顺延复核；"
+                    "shadow 模式仅打标不改数量，enabled 模式不进当日成交集合",
+    )
+    blocked_reason: Optional[str] = Field(
+        default=None,
+        description="GATE-1 拦截/降级原因: limit_down/t_plus_1/limit_up/quote_unavailable",
+    )
 
 
 class PortfolioDecision(BaseModel):
@@ -1197,6 +1207,29 @@ class PortfolioDecision(BaseModel):
                     "mode=shadow 时只算不落决策（buy_budget 不变）；mode=enabled 且 veto_buy 时"
                     "与 over_limit_forced 并列把 buy_budget 归零（风控优先于既有降级规则）。"
                     "仅留痕，不参与判定。【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── GATE-1 卖出侧可成交性投影留痕（实施报告 2026-09-29）──
+    tradability_shadow: Optional[dict] = Field(
+        default=None,
+        description="可成交性投影留痕: {mode, pending_exits, note}。mode=shadow 时仅打标"
+                    "（pending_exit/blocked_reason 落 allocation，不改数量）；mode=enabled 时"
+                    "被拦截卖单不进当日成交集合（顺延复核）。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── WI-P0-3 敞口执行接线 shadow 留痕（实施报告 2026-09-29）──
+    exposure_enforce_shadow: Optional[dict] = Field(
+        default=None,
+        description="敞口截断观测留痕: {mode, would_truncate_count, would_truncate_total_value, "
+                    "checks, note}。仅记录若强制会截断多少，shadow 下决策逐字节不变；"
+                    "enabled 前置条件=conf_w 经 ECE 校准达标（P0-5）。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── WI-P0-4 信号强度连续缩放 shadow 留痕（实施报告 2026-09-29）──
+    signal_size_shadow: Optional[dict] = Field(
+        default=None,
+        description="信号加权仓位差观测留痕: {mode, gamma, items, max_abs_delta, note}。"
+                    "对比等分 vs score^γ 加权的仓位差，shadow 不改任何仓位。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
 
 

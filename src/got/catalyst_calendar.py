@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -71,23 +72,55 @@ def _make_event_id(source: str, event_type: str, sector: str, event_date: date) 
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def _is_cn_trading_day(d: date) -> bool:
+    """单日 A 股交易日判定（WI-P1-9 真实交易日历）。
+
+    降级契约：真实交易日必不为周末，故叠加 weekday 硬约束——
+    - exchange-calendars 可用：weekend-only 约束 × 日历（自动排除节假日）；
+    - exchange-calendars 不可用：is_market_open 会 fail-open 恒返回 True，
+      weekday 约束使其自动降级为 weekend-only，**绝不会把周末误判为交易日**；
+    - 日历模块/查询异常：except 分支同样回退 weekend-only（warning 一次）。
+    """
+    if d.weekday() >= 5:  # 周六/周日恒非交易日（先短路，兼作 fail-open 守卫）
+        return False
+    try:
+        from src.core.trading_calendar import is_market_open
+        return bool(is_market_open("cn", d))
+    except Exception as exc:  # 日历模块/依赖异常 → 降级 weekday-only，不阻断构建
+        if not getattr(_is_cn_trading_day, "_warned", False):
+            logger.warning("[catalyst_calendar] 真实交易日历不可用，降级为 weekend-only: %s", exc)
+            _is_cn_trading_day._warned = True
+        return d.weekday() < 5
+
+
 def _trade_days_offset(base: date, days: int) -> date:
-    """粗略交易日偏移（跳过周末，不处理节假日）"""
+    """交易日偏移。
+
+    WI-P1-9：GOT_REAL_TRADE_CAL=1 时按真实交易日历（跳过周末+节假日）；
+    默认（开关关）保持 weekend-only 旧口径，逐字节不变。
+    """
+    use_real = os.getenv("GOT_REAL_TRADE_CAL", "0") == "1"
     result = base
     added = 0
     while added < days:
         result += timedelta(days=1)
-        if result.weekday() < 5:
+        if _is_cn_trading_day(result) if use_real else result.weekday() < 5:
             added += 1
     return result
 
 
 def _count_trade_days(start: date, end: date) -> int:
-    """两日期间的交易日数（跳过周末）"""
+    """两日期间的交易日数（含首尾交易日）。
+
+    WI-P1-9：GOT_REAL_TRADE_CAL=1 时按真实交易日历计数（节假日不计入），
+    供 drift 超时(20)/衰竭(10)/binary 宽限等埋伏退出计数使用；
+    默认保持 weekend-only 旧口径。
+    """
+    use_real = os.getenv("GOT_REAL_TRADE_CAL", "0") == "1"
     count = 0
     current = start
     while current <= end:
-        if current.weekday() < 5:
+        if _is_cn_trading_day(current) if use_real else current.weekday() < 5:
             count += 1
         current += timedelta(days=1)
     return count

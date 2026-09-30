@@ -274,6 +274,13 @@ class PortfolioDecisionNode:
             # Phase 3b / RiskOverridePlan 观测留痕（批 5 §3.3）：shadow 不改 buy_budget，
             # enabled+veto_buy 时与 over_limit_forced 并列归零预算；由 _allocate 落 self。
             risk_override_shadow=getattr(self, "_risk_override_shadow", None),
+            # GATE-1 可成交性投影留痕（实施报告 §2）：shadow 打标/enabled 顺延均记，
+            # 仅留痕不参与判定（allocation 级别的 pending_exit 才是决策投影）
+            tradability_shadow=getattr(self, "_tradability_pending", None),
+            # WI-P0-3/P0-4 shadow 留痕（实施报告 §3）：敞口截断/信号加权均为纯观测，
+            # 不改任何 allocation 决策（由 _allocate 落 self）
+            exposure_enforce_shadow=getattr(self, "_exposure_enforce_shadow", None),
+            signal_size_shadow=getattr(self, "_signal_size_shadow", None),
             data_quality=data_quality,
         )
 
@@ -3748,6 +3755,59 @@ verdict 含义：
 
         target_position_value = risk.position_limit * total_equity
 
+        # ── GATE-1: 卖出侧可成交性投影层（实施报告 §2，三态开关）──
+        #   缺省 off → 完全不进，旧路径逐字节不变（含不新增行情 IO）；
+        #   shadow → 只给卖单打 pending_exit/blocked_reason 观测标签，不改数量/预算；
+        #   enabled → 跌停封板/T+1 卖单转顺延（不进成交集合、释放资金不计入预算）。
+        #   降级红线：行情取不到 → 不拦截不抛异常，仅落 blocked_reason=quote_unavailable。
+        _tg_mode = os.getenv("GOT_TRADABILITY_GATE", "off").strip().lower()
+        _tg_enabled = _tg_mode == "enabled"
+        _tg_shadow = _tg_mode == "shadow"
+        _tg_active = _tg_enabled or _tg_shadow
+        pending_exits: List[Dict[str, Any]] = []
+        _quote_cache: Dict[str, Any] = {}
+        _entry_cache: Dict[str, Any] = {}  # symbol -> entry_date（避免同一标的多次查库）
+        _tg_today = date.today()
+
+        def _tradability_check(symbol: str, name: str, action: str):
+            """行情缓存 + 可成交性判定（同标的日内一次 IO）。异常一律放行。"""
+            from src.got.tradability import (
+                check_tradability, fetch_tradability_inputs, get_last_entry_date,
+                limit_pct_for_code,
+            )
+            if symbol not in _quote_cache:
+                try:
+                    _quote_cache[symbol] = fetch_tradability_inputs(symbol)
+                except Exception as exc:  # 绝不阻塞 Phase 2 主流程
+                    logger.debug("[Phase 2] GATE-1 行情获取异常 %s: %s", symbol, exc)
+                    _quote_cache[symbol] = {}
+            q = _quote_cache[symbol]
+            entry_date = None
+            if action == "sell":
+                # CR#4：entry_date 来自 DB（与行情无关），同标的日内缓存一次
+                if symbol not in _entry_cache:
+                    try:
+                        _entry_cache[symbol] = get_last_entry_date(symbol, _tg_today)
+                    except Exception as exc:
+                        logger.debug("[Phase 2] GATE-1 建仓日查询异常 %s: %s", symbol, exc)
+                        _entry_cache[symbol] = None
+                entry_date = _entry_cache[symbol]
+            try:
+                return check_tradability(
+                    action=action,
+                    quote_price=q.get("price"),
+                    pre_close=q.get("pre_close"),
+                    quote_low=q.get("low"),
+                    quote_high=q.get("high"),
+                    limit_pct=limit_pct_for_code(symbol, name),
+                    entry_date=entry_date,
+                    today=_tg_today,
+                )
+            except Exception as exc:  # 判定异常 → 放行（降级红线）
+                logger.debug("[Phase 2] GATE-1 判定异常 %s: %s", symbol, exc)
+                from src.got.tradability import TradabilityResult
+                return TradabilityResult(executable=True, blocked_reason="quote_unavailable")
+
         # ── Step 1: 生成卖出建议并计算释放资金 ──
         sell_proceeds = 0.0  # 卖出释放的资金
         # 评审修复#1（2026-09-28）：Step 1 同步维护「处理后的剩余股数」真相，供 Step 1.5 按
@@ -3771,6 +3831,32 @@ verdict 含义：
             action = score.action_recommendation
 
             if action == "sell":
+                # GATE-1 enabled：不可成交卖单转顺延（不落成交、释放资金不计入预算），
+                # 留 pending_exits 观测；shadow 只打标不改数量；quote 缺失不拦截。
+                if _tg_active:
+                    _tg_res = _tradability_check(score.symbol, score.name, "sell")
+                    if not _tg_res.executable:
+                        if _tg_enabled:
+                            pending_exits.append({
+                                "symbol": score.symbol, "name": score.name,
+                                "reason": _tg_res.blocked_reason, "intent": "sell",
+                                "quantity": quantity,
+                            })
+                            logger.info(
+                                f"[Phase 2] GATE-1 enabled：{score.name}({score.symbol}) 卖单顺延"
+                                f"（{_tg_res.blocked_reason}），不计入当日成交与预算"
+                            )
+                            # CR#5：标为已处理，防 Step 1.5 将同一标的再列为削减候选（重复留痕）
+                            remaining_qty[score.symbol] = 0
+                            continue
+                        _tg_flag, _tg_reason = True, _tg_res.blocked_reason
+                    elif _tg_res.blocked_reason == "quote_unavailable":
+                        # CR#3：降级放行（实际照常执行），仅留原因告警，不标 pending_exit
+                        _tg_flag, _tg_reason = False, _tg_res.blocked_reason
+                    else:
+                        _tg_flag, _tg_reason = False, None
+                else:
+                    _tg_flag, _tg_reason = False, None
                 # 强制卖出（止损/衰竭/过热/板块踢出）
                 sell_value = quantity * last_price
                 sell_proceeds += sell_value
@@ -3794,12 +3880,64 @@ verdict 含义：
                         risk_reward_ratio=0.0,
                         confidence=0.9,
                         reasoning=score.reasoning,
+                        pending_exit=_tg_flag,
+                        blocked_reason=_tg_reason,
                     )
                 )
             elif action == "reduce":
                 # 减仓 50%（成熟后期/晚期阶段）
                 reduce_quantity = int(quantity * 0.5 / 100) * 100  # 取整到 100 股
                 if reduce_quantity > 0:
+                    # GATE-1 enabled：不可成交减仓转顺延——不落零股数卖单，
+                    # 留 pending_exit=True 且 quantity_delta=0 的观测记录
+                    if _tg_enabled:
+                        _tg_res = _tradability_check(score.symbol, score.name, "sell")
+                        if not _tg_res.executable:
+                            pending_exits.append({
+                                "symbol": score.symbol, "name": score.name,
+                                "reason": _tg_res.blocked_reason, "intent": "reduce",
+                                "quantity": reduce_quantity,
+                            })
+                            allocations.append(
+                                TradeAllocation(
+                                    symbol=score.symbol,
+                                    name=score.name,
+                                    action="sell",
+                                    target_quantity=quantity,
+                                    target_value=quantity * last_price,
+                                    current_quantity=quantity,
+                                    quantity_delta=0,
+                                    price_range=(last_price * 0.98, last_price),
+                                    expected_return=pnl_pct_decimal,
+                                    stop_loss=round(last_price * 0.93, 2),
+                                    risk_reward_ratio=0.0,
+                                    confidence=0.8,
+                                    reasoning=(
+                                        f"{score.reasoning}, "
+                                        f"[GATE-1 顺延: {_tg_res.blocked_reason} 不可成交，减仓待复核]"
+                                    ),
+                                    pending_exit=True,
+                                    blocked_reason=_tg_res.blocked_reason,
+                                )
+                            )
+                            logger.info(
+                                f"[Phase 2] GATE-1 enabled：{score.name}({score.symbol}) 减仓顺延"
+                                f"（{_tg_res.blocked_reason}）"
+                            )
+                            # CR#5：标为已处理，防 Step 1.5 重复削减同一标的
+                            remaining_qty[score.symbol] = 0
+                            continue
+                    if _tg_shadow:
+                        _tg_res = _tradability_check(score.symbol, score.name, "sell")
+                        if not _tg_res.executable:
+                            _tg_flag, _tg_reason = True, _tg_res.blocked_reason
+                        elif _tg_res.blocked_reason == "quote_unavailable":
+                            # CR#3：降级放行不标 pending_exit，仅留原因
+                            _tg_flag, _tg_reason = False, _tg_res.blocked_reason
+                        else:
+                            _tg_flag, _tg_reason = False, None
+                    else:
+                        _tg_flag, _tg_reason = False, None
                     sell_value = reduce_quantity * last_price
                     sell_proceeds += sell_value
                     # 评审修复#1：扣减剩余敞口真相，Step 1.5 只可再削未处理部分
@@ -3823,6 +3961,8 @@ verdict 含义：
                             risk_reward_ratio=0.0,
                             confidence=0.8,
                             reasoning=score.reasoning,
+                            pending_exit=_tg_flag,
+                            blocked_reason=_tg_reason,
                         )
                     )
 
@@ -3901,9 +4041,40 @@ verdict 含义：
                         "仅观测超限将削谁、是否撞家族宽限；enabled 模式方落实减仓"
                     ),
                 }
+                # GATE-1：给计划内卖单补可成交性标记（shadow/enabled 均留痕，不改计划本身）
+                if _tg_active:
+                    for _trim in self._sell_source_shadow["planned_trims"]:
+                        _tres = _tradability_check(
+                            _trim["symbol"], _trim["name"], "sell"
+                        )
+                        if not _tres.executable:
+                            _trim["tradability_blocked"] = True
+                            _trim["blocked_reason"] = _tres.blocked_reason
                 if _ss_enabled:
                     over_limit_forced = True
                     for (score, quantity, last_price, reduce_quantity, sell_value) in plan:
+                        _tg_flag_w, _tg_reason_w = False, None
+                        _tres_w = None
+                        if _tg_active:
+                            _tres_w = _tradability_check(score.symbol, score.name, "sell")
+                            if not _tres_w.executable:
+                                _tg_flag_w, _tg_reason_w = True, _tres_w.blocked_reason
+                            elif _tres_w.blocked_reason == "quote_unavailable":
+                                # CR#3：降级放行不标 pending_exit，仅留原因
+                                _tg_flag_w, _tg_reason_w = False, _tres_w.blocked_reason
+                        # GATE-1 enabled：不可成交的超限削单跳过（顺延，次日计划重入）
+                        if _tg_enabled and _tres_w is not None and not _tres_w.executable:
+                            pending_exits.append({
+                                "symbol": score.symbol, "name": score.name,
+                                "reason": _tres_w.blocked_reason,
+                                "intent": "sell_source_trim",
+                                "quantity": reduce_quantity,
+                            })
+                            logger.info(
+                                f"[Phase 2] GATE-1 enabled：W2 超限削单 {score.name}"
+                                f"({score.symbol}) 顺延（{_tres_w.blocked_reason}）"
+                            )
+                            continue
                         pnl_pct = holdings_map.get(score.symbol, {}).get(
                             "unrealized_pnl_pct", 0.0
                         ) or 0.0
@@ -3926,6 +4097,8 @@ verdict 含义：
                                     f"{score.reasoning}, "
                                     f"[组合超限减仓: 削 ¥{sell_value:,.0f} 使仓位回落至上限]"
                                 ),
+                                pending_exit=_tg_flag_w,
+                                blocked_reason=_tg_reason_w,
                             )
                         )
                         logger.info(
@@ -4050,6 +4223,18 @@ verdict 含义：
             if not s.is_holding and s.action_recommendation.startswith("buy") and not s.sector_available
         ]
 
+        # ── WI-P0-3 / WI-P0-4 shadow 留痕初始化（纯计算，零 IO）──
+        # P0-3：敞口截断观测——sector_exposure_limits 目前无执行消费者，shadow 只记
+        #   「若强制会截断多少」；conf_w（:357 参 limit 公式）未经 ECE 校准前
+        #   不得让 limit 间接驱动 sizing（隔离前置，实施报告 §3 P0-3）。
+        # P0-4：等分 vs 信号加权仓位差观测；γ 为待 P0-5 标定占位值（红线 6）。
+        _ee_mode = os.getenv("GOT_EXPOSURE_ENFORCE", "shadow").strip().lower()
+        _ee_shadow = _ee_mode == "shadow"
+        _ssz_mode = os.getenv("GOT_SIGNAL_SIZE", "shadow").strip().lower()
+        _ssz_shadow = _ssz_mode == "shadow"
+        exposure_checks: List[Dict[str, Any]] = []
+        _score_by_symbol: Dict[str, float] = {}
+
         if buy_budget > 0:
             candidates = buy_candidates
 
@@ -4079,6 +4264,27 @@ verdict 含义：
                     logger.warning(f"[Phase 2] 无法获取 {score.symbol} 价格，跳过")
                     continue
 
+                # GATE-1: 涨停一字买入拦截（enabled 不进成交集合；shadow 仅留痕）
+                _tg_buy_flag = _tg_buy_reason = None
+                if _tg_active:
+                    _tres_b = _tradability_check(score.symbol, score.name, "buy")
+                    if not _tres_b.executable:
+                        if _tg_enabled:
+                            pending_exits.append({
+                                "symbol": score.symbol, "name": score.name,
+                                "reason": _tres_b.blocked_reason, "intent": "buy_blocked",
+                                "quantity": 0,
+                            })
+                            logger.info(
+                                f"[Phase 2] GATE-1 enabled：{score.name}({score.symbol})"
+                                f" 买单禁入（{_tres_b.blocked_reason}）"
+                            )
+                            continue
+                        _tg_buy_flag, _tg_buy_reason = True, _tres_b.blocked_reason
+                    elif _tres_b.blocked_reason == "quote_unavailable":
+                        # CR#3：降级放行（买单照常），仅留原因告警，不标 pending_exit
+                        _tg_buy_flag, _tg_buy_reason = False, _tres_b.blocked_reason
+
                 # 板块验证清空的候选（sector_name 为空）走 unknown 保守分支（乘数 0.55，与埋伏同档）
                 # 而非默认主线——验证失败是负面信号，不应获得主线标准预算
                 if score.sector_name:
@@ -4098,6 +4304,8 @@ verdict 含义：
 
                 quantity = int(per_stock_budget / estimated_price / 100) * 100
 
+                _score_by_symbol[score.symbol] = score.composite_score
+
                 if quantity == 0:
                     # A 股最小可买单位为 100 股：高价股的整手金额可能超出单只预算，
                     # 取整后归零。此前该路径无任何日志，候选被静默淘汰（审核 F-3）
@@ -4106,6 +4314,20 @@ verdict 含义：
                         f"¥{estimated_price * 100:,.0f}，超出单只预算 ¥{per_stock_budget:,.0f}"
                     )
                     continue
+
+                # WI-P0-3 shadow：若强制敞口会截断多少（仅观测，不改 quantity/预算）
+                if _ee_shadow:
+                    _cap_value = sector_limit * total_equity
+                    _want_value = quantity * estimated_price
+                    if _want_value > _cap_value:
+                        exposure_checks.append({
+                            "symbol": score.symbol,
+                            "sector_name": score.sector_name,
+                            "limit": sector_limit,
+                            "would_truncate_from": round(_want_value, 2),
+                            "cap_value": round(_cap_value, 2),
+                            "overflow_value": round(_want_value - _cap_value, 2),
+                        })
 
                 # D-P11: 落盘分支走向，使行为变更可见。
                 # 判据是 sector_role（D-P13），不再由 limit 反推；
@@ -4137,11 +4359,72 @@ verdict 含义：
                         reasoning=score.reasoning,
                         sector_limit_detail=sector_limit_detail,
                         intraday_snapshot=not bar_complete,  # Q4 audit: 盘中快照标记
+                        pending_exit=bool(_tg_buy_flag),
+                        blocked_reason=_tg_buy_reason,
                     )
                 )
 
         # 预算不足时，全部 BUY 候选被约束否决 → 显式透出（消除"高分候选 vs 0 交易"静默矛盾）
         vetoed_candidates = buy_candidates if buy_budget <= 0 else []
+
+        # ── WI-P0-3 shadow 留痕落盘（仅留痕不参与决策；#5a 先例不进不变组）──
+        self._exposure_enforce_shadow = {
+            "mode": _ee_mode if buy_budget > 0 else "n/a",
+            "would_truncate_count": len(exposure_checks),
+            "would_truncate_total_value": round(
+                sum(c["overflow_value"] for c in exposure_checks), 2
+            ),
+            "checks": exposure_checks,
+            "note": (
+                "P0-3 敞口执行接线观测：limit 含 conf_w 未校准因子，enabled 前置条件是 "
+                "ECE 达标（P0-5）；shadow 仅记若强制会截断多少，决策逐字节不变"
+            ),
+        } if _ee_shadow else None
+
+        # ── WI-P0-4 shadow：等分 vs 信号加权（w_i = score^γ 归一）仓位差留痕 ──
+        self._signal_size_shadow = None
+        if _ssz_shadow and buy_budget > 0 and allocations:
+            _gamma = float(os.getenv("GOT_SIGNAL_SIZE_GAMMA", "0.5"))
+            _buy_allocs = [a for a in allocations if a.action == "buy"]
+            _scores = [
+                max(_score_by_symbol.get(a.symbol, 0.0), 1.0) for a in _buy_allocs
+            ]
+            if _buy_allocs and sum(_scores) > 0:
+                _ws = [s ** _gamma for s in _scores]
+                _wsum = sum(_ws)
+                _sig_items = []
+                for _a, _w in zip(_buy_allocs, _ws):
+                    _sig_val = buy_budget * _w / _wsum
+                    _sig_items.append({
+                        "symbol": _a.symbol,
+                        "name": _a.name,
+                        "equal_value": round(_a.target_value, 2),
+                        "scored_value": round(_sig_val, 2),
+                        "delta": round(_sig_val - _a.target_value, 2),
+                    })
+                self._signal_size_shadow = {
+                    "mode": "shadow",
+                    "gamma": _gamma,
+                    "gamma_status": "待 WI-P0-5 标定（占位 0.5，γ<1 收敛马太效应）",
+                    "items": _sig_items,
+                    "max_abs_delta": round(
+                        max(abs(i["delta"]) for i in _sig_items), 2
+                    ),
+                    "note": (
+                        "P0-4 信号强度连续缩放观测：未乘 role_multiplier 的裸预算口径对比；"
+                        "confidence 不直接进 sizing（除非 ECE 达标）；shadow 不改任何仓位"
+                    ),
+                }
+
+        # GATE-1 留痕：被拦截/打标的顺延清单（供归档复核，shadow 与 enabled 均记）
+        self._tradability_pending = {
+            "mode": "enabled" if _tg_enabled else ("shadow" if _tg_shadow else "off"),
+            "pending_exits": pending_exits,
+            "note": (
+                "GATE-1 可成交性投影：enabled 下被拦截卖单不进当日成交集合（顺延待次日复核）；"
+                "shadow 下仅打 pending_exit/blocked_reason 观测标签，决策逐字节不变"
+            ),
+        } if _tg_active else None
         # Q9-B：板块验证失败被禁入的候选同样显式透出（按综合分降序并入，避免与预算否决重复列示）
         if sector_vetoed:
             logger.info(
