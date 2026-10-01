@@ -570,6 +570,10 @@ class PortfolioDecisionNode:
         # Fix 3: 构建家族→锚点映射（漂移宽限需要）
         family_anchor_map = self._build_family_anchor_map(unified)
 
+        # ── C-B1/B3：持仓 HWM 回撤（移动止盈依据 + 持有天数/回撤观测）──
+        # 逐只日K IO（与 _batch_fetch_tech_scores 同源）；失败返回空→两观测字段 None、追踪 no-op。
+        hwm_map = self._batch_fetch_hwm(positions, thesis_map, ambush_snapshot_map)
+
         # 批量计算资金面/消息面评分（复用 screener 的方法，避免重复实现）
         holding_candidates = []
         for position in positions:
@@ -608,6 +612,18 @@ class PortfolioDecisionNode:
             name = self._resolve_holding_name(symbol, position.get("name", symbol))
             pnl_pct = position.get("unrealized_pnl_pct", 0.0) or 0.0
             pnl_pct_decimal = pnl_pct / 100.0
+
+            # ── C-B1/B3：本只持仓 HWM 回撤与持有天数（追踪仅用于非埋伏主线分支）──
+            _hwm_info = hwm_map.get(symbol)
+            _hwm_gain = _hwm_info.get("hwm_gain") if _hwm_info else None
+            _drawdown = _hwm_info.get("drawdown") if _hwm_info else None
+            _days_held: Optional[int] = None
+            if _hwm_info and _hwm_info.get("entry_date") is not None:
+                from src.got.catalyst_calendar import _count_trade_days
+                try:
+                    _days_held = _count_trade_days(_hwm_info["entry_date"], date.today())
+                except Exception:
+                    _days_held = None
 
             # 查找该股票所属板块（从 sector_context 的 confirmed_sectors 匹配）
             stock_sector_info = self._find_stock_sector(
@@ -797,12 +813,15 @@ class PortfolioDecisionNode:
                     action = "hold"
             else:
                 # 使用生命周期驱动逻辑（吃鱼身+高切低策略）
+                # C-B1：传入 HWM 高点收益/回撤，开关开启时触发移动止盈（埋伏仓已走上方独立分支、不受影响）
                 action, _ = self._lifecycle_sell_signal(
                     pnl_pct_decimal,
                     lifecycle_phase,
                     lifecycle_day,
                     overheat_severity,
                     risk_assessment.stop_loss_threshold,
+                    hwm_gain_pct=_hwm_gain,
+                    drawdown_from_hwm=_drawdown,
                 )
 
             # 构建 reasoning，包含板块情报信息
@@ -897,6 +916,16 @@ class PortfolioDecisionNode:
                 else:
                     reasoning += f", [埋伏持有:{snap.category_tag}]"
 
+            # ── C-B3：持有天数/高点回撤观测标注（纯观测，埋伏/主线均适用）──
+            if _hwm_info is not None:
+                _dd_pct = _drawdown * 100.0 if _drawdown is not None else 0.0
+                if _days_held is not None:
+                    reasoning += f", [持有{_days_held}日,高点回撤{_dd_pct:.0f}%]"
+                else:
+                    reasoning += f", [高点回撤{_dd_pct:.0f}%]"
+                if _hwm_info.get("approx"):
+                    reasoning += " [近似HWM]"
+
             # 板块分类（用于输出可观测性）
             sector_classification = None
             if sector_name and sector_name in sector_intel_map:
@@ -943,6 +972,8 @@ class PortfolioDecisionNode:
                     ambush_position_type=ambush_position_type,
                     ambush_exit_signal=ambush_exit_signal,
                     ambush_exit_reason=ambush_exit_reason,
+                    days_held=_days_held,
+                    drawdown_from_hwm=_drawdown,
                 )
             )
 
@@ -2107,6 +2138,99 @@ class PortfolioDecisionNode:
             logger.warning(f"[Phase 2] 技术指标获取失败，降级为 P&L 代理: {e}")
             return {}
 
+    def _batch_fetch_hwm(
+        self,
+        positions: List[Dict[str, Any]],
+        thesis_map: Dict[str, Any],
+        ambush_snapshot_map: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """工作流 C-B1：批量获取持仓自入场以来的最高收盘（HWM）与当前回撤。
+
+        与 `_batch_fetch_tech_scores` 同源（TechnicalIndicatorService 前复权日K，60 日窗口）。
+        新增一次逐只 IO（非零成本，计划 §4.2 Critical #2）。
+
+        口径：
+        - 入场价：优先取论点/埋伏快照 entry_price；缺失或无入场日（近似）时用 current/(1+pnl) 反推。
+        - HWM：入场日以来 close 最大值；无入场日或入场日超出 60 日窗口 → 窗口内最高点近似（approx=True）。
+        - current：窗口最新一根收盘（与 HWM 同前复权基准，避免除权失真）。
+        - K 线获取失败/不足 → 该 symbol 不入结果（上层追踪 no-op、动作退回现逻辑）。
+
+        Returns:
+            {symbol: {hwm, current, hwm_gain, drawdown, entry_date, approx}}
+        """
+        if not positions:
+            return {}
+
+        from src.config import get_config
+        from src.services.technical_indicator import TechnicalIndicatorService
+
+        try:
+            service = TechnicalIndicatorService(get_config())
+        except Exception as e:
+            logger.warning(f"[C-B1] 技术指标服务初始化失败，移动止盈/观测不生效: {e}")
+            return {}
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for position in positions:
+            symbol = position.get("symbol", "")
+            if not symbol:
+                continue
+            code = symbol.replace("SH", "").replace("SZ", "").replace("BJ", "")
+            if not code:
+                continue
+
+            pnl = (position.get("unrealized_pnl_pct", 0.0) or 0.0) / 100.0
+            snap = thesis_map.get(symbol) or ambush_snapshot_map.get(symbol)
+            entry_date = getattr(snap, "entry_date", None) if snap is not None else None
+            entry_price = getattr(snap, "entry_price", 0.0) if snap is not None else 0.0
+
+            try:
+                df = service._get_history(code, days=60)
+            except Exception:
+                df = None
+            if df is None or len(df) < 2 or "close" not in df.columns or "date" not in df.columns:
+                continue
+
+            try:
+                closes = df["close"].astype(float)
+                current = float(closes.iloc[0])  # 降序，最新在前
+                if current <= 0:
+                    continue
+                approx = False
+                if entry_date is not None:
+                    # df["date"] 为 "YYYY-MM-DD" 字符串，ISO 字典序比较等价日期比较
+                    sub = closes[df["date"].astype(str) >= entry_date.isoformat()]
+                    if len(sub) >= 1:
+                        hwm = float(sub.max())
+                    else:
+                        hwm = float(closes.max())
+                        approx = True  # 入场日超出 60 日窗口 → 窗口最高点近似
+                else:
+                    hwm = float(closes.max())
+                    approx = True  # 无快照存量仓 → 窗口最高点近似
+                # 成本基准：入场价已知且非近似→用 entry_price；否则用 current/(1+pnl) 反推
+                if entry_price and entry_price > 0 and not approx:
+                    cost = float(entry_price)
+                else:
+                    cost = current / (1.0 + pnl) if (1.0 + pnl) > 0 else current
+                if cost <= 0:
+                    continue
+                result[symbol] = {
+                    "hwm": hwm,
+                    "current": current,
+                    "hwm_gain": hwm / cost - 1.0,
+                    "drawdown": (hwm - current) / hwm if hwm > 0 else 0.0,
+                    "entry_date": entry_date,
+                    "approx": approx,
+                }
+            except Exception as e:
+                logger.debug(f"[C-B1] {symbol} HWM 计算失败（跳过追踪）: {e}")
+                continue
+
+        if result:
+            logger.info(f"[C-B1] 持仓 HWM 回撤获取成功: {len(result)}/{len(positions)} 只")
+        return result
+
     def _estimate_risk_score(
         self, pnl_pct_decimal: float, sector_type: str
     ) -> float:
@@ -2135,6 +2259,8 @@ class PortfolioDecisionNode:
         lifecycle_day: Optional[int],
         overheat_severity: Optional[float],
         stop_loss_threshold: float,
+        hwm_gain_pct: Optional[float] = None,
+        drawdown_from_hwm: Optional[float] = None,
     ) -> tuple[str, str]:
         """生命周期驱动的卖出信号（论文依据：Morgan Stanley 2023, Dickinson 2011）
 
@@ -2143,10 +2269,23 @@ class PortfolioDecisionNode:
         - mature/late_stage = 减速，开始减仓
         - exhausted = 清仓
 
+        C-B1 移动止盈（工作流 C，开关 LIFECYCLE_TRAILING_STOP_ENABLED 默认关）：
+        - 硬止损/exhausted/过热三类强制卖出优先级不变，均先于追踪；
+        - 曾盈利≥ARM 激活追踪后，自最髙收盘回撤≥REDUCE→reduce / ≥SELL→sell；
+        - hwm_gain_pct / drawdown_from_hwm 任一为 None（K 线缺失/无入场价）→追踪 no-op、退回现逻辑。
+
         Returns:
             (action, reason): sell/reduce/hold, 理由
         """
-        # 硬止损（保留）
+        from src.got.catalyst_config import (
+            LIFECYCLE_TRAILING_STOP_ENABLED,
+            LIFECYCLE_MATURE_REDUCE_DAY,
+            TRAILING_ARM_PCT,
+            TRAILING_DRAWDOWN_REDUCE,
+            TRAILING_DRAWDOWN_SELL,
+        )
+
+        # 硬止损（保留，最高优先级）
         if pnl_pct_decimal < stop_loss_threshold:
             return "sell", f"触发止损线 {stop_loss_threshold:.0%}, P&L {pnl_pct_decimal:.1%}"
 
@@ -2158,10 +2297,28 @@ class PortfolioDecisionNode:
         if overheat_severity and overheat_severity > 0.7:
             return "sell", f"过热严重度 {overheat_severity:.2f} > 0.7，建议清仓"
 
-        # 减仓信号：late_stage 或 mature 且天数 > 30
+        # ── C-B1 移动止盈：曾盈利≥ARM 激活，按自高点回撤减仓/清仓（强制卖出之后、生命期减仓之前）──
+        if (
+            LIFECYCLE_TRAILING_STOP_ENABLED
+            and hwm_gain_pct is not None
+            and drawdown_from_hwm is not None
+            and hwm_gain_pct >= TRAILING_ARM_PCT
+        ):
+            if drawdown_from_hwm >= TRAILING_DRAWDOWN_SELL:
+                return "sell", (
+                    f"移动止盈：高点收益 {hwm_gain_pct:.0%} 后回撤 {drawdown_from_hwm:.0%} "
+                    f"≥{TRAILING_DRAWDOWN_SELL:.0%}，清仓锁利"
+                )
+            if drawdown_from_hwm >= TRAILING_DRAWDOWN_REDUCE:
+                return "reduce", (
+                    f"移动止盈：高点收益 {hwm_gain_pct:.0%} 后回撤 {drawdown_from_hwm:.0%} "
+                    f"≥{TRAILING_DRAWDOWN_REDUCE:.0%}，减半锁盈"
+                )
+
+        # 减仓信号：late_stage 或 mature 且天数 > 阈值（C-B2 可配，缺省 30）
         if lifecycle_phase == "late_stage":
             return "reduce", "板块进入晚期阶段，建议减仓 50%"
-        if lifecycle_phase == "mature" and lifecycle_day and lifecycle_day > 30:
+        if lifecycle_phase == "mature" and lifecycle_day and lifecycle_day > LIFECYCLE_MATURE_REDUCE_DAY:
             return "reduce", f"板块成熟期已 {lifecycle_day} 天，建议减仓 50%"
 
         # 持有信号：launch/acceleration = 鱼身
@@ -3549,6 +3706,16 @@ verdict 含义：
         news_overall = self._extract_news_overall(news_context)
 
         results = []
+        # ── 工作流 B：Node1 熊市收手闸门（§3.1）──
+        # 只认 Node1 raw regime（market_context.market_state.regime），不用 Node6 unified.market_regime
+        # （Node6 经 2 日确认 + 迟滞，0930 实测 Node1=bear 而 Node6=transition，正是"熊市还在买"漏口）。
+        # F3：market_state 缺失或 regime 为空 → 闸门不触发（维持现行为）。
+        _bear_gate_on = os.getenv("GOT_BEAR_ENTRY_GATE", "1") == "1"
+        _ms_state = getattr(market_context, "market_state", None) if market_context is not None else None
+        _node1_regime = getattr(_ms_state, "regime", None) if _ms_state is not None else None
+        _bear_day_gate = _bear_gate_on and _node1_regime == "bear"
+        _bear_dip_mode = os.getenv("GOT_BEAR_DIP_MODE", "veto")  # veto=降 watch / soft=仅乘性降权保留
+        _bear_gate_hits = 0
         for stock in finalists:
             # 查找股票所属板块（从 stock 的 sector_name 字段）
             # 2026-08-18 修复：ScreenerStock 的属性是 sector_name，不是 sector
@@ -3675,6 +3842,27 @@ verdict 含义：
             if not getattr(stock, "sector_available", True) and action.startswith("buy"):
                 action = "watch"
 
+            # ── 工作流 B：bear 日收手闸门（仅压新开买入建议，不动持仓；豁免埋伏来源 §3.3）──
+            # 与既有「板块验证失败→watch」叠加：上游已打 watch 则 startswith(buy) 为假自然不重复触发。
+            if _bear_day_gate and action.startswith("buy"):
+                _is_ambush = bool(stock_sector) and stock_sector in self._bypass_ambush_sectors
+                if _is_ambush:
+                    pass  # 豁免：bear 日埋伏为左侧正超额，与 buy_trend@bear 毒药格是两种东西
+                elif action == "buy_trend":
+                    action = "watch"
+                    _bear_gate_hits += 1
+                    base_reasoning += " [Node1=bear 收手闸门: buy_trend→watch]"
+                elif action == "buy_dip":
+                    if _bear_dip_mode == "veto":
+                        action = "watch"
+                        _bear_gate_hits += 1
+                        base_reasoning += " [Node1=bear 收手闸门: buy_dip→watch]"
+                    else:  # soft：仅乘性降权、保留 buy_dip 建议（上线后与 veto 对照）
+                        _soft = float(os.getenv("GOT_BEAR_DIP_SOFT_FACTOR", "0.8"))
+                        adjusted_composite = round(adjusted_composite * _soft, 4)
+                        _bear_gate_hits += 1
+                        base_reasoning += f" [Node1=bear 收手闸门: buy_dip 软降权×{_soft}(soft)]"
+
             # 板块分类（用于输出可观测性）
             sector_classification = None
             if stock_sector and stock_sector in sector_intel_map:
@@ -3719,6 +3907,14 @@ verdict 含义：
         results.sort(key=lambda x: self._lifecycle_priority_score(
             x.lifecycle_phase, x.lifecycle_day, x.composite_score, sentiment_momentum
         ), reverse=True)
+
+        # 工作流 B：闸门命中计数（可观测，供上线后 A/B 复盘；reasoning 已逐单落盘）
+        self._bear_gate_hits = _bear_gate_hits
+        if _bear_day_gate:
+            logger.info(
+                f"[Phase 2] Node1=bear 收手闸门命中 {_bear_gate_hits} 单"
+                f"（dip_mode={_bear_dip_mode}，埋伏来源已豁免）"
+            )
 
         return results
 

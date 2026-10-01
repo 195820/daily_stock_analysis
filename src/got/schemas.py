@@ -1111,6 +1111,15 @@ class UnifiedScoringResult(BaseModel):
         default="",
         description="选股池来源标记：空=Node2 actionable 正常通道 / bypass_ambush=蓄水池升格旁路补选",
     )
+    # ── 工作流 C：持仓延续性观测字段（C-B3，纯观测不参与评分；仅持仓股有效）──
+    days_held: Optional[int] = Field(
+        default=None,
+        description="持有交易日数（入场日→今日，入场日取自持仓论点/埋伏快照；无入场日=None）",
+    )
+    drawdown_from_hwm: Optional[float] = Field(
+        default=None,
+        description="自入场以来最高收盘的回撤幅度（正数=回撤比 0~1）；K 线缺失/不足=None（追踪 no-op）",
+    )
 
 
 class TradeAllocation(BaseModel):

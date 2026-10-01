@@ -18,8 +18,9 @@ from unittest.mock import patch
 from src.got.nodes.aggregator import AggregatorNode
 from src.got.schemas import (
     SectorContext, CapitalContext, CapitalEvidence, NewsContext, SentimentContext,
-    SectorDetail, CatalystEvent, CatalystCalendar,
+    SectorDetail, CatalystEvent, CatalystCalendar, SectorIntel, AmbushCandidate,
 )
+from src.got.catalyst_config import AMBUSH_ACCUM_MULTIPLIER
 
 
 # ─────────────────────────────────────────────────────────────
@@ -222,6 +223,90 @@ class TestDecisionPathUnchanged(_FunnelTestBase):
         first = once()
         second = once()
         self.assertEqual(first, second, "同日重跑 funnel/决策三元组必须逐字节一致")
+
+
+class TestG4FreezeRelease(_FunnelTestBase):
+    """工作流 A：G4 资金闸门冻结放行（GOT_AMBUSH_G4_FREEZE=1）。"""
+
+    def test_missing_released_and_counted_as_frozen_not_evaluated(self):
+        """开关开 + missing 候选 → 入池 + frozen_released=1，不虚计 evaluated/accepted/skipped。"""
+        name = "电气设备"
+        capital = _make_capital({})  # 无资金流数据 → missing
+        news = _make_news([_make_event(name)])
+        with patch("src.got.nodes.aggregator.AMBUSH_G4_FREEZE", True):
+            pool, reservoir, _ = self._run_channel(
+                _make_sector([name]), capital, news, _make_sentiment(),
+            )
+        funnel = self._funnel()
+        self.assertTrue(any(c.sector_name == name for c in pool), "冻结期 missing 应入池")
+        self.assertEqual(funnel["G4_吸筹"]["frozen_released"], 1)
+        self.assertEqual(funnel["G4_吸筹"]["evaluated"], 0)
+        self.assertEqual(funnel["G4_吸筹"]["accepted"], 0)
+        self.assertEqual(funnel["G4_吸筹"]["skipped"], 0)
+        self.assertEqual(funnel["final_pool"], 1)
+        # 不新增 data_missing 蓄水池条目（被①接管）
+        self.assertFalse(any(r.sector_name == name and r.reason == "data_missing" for r in reservoir))
+        cand = next(c for c in pool if c.sector_name == name)
+        self.assertTrue(cand.gate_notes.startswith("G4冻结放行"), f"gate_notes 应标冻结: {cand.gate_notes}")
+        self.assertEqual(cand.accum_strength, "missing", "数据诚实：保留真实 accum_strength 不改写")
+
+    def test_freeze_off_preserves_reservoir_diversion(self):
+        """开关关（缺省）→ 旧行为不变：missing 走蓄水池 data_missing，G4 计 skipped。"""
+        name = "水务"
+        capital = _make_capital({})
+        news = _make_news([_make_event(name)])
+        with patch("src.got.nodes.aggregator.AMBUSH_G4_FREEZE", False):
+            pool, reservoir, _ = self._run_channel(
+                _make_sector([name]), capital, news, _make_sentiment(),
+            )
+        funnel = self._funnel()
+        self.assertFalse(any(c.sector_name == name for c in pool), "开关关不应入池")
+        self.assertEqual(funnel["G4_吸筹"]["skipped"], 1)
+        self.assertEqual(funnel["G4_吸筹"]["frozen_released"], 0)
+        self.assertTrue(any(r.sector_name == name and r.reason == "data_missing" for r in reservoir))
+
+    def test_run_ambush_gates_freeze_missing_semantics(self):
+        """直调 _run_ambush_gates：freeze_missing=True 放行 / =False 静默（兼守护升格支路传 False 不冻结）。"""
+        capital = _make_capital({})
+        on = self.node._run_ambush_gates("半导体", [], capital, [], date.today(), freeze_missing=True)
+        self.assertTrue(on[0], "freeze_missing=True 应视同过闸")
+        self.assertEqual(on[3], "missing")
+        off = self.node._run_ambush_gates("半导体", [], capital, [], date.today(), freeze_missing=False)
+        self.assertFalse(off[0], "freeze_missing=False（升格支路）应维持旧行为")
+
+    def test_multiplier_missing_strictly_below_weak(self):
+        """防倒挂：乘数表 missing ×0.5 严格低于 weak（同催化分下冻结条目不高于有弱证据者）。"""
+        self.assertEqual(AMBUSH_ACCUM_MULTIPLIER["missing"], 0.5)
+        self.assertLess(AMBUSH_ACCUM_MULTIPLIER["missing"], AMBUSH_ACCUM_MULTIPLIER["weak"])
+
+
+class TestDeterministicPromotionFreeze(_FunnelTestBase):
+    """工作流 A ③：确定性提升条件 B 对 missing 的放宽（仅开关开时生效）。"""
+
+    def _build_args(self, name):
+        sector = SectorIntel(sector_name=name, sector_role="ambush", classification="caution", reasoning="")
+        pool_entry = AmbushCandidate(
+            sector_name=name, category_tag="drift", catalyst_score=1.0, accum_strength="missing",
+        )
+        events_by_sector = {name: [_make_event(name)]}
+        return [sector], [pool_entry], events_by_sector
+
+    def test_missing_promoted_when_freeze_on_with_marker(self):
+        name = "先进封装"
+        sectors, pool, ev = self._build_args(name)
+        with patch("src.got.nodes.aggregator.AMBUSH_G4_FREEZE", True):
+            n = self.node._deterministic_catalyst_promotion(sectors, pool, ev)
+        self.assertEqual(n, 1)
+        self.assertEqual(sectors[0].classification, "actionable")
+        self.assertIn("[冻结期提升-无资金准据]", sectors[0].reasoning)
+
+    def test_missing_not_promoted_when_freeze_off(self):
+        name = "先进封装"
+        sectors, pool, ev = self._build_args(name)
+        with patch("src.got.nodes.aggregator.AMBUSH_G4_FREEZE", False):
+            n = self.node._deterministic_catalyst_promotion(sectors, pool, ev)
+        self.assertEqual(n, 0)
+        self.assertEqual(sectors[0].classification, "caution")
 
 
 if __name__ == "__main__":

@@ -249,6 +249,35 @@ AMBUSH_NOMINATION_MIN_CONSECUTIVE = 2   # G3: 归档连续正流入下限（或 
 AMBUSH_NOMINATION_DISABLED = os.environ.get("AMBUSH_NOMINATION_DISABLED", "").lower() == "true"  # 紧急回滚开关
 ACCUMULATION_TOLERANCE = 0.5          # 吸筹闸噪声容忍度（亿）：净流出 < 0.5 亿视为持平，不算否决
 
+# ── 埋伏通道 relations 补挂（A/B 根因修复，2026-09-30）──
+# 事件名分桶查表落空时，用 glue.relations（board_code 键，对截断名/别名免疫）反查
+# 补挂当日日历事件。索引当日 in-memory glue 优先，前日归档仅作独立调用回退
+# （实测：埋伏名单日间轮换，前日 relations 对当日名单覆盖为 0）；事件回连后仍走
+# CATALYST_CONFIDENCE_GATE 与 ★★★利空线，glue 自报 confidence/direction 不作数。
+# 缺省 on，设 0 一键回滚。
+AMBUSH_RELATIONS_WIRING = os.environ.get("GOT_AMBUSH_RELATIONS_WIRING", "1") == "1"
+
+# ── 埋伏通道 G4 资金闸门冻结（工作流 A，2026-10-01）──
+# 缺省 "0"（关闭＝现行为完全不变，合入不改生产）；上线动作＝在 .env 显式置 1 开启，
+# 回滚置 0 或删变量即恢复。只做「无资金流数据(missing)」的冻结放行，坏信号(吸筹观察/净流出)照旧拒。
+AMBUSH_G4_FREEZE = os.environ.get("GOT_AMBUSH_G4_FREEZE", "0") == "1"
+
+# 吸筹档位→催化分乘数（防倒挂：missing 严格低于 weak，避免冻结放行条目反而高于有弱吸筹证据者）。
+# 主循环与升格支路共用此表，禁止各写各的；查表直接用真实 accum_strength，不做映射改写。
+AMBUSH_ACCUM_MULTIPLIER = {"strong": 1.0, "medium": 0.8, "weak": 0.6, "legacy": 1.0, "missing": 0.5}
+
+# ── 工作流 C：持仓延续性管理（移动止盈 + 天数断点，2026-10-01）──
+# 缺省关闭（合入不改生产）；上线动作＝在 .env 显式置 1，回滚置 0/删变量。
+# 仅作用于非埋伏主线持仓（埋伏仓走 P4 催化剂退出，不叠加追踪，避免双重触发，§4.2 C-B1）。
+LIFECYCLE_TRAILING_STOP_ENABLED = os.environ.get("GOT_TRAILING_STOP_ENABLED", "0") == "1"
+TRAILING_ARM_PCT = float(os.environ.get("GOT_TRAILING_ARM_PCT", "0.10"))            # 曾盈利≥10% 才激活追踪
+TRAILING_DRAWDOWN_REDUCE = float(os.environ.get("GOT_TRAILING_DD_REDUCE", "0.08"))  # 自高点回撤≥8% → reduce 减半锁盈
+TRAILING_DRAWDOWN_SELL = float(os.environ.get("GOT_TRAILING_DD_SELL", "0.12"))      # 自高点回撤≥12% → sell 清仓
+
+# mature 减仓天数断点（C-B2）：绝对断点不写死为确定性规则（§1.4），只做可配参数 + 观测分箱。
+# 缺省 30＝不改生产；上线前盘点确认冲击可接受后置 14（§4.2 C-B2），并按 day 分箱积累 2–3 月回归校准。
+LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
+
 # 影响等级→权重映射
 IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 

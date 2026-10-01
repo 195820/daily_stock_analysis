@@ -62,6 +62,9 @@ from src.got.catalyst_config import (
     AMBUSH_NOMINATION_MULTIPLIER,
     AMBUSH_NOMINATION_MIN_CONSECUTIVE,
     AMBUSH_NOMINATION_DISABLED,
+    AMBUSH_RELATIONS_WIRING,
+    AMBUSH_G4_FREEZE,
+    AMBUSH_ACCUM_MULTIPLIER,
     ACCUMULATION_TOLERANCE,
     AGENT_SEMANTIC_GLUE_ENABLED,
     AGENT_SEMANTIC_GLUE_SHADOW,
@@ -88,6 +91,16 @@ from src.got.persistence import (
 from src.got.indicators import clip
 
 logger = logging.getLogger(__name__)
+
+# relations 补挂丢弃桶：升格支路/覆盖观测的计数不进主漏斗（只借道 _supplement_from_relations
+# 的计数接口）；预置零值而非 defaultdict，防长期运行下键值无界增长
+_DISCARD_STATS: dict = {
+    "legacy_miss_total": 0,
+    "relations_matched": 0,
+    "legacy_miss_and_no_relations_hit": 0,
+    "relations_hit_all_missed": 0,
+    "supplemented_events": 0,
+}
 
 # glue 结果归档根目录（可注入：测试通过 conftest 指向 tmp_path，
 # 避免夹具数据覆盖生产影子样本 data/got_daily/{date}/agent_glue.json）
@@ -227,15 +240,13 @@ class AggregatorNode:
             f"dwell_days={regime.dwell_days}"
         )
 
-        # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
-        ambush_pool, ambush_reservoir, ambush_veto_log = await self._build_ambush_channel(
-            sector, capital, news, sentiment, regime=regime,
-        )
-
         # ── Agent 语义粘合层（docs/got/archive/agent_glue_plan_0903.md §5.4 时序修订）──
-        # 在 _build_sector_intel 之前调用，结果作为参数传入
-        # A4 阶段：调用 + 归档，glue 结果暂不影响 _build_sector_intel 行为
-        candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, ambush_pool)
+        # 时序前置到 _build_ambush_channel 之前（2026-09-30 全流程实测修正）：
+        # 埋伏名单日间轮换几乎不相交，前日归档 relations 对当日名单覆盖实测为 0，
+        # 补挂须消费当日 in-memory glue。环险排除：_collect_sector_candidates 的
+        # 埋伏支路直接消费 sector.ambush（Node 2 输入，不依赖池产出），环仅来自
+        # 池外补入支路——此处以 ambush_pool=None 收集，通道后用完整池重收集补齐。
+        candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, None)
         glue = await self._agent_semantic_glue(
             candidates_for_glue, news, capital, sentiment,
         )
@@ -253,8 +264,19 @@ class AggregatorNode:
             if getattr(glue, "degraded", False):
                 raise RuntimeError(f"[Node 6] glue 已降级，不允许继续: {getattr(glue, 'warnings', [])}")
         self._a6_glue_active = bool(not is_replay and getattr(glue, "status", None) == "ok" and not getattr(glue, "degraded", False))
+        # relations 补挂索引（当日优先）：写入缓存供 _build_ambush_channel 及其内部
+        # 升格分支消费；degraded/no_candidates 时索引为空→补挂恒 no-op
+        self._rel_idx_cache = self._build_relations_index(glue)
+
+        # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
+        ambush_pool, ambush_reservoir, ambush_veto_log = await self._build_ambush_channel(
+            sector, capital, news, sentiment, regime=regime,
+        )
 
         # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
+        # 重收集（含池外补入）：蓄水池升格/近失入池的板块可能不在 Node 2 名单，
+        # 须补入候选才能拿 SectorIntel（与前置收集同一规则函数，幂等）
+        candidates_for_glue, member_to_group_glue = self._collect_sector_candidates(sector, ambush_pool)
         sector_intels = self._build_sector_intel(
             sector, capital, news, sentiment,
             ambush_pool=ambush_pool, ambush_reservoir=ambush_reservoir,
@@ -2133,12 +2155,17 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             # 条件 B：吸筹证据
             in_pool = s.sector_name in ambush_pool_names
             has_evidence = False
+            promoted_via_freeze = False
             if in_pool:
                 pool_entry = ambush_pool_map[s.sector_name]
                 accum_strength = getattr(pool_entry, "accum_strength", "")
                 nominated = getattr(pool_entry, "nominated", False)
                 if accum_strength in ("strong", "medium", "weak") or nominated:
                     has_evidence = True
+                elif AMBUSH_G4_FREEZE and accum_strength == "missing":
+                    # 工作流 A：冻结期无资金准据的 missing 也可满足条件 B（条件 A 合格催化不动）
+                    has_evidence = True
+                    promoted_via_freeze = True
             else:
                 if s.capital_check == "aligned":
                     has_evidence = True
@@ -2150,6 +2177,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             s.classification = "actionable"
             event_titles = "; ".join(e.title[:30] for e in qualified_events[:2])
             s.reasoning += f" [确定性提升: 日历催化×吸筹证据] {event_titles}"
+            if promoted_via_freeze:
+                s.reasoning += " [冻结期提升-无资金准据]"  # 可审计：标记经由 G4 冻结放行的提升
             promoted_count += 1
             logger.info(
                 f"[Node 6] 确定性提升: {s.sector_name} caution→actionable "
@@ -2171,6 +2200,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         capital: "CapitalContext",
         hot_sectors: list[str],
         today: date,
+        freeze_missing: bool = False,
     ) -> tuple[bool, str, str, str, dict]:
         """4 层闸门流水线（★★★利空 + 防买顶 + 拥挤度 + 吸筹确认）。
 
@@ -2215,6 +2245,10 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         )
         if not accumulation_ok:
             if accum_strength == "missing":
+                # 工作流 A：G4 资金闸门冻结——missing（无资金流证据，非市场否决）视同过闸。
+                # 只对当日候选 opt-in（升格支路传 False）；坏信号（吸筹观察/净流出）不走此分支。
+                if freeze_missing:
+                    return True, "", "G4冻结放行(无资金流证据)", accum_strength, evidence
                 # 数据缺失保持静默（由调用方转蓄水池观察，语义不变）
                 return False, "", "", accum_strength, evidence
             # S1 留痕：吸筹失败 = "时机未到的观察"而非市场否决，不再静默丢弃；
@@ -2420,13 +2454,28 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         calendar = getattr(news_ctx, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
         events_by_sector = self._group_events_by_sector(all_events)
+        # relations 补挂（与今日候选支路同源）：优先复用本日 run 缓存的索引（当日 glue），
+        # 独立调用时（单测/回放）自行载入前日归档回退；开关关→空索引→恒 no-op
+        # W1 修正：回退载入须锚定 _run_date（回放不得读"相对真实今天"的归档，防前视）
+        rel_index = getattr(self, "_rel_idx_cache", None)
+        if rel_index is None:
+            rel_index = (
+                self._load_prev_glue_relations_index(
+                    before=getattr(self, "_run_date", None) or date.today())
+                if AMBUSH_RELATIONS_WIRING else {}
+            )
         # Q2 audit: 补传 sector_ctx，蓄水池升格的情绪面验证同样走 THS 热度口径
         hot_sectors = self._extract_hot_sectors(sentiment_ctx, sector_ctx)
 
-        # A2 可观测性：蓄水池板块的催化事件覆盖率
+        # A2 可观测性：蓄水池板块的催化事件覆盖率（含 relations 补挂，与实际查表同口径）
+        # W2 修正：覆盖观测用一次性 stats，避免与下方条件 2 的补挂调用双重计数
+        _covered_probe_stats = {k: 0 for k in _DISCARD_STATS}
         covered = sum(
             1 for e in reservoir_entries
-            if self._lookup_sector_events(e.sector_name, events_by_sector)
+            if self._supplement_from_relations(
+                self._lookup_sector_events(e.sector_name, events_by_sector),
+                e.sector_code, rel_index, all_events, _covered_probe_stats,
+            )
         )
         logger.info(
             f"[Node 6] 蓄水池升格: {len(reservoir_entries)} 板块, "
@@ -2444,8 +2493,12 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 remaining.append(entry)
                 continue
 
-            # 条件 2: 有合格催化剂（A2: 归一化查找）
+            # 条件 2: 有合格催化剂（A2: 归一化查找；落空时 relations 补挂，
+            # 升格支路计数不进主漏斗，命中经日志留痕）
             sector_events = self._lookup_sector_events(name, events_by_sector)
+            sector_events = self._supplement_from_relations(
+                sector_events, entry.sector_code, rel_index, all_events, _DISCARD_STATS,
+            )
             qualified_events = [
                 e for e in sector_events
                 if e.confidence >= CATALYST_CONFIDENCE_GATE
@@ -2477,18 +2530,18 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 continue
 
             # 升格 → 重新走闸门（升格路径不交叉提名：提名仅当日候选直入）
+            # Warning #7：升格支路显式 freeze_missing=False——冻结只对当日候选生效，
+            # 否则蓄水池存量 data_missing 条目会在冻结首日一次性升格涌入、挤占正式池名额
             gate_passed, fail_reason, accum_detail, accum_strength, _ = self._run_ambush_gates(
-                name, sector_events, capital_ctx, hot_sectors, today,
+                name, sector_events, capital_ctx, hot_sectors, today, freeze_missing=False,
             )
 
             if gate_passed:
                 score, top_event, category_tag, event_titles = self._compute_catalyst_score(
                     qualified_events, today,
                 )
-                # v2.1: 吸筹档位乘数（strong=1.0 / medium=0.8 / weak=0.6 / legacy=1.0）
-                accum_multiplier = {"strong": 1.0, "medium": 0.8, "weak": 0.6, "legacy": 1.0}.get(
-                    accum_strength, 1.0
-                )
+                # v2.1: 吸筹档位乘数（共用模块级常量 AMBUSH_ACCUM_MULTIPLIER，防与另一处各写各的）
+                accum_multiplier = AMBUSH_ACCUM_MULTIPLIER.get(accum_strength, 1.0)
                 adjusted_score = round(score * accum_multiplier, 3)
                 promoted_pool.append(AmbushCandidate(
                     sector_name=name,
@@ -2512,6 +2565,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 remaining.append(entry)
                 if fail_reason:
                     logger.info(f"[Node 6] 升格未通过闸门: {name}, {fail_reason}")
+
+        # S3 可观测出口：升格支路的补挂计数不进主漏斗，至少在 run 末尾留一次快照
+        # （进程内累加，重启归零；与候选支路的 relations_supplement 分开读数）
+        if AMBUSH_RELATIONS_WIRING and _DISCARD_STATS["legacy_miss_total"]:
+            logger.info(f"[Node 6] 升格支路 relations 补挂快照: {_DISCARD_STATS}")
 
         return promoted_pool, remaining
 
@@ -2545,7 +2603,27 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         calendar = getattr(news, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
         events_by_sector = self._group_events_by_sector(all_events)
-        today = date.today()
+        # 与今日候选支路同形（L217）：锚定 _run_date，回放时 today=回放日
+        today = getattr(self, "_run_date", None) or date.today()
+
+        # relations 补挂（A/B 根因修复）：名称查表落空时用 board_code 反查补挂当日日历事件。
+        # 索引优先消费 run() 前置写入的当日 in-memory glue（实测：埋伏名单日间轮换，
+        # 前日归档覆盖为 0）；独立调用（单测/回放）回退前日归档，before=today 守回放前视
+        rel_index = getattr(self, "_rel_idx_cache", None)
+        if rel_index is None:
+            rel_index = (
+                self._load_prev_glue_relations_index(before=today)
+                if AMBUSH_RELATIONS_WIRING else {}
+            )
+            self._rel_idx_cache = rel_index
+        rel_supplement_stats = {
+            "wiring": "on" if AMBUSH_RELATIONS_WIRING else "off",
+            "legacy_miss_total": 0,
+            "relations_matched": 0,
+            "legacy_miss_and_no_relations_hit": 0,
+            "relations_hit_all_missed": 0,
+            "supplemented_events": 0,
+        }
         
         pool: list[AmbushCandidate] = []
         reservoir: list[AmbushReservoirEntry] = []
@@ -2562,7 +2640,7 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             "G1_利空": {"evaluated": 0, "rejected": 0},
             "G2_防买顶": {"evaluated": 0, "rejected": 0, "skipped": 0, "skipped_reason": None, "data_source": "THS板块热度" if hot_sectors else "无数据"},
             "G3_拥挤度": {"evaluated": 0, "rejected": 0, "skipped": 0, "skipped_reason": None, "data_source": "THS板块热度" if hot_sectors else "无数据"},
-            "G4_吸筹": {"evaluated": 0, "rejected": 0, "accepted": 0, "skipped": 0, "skipped_reason": None},
+            "G4_吸筹": {"evaluated": 0, "rejected": 0, "accepted": 0, "skipped": 0, "skipped_reason": None, "frozen_released": 0},
             "final_pool": 0,
         }
 
@@ -2603,13 +2681,18 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
             for detail in sector.ambush:
                 name = detail.name
                 sector_events = self._lookup_sector_events(name, events_by_sector)
+                # relations 补挂：仅在名称查表落空时触发（纯增量，不动已命中关系）
+                sector_events = self._supplement_from_relations(
+                    sector_events, detail.code, rel_index, all_events, rel_supplement_stats,
+                )
 
                 # D-P2: 闸门漏斗追踪（每个候选都评估 G1）
                 gate_funnel["G1_利空"]["evaluated"] += 1
 
-                # 闸门流水线（抽取为独立方法，供升格复用）
+                # 闸门流水线（抽取为独立方法，供升格复用）；工作流 A：当日候选 opt-in 冻结
                 gate_passed, fail_reason, accum_detail, accum_strength, evidence = self._run_ambush_gates(
                     name, sector_events, capital, hot_sectors, today,
+                    freeze_missing=AMBUSH_G4_FREEZE,
                 )
 
                 # D-P2: 根据 fail_reason 追踪闸门漏斗（计数口径见 _gate_stat，
@@ -2639,8 +2722,13 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                     else:
                         _gate_stat("G2_防买顶", "skipped", "data_unavailable(THS热度为空)")
                         _gate_stat("G3_拥挤度", "skipped", "data_unavailable(THS热度为空)")
-                    _gate_stat("G4_吸筹", "evaluated")
-                    _gate_stat("G4_吸筹", "accepted")
+                    if accum_strength == "missing":
+                        # 工作流 A：G4 冻结放行（missing 视同过闸）——不计 evaluated/accepted，
+                        # 避免"无数据"虚增为"评估并接受"，单独计 frozen_released
+                        _gate_stat("G4_吸筹", "frozen_released")
+                    else:
+                        _gate_stat("G4_吸筹", "evaluated")
+                        _gate_stat("G4_吸筹", "accepted")
                     # 继续处理后续逻辑（催化剂排序等）
 
                 # 以下保持原有逻辑不变
@@ -2731,10 +2819,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                     qualified_events, today,
                 )
 
-                # v2.1: 吸筹档位乘数（strong=1.0 / medium=0.8 / weak=0.6 / legacy=1.0）
-                accum_multiplier = {"strong": 1.0, "medium": 0.8, "weak": 0.6, "legacy": 1.0}.get(
-                    accum_strength, 1.0
-                )
+                # v2.1: 吸筹档位乘数（共用模块级常量 AMBUSH_ACCUM_MULTIPLIER，防与另一处各写各的）
+                accum_multiplier = AMBUSH_ACCUM_MULTIPLIER.get(accum_strength, 1.0)
                 adjusted_score = round(score * accum_multiplier, 3)
 
                 pool.append(AmbushCandidate(
@@ -2746,7 +2832,11 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                     top_event_date=top_event.event_date if top_event else None,
                     top_event_level=top_event.impact_level if top_event else 1,
                     accumulation_detail=accum_detail,
-                    gate_notes=f"闸门全通过({accum_strength}×{accum_multiplier})",
+                    gate_notes=(
+                        f"G4冻结放行({accum_strength}×{accum_multiplier})"
+                        if accum_strength == "missing"
+                        else f"闸门全通过({accum_strength}×{accum_multiplier})"
+                    ),
                     accum_strength=accum_strength,
                 ))
 
@@ -2838,8 +2928,17 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
         pool = pool[:CATALYST_MAX_POOL_SIZE]
 
         # 轨道三：比例熔断——无数据占比过半时大概率是数据源故障（Node 3 降级/接口变更），
-        # 而非个别板块盲区，显式告警避免静默空池
-        if sector.ambush and missing_count > len(sector.ambush) / 2:
+        # 而非个别板块盲区，显式告警避免静默空池。
+        # 工作流 A：冻结态下 missing 被①接管、不再递增 missing_count，熔断条件恒 False自然退役；
+        # 改为观测 frozen_released/initial 占比（过半打 INFO）；WARN 告警保留给开关关闭态。
+        if AMBUSH_G4_FREEZE and sector.ambush:
+            _frozen_n = gate_funnel["G4_吸筹"]["frozen_released"]
+            if _frozen_n > len(sector.ambush) / 2:
+                logger.info(
+                    f"[Node 6] 冻结放行占比观测: {_frozen_n}/{len(sector.ambush)} "
+                    f"埋伏候选因无资金流数据被 G4 冻结放行（>50%，数据源修复后应移除开关）"
+                )
+        elif sector.ambush and missing_count > len(sector.ambush) / 2:
             logger.warning(
                 f"[Node 6] ⚠️ 资金流数据源覆盖异常: {missing_count}/{len(sector.ambush)} "
                 f"埋伏候选无资金流数据（>50%），疑似数据源故障，请检查 Node 3"
@@ -2850,6 +2949,8 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
 
         # D-P2: 完成闸门漏斗追踪
         gate_funnel["final_pool"] = len(pool)
+        # relations 补挂永久观测（非影子期专属：误挂归因与供给面读数长期需要）
+        gate_funnel["relations_supplement"] = rel_supplement_stats
         self._ambush_gate_funnel = gate_funnel
 
         logger.info(
@@ -2992,6 +3093,119 @@ AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消�
                 return result
 
         return []
+
+    @staticmethod
+    def _build_relations_index(glue) -> dict[str, list[dict]]:
+        """当日 in-memory glue → {board_code: [{event_id, direction}]} 索引。
+
+        与 _load_prev_glue_relations_index 消费端同构；glue 缺失/degraded/无 relations
+        时返回空索引（补挂恒 no-op）。护栏不变：direction 预筛、日历原值过闸。
+        """
+        index: dict[str, list[dict]] = {}
+        for r in (getattr(glue, "relations", None) or []):
+            code = str(getattr(r, "board_code", "") or "")
+            eid = str(getattr(r, "event_id", "") or "")
+            if code and eid:
+                index.setdefault(code, []).append(
+                    {"event_id": eid, "direction": str(getattr(r, "direction", "positive"))}
+                )
+        if index:
+            logger.info(
+                f"[relations补挂] 载入当日 glue relations: "
+                f"({sum(len(v) for v in index.values())} 关系 / {len(index)} 板块)"
+            )
+        return index
+
+    @staticmethod
+    def _load_prev_glue_relations_index(root=None, before: Optional[date] = None) -> dict[str, list[dict]]:
+        """读最近一份归档 agent_glue.json 的 relations，建 {board_code: [{event_id, direction}]} 索引。
+
+        归档回退路径（仅独立调用：单测/直接实例化）：生产 run() 已改为消费当日
+        in-memory glue（见 _build_relations_index）——实测埋伏名单日间轮换几乎不相交，
+        前日 relations 对当日名单覆盖为 0，只能作兜底。
+        取当日之前的归档：A-P0-1 排除当天守同日重跑幂等。取当日归档会读到
+        本次 run 正在写入的文件（glue 落盘先于通道评估），内存路径不存在此问题。
+        降级：无归档/解析失败 → 空索引（与开关关闭同效，不阻断主流程）。
+        """
+        from src.got.archive import list_archive_dirs
+        archive_root = Path(root) if root is not None else GLUE_ARCHIVE_ROOT
+        dirs = list_archive_dirs(reverse=True, before=before or date.today(), base_dir=archive_root)
+        for d in dirs:
+            p = d / "agent_glue.json"
+            if not p.exists():
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:
+                logger.debug(f"[relations补挂] 解析 {p} 失败: {exc}")
+                continue
+            index: dict[str, list[dict]] = {}
+            for r in (data.get("relations") or []):
+                if not isinstance(r, dict):
+                    continue
+                code = str(r.get("board_code", ""))
+                eid = str(r.get("event_id", ""))
+                if code and eid:
+                    index.setdefault(code, []).append(
+                        {"event_id": eid, "direction": str(r.get("direction", "positive"))}
+                    )
+            if index:
+                logger.info(
+                    f"[relations补挂] 载入前日 relations: {p.parent.name}/agent_glue.json "
+                    f"({sum(len(v) for v in index.values())} 关系 / {len(index)} 板块)"
+                )
+            return index
+        return {}
+
+    @staticmethod
+    def _supplement_from_relations(
+        sector_events: list[CatalystEvent],
+        code: str,
+        rel_index: dict[str, list[dict]],
+        all_events: list[CatalystEvent],
+        stats: dict,
+    ) -> list[CatalystEvent]:
+        """名称查表落空时的 relations 补挂（仅空时触发，纯增量不动已命中关系）。
+
+        护栏（设计讨论 2026-09-30）：
+        - 只信当日日历事件原值：relation 回连 events 取不到即丢（前日事件已过期）；
+        - relation 自报 direction==negative 不补挂（利空线不松弛）；回连后下游
+          合格过滤 / ★★★利空闸 / B 公式均照常执行；
+        - relation 自报 confidence 不作数，下游 CATALYST_CONFIDENCE_GATE 照旧。
+        永久观测：legacy_miss_and_no_relations_hit / relations_matched /
+        relations_hit_all_missed 计数落 ambush_gate_funnel。relations_matched 仅表示
+        索引命中 code（不论事件是否最终放行）；真实补挂须看 supplemented_events>0。
+        """
+        if sector_events or not rel_index:
+            return sector_events
+        stats["legacy_miss_total"] += 1
+        rels = rel_index.get(code or "")
+        if not rels:
+            stats["legacy_miss_and_no_relations_hit"] += 1
+            return sector_events
+        event_by_id = {e.event_id: e for e in all_events if e.event_id}
+        hits: list[CatalystEvent] = []
+        seen_ids: set[str] = set()
+        for rel in rels:
+            if rel.get("direction") == "negative":
+                continue
+            ev = event_by_id.get(rel.get("event_id", ""))
+            if ev is None:
+                continue
+            if ev.event_id not in seen_ids:
+                seen_ids.add(ev.event_id)
+                hits.append(ev)
+        stats["relations_matched"] += 1
+        if hits:
+            stats["supplemented_events"] += len(hits)
+            logger.info(
+                f"[relations补挂] {code}: 名称查表落空，relations 补挂 {len(hits)} 个事件 "
+                f"({', '.join(e.title[:24] for e in hits[:2])})"
+            )
+        else:
+            stats["relations_hit_all_missed"] += 1  # 索引命中但全被护栏拦下
+        return hits
 
     @staticmethod
     def _check_negative_catalyst(events: list[CatalystEvent]) -> Optional[str]:
