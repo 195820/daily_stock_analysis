@@ -329,6 +329,9 @@
 - **WI-P0-4 sizing 信号强度连续缩放 shadow**：`GOT_SIGNAL_SIZE`（缺省 shadow）对比等分 vs `score^γ` 加权仓位差（γ=0.5），纯观测；schema 加 `signal_size_shadow`。
 - **WI-P0-5 阈值回归校准闭环**：离线脚本 `scripts/recalibrate_thresholds.py` 产出 `data/threshold_calibration.json`（lifecycle day 建议、drift/binary 附 Wilson 区间与 `insufficient_sample` 标注）。
   真实读数（2026-09-30 跑，见 §11.4）：催化剂/lifecycle 箱 **`status=ok`**（449 已兑现样本，`recommendation_day=5`）；埋伏 drift/binary 箱 `insufficient_sample`（0 平仓样本，结构性稀缺，见 §11.4）。
+- **GATE-2 最优停止 pooled/分层先验（2026-10-06）**：新增离线脚本 `scripts/calibrate_optimal_stop.py` → 工件 `data/optimal_stop_priors.json`（`data/` 已 gitignore，脚本入库、产物不入库，与 `wave_calibration.jsonl` 同惯例）。
+  主线段面板来自 GOT 归档（`unified.sector_role` + `sector.json.today_change`，天然 point-in-time），pooled μ/σ/θ + `家族 × regime` 分层箱，小样本箱 `w=n/(n+k)` 向全局收缩；右删失段（段尾落在归档最后一天）默认剔除。
+  读数与使用约束见 §11.5。测试 `tests/test_optimal_stop_priors.py`（10 例纯函数）。**零在线改动**：P0-1/P1-1 消费本工件属后续 WI。
 - **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
 - **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检（b embedding 兜底延后）。
 - **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
@@ -370,6 +373,32 @@
 3. **无现成重放器**：`backtest_september.py` 仅对 Top-5 推荐算前瞻收益，**不**重放埋伏生命周期；`run_phase2_only.py` 单日跳 Phase2。均需自建“模拟交易日贯穿 + 顺序多日 + 隔离写临时表”的重放 harness（本身就是一个独立 WI）。
 
 **处置**：ambush_drift/binary 保持 `keep_legacy`（工件已如此标注）；若后续重视埋伏阈值标定，需先立“埋伏生命周期重放 harness”专项。lifecycle 侧的 day=5 转正仍走 §8 shadow→读数→裁决流程，不因“数据够了”而跳过决策安全闸门。
+
+### 11.5 GATE-2 最优停止先验真实读数（2026-10-06，`as_of=2026-10-06`）
+
+直跑 `scripts/calibrate_optimal_stop.py`（默认 `--min-len 2 --min-samples 12 --shrink-k 8 --censor-tail-days 1`）：
+
+**面板规模**：47 个合规归档日（20260724→20260930；必须排除 `20260805_backup`/`20260817_pre_fix`/`_cache` 这类快照目录，否则同一天的板块被重复计入两次）→ 主线板块-日 512（`unified.sector_role=mainline` 401 + 仅 `sector.json state=active_mainline` 111）→ 107 段（≥2 交易日）→ 剔 3 条右删失 → **102 段可用 / 173 个板块 / 318 板块-日**。
+
+| 读数 | 绝对（板块自身） | 超额（减中证1000） |
+|---|---|---|
+| 日均漂移 μ | **+1.21%/日** | **+0.66%/日** |
+| 日波动 σ | 1.81% | — |
+| 段累计收益 p50 | +2.92% | +1.17% |
+| θ（段内峰值日）p50 | **2 日** | **2 日** |
+| P(θ≤t) | t=2:64% / t=3:82% / t=5:97% | t=2:72% / t=3:85% / t=5:98% |
+| 峰值优于段尾的比例 | 45.1%（Wilson95 35.8–54.8%） | — |
+| 出主线后 fwd1 | −3.43%（n=58） | **−1.21%** |
+
+**旁证**：`data/wave_calibration.jsonl` 1249 行自报 `wave_days` p50=2、97.2%<7 天 ↔ 本面板实测段长 p50=2、98.0%<7 天 → 「主线寿命 93.5%<7 天」在板块尺度同向复现（§2 GATE-2 现状事实成立）。
+
+**分层箱状态**：24 个 `家族 × regime` 箱，仅「其他×bull」(17) 与「AI硬件×bull」(13) 达 `min_samples=12`；其余均 `shrunk`（w=n/(n+8)）。**含义**：P0-1 上线应以 pooled 为主、家族箱仅作弱条件化（收缩后差值小于箱内噪声）；早期归档无 `sector_role`/`frame_group`/`regime`，故 `unknown` 箱不可避免。
+
+**两个必须记住的口径坑**（已写进脚本注释 + 测试钉住）：
+1. `sector.json.active_mainline` 顶层是**家族分组**（`group_name`+`members[]`），板块在 `members` 里。不下钻就会把全部活跃主线整批丢掉、只剩 `exhausted_mainline`，结果 θ 被系统性拉到第 1 天、pooled 段累计收益由 **+2.9% 变 −1.9%**（初版实踩，属伪结论）。
+2. **右删失**：段尾正好是归档最后一天的段，其真实峰值可能在 as_of 之后，留着会把 θ 拉早，故默认剔除并如实计数。
+
+**与 WI-P0-5 的关系**：本 WI 的分布输入是 GOT 归档面板（生产当日所见的板块涨跌幅），而非 P6 `catalyst_realizations`；P6 侧的 median 衰减曲线仍由 `threshold_calibration.json`（§11.4）独立承载。两者互不阻塞：P0-1 的 θ 先验取本工件，lifecycle day 取 P0-5 工件。**待裁决**：窗口只 47 交易日/102 段，且 `edge_next_day` 到第 5 日后 n≤10（只有方向无精度），P0-1 的 `posterior` 分支阈值定值需实盘累积更多完整主线生灭周期后再拍（§8 转正流程）。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
