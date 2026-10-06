@@ -529,7 +529,7 @@
 
 **机制发现（比读数值钱）**：`aggregator.py:1075` 任务2 原文是「families — 家族归属（**仅对落「其他」的板块**）」，即 **规则侧词表能命中的板块，glue 根本没有家族裁量权**：
 - 治理 glue 家族误配的杠杆点不在 prompt，而在**词表覆盖度**：词表收一个板块，glue 就少一个自由裁量面。这把 WI-P1-7(a)（词表治理）与 (b)（embedding 兜底）串成同一根因链，也说明 (b) 的受益面就是「其他」存量本身。
-- 同时发现：prompt 里硬编码的家族白名单只有 **12 个**（`aggregator.py:1077`，`export_glue_family_audit.py:50` 的 `PROMPT_VOCAB` 同步记录），而校验侧 `controlled_set = set(CONTROLLED_FAMILIES) | {"无归属"}` 是 **14 族 + 无归属**（`aggregator.py:1153`）——**华为生态 / 前沿科技 从未告知 LLM**，glue 几乎不可能产出这两个家族（产出也不会被 S4 拦）。本轮未改（改 prompt 需走 C-P12 replay 验证），列为待决。
+- 同时发现：prompt 里硬编码的家族白名单只有 **12 个**（`aggregator.py:1077`，`export_glue_family_audit.py:50` 的 `PROMPT_VOCAB` 同步记录），而校验侧 `controlled_set = set(CONTROLLED_FAMILIES) | {"无归属"}` 是 **14 族 + 无归属**（`aggregator.py:1153`）——**华为生态 / 前沿科技 从未告知 LLM**，glue 几乎不可能产出这两个家族（产出也不会被 S4 拦）。本轮未改（改 prompt 需走 C-P12 replay 验证），列为待决。**→ 已拍（2026-10-06）：只做同源化 + 守卫测试，暂不告知两个盲区家族**——盲区本身不变，但「靠人同步两份名单」这个长盲区的原因已消除，见 §11.12。
 
 **两条非达标判定的处置**：
 
@@ -652,6 +652,24 @@
 **遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算（akshare 是「按报告期返回全市场表」，一个报告期只拉一次，所以**只有首股付这份钱**）⇒ 负责人拍「**先挂 backlog 观察，不动配置**」（backlog §7 #11）：先在真实逐日跑里统计 bundle 延迟分位与各块实际超时率，有读数再定是提预算还是把基本面取数从 3 s 主链路挪出；⚠️ **单股一次性路径（`alphasift_service.py:2162` / RiskAgent `get_stock_info`）不存在摊薄——它就是首股，可能长期拿不到基本面**，观察期统计必须与逐日批量路径分开计；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
 
 **改动面**：`data_provider/fundamental_adapter.py`（报告期取数 + 进程内表缓存 + `strict` 过滤口径 + `forecast_type` + 结构化 `quick_report` + 错误口径）+ `tests/test_fundamental_adapter.py` 新增 `TestReportPeriodTables` 12 例（含两例守卫：`source_never_passes_symbol_to_period_table_apis` 用 regex 扫本模块源码，`"<接口>",\s*\{\s*"symbol"` 必须零命中；`test_installed_akshare_period_apis_take_only_date` 在 akshare 存在时 inspect 断言三接口有 `date` 且**没有 `symbol`**——防止下次升级又把签名改回去而无人知）。验证：adapter + fundamental_context **42 passed / 3.4 s 零触网**；全目录收集基线对账（`git stash push` 这两个文件）＝**1941 items / 13 errors** → 改后 **1953 items / 13 errors**（新增 12 例、13 个收集错误全为既存如 `python-multipart` / yfinance 缺失）；消费者子集 **378 passed, 1 failed**，该失败 `test_multi_agent::test_agent_research_returns_timeout_response` 经 stash 对账为**既存**（基线同样 1 failed / 148 passed）。文档＝§1 矩阵新增 P1-11 行 + §6 WI-P1-11 全节 + §11.10 该段尾部把「待拍」改成本裁决指针 + 本节。
+
+### 11.12 prompt 家族白名单同源化（2026-10-06 负责人拍「只做同源化 + 守卫测试」）
+
+**拍板内容**：§11.8 那条待决（12 vs 14 漂移）不靠「补两个家族」解决，而是消除「第二份名单」本身；「华为生态 / 前沿科技」**暂不告知 LLM**（盲区不变）。
+
+**改动（零行为变更）**：名单源从三处收为一处。
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `family_keywords.py` | 无（名单只活在 prompt 正文里） | 新增 `PROMPT_EXPOSED_FAMILIES`（12 族）+ 注释写明为何不等于全量受控词表 |
+| `nodes/aggregator.py:1077` | 手抄一行 12 族 | `{' / '.join(PROMPT_EXPOSED_FAMILIES)}`（渲染后**逐字不变**） |
+| `scripts/export_glue_family_audit.py:50` | **第三份**手抄 `PROMPT_VOCAB` | `PROMPT_VOCAB = list(PROMPT_EXPOSED_FAMILIES)`（别名；审计页「未列给 LLM」标记照引） |
+
+**为何不直接补两个盲区家族**（留给后人）：告知新家族是**在线 prompt 行为变更**，不是加两个词那么小——「华为概念/欧拉」与 AI硬件的「华为算力/华为海思」、智能驾驶的「华为汽车」**直接竞争**（词表侧按声明序首命中已被先收的族拿掉）；一旦告知，LLM 会把华为系板块往「华为生态」拉，而规则侧同名字板块给另一族 ⇒ **制造新的回收/推翻差异，M3 读数口径会漂**；必须走 C-P12 式 replay 对照（A/B 各跑几天）才能转正。本轮不付这个代价。
+
+**守卫四例**（`tests/test_node6_glue.py::TestGluePrompt`）：渲染行逐字等于 join 结果；exposed ⊆ controlled（否则 LLM 产出会被 S4 拦掉）；**盲区必须显式声明**（`controlled − exposed == {"华为生态", "前沿科技"}`——新增第 15 个家族时这里报错，逼作者停下来声明而不是一错再错）；源码扫描 `aggregator.py` 不得再出现 `AI软件 / AI硬件` 这种手抄形式。
+
+**验证**：十套消费侧同跑 **179 passed / 6.48 s**（node6_glue / family_embed / m3_review / glue_pipeline / aggregator_run_smoke / reverse_lookup / cross_node_signals / p2_9 / node6_candidates / a6_wiring）；`export_glue_family_audit.py --days 20260929 20260930` 重跑正常（候选 34 行，both_none=6/dropped=8/recovered=12/same=8，盲区标记仍在）。顺手修正该测试文件 docstring 里过时的「CONTROLLED_FAMILIES 12 + 1」→ 14。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。

@@ -89,6 +89,7 @@ from src.got.persistence import (
     EMA_WARMUP_SAMPLES,
 )
 from src.got.indicators import clip
+from src.got.family_keywords import PROMPT_EXPOSED_FAMILIES
 
 logger = logging.getLogger(__name__)
 
@@ -1074,7 +1075,7 @@ class AggregatorNode:
 
 ### 任务2: families — 家族归属（仅对落「其他」的板块）
 以下家族名称是受控词表，你只能从中选择：
-AI软件 / AI硬件 / 周期资源 / 新能源 / 农业 / 医药 / 军工 / 消费 / 智能驾驶 / 金融 / 机器人 / 生态环保
+{' / '.join(PROMPT_EXPOSED_FAMILIES)}
 如果某板块不属于任何家族，family 写 "无归属"。
 
 {t3_block}

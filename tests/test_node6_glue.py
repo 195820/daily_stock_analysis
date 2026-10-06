@@ -7,7 +7,7 @@ Phase 1-A4 单元测试：_agent_semantic_glue 语义粘合层。
 2. 事件去冗余（4 个冗余字段剥离）
 3. prompt 组装（候选板块 + 事件 + 资金流 + 情绪热榜）
 4. 输出解析 + 校验（S3 覆盖不全 / S4 家族名越界 / S5 强度越界）
-5. 受控词表（CONTROLLED_FAMILIES 12 + 1）
+5. 受控词表（CONTROLLED_FAMILIES 14）与 prompt 白名单同源（PROMPT_EXPOSED_FAMILIES）
 6. 0903 回放：开关关闭时输出与 A3 基线一致
 """
 
@@ -41,6 +41,7 @@ from src.got.schemas import (
     SentimentContext,
 )
 from src.got.nodes.aggregator import AggregatorNode
+from src.got.family_keywords import PROMPT_EXPOSED_FAMILIES
 from datetime import date
 
 
@@ -213,7 +214,38 @@ class TestGlueStripEvent(unittest.TestCase):
 
 
 class TestGluePrompt(unittest.TestCase):
-    """测试 prompt 组装。"""
+    """测试 prompt 组装与家族白名单同源（2026-10-06 收口：防再长出第二份手抄名单）。"""
+
+    def test_prompt_vocab_line_is_rendered_from_single_source(self):
+        """prompt 那行家族名单必须由 PROMPT_EXPOSED_FAMILIES 渲染（逐字相等）。"""
+        prompt = AggregatorNode._build_glue_prompt(
+            _make_candidates(), _make_news(), _make_capital(), _make_sentiment(),
+        )
+        self.assertIn("你只能从中选择：\n" + " / ".join(PROMPT_EXPOSED_FAMILIES) + "\n", prompt)
+
+    def test_exposed_families_are_subset_of_controlled(self):
+        """告知 LLM 的必须是受控词表的子集（否则 LLM 产出会被 S4 拦掉）。"""
+        self.assertFalse(set(PROMPT_EXPOSED_FAMILIES) - set(CONTROLLED_FAMILIES))
+        self.assertEqual(len(PROMPT_EXPOSED_FAMILIES), 12)
+
+    def test_exposed_family_blindness_is_declared(self):
+        """盲区必须显式声明：当前只允许「华为生态 / 前沿科技」两个未告知。
+
+        新增家族会在这里报错——逼写代码的人停下来声明：这个新族到底是
+        「已走 replay 对照后入 prompt」还是「暂不告知 LLM」，而不是像上一轮
+        那样默默让两份名单错开。
+        """
+        blind = set(CONTROLLED_FAMILIES) - set(PROMPT_EXPOSED_FAMILIES)
+        self.assertEqual(blind, {"华为生态", "前沿科技"})
+
+    def test_aggregator_has_no_hand_copied_family_list(self):
+        """源码守卫：aggregator.py 里不得再出现手抄的家族枚举行（只允许 join）。"""
+        import inspect
+
+        source = inspect.getsource(sys.modules[AggregatorNode.__module__])
+        # 「AI软件 / AI硬件」这种相邻两族名带分隔符的形式只可能出现在手抄名单里
+        self.assertNotIn("AI软件 / AI硬件", source)
+        self.assertIn("' / '.join(PROMPT_EXPOSED_FAMILIES)", source)
 
     def test_prompt_contains_candidates(self):
         """prompt 包含候选板块代码。"""

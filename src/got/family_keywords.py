@@ -137,6 +137,21 @@ CONTROLLED_FAMILIES: list[str] = [name for name, _ in FAMILY_KEYWORDS]
 # 派生：家族名集合（sector_analysis.py 内部快速查找用）
 FAMILY_NAMES: set[str] = {name for name, _ in FAMILY_KEYWORDS}
 
+# 告知 LLM 的家族白名单（glue prompt 任务2 唯一数据源，2026-10-06 同源化收口）
+# ---------------------------------------------------------------------------
+# 背景：prompt 里那行家族列表曾是**手抄的第二份名单**，与 CONTROLLED_FAMILIES 漂移
+# 到 12 vs 14（校验侧 `controlled_set` 接受 14 族 + 无归属，embedding 兜底候选也是 14），
+# 结果是新增家族默默不进 prompt、无人得知。现在只留**一个名单源**。
+# 本清单刻意 **不等于全量受控词表**：「华为生态 / 前沿科技」仍不告知 LLM。
+# 补这两个族是**在线 prompt 行为变更**（「华为概念/欧拉」与 AI硬件的「华为算力/华为海思」、
+# 智能驾驶的「华为汽车」直接竞争），必须先走 C-P12 式 replay 对照才能转正，
+# 见【架构计划】§11.8 / §11.12。**新增第 15 个家族时：默认不入本清单**，
+# 要入就得同时提交 replay 读数（守卫测试 test_exposed_family_blindness_is_declared 会逼你声明）。
+PROMPT_EXPOSED_FAMILIES: list[str] = [
+    "AI软件", "AI硬件", "周期资源", "新能源", "农业", "医药",
+    "军工", "消费", "智能驾驶", "金融", "机器人", "生态环保",
+]
+
 
 def _audit_keyword_overlaps() -> list[tuple[str, list[str]]]:
     """跨族关键词重叠自检（WI-P1-7(a)）。

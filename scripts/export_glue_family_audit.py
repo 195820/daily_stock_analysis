@@ -33,7 +33,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.got.family_keywords import FAMILY_KEYWORDS  # noqa: E402
+from src.got.family_keywords import FAMILY_KEYWORDS, PROMPT_EXPOSED_FAMILIES  # noqa: E402
 from src.got.schemas import CONTROLLED_FAMILIES  # noqa: E402
 
 ARCHIVE_ROOT = PROJECT_ROOT / "data" / "got_daily"
@@ -46,11 +46,10 @@ NEWS_FILE = "news.json"
 RULE_NONE = "其他"
 GLUE_NONE = "无归属"
 
-# prompt 任务3 硬编码列举给 LLM 的家族（与 CONTROLLED_FAMILIES 漂移，见 §8 附注）
-PROMPT_VOCAB = [
-    "AI软件", "AI硬件", "周期资源", "新能源", "农业", "医药",
-    "军工", "消费", "智能驾驶", "金融", "机器人", "生态环保",
-]
+# prompt 任务2 告知 LLM 的家族名单：**直接 import 单一名单源**（不再手抄第三份）。
+# 2026-10-06 同源化：本名现为别命，真身在 family_keywords.PROMPT_EXPOSED_FAMILIES；
+# 与 CONTROLLED_FAMILIES 的差集（当前＝华为生态/前沿科技）在下面词表页标「未列给 LLM」。
+PROMPT_VOCAB = list(PROMPT_EXPOSED_FAMILIES)
 
 
 def _glue_path(day: str, variant: str = "") -> Path:
