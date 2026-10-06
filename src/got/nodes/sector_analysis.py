@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta
 from typing import Any, List, Optional
 
@@ -46,6 +47,7 @@ from src.got.schemas import (
     SectorDetail,
 )
 from src.got.family_keywords import FAMILY_KEYWORDS, FAMILY_NAMES
+from src.got import family_embed
 from src.storage import DatabaseManager, Node2SectorTrendRecord
 
 logger = logging.getLogger(__name__)
@@ -660,7 +662,41 @@ class SectorAnalysisNode:
             # Step 3.4: 主线家族聚合（数据驱动相关性聚类，替代硬编码关键词）
             result.theme_families = self._build_theme_families(analyzed, sectors_raw)
 
-            # Step 3.4a: 跨板块拥挤检测（R2）
+            # Step 3.4c: 「其他」板块的 embedding 家族兜底（WI-P1-7(b)，2026-10-06）
+            # 三态开关 GOT_FAMILY_EMBED_FALLBACK：off（缺省）/ shadow / enabled。
+            # 复用 glue_pipeline 的 L1 向量检索件，但走生产独立开关（计划 §315 红线：
+            # glue_pipeline 本身仍 replay-only，本处只借 embed_texts/retrieve_topk/缓存惯例）。
+            # off 时 resolve_family_overrides 立即返回、不触网不改判 → 旧路径逐字节不变。
+            # 阈值同为环境变量读取期取值（缺省值为未标定启发式，先由 shadow 攒读数）。
+            fe_min_score = float(os.getenv("GOT_FAMILY_EMBED_MIN_SCORE", "0.55"))
+            fe_min_margin = float(os.getenv("GOT_FAMILY_EMBED_MIN_MARGIN", "0.05"))
+            fe_report: Optional[dict] = None
+            try:
+                fe_report = await family_embed.resolve_family_overrides(
+                    [{"code": s.code, "name": s.name} for s in analyzed],
+                    date.today(),
+                    min_score=fe_min_score,
+                    min_margin=fe_min_margin,
+                )
+            except Exception as e:  # noqa: BLE001 — 兜底能力异常不得影响 Node 2 主流程
+                logger.warning("[Node 2] 家族 embedding 兜底异常，保持原家族判定: %s", e)
+                fe_report = None
+            if fe_report and fe_report.get("mode", "off") != "off":
+                result.family_embed_shadow = fe_report
+                if fe_report["mode"] == "enabled" and fe_report["overrides"]:
+                    # 只改 frame_group，不改 state/score；后续家族拥挤/主线聚合/Node 6
+                    # 家族中继（frame_group_lookup）自然消费新家族
+                    for s in analyzed:
+                        hit = fe_report["overrides"].get(s.name)
+                        if hit:
+                            s.frame_group = hit["family"]
+                    result.notes.append(
+                        f"ℹ️ [家族兜底 enabled] embedding 兜底改判 {len(fe_report['overrides'])} "
+                        f"个原「其他」板块（阈值 score≥{fe_min_score}/margin≥{fe_min_margin}）"
+                    )
+                    logger.info("[Node 2] 家族兜底 enabled: %s", list(fe_report["overrides"]))
+
+            # Step 3.4a: 跨板块拥挤检测（R2）—— 必须在兜底改判之后，拥挤才能看到新家族
             crowding_warnings = self._detect_family_crowding(analyzed)
             if crowding_warnings:
                 result.notes.extend(crowding_warnings)

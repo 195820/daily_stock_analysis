@@ -441,6 +441,16 @@ class SectorContext(BaseModel):
         default_factory=dict,
         description="同花顺板块热度 {板块名: 热度值}，供 Node 6 埋伏通道 G2/G3 闸门消费（替代恒空的 associated_sectors）"
     )
+    # ── WI-P1-7(b) 家族 embedding 兜底留痕（【架构计划】§6，2026-10-06）──
+    family_embed_shadow: Optional[dict] = Field(
+        default=None,
+        description="「其他」板块的 embedding 家族兜底观测留痕: {mode, unmatched_boards, "
+                    "overrides, would_flip_count, threshold, cache_hits, skipped_*}。"
+                    "shadow 态只记「若兜底会改判的板块清单」，frame_group 逐字节不变；"
+                    "off 态恒为 None（缺省，不触网不算向量）；enabled 才真改判。"
+                    "阈值 score/margin 为未标定工程启发式，转正前由 shadow 读数收紧。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
 
 
 

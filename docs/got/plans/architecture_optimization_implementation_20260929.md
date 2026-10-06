@@ -177,6 +177,9 @@
 - **开关**：`GOT_FAMILY_EMBED_FALLBACK`（shadow 记录"若兜底会改判的板块清单"）。
 - **验收**：重叠词归属确定且可解释；兜底不引入错误家族（人工抽检一批）；家族变更前后漂移/清仓判定 diff 审校。
 - **风险**：embedding 误兜底 → 保守阈值 + 留痕人工复核。
+- **落地（2026-10-06，b 项 shadow 态）**：新建生产模块 `src/got/family_embed.py`（家族原型文本 / 保守阈值裁决 / 按日向量缓存）+ Node 2 `run()` Step 3.4c 接线 + `SectorContext.family_embed_shadow`；
+  相似度与缓存**全量复用 `glue_pipeline` 的 L1 件**（`embed_texts`/`retrieve_topk`/`_cache_key`/`L1_EMBED_CACHE_ROOT`），glue_pipeline 自身仍 replay-only（本文 §「不把 glue_pipeline 当生产家族粘合」红线不破）；
+  开关缺省 **off**（不触网、不改判、旧路径逐字节不变），详见 §11.7。c 项（留痕人工复核 → 转正）仍以 shadow 清单为前置。
 
 ### WI-P1-8 · disagreement 转正 + memory 校准（O5）
 - **现状代码事实**：`disagreement.py` 已实现 11 类冲突分类学 + 加权共识 + RiskOverridePlan + `_SOURCE_PRIOR_WEIGHTS`；情绪 `fear_greed>=0.8→risk_caution` 内建；但 `memory=None` 退化等权（`:189`），默认影子（`GOT_DISAGREEMENT_SHADOW=1`）只落观测。
@@ -334,7 +337,8 @@
   主线段面板来自 GOT 归档（`unified.sector_role` + `sector.json.today_change`，天然 point-in-time），pooled μ/σ/θ + `家族 × regime` 分层箱，小样本箱 `w=n/(n+k)` 向全局收缩；右删失段（段尾落在归档最后一天）默认剔除。
   读数与使用约束见 §11.5。测试 `tests/test_optimal_stop_priors.py`（10 例纯函数）。**零在线改动**：P0-1/P1-1 消费本工件属后续 WI。
 - **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
-- **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检（b embedding 兜底延后）。
+- **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检。
+- **WI-P1-7(b) 「其他」板块 embedding 家族兜底（2026-10-06，shadow 态）**：新增生产模块 `src/got/family_embed.py`（家族原型文本 / `select_family` 保守阈值 / 按日向量缓存复用 L1 惯例）+ Node 2 `run()` Step 3.4c 接线（排在拥挤检测之前，改判后拥挤/主线聚合/Node 6 家族中继自然消费新家族）；`SectorContext.family_embed_shadow`（缺省 None）落「若兜底会改判的板块清单」。开关 `GOT_FAMILY_EMBED_FALLBACK`（**缺省 off**，off 立即返回不触网）；阈值 `GOT_FAMILY_EMBED_MIN_SCORE`/`_MARGIN`（缺省 0.55/0.05，未标定启发式）。测试 `tests/test_family_embed_fallback.py`（26 例，embedding 全桩、不触网）。读数与转正条件见 §11.7。
 - **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
 
 ### 11.2 延后裁决
@@ -342,6 +346,8 @@
 - **WI-P2-7 / P2-10 / P2-12**（漏斗分数化 / 轮动换手惩罚 / 蓄水池自适应）：均改在线选股·轮动·池容量判据，触候选池归零红线（§0.1-3），且各自新阈值（漏斗分档权 / 换手惩罚系数 / 池容量函数）**不在 P0-5 本次标定范围**——P0-5 仅覆盖 lifecycle/ambush 阈值。§11.4 已更正：lifecycle 箱已 `ok`（并非全盘 insufficient_sample），但此三项依赖的是其自身未标定阈值，故仍延后。
 - **WI-P0-2 lifecycle 时间阈值前移**：数据前置**已满足**（§11.4：催化剂箱 449 样本 `status=ok`，建议 day=5 替代写死 30），非“样本不足”阻塞；仍延后的真实原因是它改在线退出决策（红线 §0.1-1 需先 shadow 读数），且 449 样本存在幸存者偏差（median T1→T5 仍递增 0.02→0.36，工件 caveat①），day=5 只作方向佐证不作精确最优点。
 - **WI-P2-1/2/3/4/5/6/8/11**：硬依赖 P0-1/P1-3/P1-8/GATE-2 尚未落地，按 §6 排期属第 2–4 批，本轮不启动。**其中 P2-4 已在 §11.6 完成解冻前置取证，阻塞项从「依赖未落地」升级为「前提被证伪（方向反指）」——不是攒样本能解的，需先重定风险方向再谈接线。**
+
+- **WI-P1-7(b) 家族兜底「enabled 转正」**：shadow 态已落地（§11.7），但 enabled 真改判需先按验收「人工抽检一批」读完 shadow 留痕的误兜底率；阈值 0.55/0.05 属未标定工程启发式，**不得直接当转正阀值**。
 
 ### 11.3 代码审查修复（2026-09-30 CR 轮）
 对 §11.1 已落地项发起代码审查（无 Critical），7 项 Warning/Suggestion 全部修复：
@@ -422,6 +428,27 @@
 **结论与红线**：`unlock_ready=False`，三项前置全缺。最重要的一条不是样本量——**Q2 给出的是正向超额**：若照 WI-P2-4 原文（解禁临近→提前降仓/退出）接线，会在现有票池上系统性做反向操作。解冻评估需先回答两问：① 该正向是否板块扇出/小样本假象（同一天 44 个股事件扇到 127 板块日，独立性远小于行数；n=46 亦受 142 板块缓存选择偏差约束）；② 解禁是否该按**个股级**而非板块级度量（现通道是「个股事件→板块扇出」，一个 13 倍扇出的解禁会把无关板块一起打标）。这两问未解前，`GOT_RISK_EVENTS` 不得进入 shadow。
 
 测试 `tests/test_lockup_risk_events.py`（18 例纯函数 + 临时库端到端降级：锚定回退顺序、窗口越界不编数、扇出/板块日去重、符号检验精确概率、四态方向判定、只读约束 `mode=ro` 拒写）。**零在线改动**：不建表、不加开关、不接退出链。
+
+### 11.7 WI-P1-7(b) 「其他」板块 embedding 家族兜底（2026-10-06 落地 shadow 态，开关缺省 off）
+
+新增生产模块 `src/got/family_embed.py` + Node 2 `run()` Step 3.4c 接线 + `SectorContext.family_embed_shadow`。
+计划原文只给了一句「复用 glue_pipeline 的 L1 检索接地能力**但接进生产路径**」，与 §315「不把 glue_pipeline 当生产家族粘合（replay-only）」并存 → 落地口径：**只借四个件**（`embed_texts`/`retrieve_topk`/`_cache_key`/`L1_EMBED_CACHE_ROOT` 按日缓存惯例），相似度与缓存不另写第二套；`glue_pipeline` 本身仍 replay-only，兜底走独立开关。
+
+**三态与红线**（`GOT_FAMILY_EMBED_FALLBACK`）：
+
+| 态 | 行为 |
+|---|---|
+| off（缺省） | `resolve_family_overrides` 立即返回 `skipped_reason=mode_off`：不触网、不读/写向量缓存、`family_embed_shadow` 保持 None、`frame_group` 零改动 |
+| shadow | 照常算向量 + 落清单（`unmatched_boards` 逐板含 reason/score/margin/前 3 名 + `overrides`/`would_flip_count`），**不改任何 frame_group** |
+| enabled | 按 `overrides` 真写 `SectorDetail.frame_group`（只改家族，不改 state/评分）+ notes 留痕 |
+
+接线位置红线：Step 3.4c 排在 Step 3.4a（家族拥挤）**之前**——否则拥挤降权、主线家族聚合、Node 6 家族中继/漂移宽限（`frame_group_lookup`）都看不到兜底后的家族；`_build_theme_families` 走数据驱动相关性、不用词表，故不受影响（次序不变）。
+
+**离线自检读数（`.review_tmp/p17b_selfcheck.py`，强制清空 embedding key 不触网）**：off → `mode_off`、trace 空、零缓存文件；shadow → `embedding_unavailable`、overrides 0、cache_hits/misses 均 0；非法开关值（`nonsense`）→ 回落 off（不得意外开启改判）；shadow 下命中词表板块被正确排除（skipped_count=1）。候选家族 14 个（= FAMILY_KEYWORDS 去掉「其他」）。
+
+**阈值口径**：`GOT_FAMILY_EMBED_MIN_SCORE=0.55` / `GOT_FAMILY_EMBED_MIN_MARGIN=0.05` 属**未标定工程启发式**（按本文 §179「保守阈值 + 留痕人工复核」拍的缺省值，无数据依据），不得直接当转正阈值。转正需先回答三问：① shadow 期「其他」板块占比与拒绝原因分布（low_score / ambiguous / ok）；② `would_flip` 清单人工抽检——兜底家族是否真的对（验收原文「人工抽检一批」）；③ enabled 首日 `frame_group` 变更清单及其经家族中继/漂移宽限的下游 diff。`.env` 已配 `GLUE_EMBEDDING_API_KEY`，真实 shadow 读数需首个非交易日跑 `GOT_FAMILY_EMBED_FALLBACK=shadow` 产生（本轮只落能力 + 离线自检，不产读数）。
+
+测试 `tests/test_family_embed_fallback.py`（26 例：文本构造含关键词截断、保守阈值四口径、开关归一与非法值回落、词表复核分流、缓存命中不请求 embedding、未命中落按日文件、数量不匹配报错、三态生产入口、改判谓词（off/shadow 不改 enabled 才改）、接线守卫 Step 3.4c 先于拥挤检测）。与 `test_sector_state_machine`/`test_wave_days`/`test_sector_rotation` 同跑 98 passed；与 `test_glue_pipeline`/`test_aggregator_run_smoke`/`test_reverse_lookup`/`test_cross_node_signals`/`test_p2_9_context_consistency`/`test_node6_candidates`/`test_a6_wiring` 同跑 108 passed。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
