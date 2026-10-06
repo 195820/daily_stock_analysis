@@ -339,6 +339,7 @@
 - **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
 - **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检。
 - **WI-P1-7(b) 「其他」板块 embedding 家族兜底（2026-10-06，shadow 态）**：新增生产模块 `src/got/family_embed.py`（家族原型文本 / `select_family` 保守阈值 / 按日向量缓存复用 L1 惯例）+ Node 2 `run()` Step 3.4c 接线（排在拥挤检测之前，改判后拥挤/主线聚合/Node 6 家族中继自然消费新家族）；`SectorContext.family_embed_shadow`（缺省 None）落「若兜底会改判的板块清单」。开关 `GOT_FAMILY_EMBED_FALLBACK`（**缺省 off**，off 立即返回不触网）；阈值 `GOT_FAMILY_EMBED_MIN_SCORE`/`_MARGIN`（缺省 0.55/0.05，未标定启发式）。测试 `tests/test_family_embed_fallback.py`（26 例，embedding 全桩、不触网）。读数与转正条件见 §11.7。
+- **M3 家族归属人工终审（2026-10-06）**：分层口径 36 样本已判满，误配率 **2.8%**（无关系 1 / 弱关系 4 / 强关系 31），逐日连续 5 日达标 `status=met`。唯一「无关系」误配（低空经济→智能驾驶）已对症收口：**军工族新增关键词 "低空"**，`_build_frame_group("低空经济") == "军工"`。读数、机制发现与 full 口径待复跑见 §11.8。
 - **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
 
 ### 11.2 延后裁决
@@ -449,6 +450,38 @@
 **阈值口径**：`GOT_FAMILY_EMBED_MIN_SCORE=0.55` / `GOT_FAMILY_EMBED_MIN_MARGIN=0.05` 属**未标定工程启发式**（按本文 §179「保守阈值 + 留痕人工复核」拍的缺省值，无数据依据），不得直接当转正阈值。转正需先回答三问：① shadow 期「其他」板块占比与拒绝原因分布（low_score / ambiguous / ok）；② `would_flip` 清单人工抽检——兜底家族是否真的对（验收原文「人工抽检一批」）；③ enabled 首日 `frame_group` 变更清单及其经家族中继/漂移宽限的下游 diff。`.env` 已配 `GLUE_EMBEDDING_API_KEY`，真实 shadow 读数需首个非交易日跑 `GOT_FAMILY_EMBED_FALLBACK=shadow` 产生（本轮只落能力 + 离线自检，不产读数）。
 
 测试 `tests/test_family_embed_fallback.py`（26 例：文本构造含关键词截断、保守阈值四口径、开关归一与非法值回落、词表复核分流、缓存命中不请求 embedding、未命中落按日文件、数量不匹配报错、三态生产入口、改判谓词（off/shadow 不改 enabled 才改）、接线守卫 Step 3.4c 先于拥挤检测）。与 `test_sector_state_machine`/`test_wave_days`/`test_sector_rotation` 同跑 98 passed；与 `test_glue_pipeline`/`test_aggregator_run_smoke`/`test_reverse_lookup`/`test_cross_node_signals`/`test_p2_9_context_consistency`/`test_node6_candidates`/`test_a6_wiring` 同跑 108 passed。
+
+### 11.8 M3 家族归属人工终审（2026-10-06 首次读齐）
+
+负责人逐行判完评审包的 36 行（`data/glue_family_audit/m3_review_20261006.{csv,md}`，归档日 0923/0924/0928/0929/0930，分层口径 seed=42），`--score` 实跑读数：
+
+| 日 | 样本 | 强 | 弱 | 无 | 误配率 | 判定 |
+|---|---|---|---|---|---|---|
+| 20260923 | 7 | 7 | 0 | 0 | 0.0% | 达标 |
+| 20260924 | 8 | 7 | 1 | 0 | 0.0% | 达标 |
+| 20260928 | 7 | 6 | 1 | 0 | 0.0% | 达标 |
+| 20260929 | 7 | 6 | 0 | **1** | **14.3%** | 达标（贴线：再一条即 28.6% 破线） |
+| 20260930 | 7 | 5 | 2 | 0 | 0.0% | 达标 |
+| **合并** | **36** | **31** | **4** | **1** | **2.8%** | Wilson95 **[0.49%, 14.17%]**（上界仍压住 15% 红线） |
+
+末尾连续达标 5 日 → `status=met`。**但这不是转正**：分层口径对「回收/冲突」两层对抗性超采，§8.1 转正必须 `--sample-mode full` 复跑；本轮只跑了分层初筛。
+
+**机制发现（比读数值钱）**：`aggregator.py:1075` 任务2 原文是「families — 家族归属（**仅对落「其他」的板块**）」，即 **规则侧词表能命中的板块，glue 根本没有家族裁量权**：
+- 治理 glue 家族误配的杠杆点不在 prompt，而在**词表覆盖度**：词表收一个板块，glue 就少一个自由裁量面。这把 WI-P1-7(a)（词表治理）与 (b)（embedding 兜底）串成同一根因链，也说明 (b) 的受益面就是「其他」存量本身。
+- 同时发现：prompt 里硬编码的家族白名单只有 **12 个**（`aggregator.py:1077`，`export_glue_family_audit.py:50` 的 `PROMPT_VOCAB` 同步记录），而校验侧 `controlled_set = set(CONTROLLED_FAMILIES) | {"无归属"}` 是 **14 族 + 无归属**（`aggregator.py:1153`）——**华为生态 / 前沿科技 从未告知 LLM**，glue 几乎不可能产出这两个家族（产出也不会被 S4 拦）。本轮未改（改 prompt 需走 C-P12 replay 验证），列为待决。
+
+**两条非达标判定的处置**：
+
+| 行 | 板块 | 判定 | 处置 |
+|---|---|---|---|
+| #25 | 低空经济→智能驾驶 | **无关系**（计入分子） | **改**。先跨日取证：20260921 / 20260929 两个抽查日都被 glue 判为智能驾驶——是稳定复现的系统性偏置（LLM 把 eVTOL/无人机的「自主飞行」语义拉到「自动驾驶」），非一次性抖动。收口到**军工**（新增关键词 "低空"）：低空载具属航空产业链，成分股多为主机厂与机载设备商。规则侧命中后 glue 不再介入，误配源头切断 |
+| #34 | 电气设备→新能源 | **弱关系**（不计分子） | **不改**。M3 口径只把「无关系」计入，弱关系是允许态；把「电气设备」硬绑「新能源」会把弱关系固化为强关系假象，还误伤传统电气/电机板块。另跨日核对：电气设备也在 0924/0930 稳定拿新能源，属可接受的弱锚定。仅登记为弱关系堆积观察项（弱关系占比 4/36=11.1%，脚本注释定性为 prompt 收紧信号） |
+
+**附带发现（词表粒度）**：「日用化工」在 0924 是推翻行（规则侧周期资源 / glue 侧消费），负责人判 glue 归消费正确——即「化工」这个关键词子串同时吸了上游石化与下游日化，语义过粗。但它是 **overridden** 而非 recovered，本轮不收（收就是反向限制 glue 推翻规则侧的能力，方向与 M3 结论相反）。归 WI-P1-7(a) 后续细粒度拆族事项。
+
+**改动面与回归**：本轮仅一词表条目（`family_keywords.py` 军工族 +"低空"）+ 一个守卫测试（`test_dikong_resolves_to_military_family`：断言「低空」唯一登记于军工、`_build_frame_group("低空经济")=="军工"`、不再落「其他」、智能驾驶族不得沾「低空」）。`_audit_keyword_overlaps()` 返回 `[]`（无新增跨族重叠）、`CONTROLLED_FAMILIES` 仍 14（不动 `test_node6_glue` 的 ==14 断言）。同跑：gate1/family_embed/node6_glue/m3_review 四套 92 passed；Node 2 三套 + 消费侧七套 180 passed，零回归。
+
+**这是在线决策变更（非纯观测）**：`低空经济` 的 `frame_group` 由「其他」变「军工」，下游会跟着动：家族拥挤检测计数、主线家族聚合、Node 6 家族中继与 `family_anchor_map` 漂移宽限。需知道的就是：首个生产日跑后，0921/0929 类归档的家族口径与新归档不可直接对比（与「换电」治理同性质，但那轮是零行为变更，本轮不是）。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。

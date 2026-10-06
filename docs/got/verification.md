@@ -246,7 +246,7 @@ reason 为「开关关闭」。「纯技术分」是另一条 reason，两者含
 |---|---|---|---|---|
 | **M1** | **glue 侧** `agent_glue.json` 的 `strengths[].news_read` 非 `low`/`unknown`（C-P6） | ≥ 60% | **11/32 = 34.4%** | 实测 < 红线 |
 | **M2** | ≥1 条 `relations[]` 的候选占比 | ≥ 70% | **9/32 = 28.1%**（四日 21.1% / 13.6% / 21.9% / 28.1%） | 4/4 不达标 |
-| **M3** | 人工抽查误配率 | ≤ 15% | 未测 | 依赖人工抽查 |
+| **M3** | 人工抽查误配率 | ≤ 15% | **2.8%**（分层初筛口径 36 样本：无关系 1 / 弱关系 4 / 强关系 31，Wilson95 [0.49%, 14.17%]，连续 5 日达标）——**不是转正**，§8.1 要求 `--sample-mode full` 复跑；读数见 [`plans/architecture_optimization_implementation_20260929.md`](plans/architecture_optimization_implementation_20260929.md) §11.8 | 首次读齐（2026-10-06 负责人终审） |
 | **M4-a** | `ρ(glue.strength, tech_score)` | ≥ 0.6 | **0.591 P / 0.419 S** | 不达标且 n=32 |
 | **M4-b** | `ρ(glue.strength, 旧 composite)`（反向指标） | < 1.0 | 0.646 P / 0.500 S | 达 |
 | **M4-c** | `ρ(glue.strength, 旧 composite)`（下限） | ≥ 0.3 | 0.646 P / 0.500 S | 达 |
@@ -539,3 +539,5 @@ ls -la data/got_screener/ | tail
 *修订：2026-09-26（第十轮，C-P12 prompt A/B 双版回放）—— **R-C6 由「有效样本 0 天 SKIP」→「两版各 9 天 M2×M3 对照矩阵已产出、待负责人判读」**（§4 R-C6 行）：新增 `GLUE_PROMPT_VARIANT`（a/b）/`GLUE_MAX_TOKENS` env（均仅 replay 生效、生产零影响）+ `agent_glue.json` `prompt_variant` 留痕 + `verify_glue_metrics.py --compare`（按变体逐日 M1′/M2/低置信占比/放弃事件 + ΔM2 矩阵 + 目录尾缀一致性校验 + `--m3-audit` 分层预审表）。A/B 各回放 0901/02/03/04/07/08/09/10/14 共 9 日（`{date}/_replay/variant_a|b/agent_glue.json`、均 status=ok/md5 互异）；矩阵：A 均值 M2=35.5%/低置信 6.8%、B 均值 M2=46.3%/低置信 40.8%（印证 §2.6 M2↔M3 拉锯）。⚠️ 0902 B 版撞 16000 截断、临时 24000(A)/32000(B) 重跑，与其他日不对称，有效对照建议取 8 天（剔除 0902）。矩阵/预审表见 `cp12_prompt_variants_draft_20260926.md` / `cp12_m3_audit_20260926.md`；`--date 20260910` R-C3 锚点逐字节一致，R-C6 按设计仍 SKIP（无曲线判读即 SKIP，非缺数据）。达标判读 / C-P13 标定 / OPEN-C1 阈值重标归项目负责人。*
 
 *修订：2026-09-27（第十一轮，C-P12 事件级复核 + C-P13 架构调研登记）—— 事件级 A/B 对照表 `cp12_event_level_ab_20260926.md` 实测（A relation=336 / B=428，交集 168 / B 补挂 229 / A 有 B 无 104），暴露两项此前披露不足的质量问题：**① 0902 A 版为退化重复循环**（191 条 relation 仅 28 命中事件，属生成/解码故障非 prompt 内容，§4 R-C6 行已标「标定应整日作废」）；**② B 版存在真·过度归属幻觉**（0903 房贷→24 板含减肥药/短剧游戏、金价→短剧游戏），导致现有 10 行分层预审样本抽不到高扇出病态事件→**M3_B 会被低估**（终审需补高扇出过采样专项表）。**架构结论**：A/B 为同一生成架构在召回/精确单旋钮上的两端、§2.6 拉锯结构性无解，基于外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）给出「接地式召回-验证」5 层管线修正方案，设计笔记见 `cp13_grounding_pipeline_research_20260926.md`（待拍板）。本轮纯文档登记，零代码/行为变更；R-C3 锚点未触及、R-C6 仍按设计 SKIP。*
+
+*修订：2026-10-06（第十二轮，M3 首次读齐）—— §6 **M3 由「未测」改为首次实测**：负责人逐行判完分层口径 36 样本 → 误配率 **2.8%**（无关系 1 / 弱关系 4 / 强关系 31）、Wilson95 [0.49%, 14.17%]、逐日连续 5 日达标 `status=met`。⚠️ **分层初筛 ≠ 转正**（§8.1 要求 `--sample-mode full` 复跑，本轮未跑）。唯一「无关系」误配（低空经济→智能驾驶，20260921/0929 两个抽查日稳定复现的系统性偏置）已做对症收口：`family_keywords.py` 军工族新增关键词 "低空"——依据是 `aggregator.py:1075` 任务2「家族归属（仅对落「其他」的板块）」，规则侧命中后 glue 不再有裁量权。**本轮含在线决策变更**（非纯观测）：`低空经济` 的 `frame_group` 由「其他」变「军工」，拥挤计数 / 主线聚合 / Node 6 家族中继会跟着动。读数表、机制发现、prompt 12 族 vs `CONTROLLED_FAMILIES` 14 族漂移、电气设备弱关系为何不改的论证均见架构实施计划 **§11.8**。守卫测试 `test_dikong_resolves_to_military_family`；同跑 92 + 180 passed、`_audit_keyword_overlaps()` 仍 `[]`。*

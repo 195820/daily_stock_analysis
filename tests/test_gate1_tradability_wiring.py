@@ -323,6 +323,27 @@ def test_huandian_resolves_to_ad_family() -> None:
     assert owners == ["智能驾驶"]
 
 
+def test_dikong_resolves_to_military_family() -> None:
+    """M3 终审收口（2026-10-06）：「低空经济」走规则侧，不再留给 glue 自由裁量。
+
+    背景：glue 任务2 只对规则侧落「其他」的板块有家族裁量权（aggregator.py 提示词
+    明写「仅对落『其他』的板块」）。“低空经济”连续两个抽查日被 glue 判成
+    「智能驾驶」（负责人判「无关系」），收口到军工后规则侧直接命中，误配源头切断。
+    """
+    from src.got.family_keywords import FAMILY_KEYWORDS
+    from src.got.nodes.sector_analysis import _build_frame_group
+
+    owners = [fam for fam, kws in FAMILY_KEYWORDS if "低空" in kws]
+    assert owners == ["军工"], f"「低空」应唯一登记于军工，实际: {owners}"
+    # 真产函数级别断言（不重新实现首命中规则），防止声明序漂移
+    assert _build_frame_group("低空经济") == "军工"
+    # 回归护栏：不得再落「其他」（那是 glue 裁量权的入口）
+    assert _build_frame_group("低空经济") != "其他"
+    # 智能驾驶族不得沾“低空”——否则本轮 M3 误配会重新引入
+    ad_keywords = dict(FAMILY_KEYWORDS)["智能驾驶"]
+    assert not [k for k in ad_keywords if "低空" in k]
+
+
 # ─────────────────────────────────────────────────────────────
 # WI-P0-3 / WI-P0-4 shadow 留痕（仅观测，不改决策）
 # ─────────────────────────────────────────────────────────────
