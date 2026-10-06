@@ -493,6 +493,7 @@
 **离线自检读数（`.review_tmp/p17b_selfcheck.py`，强制清空 embedding key 不触网）**：off → `mode_off`、trace 空、零缓存文件；shadow → `embedding_unavailable`、overrides 0、cache_hits/misses 均 0；非法开关值（`nonsense`）→ 回落 off（不得意外开启改判）；shadow 下命中词表板块被正确排除（skipped_count=1）。候选家族 14 个（= FAMILY_KEYWORDS 去掉「其他」）。
 
 **阈值口径**：`GOT_FAMILY_EMBED_MIN_SCORE=0.55` / `GOT_FAMILY_EMBED_MIN_MARGIN=0.05` 属**未标定工程启发式**（按本文 §179「保守阈值 + 留痕人工复核」拍的缺省值，无数据依据），不得直接当转正阈值。转正需先回答三问：① shadow 期「其他」板块占比与拒绝原因分布（low_score / ambiguous / ok）；② `would_flip` 清单人工抽检——兜底家族是否真的对（验收原文「人工抽检一批」）；③ enabled 首日 `frame_group` 变更清单及其经家族中继/漂移宽限的下游 diff。`.env` 已配 `GLUE_EMBEDDING_API_KEY`，真实 shadow 读数需首个非交易日跑 `GOT_FAMILY_EMBED_FALLBACK=shadow` 产生（本轮只落能力 + 离线自检，不产读数）。
+**→ 2026-10-06 负责人改拍「离线回放攒读数」，首批读数已产出（见 §11.13），三问回答如下**：① 已答——10 归档日 93 个「其他」板块 **93/93 全部 `low_score` 被拒**，可兜底 0，ambiguous/no_candidate 均未出现；② `would_flip` 现阈值下为空集，无清单可抽——阈值降到 ≤0.48 才有抽检面，第一档 11 板块已抽（§11.13 敏感性段）；③ 未做且**当前不必做**——读数核心结论是 **0.55/0.05 这对工程启发式在真实数据上不可达（score 最高仅 0.5143），enabled 转正前必须先重标定阈值**，照现值转正等于永久空转。开关仍缺省 off，本轮零生产代码改动。
 
 测试 `tests/test_family_embed_fallback.py`（26 例：文本构造含关键词截断、保守阈值四口径、开关归一与非法值回落、词表复核分流、缓存命中不请求 embedding、未命中落按日文件、数量不匹配报错、三态生产入口、改判谓词（off/shadow 不改 enabled 才改）、接线守卫 Step 3.4c 先于拥挤检测）。与 `test_sector_state_machine`/`test_wave_days`/`test_sector_rotation` 同跑 98 passed；与 `test_glue_pipeline`/`test_aggregator_run_smoke`/`test_reverse_lookup`/`test_cross_node_signals`/`test_p2_9_context_consistency`/`test_node6_candidates`/`test_a6_wiring` 同跑 108 passed。
 
@@ -670,6 +671,31 @@
 **守卫四例**（`tests/test_node6_glue.py::TestGluePrompt`）：渲染行逐字等于 join 结果；exposed ⊆ controlled（否则 LLM 产出会被 S4 拦掉）；**盲区必须显式声明**（`controlled − exposed == {"华为生态", "前沿科技"}`——新增第 15 个家族时这里报错，逼作者停下来声明而不是一错再错）；源码扫描 `aggregator.py` 不得再出现 `AI软件 / AI硬件` 这种手抄形式。
 
 **验证**：十套消费侧同跑 **179 passed / 6.48 s**（node6_glue / family_embed / m3_review / glue_pipeline / aggregator_run_smoke / reverse_lookup / cross_node_signals / p2_9 / node6_candidates / a6_wiring）；`export_glue_family_audit.py --days 20260929 20260930` 重跑正常（候选 34 行，both_none=6/dropped=8/recovered=12/same=8，盲区标记仍在）。顺手修正该测试文件 docstring 里过时的「CONTROLLED_FAMILIES 12 + 1」→ 14。
+
+### 11.13 WI-P1-7(b) shadow 首批读数（离线回放，2026-10-06 负责人拍「离线回放攒 shadow 读数」）
+
+**方法**：`.review_tmp/p17b_shadow_run.py` 读最近 10 个归档日（20260916~20260930）`unified.json` 的 `confirmed_sectors`（板块 250 个），逐日直调 `resolve_family_overrides(boards, run_date=归档日, mode="shadow")`。可行性依据：环境变量在读取期取值、离线脚本显式传 mode 不碰 `frame_group`；向量缓存按 (model+text) 为键跨日共享——14 条原型文本必命中，只有板块名是新向量。首跑报 `GLUE_EMBEDDING_API_KEY 未配置`（`.review_tmp` 脚本不经 `src/config.setup_env`，而 `catalyst_config` 在 **import 期**读 `os.environ`）⇒ 脚本头部补 `load_dotenv(ROOT/.env)` 后跑通。
+
+**读数**（阈值 0.55 / margin 0.05，未标定工程启发式）：
+
+| 项 | 值 |
+|---|---|
+| 落「其他」占比 | 93 / 250（**37.2%**，即 (b) 的受益面） |
+| 可兜底（ok） | **0**（兜底率 0.0%） |
+| 拒绝原因 | `low_score` **93/93**；ambiguous 0、no_candidate 0 |
+| score 分布 | min 0.3081 / median 0.4153 / **max 0.5143**（无一达线） |
+| margin 分布 | min 0.0001 / median 0.0327 / max 0.132 |
+| 首选家族（含被拒） | 消费17 / AI硬件16 / **前沿科技10** / 周期资源9 / 金融8 / 智能驾驶6 / 新能源6 / 生态环保5 / 农业4 / 医药4 / 机器人4 / 军工2 / **华为生态2** |
+
+逐日「其他」：8/7/8/10/6/10/15/12/9/8。样本只取近三周是刻意的——早前 probe 显示「其他」存量随词表演进塌缩（8 月单日到 44），拿旧档会高估负荷（§11.8「词表收一个板块、兜底少一个自由裁量面」的定量复证）。
+
+**核心结论：现阈值下 enabled 转正是彻底空转**（最高 0.5143 < 0.55），转正前必须先做阈值重标定，不得照用工程启发式值。
+
+**阈值降档敏感性**（`.review_tmp/p17b_threshold_sens.py`，通过数＝score≥S 且 margin≥0.05）：S=0.50 → 5；S=0.48 → 17；S=0.45 → **20 行（去重 11 个板块）**；S=0.40 → 32。S=0.45/M=0.05 一档抽检（回答三问②的首批面）：动力电池→新能源（0.514）、第三代半→AI硬件（0.507）、酿酒→消费（0.505）、稀缺资源/小金属→周期资源（margin 0.13 级）、汽车整车→智能驾驶（×3 日稳定）、医疗保健→医药（×4 日稳定）、农用机械→农业、水力发电→新能源、机械基件→机器人、NFT概念→前沿科技——**11 个板块判属全部成立，无一误判**。即 embedding 的**排序**能力是对的，错的是**绝对值**阈值：原型文本是关键词清单而板块名只有 2~5 字，cosine 天然偏低（margin≥0.05 还能把「靠名字相似」的伪命中挡掉大半，S=0.45 时 margin 单独只另拒 6 行）。
+
+**读数里与 §11.12 裁决的张力（诚实登记）**：首选家族「前沿科技」出现 10 次、「华为生态」2 次——恰是 prompt 从未告知 LLM 的两个盲区家族，且降档抽检面含 NFT概念→前沿科技。**embedding 判得出 glue 永远产不出的家族**。这不推翻「暂不告知 LLM」（那是在线行为变更需 replay），但给重标定 WI 追加一条必答题：`FALLBACK_FAMILIES`（14 候选、含盲区）是否应与 `PROMPT_EXPOSED_FAMILIES`（12）对齐——enabled 是绕过 glue 直接写 `frame_group` 的，它写得出盲区家族，而 M3/glue 口径里没有这两个家族。
+
+**边界与留痕**：本轮零生产代码改动、不改任何配置缺省值；读数工件在 `.review_tmp/p17b_shadow_readout.{json,md}`（gitignored）。「11 板块无误判」是 AI 自检，转正评审仍需负责人复核；标定样本只覆盖 2026-09 十个工作日，逐 WI 转正前需扩样本复跑。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
