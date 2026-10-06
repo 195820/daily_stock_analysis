@@ -328,13 +328,15 @@
 - **WI-P0-3 敞口执行接线 shadow**：`GOT_EXPOSURE_ENFORCE`（缺省 shadow）记录"若强制会截断多少"，纯观测不改决策；schema 加 `exposure_enforce_shadow`。
 - **WI-P0-4 sizing 信号强度连续缩放 shadow**：`GOT_SIGNAL_SIZE`（缺省 shadow）对比等分 vs `score^γ` 加权仓位差（γ=0.5），纯观测；schema 加 `signal_size_shadow`。
 - **WI-P0-5 阈值回归校准闭环**：离线脚本 `scripts/recalibrate_thresholds.py` 产出 `data/threshold_calibration.json`（lifecycle day 建议、drift/binary 附 Wilson 区间与 `insufficient_sample` 标注）。
+  真实读数（2026-09-30 跑，见 §11.4）：催化剂/lifecycle 箱 **`status=ok`**（449 已兑现样本，`recommendation_day=5`）；埋伏 drift/binary 箱 `insufficient_sample`（0 平仓样本，结构性稀缺，见 §11.4）。
 - **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
 - **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检（b embedding 兜底延后）。
 - **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
 
 ### 11.2 延后裁决
 - **WI-P1-4 Node2 二波识别**：核心已由 v3.5 `decide_wave_days`（`sector_analysis.py:70`）覆盖——冷却期冻结继承、真洗盘（间隙≥2 交易日 + 自出框前平台回撤≥10 分）重置 wave_days=1。`fresh momentum 豁免老化`残留分支需维护者用真实样本裁决，本轮不动。
-- **WI-P2-7 / P2-10 / P2-12**（漏斗分数化 / 轮动换手惩罚 / 蓄水池自适应）：均改在线选股·轮动·池容量判据，触候选池归零红线（§0.1-3）且新阈值须先经 P0-5 标定（§0.1-6）；当前标定样本尚 `insufficient_sample`，先延后待读数。
+- **WI-P2-7 / P2-10 / P2-12**（漏斗分数化 / 轮动换手惩罚 / 蓄水池自适应）：均改在线选股·轮动·池容量判据，触候选池归零红线（§0.1-3），且各自新阈值（漏斗分档权 / 换手惩罚系数 / 池容量函数）**不在 P0-5 本次标定范围**——P0-5 仅覆盖 lifecycle/ambush 阈值。§11.4 已更正：lifecycle 箱已 `ok`（并非全盘 insufficient_sample），但此三项依赖的是其自身未标定阈值，故仍延后。
+- **WI-P0-2 lifecycle 时间阈值前移**：数据前置**已满足**（§11.4：催化剂箱 449 样本 `status=ok`，建议 day=5 替代写死 30），非“样本不足”阻塞；仍延后的真实原因是它改在线退出决策（红线 §0.1-1 需先 shadow 读数），且 449 样本存在幸存者偏差（median T1→T5 仍递增 0.02→0.36，工件 caveat①），day=5 只作方向佐证不作精确最优点。
 - **WI-P2-1/2/3/4/5/6/8/11**：硬依赖 P0-1/P1-3/P1-8/GATE-2 尚未落地，按 §6 排期属第 2–4 批，本轮不启动。
 
 ### 11.3 代码审查修复（2026-09-30 CR 轮）
@@ -347,6 +349,27 @@
 - **CR#6（WI-P0-5）**：`recalibrate_thresholds.py` docstring 产出文件名对齐实际 `threshold_calibration.json`；三处统计函数加 `n==0` 早退，空箱不再 `days[-1]`/`mean([])` 崩溃。
 - **CR#7（GATE-1）**：`tradability.py` 模块 docstring 封板口径对齐实现（跌停看当日最高价是否全天贴住跌停、涨停看最低价，high/low 双界）。
 测试同步：新增 `test_t_plus_1_blocked_even_when_quote_missing`（CR#2 回归）、重写 `test_calendar_library_unavailable_never_counts_weekend`（CR#1 真实 fail-open 口径）、修正 `test_quote_unavailable_never_blocks_enabled`（CR#3 新语义：`pending_exit is False` 且不进顺延集合）。回归：`test_gate1_tradability_wiring.py` + `test_p2_9_context_consistency.py` 36 passed；portfolio/node6/aggregator 相关 11 文件组合 162 passed（开关全关旧路径无扰动）。
+
+### 11.4 P0-5 真实标定读数 + 埋伏侧回测可行性（2026-09-30）
+
+用历史数据直跑 `scripts/recalibrate_thresholds.py`（`as_of=2026-09-30`、`min_samples=30`）的实际产出，纠正 §11.2 此前“标定样本尚 insufficient_sample”的一束式误判：
+
+| 标定箱 | 样本 | 状态 | 关键读数 |
+|---|---|---|---|
+| lifecycle_day | **449** | ✅ `ok` | `recommendation_day=5`（替代写死 30）；median 收益 T1=0.019 / T3=0.142 / T5=0.360；T1 胜率 0.508（Wilson 95% [0.462, 0.554]）；故事寿命 p50=3 / p75=5 日历日 |
+| ambush_drift | **0** | ❌ insufficient_sample | keep_legacy |
+| ambush_binary_grace | **0** | ❌ insufficient_sample | keep_legacy |
+
+**存量真相（直查库）**：`catalyst_realizations` 685 条 / 其中 449 条已兑现带 T+1 收益（event_date 跨 2026-08-15→10-12）；`ambush_position_snapshots` 全表仅 3 条且**全部 drift、全部 is_open、0 binary、0 平仓**。
+
+**结论一：催化剂/lifecycle 侧无需额外回测，历史数据已够**——P0-2 的数据前置已满足（`status=ok`），仅因“改在线决策需先 shadow”+幸存者偏差 caveat 而未启用。
+
+**结论二：埋伏 drift/binary 侧“用历史数据回测”不是快赢**，三重阻塞：
+1. **结构性稀缺**（最根本）：跨 ~48 个交易日实盘仅产 3 条快照，埋伏建仓 buy 被 gate funnel + 蓄水池重重闸限流，本就极少转化；binary 一条未产。即便完美重放现有 `data/got_daily/` 产物，closed 样本上限仍受限于 buy 触发频率，难达 drift/binary 各 ≥30。
+2. **硬编 `date.today()`**：`_write_ambush_buy_snapshots`（entry_date，:2437/:2467）与 `_close_ambush_snapshots`（exit_date，:2886/:2899）均取墙钟今日，且平仓仅按 symbol+is_open 匹配（无日期护栏）——逐日重放会把 held_trading_days 压为 0 或串扰。
+3. **无现成重放器**：`backtest_september.py` 仅对 Top-5 推荐算前瞻收益，**不**重放埋伏生命周期；`run_phase2_only.py` 单日跳 Phase2。均需自建“模拟交易日贯穿 + 顺序多日 + 隔离写临时表”的重放 harness（本身就是一个独立 WI）。
+
+**处置**：ambush_drift/binary 保持 `keep_legacy`（工件已如此标注）；若后续重视埋伏阈值标定，需先立“埋伏生命周期重放 harness”专项。lifecycle 侧的 day=5 转正仍走 §8 shadow→读数→裁决流程，不因“数据够了”而跳过决策安全闸门。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
