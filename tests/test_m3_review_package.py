@@ -210,6 +210,20 @@ def test_render_md_reports_shortfall(mod):
     assert "抽样缺口" not in md or "未跨层补齐" in md          # 有缺口必须写明不补齐
 
 
+def test_process_note_records_promotion_decision(mod):
+    """2026-10-06 负责人裁决：M3 直接以分层终审读数结案，不再要求 full 复跑。
+
+    这条断言守的是「口径文案与裁决一致」：full 复跑作为前置已被放弃，若文案里又出现
+    「转正必须 full 复跑」，评审包会对使用者发出一个永远不会被满足的要求（假告警）。
+    """
+    note = mod.process_note("stratified")
+    assert "结案" in note and "2026-10-06" in note
+    assert "放弃 full 复跑" in note
+    assert "必须用 `--sample-mode full`" not in note
+    # stratified 仍是偏高读数（只是偏保守），不得退化成「无条件可信」
+    assert "难点超采" in note and "日常预警" in note
+
+
 def test_csv_roundtrip_leaves_grade_empty(mod, tmp_path):
     pkg = _pkg(mod)
     recs = mod.csv_rows(pkg["rows"])

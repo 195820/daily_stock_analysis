@@ -17,9 +17,16 @@
 
 口径可比性（重要，别自欺）：
 - `--sample-mode stratified`（缺省，OPEN-C2 建议口径）对「回收/冲突」两类**对抗性超采**，
-  其误配率是偏高的初筛读数，**不能**直接当 §8.2 的转正依据；
-- `--sample-mode full`（§8.1 原文「每日候选全量」）才是转正口径；分层初筛只作日常预警。
-  计分结果会写明本次是哪一口径。
+  读数**偏高**——偏高意味着拿它当验收是保守方向（不会把差的说成好的），但当作精确水位
+  读数时须按层外推；
+- `--sample-mode full` 是 §8.1 原文「每日候选全量」口径，随时可跑（分母 = glue 给出了归属
+  的行，实测日均约 13 条，在 §8.1 自己的 ≤10 分钟/日预算内）。
+
+【2026-10-06 负责人裁决】M3 **直接以分层终审读数结案**，放弃「转正必须先 full 复跑」这一
+前置：分层样本里难点（回收+推翻）占 26/36＝72.2%，而总体仅 36/65＝55.4%，故 2.8% 是偏高
+读数；按层外推回全量口径 ≈2.2%，两读数同处 15% 红线内且与红线差一个数量级，复跑不改变结论。
+此后 stratified 口径定位为**日常预警**：破线须人工复核再决定是否回到全量口径，不自动回滚。
+计分结果会写明本次是哪一口径。
 
 抽样与类别判定全部复用既有审核工具 `scripts/export_glue_family_audit.py`
 （`discover_days` / `load_day` / `classify` / `flag_cross_day_instability`），不另写第二套口径；
@@ -28,7 +35,7 @@
 用法：
     python scripts/build_m3_review_package.py                     # 最近 5 个有效归档日，分层抽 10/日
     python scripts/build_m3_review_package.py --days 20260928 20260929
-    python scripts/build_m3_review_package.py --sample-mode full  # §8.1 转正口径
+    python scripts/build_m3_review_package.py --sample-mode full  # §8.1 原全量口径（可选复核）
     python scripts/build_m3_review_package.py --score data/glue_family_audit/m3_review_20261006.csv
 """
 
@@ -277,7 +284,7 @@ def process_note(sample_mode: str) -> str:
 | 计入规则 | 误配率 = 「无关系」/（强 + 弱 + 无）。**只有「无关系」计入分子**（OPEN-C2 原文） |
 | 分母口径 | §8.1 定义 M3 针对「glue **给出了归属**」的行；glue 弃权/双空（`无归属`）不入分母，另作「glue 弃权率」披露 |
 | 红线 | 单日误配率 ≤ 15%（10 样本 → 最多 1 条无关系；2 条即 20% 破线） |
-| 转正 | **连续 {STREAK_DAYS_REQUIRED} 个抽查日**逐日达标，且必须用 `--sample-mode full` 口径复跑（分层样本对难点超采，读数偏高，只作预警初筛） |
+| 结案 | 原 §8.1 前置＝「连续 {STREAK_DAYS_REQUIRED} 个抽查日逐日达标 **且** `--sample-mode full` 复跑」。**2026-10-06 负责人裁决：直接以分层终审读数结案，放弃 full 复跑前置**（分层对难点超采 → 读数偏高，属保守方向；按层外推全量口径 ≈2.2%，两者都在红线内）。本口径此后作**日常预警**，破线需人工复核再决定是否回到全量 |
 | 回填 | 把本表 `grade` 列填成 强关系/弱关系/无关系/无法判定 之一（csv 或 HTML 页 对/错/存疑 键位 1/2/3 均可），再跑 `--score` |
 """
 
@@ -510,7 +517,9 @@ def score_package(path: str) -> int:
     print(f"末尾连续达标 {res['streak_days_met']} 日（历史最长 {res['longest_streak_days']}）"
           f"→ status={res['status']}；有效抽查日 {res['days_with_data']}，无数据日 {res['days_without_data']}")
     if mode == "stratified":
-        print("⚠️ 分层初筛口径：对难点超采、读数偏高，转正须用 --sample-mode full 复跑（§8.1）")
+        print("ℹ️ 分层口径：对难点超采、读数偏高（保守方向）。M3 已于 2026-10-06 直接结案，"
+              "不再要求 --sample-mode full 复跑；本口径此后作日常预警，破线请人工复核后再"
+              "决定是否回到全量（glue 本身早已 A6 转正在线，此处不回滚）")
     out = csv_path.with_name(csv_path.stem + "_score.json")
     out.write_text(json.dumps({"sample_mode": mode, **res}, ensure_ascii=False, indent=1),
                    encoding="utf-8")

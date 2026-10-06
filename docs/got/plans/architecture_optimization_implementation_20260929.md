@@ -339,7 +339,7 @@
 - **WI-P1-9 真实交易日历**：`catalyst_calendar.py` 加 `_is_cn_trading_day`（复用 `src.core.trading_calendar.is_market_open`，缺包降级 weekend-only），`GOT_REAL_TRADE_CAL` 分流（缺省关）。
 - **WI-P1-7(a) 家族词表歧义**：`family_keywords.py` 移除新能源族"换电"重叠 + 加 `_audit_keyword_overlaps` 自检。
 - **WI-P1-7(b) 「其他」板块 embedding 家族兜底（2026-10-06，shadow 态）**：新增生产模块 `src/got/family_embed.py`（家族原型文本 / `select_family` 保守阈值 / 按日向量缓存复用 L1 惯例）+ Node 2 `run()` Step 3.4c 接线（排在拥挤检测之前，改判后拥挤/主线聚合/Node 6 家族中继自然消费新家族）；`SectorContext.family_embed_shadow`（缺省 None）落「若兜底会改判的板块清单」。开关 `GOT_FAMILY_EMBED_FALLBACK`（**缺省 off**，off 立即返回不触网）；阈值 `GOT_FAMILY_EMBED_MIN_SCORE`/`_MARGIN`（缺省 0.55/0.05，未标定启发式）。测试 `tests/test_family_embed_fallback.py`（26 例，embedding 全桩、不触网）。读数与转正条件见 §11.7。
-- **M3 家族归属人工终审（2026-10-06）**：分层口径 36 样本已判满，误配率 **2.8%**（无关系 1 / 弱关系 4 / 强关系 31），逐日连续 5 日达标 `status=met`。唯一「无关系」误配（低空经济→智能驾驶）已对症收口：**军工族新增关键词 "低空"**，`_build_frame_group("低空经济") == "军工"`。读数、机制发现与 full 口径待复跑见 §11.8。
+- **M3 家族归属人工终审（2026-10-06）**：分层口径 36 样本已判满，误配率 **2.8%**（无关系 1 / 弱关系 4 / 强关系 31），逐日连续 5 日达标 `status=met`。唯一「无关系」误配（低空经济→智能驾驶）已对症收口：**军工族新增关键词 "低空"**，`_build_frame_group("低空经济") == "军工"`。**M3 已直接结案转正**（负责人裁决放弃 §8.1 的 full 复跑前置；分层偏高读数作验收，外推全量 ≈2.2%），读数、机制发现与结案论证见 §11.8。
 - **WI-P2-9(a) persistence 跨日一致性断言 shadow**：`persistence.py` 加纯函数 `cross_day_consistency_diff`（板块名归一后取 JSON↔DB 双向差）+ `query_db_mainline_family_sector_names`；`aggregator._save_context` save 成功后按 `GOT_CONTEXT_CONSISTENCY`（缺省 off）影子留痕，异常内部兜底绝不外抛。测试 `tests/test_p2_9_context_consistency.py`。**enabled 语义"统一真相源 + 冲突拦截"归入延后**（需先定单一 source-of-truth 口径）。
 
 ### 11.2 延后裁决
@@ -464,7 +464,23 @@
 | 20260930 | 7 | 5 | 2 | 0 | 0.0% | 达标 |
 | **合并** | **36** | **31** | **4** | **1** | **2.8%** | Wilson95 **[0.49%, 14.17%]**（上界仍压住 15% 红线） |
 
-末尾连续达标 5 日 → `status=met`。**但这不是转正**：分层口径对「回收/冲突」两层对抗性超采，§8.1 转正必须 `--sample-mode full` 复跑；本轮只跑了分层初筛。
+末尾连续达标 5 日 → `status=met`。
+
+**结案决策（2026-10-06 负责人裁决：直接转正，放弃 full 复跑）**：原 §8.1 写的是转正须 `--sample-mode full`（每日候选全量）复跑，本轮未跑。裁决依据是三项实测，不是嫌麻烦：
+
+| 项 | 分层口径（已判完） | 全量口径（按层外推） |
+|---|---|---|
+| 分母 | 36 行 | 65 行（同 5 日，日均约 13 条） |
+| 难点占比（回收+推翻） | 26/36 = **72.2%** | 36/65 = **55.4%** |
+| 误配率 | **2.8%** | ≈ **2.2%**（唯一误配落在回收层：35/65 × 1/25） |
+
+分层对难点超采 ⇒ 2.8% 是**偏高**读数，拿偏高读数作验收属**保守方向**（不会把差的说成好的）；两个读数都在 15% 红线内且与红线差一个数量级，复跑只补仪式、不改变结论。日后若要补，代价也不大：全量分母日均约 13 条，本就在 §8.1 自己写的「≤10 分钟/日」预算内（早前估计的「120 行」是含 glue 弃权/双空的总候选，它们不入分母、无需判读）。
+
+**结案后口径的新定位**：stratified 降为**日常预警**，不再是转正前置。要注意它天然偏高——单日 7~8 样本里 1 条无关系就是 14.3% 贴线，而同样一条放到全量口径只有 1/13≈7.7%。所以**破线须人工复核再决定是否回到全量，不自动回滚**（评审包脚本的 `--score` 文案与 `process_note` 已同步改口，并有守卫测试防人写回去）。
+
+**残留风险不在口径，在统计功效**：n=36，Wilson95 上界 14.17% 只是勉强压住 15%；弱关系堆积 4/36＝11.1% 是 prompt 收紧信号，本轮未处理。
+
+**本项结案 ≠ glue 上线闸门**：glue 早在 2026-09-17 A6 阶段 1 就转正在线（`AGENT_SEMANTIC_GLUE_ENABLED` 缺省 true、`_SHADOW` 缺省 false，`aggregator.py:1283` 的 S6 关闭即报错），M3 是上线后的质量审计指标。§8.2「双达标」里的 M1（34.4% < 60%）/ M2（28.1% < 70%）/ M4-a（0.591 < 0.6）仍是未达的水位监控项，本次结案不动它们。
 
 **机制发现（比读数值钱）**：`aggregator.py:1075` 任务2 原文是「families — 家族归属（**仅对落「其他」的板块**）」，即 **规则侧词表能命中的板块，glue 根本没有家族裁量权**：
 - 治理 glue 家族误配的杠杆点不在 prompt，而在**词表覆盖度**：词表收一个板块，glue 就少一个自由裁量面。这把 WI-P1-7(a)（词表治理）与 (b)（embedding 兜底）串成同一根因链，也说明 (b) 的受益面就是「其他」存量本身。
@@ -482,6 +498,8 @@
 **改动面与回归**：本轮仅一词表条目（`family_keywords.py` 军工族 +"低空"）+ 一个守卫测试（`test_dikong_resolves_to_military_family`：断言「低空」唯一登记于军工、`_build_frame_group("低空经济")=="军工"`、不再落「其他」、智能驾驶族不得沾「低空」）。`_audit_keyword_overlaps()` 返回 `[]`（无新增跨族重叠）、`CONTROLLED_FAMILIES` 仍 14（不动 `test_node6_glue` 的 ==14 断言）。同跑：gate1/family_embed/node6_glue/m3_review 四套 92 passed；Node 2 三套 + 消费侧七套 180 passed，零回归。
 
 **这是在线决策变更（非纯观测）**：`低空经济` 的 `frame_group` 由「其他」变「军工」，下游会跟着动：家族拥挤检测计数、主线家族聚合、Node 6 家族中继与 `family_anchor_map` 漂移宽限。需知道的就是：首个生产日跑后，0921/0929 类归档的家族口径与新归档不可直接对比（与「换电」治理同性质，但那轮是零行为变更，本轮不是）。
+
+**结案轮改动面（2026-10-06 第二批，纯口径文案，零抽样/计分变更）**：`scripts/build_m3_review_package.py` 三处同步——模块 docstring 的「口径可比性」、`process_note()` 的「转正」行改为「结案」、`--score` 末尾提示行。抽样逻辑、三档判据、计分公式、`--sample-mode` 缺省值一律不动（`--score` 复跑读数仍为 2.8% / `status=met`）。新增守卫测试 `test_process_note_records_promotion_decision`：断言 note 已记录结案裁决且不再出现「必须用 `--sample-mode full`」——防止评审包继续向使用者发出一个永远不会被满足的要求（假告警）。`tests/test_m3_review_package.py` **18 passed**。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
