@@ -210,7 +210,18 @@
 
 ### 3.4 D 层（`archive/got_layer_d_plan_0911.md` §7.2）
 
-OPEN-D1（P2-2 界点归因）、OPEN-D2（`associated_sectors` 是否真无可靠数据源）、OPEN-D3（`CATALYST_CONFIDENCE_GATE` 校准样本）、OPEN-D4（`AMBUSH_SCORE_FLOOR=0.30` 来源与带宽）、OPEN-D5（蓄水池驱逐规则 FIFO vs 质量）、OPEN-D6（P2-3 `raw_position > 1.0` 语义）、OPEN-D7（正式池水位目标取值，暂定 `(2,6)`）、OPEN-D8（P1-1 新归属，排在下一批）→ ✅ **已结（2026-09-28 小尾巴轮：`_resolve_holding_name` 消费侧兜底落地）**、OPEN-D9（`current_position_ratio` 截断不可证伪，建议落盘 `raw_position`）
+OPEN-D1（P2-2 界点归因）、OPEN-D2（`associated_sectors` 是否真无可靠数据源）、OPEN-D3（`CATALYST_CONFIDENCE_GATE` 校准样本 → 🧾 **取证表已产出（2026-10-06）**：`scripts/calibrate_catalyst_confidence_gate.py` 只读取证（分箱质量/门槛模拟/归档漏斗 reason/分类质量），产物 `reports/catalyst_confidence_gate_forensics_YYYYMMDD.md|.json`（reports/ 不入库）——初读：减基准超额胜率随阈值 0.50→0.80 极差仅 3pp、方向正确率（净化）反而 44%→34% 倒挂 → **现 confidence 分值对兑现质量无实质区分度**，取值/改结构归负责人（联动 OPEN-D10）；**本次仅取证不改值**（glue_consumed 9<10 交易日）、OPEN-D4（`AMBUSH_SCORE_FLOOR=0.30` 来源与带宽）、OPEN-D5（蓄水池驱逐规则 FIFO vs 质量）、OPEN-D6（P2-3 `raw_position > 1.0` 语义）、OPEN-D7（正式池水位目标取值，暂定 `(2,6)`）、OPEN-D8（P1-1 新归属，排在下一批）→ ✅ **已结（2026-09-28 小尾巴轮：`_resolve_holding_name` 消费侧兜底落地）**、OPEN-D9（`current_position_ratio` 截断不可证伪，建议落盘 `raw_position`）
+
+- **OPEN-D10**（P1-1 取证时发现，2026-10-06）`direction` 字段语义污染致方向准确率系统性伪低：
+  `catalyst_config.GLOBAL_TO_A_SHARE_MAP` 的 `direction` 存的是**漂移类型词**（`drift`/`fade`/`binary`），
+  而 `catalyst_realization._check_direction`（L742）只认 `positive`/`negative`/`binary`，其余恒 `return False`。
+  实测污染 464 条已兑现样本中的 **162 条（35%，conf=0.8 整档 149 条几乎全在列）**：
+  原始口径方向准确率 **29%** → 净化后 **44%**（有效样本 302）。
+  ❗ **副作用**：`scripts/calibrate_catalyst_params.py`（T4）按 `direction_acc < 0.5 → 建议降门槛至 0.60` 分支，
+  属该缺陷导致的**伪结论**，不得采用（新脚本已按净化口径重算并标注）。
+  待拍板二选一：① 修源头（映射表 `direction` 改 positive/negative/binary，`category_tag` 已是类型位）；
+  ② 修判定（`_check_direction` 补 drift→正 / fade→负 分支）。**两者均改变已有统计读数**，
+  属新 WI（不并入 P1-1 门槛标定），修后需回填重算 P6 兑现报表。
 
 ### 3.5 B 层（`archive/got_layer_b_plan_0911.md` §7.2）
 
@@ -336,7 +347,7 @@ OPEN-B1…B7 —— 见 §1.B。
 | **Phase 4b** | remote §5 MarketThemeContext Step 2（mootdx 板块排名接入） | **A6 之后**；Step 1（模型定义）已完成。〔**排期批 5 §2 已落（2026-09-28，影子态）**〕：`market_theme.py` 增 `build_theme_context`（mootdx `get_board_quick_change` 批量自算，禁逐板 kline；三时框同向判 phase；失败回退 unknown 零行为）；builder 调用落 `orchestrator.py`（AggregatorNode 无 fetcher）；aggregator 组装段 `GOT_MARKET_THEME_SHADOW`/`_ENABLED` 三态消费 + `schemas.UnifiedContext` 两观测字段 + archive「🧭 市场结构」段。相关性验收脚本 `.review_tmp/cp4b_correlation_acceptance.py` 诚实 SKIP（enabled 转正前置）。`test_market_theme_step2.py` 11 绿；R-C3 十锚点逐位一致 PASS。排名源=mootdx（TickFlow 探测证不达标，见 §7/5b）。 |
 | **Phase 4d** | remote §7 AlphaSift 选股引擎 | **A6 之后**（归零率基线重标 D-3）。〔**排期批 5 §4 部分落地（2026-09-28）**〕：✅ **4.1 归零率基线观测化**——`stock_screener.run_got_mode` 5 轮漏斗补 `funnel_stats`（actionable 板块数/0 只入选板块/逐轮存活数）落 GOT 归档，`ScreenerRunResult.funnel_stats` 观测字段不进判定（D-3 基线首次可落盘，需攒 ≥10 交易日）；✅ **4.2 快照源连通性取证**——`79.push2.eastmoney.com` 当前**可达未封**（见 verification.md §7.1），hotspot 因子无需降级、§1 申请清单联动不触发。⏳ **4.3 影子接线 + 2 周评估**未开工（前置=D-3 基线满 10 日）。`test_got_funnel_stats.py` 4 绿。 |
 | **Phase 5b** | remote §10 TickFlow 数据源 | **需申请 API Key**〔key 已就位（2026-09-28），改能力探测批，见 verification.md §7〕：探测证 **TickFlow 不能作 4b 板块排名源**（概念 universe=0、`get_by_universes`/`klines.batch`=PermissionError，套餐权限所限）；`quotes.get_by_symbols` 个股实时可用（Phase 6/5c 候选）。mootdx 先行定案（拍板②）。 |
-| **Phase 5c** | glue P1 调参 + OPEN-1 家族仓位 | **✅ 已拍板为本批主线（2026-09-28 排期）**，规格见 `archive/agent_glue_plan_0903.md` §P1（P1-1…P1-4）；⚠️ P1-1 分位重标需转正后 ≥10 交易日样本（预计 ~10-05 解锁），W3/W4 单独立项不在本批。**〔排期批 4 实施进度的2026-09-28〕**：✅ **4.1 W2/W1 卖出来源已落**（三态开关：`GOT_SELL_SOURCE_ENABLED` 生效默认关 + `GOT_SELL_SOURCE_SHADOW` 影子默认开·跑检测落 `sell_source_shadow` 观测字段不改决策；单测 7 绿，详 §3.1 OPEN-1）；✅ **4.5 zip 金丝雀已落**（`aggregator.py` 家族梯队 `zip(members, member_details)` 长度错配显式留痕，OPEN-4 X1 同型防御）；⏸️ **4.2 P1-1 分位重标 DEFER**（批 2.3 实测 `glue_consumed` 样本仅 **6<10** 交易日，按 gating 顺延至解锁日）；✅ **4.3 P1-2 护栏复核=验证性无代码**（OVERHEAT/top_n/_wave_coeff 本体不动）；⏳ **4.4 P1-3 `CATALYST_CONFIDENCE_GATE=0.7` 真校准=数值判定归负责人**（§0 性质约束，本批不擅自设值） |
+| **Phase 5c** | glue P1 调参 + OPEN-1 家族仓位 | **✅ 已拍板为本批主线（2026-09-28 排期）**，规格见 `archive/agent_glue_plan_0903.md` §P1（P1-1…P1-4）；⚠️ P1-1 分位重标需转正后 ≥10 交易日样本（预计 ~10-05 解锁），W3/W4 单独立项不在本批。**〔排期批 4 实施进度的2026-09-28〕**：✅ **4.1 W2/W1 卖出来源已落**（三态开关：`GOT_SELL_SOURCE_ENABLED` 生效默认关 + `GOT_SELL_SOURCE_SHADOW` 影子默认开·跑检测落 `sell_source_shadow` 观测字段不改决策；单测 7 绿，详 §3.1 OPEN-1）；✅ **4.5 zip 金丝雀已落**（`aggregator.py` 家族梯队 `zip(members, member_details)` 长度错配显式留痕，OPEN-4 X1 同型防御）；⏸️ **4.2 P1-1 分位重标 DEFER**（批 2.3 实测 `glue_consumed` 样本仅 **6<10** 交易日，按 gating 顺延至解锁日）；✅ **4.3 P1-2 护栏复核=验证性无代码**（OVERHEAT/top_n/_wave_coeff 本体不动）；⏳ **4.4 P1-3 `CATALYST_CONFIDENCE_GATE=0.7` 真校准=数值判定归负责人**（§0 性质约束，本批不擅自设值）**〔2026-10-06 取证推进：新脚本 `scripts/calibrate_catalyst_confidence_gate.py` 已入库（只读，不改值），分位读数显示 confidence 无实质区分度（见 §3.4 OPEN-D3）；同时发现 `direction` 语义污染新缺陷→ OPEN-D10，需先修数据再读方向类指标；glue_consumed 仍 9<10 交易日，判读顺延至 10-08 复市后重算〕** |
 | **P0-B B3** | `crowded_families` 处置（Node 2 停产 vs 修正口径） | ✅ **已拍板（2026-09-28）：维持现状+加口径标注**，不停产不新增接线。注：旧「无消费者」记载过期——实有 3 处活消费（Node 6 续航 crowded 标记 / Phase 2 追加降权 ×0.90 / 埋伏 G3 输入，2026-09-28 grep 实测）；标注已落（`sector_analysis.py` 产出处 + schemas 两处字段描述） |
 
 > ⚠️ **批次 5 影子读数有数期作废并重起（2026-09-29，批 5 审查修复收尾）**：Ultra Review （`ULTRA_REVIEW_20260928_batch5.md`）发现 Critical #1——`aggregator.run()` 内裸 `os.getenv` 因缺模块级 `import os` 抛 NameError，使 3b `conflict_summary_shadow` / 4b `market_theme_shadow` 两个影子字段自 0928 合入以来**从未真正产出**（run() 必崩；域回归 86 passed 未捕获因当时无 run() 级测试）。已补 `import os` + 新增 `tests/test_aggregator_run_smoke.py`（run() 级冒烟，修复前必失败）。**后果**：0929 之前任何归档的 3b/4b 影子字段均为空/不存在，不可作 4b/3b 转正的标定读数输入；影子读数自本修复部署之日起重新累。4.1 `sell_source_shadow` 在 `portfolio_decision`（非 aggregator.run）路径，**不受此崩溃影响**，但同样需 P0 提交后重新累读数验证。
