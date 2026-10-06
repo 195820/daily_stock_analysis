@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta
+import time
+from datetime import date, datetime, timedelta
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -141,12 +143,17 @@ def _extract_cash_dividend_per_share(row: pd.Series) -> Optional[float]:
     return _parse_dividend_plan_to_per_share(plan_text)
 
 
-def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+def _filter_rows_by_code(df: pd.DataFrame, stock_code: str, *, strict: bool = False) -> pd.DataFrame:
+    """按代码列过滤本股行。
+
+    strict=True（「按报告期返回全市场表」的接口专用）：连代码列都没有时返回空表，
+    绝不把整表当成本股。默认保持历史行为（无代码列时返回原表）。
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     code_cols = [c for c in df.columns if any(k in str(c) for k in ("代码", "股票代码", "证券代码", "symbol", "ts_code"))]
     if not code_cols:
-        return df
+        return pd.DataFrame() if strict else df
 
     target = _normalize_code(stock_code)
     for col in code_cols:
@@ -237,6 +244,37 @@ def _build_dividend_payload(
     }
 
 
+# ─────────────────────────────────────────────────────────────
+# 「按报告期返回全市场表」的业绩类接口（预告 / 快报）
+#
+# akshare 1.18.91 实测签名（三个都**只收 date、不收 symbol**）：
+#   stock_yjyg_em(date='20200331')  业绩预告（含「预告类型」列）
+#   stock_yjkb_em(date='20211231')  业绩快报（全数值列，无摘要文本）
+#   stock_yjbb_em(date='20200331')  业绩报表（不是预告，本适配器已不再使用）
+# 修复前用 {"symbol": code} 调用必然 TypeError，回退空参又拿到默认报告期
+# （2020Q1 / 2021年报，陈旧 4-6 年）再按代码过滤 → 绝大多数股票取不到行，
+# RiskAgent 的「业绩预亏」通路长期为空。另：未公布报告期在 akshare 内部
+# 报 TypeError（实测 'NoneType' object is not subscriptable），靠逐期回退处理。
+# 详见 tests/test_fundamental_adapter.py 的签名守卫与逐期回退用例。
+# ─────────────────────────────────────────────────────────────
+
+REPORT_PERIOD_LOOKBACK = 2        # 逐股回看最近几个报告期（新→旧）
+REPORT_TABLE_TTL_SECONDS = 1800   # 全市场表进程内缓存：一次拉取服务整轮逐股查询
+REPORT_TABLE_MAX_ENTRIES = 6      # 缓存表数量上限（单表 2k-5k 行，防长跑内存增长）
+
+
+def _recent_report_periods(as_of: Optional[datetime] = None,
+                           count: int = REPORT_PERIOD_LOOKBACK) -> List[str]:
+    """最近若干个「已结束的」报告期，YYYYMMDD，新→旧。"""
+    now = as_of or datetime.now()
+    ends: List[date] = []
+    for year in (now.year, now.year - 1, now.year - 2):
+        for month, day in ((12, 31), (9, 30), (6, 30), (3, 31)):
+            ends.append(date(year, month, day))
+    recent = [d for d in sorted(ends, reverse=True) if d <= now.date()]
+    return [d.strftime("%Y%m%d") for d in recent[:max(1, count)]]
+
+
 def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
@@ -263,6 +301,77 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
 
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
+
+    def __init__(self) -> None:
+        # (接口名, 报告期) → (时间戳, 全市场表)。逐股共用，避免每只股票重拉全市场。
+        self._report_tables: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+        self._report_table_lock = RLock()
+
+    def _get_report_table(
+        self,
+        ak_module: Any,
+        func_name: str,
+        period: str,
+        errors: List[str],
+    ) -> Optional[pd.DataFrame]:
+        """取某报告期的全市场表，进程内按 (接口, 报告期) 缓存。"""
+        key = (func_name, period)
+        now = time.time()
+        with self._report_table_lock:
+            cached = self._report_tables.get(key)
+            if cached is not None and now - cached[0] < REPORT_TABLE_TTL_SECONDS:
+                return cached[1]
+
+        fn = getattr(ak_module, func_name, None)
+        if fn is None:
+            return None
+        try:
+            df = fn(date=period)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{func_name}:{type(exc).__name__}")
+            return None
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+
+        with self._report_table_lock:
+            if len(self._report_tables) >= REPORT_TABLE_MAX_ENTRIES and key not in self._report_tables:
+                oldest = min(self._report_tables, key=lambda k: self._report_tables[k][0])
+                self._report_tables.pop(oldest, None)
+            self._report_tables[key] = (now, df)
+        return df
+
+    def _fetch_report_rows(
+        self,
+        func_names: Tuple[str, ...],
+        stock_code: str,
+        errors: List[str],
+    ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        """查本股最近几条业绩记录：报告期新→旧，主源无记录再试降级源。"""
+        try:
+            import akshare as ak
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"import_akshare:{type(exc).__name__}")
+            return None, None
+
+        periods = _recent_report_periods()
+        attempt_errors: List[str] = []
+        tables_seen = 0
+        for func_name in func_names:
+            for period in periods:
+                table = self._get_report_table(ak, func_name, period, attempt_errors)
+                if table is not None:
+                    tables_seen += 1
+                matched = _filter_rows_by_code(table, stock_code, strict=True)
+                if not matched.empty:
+                    return matched, func_name
+        # 错误上报口径：拿到过表但本股无行 = 该股确实没有业绩预告/快报（正常缺失）；
+        # 未公布的报告期在 akshare 内部报 TypeError（实测）也属正常缺失。
+        # 只有「一个表都没拿到」才上报，否则每只股都带一条假错会把 earnings 块误标 failed。
+        if tables_seen == 0:
+            for err in attempt_errors:
+                if err not in errors:
+                    errors.append(err)
+        return None, None
 
     def _call_df_candidates(
         self,
@@ -339,34 +448,50 @@ class AkshareFundamentalAdapter:
                     result["earnings"]["financial_report"] = financial_report_payload
                 result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast
-        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
-            ("stock_yjbb_em", {}),
-        ])
+        # Earnings forecast（业绩预告：接口按报告期返回全市场表 → 表内过滤本股）
+        # 降级源 stock_yjbb_em（业绩报表）已移除：它不是预告，旧候选按「预告/业绩变动/
+        # 内容/摘要/公告」取列时会捡到「公告日期」当摘要（实测 600519），且单期 11,449 行 /
+        # ~11 秒，会吃光整个 bundle 的时间预算。本股无预告记录 → 留空就是正确读数。
+        forecast_errors: List[str] = []
+        forecast_df, forecast_source = self._fetch_report_rows(
+            ("stock_yjyg_em",), stock_code, forecast_errors
+        )
         result["errors"].extend(forecast_errors)
         if forecast_df is not None:
-            row = _extract_latest_row(forecast_df, stock_code)
-            if row is not None:
-                result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
-                )[:200]
-                result["source_chain"].append(f"earnings_forecast:{forecast_source}")
+            row = forecast_df.iloc[0]
+            result["earnings"]["forecast_summary"] = _safe_str(
+                _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
+            )[:200]
+            # 「预告类型」（预增/首亏/减亏/扭亏…）是判断利好/利空的直接依据，
+            # 之前整列被丢弃。
+            type_col = next(
+                (c for c in row.index if str(c).strip() in ("预告类型", "预测类型")), None
+            )
+            if type_col is not None:
+                forecast_type = _safe_str(row.get(type_col))
+                if forecast_type:
+                    result["earnings"]["forecast_type"] = forecast_type
+            result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
-        # Earnings quick report
-        quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
-            ("stock_yjkb_em", {}),
-        ])
+        # Earnings quick report（业绩快报）
+        # stock_yjkb_em 的表里**没有任何摘要类文本列**（实测列：每股收益 / 营业收入-*/
+        # 净利润-*/每股净资产/净资产收益率/所处行业/公告日期），旧实现按「快报/摘要/公告/
+        # 说明」取列只会得到一个公告日期 → 改落结构化数值，取不到就不写字段。
+        quick_errors: List[str] = []
+        quick_df, quick_source = self._fetch_report_rows(
+            ("stock_yjkb_em",), stock_code, quick_errors
+        )
         result["errors"].extend(quick_errors)
         if quick_df is not None:
-            row = _extract_latest_row(quick_df, stock_code)
-            if row is not None:
-                result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
-                )[:200]
+            row = quick_df.iloc[0]
+            quick_payload = {
+                "revenue": _safe_float(_pick_by_keywords(row, ["营业收入-营业收入"])),
+                "net_profit": _safe_float(_pick_by_keywords(row, ["净利润-净利润"])),
+                "net_profit_yoy": _safe_float(_pick_by_keywords(row, ["净利润-同比增长"])),
+                "announce_date": _normalize_report_date(_pick_by_keywords(row, ["公告日期"])),
+            }
+            if any(v is not None for v in quick_payload.values()):
+                result["earnings"]["quick_report"] = quick_payload
                 result["source_chain"].append(f"earnings_quick:{quick_source}")
 
         # Dividend details (cash dividend, pre-tax)

@@ -43,6 +43,7 @@
 | P1-8 | disagreement 转正 + memory 校准（O5） | `disagreement.py` / `portfolio_decision.py` | P1 | — | 既有 `GOT_DISAGREEMENT_*` |
 | P1-9 | 真实交易日历接入（O3a） | `catalyst_calendar.py` `_count_trade_days` | P1 | — | `GOT_REAL_TRADE_CAL` |
 | P1-10 | 业绩预告**方向分流**（earnings 不再恒 `drift`） | `catalyst_calendar.py` `_fetch_earnings_calendar`/`_build_structured_events` | P1 | 取证产物 `data/earnings_forecast_evidence.json`（§11.10） | `GOT_EARNINGS_DIRECTION` |
+| P1-11 | 基本面适配层业绩接口**取数修复**（yjyg/yjkb 只收 date，旧候选恒喂空/陈旧） | `data_provider/fundamental_adapter.py` | P1（**2026-10-06 已落地**，§11.11） | — | 无（修取数 bug，不改决策语义） |
 | P2-1 | 账户级熔断扩展（连亏冷却/周月回撤） | `portfolio_decision.py` 3b 骨架 | P2 | P1-8 | `GOT_ACCOUNT_BREAKER` |
 | P2-2 | 统一止损真相源（C3） | `portfolio_decision.py` 两套止损 | P2 | P0-1 | `GOT_STOP_UNIFY` |
 | P2-3 | expected_return 动态化（C4） | `portfolio_decision.py` `_allocate` | P2 | P0-1 | 复用 P0-1 |
@@ -208,6 +209,19 @@
 - **依赖**：取证产物 `data/earnings_forecast_evidence.json`；无在线硬依赖。
 
 ---
+
+### WI-P1-11 · 基本面适配层「业绩预告/快报」取数修复（2026-10-06 负责人拍板「立即另开 WI 修」，**已落地**）
+- **触发**：§11.10 附带发现的活 bug，负责人裁决单开 WI 即修（backlog §7 #10）。实测危害比登记时估的更大，读数与同族未修项见 §11.11。
+- **根因（实测签名，不猜）**：`stock_yjyg_em / stock_yjbb_em / stock_yjkb_em` 三个 akshare 接口**只接受 `date`（报告期）**，旧候选传 `{"symbol": code}` 必然 `TypeError` → 回退空参 → 拿默认报告期（2020-03-31 / 2021-12-31，陈旧 4-6 年）再按代码过滤 → 绝大多数股票取不到行。
+- **改动面**（`data_provider/fundamental_adapter.py`，不新增依赖、不改决策语义）：
+  ① `_recent_report_periods()` 取最近 2 个已结束报告期（新→旧）；`_get_report_table()` 按 (接口, 报告期) 进程内缓存全市场表（TTL 1800s、上限 6 张、满则淘最旧）；`_fetch_report_rows()` 逐期回退 + 表内过滤本股。逻辑上「一只股票拉一次全市场表」变成「一个报告期拉一次」。
+  ② `_filter_rows_by_code(..., strict=True)`：全市场表专用口径——无代码列一律返回空表，**不做「取首行/整表」降级**（那等于把另一只股当本股）。默认口径不变。
+  ③ 预告链路**只保留 `stock_yjyg_em`**，移除 `stock_yjbb_em` 降级：业绩报表不是预告，按旧关键词取列会捡到「公告日期」当摘要（实测 600519），且单期 11,449 行 / ~11 s 会吃光整个 bundle 的时间预算。本股无预告记录 → 留空就是正确读数。
+  ④ 快报：`quick_report_summary`（该表里没有摘要文本列，旧实现只会输出一个日期）→ 改结构化 `earnings.quick_report {revenue, net_profit, net_profit_yoy, announce_date}`。
+  ⑤ **新增 `earnings.forecast_type`** ＝「预告类型」（预增/首亏/减亏/扭亏/续亏…）：这是 WI-P1-10 方向分流与 WI-P2-13 风险提示真正需要的输入，此前在单股层整列被丢弃。
+- **错误上报口径**：未公布的报告期会在 akshare 内部报 `TypeError: 'NoneType' object is not subscriptable`（实测），拿到过表但本股无行＝「该股没有预告」的正常缺失——两类都**不再写进 `errors`**，只「一个表都没拿到」才上报（否则每只股都带一条假错，会把 earnings 块误标 failed）。
+- **红线**：不动 `fundamental_fetch_timeout_seconds` 等预算配置（属另一拍）；不动 institution/top10 那些同族但需先定口径的候选；`forecast_type` 的消费（分流/提示）不属本 WI。
+- **开关**：无。这是取数纠错，fail-open 语义保持（取不到就留空），不引入新的在线决策路径。
 
 ## 5. P2 工作项（纪律护栏与能力扩展）
 
@@ -595,7 +609,7 @@
 3. 曾断言「akshare 1.18.91 无减持接口」——**不成立**：`stock_ggcg_em(symbol="股东减持")`（实测 113,021 行 / 111 s，列含 股东名称/变动数量/占总股本比例/变动开始日/变动截止日/公告日，**无日期参数**）与 `stock_hold_management_detail_cninfo(symbol="减持")`（实测 16,581 行 / 3.3 s，仅董监高）都在。真正的缺口更窄也更关键：**没有前瞻的「减持计划/拟减持」公告源**（全库搜这两个词零命中）——已发生的变动是滞后确认，而卖压信号主要在主披露时点。⇒ 裁决②「暂用 LLM 新闻通路」仍成立（覆盖计划公告那一半），但理由换成真实的那条；回溯性变动源可用于 WI-P2-13 的提示行。
 4. 覆盖校验的首版负结果（249→233）及其成因，已在上方写明——**一个看起来是「改进」的校验，先让证据变小了**，原因就是拿超集序列判区间内覆盖。
 
-**另一条附带发现的活 bug（单股基本面层，与催化剂日历无关）**：`data_provider/fundamental_adapter.py:343-348` 的候选串用 `stock_yjyg_em(symbol=code)`，而实测签名是 `stock_yjyg_em(date='20200331')`——**不接受 symbol** → TypeError → 落第二候选 `("stock_yjyg_em", {})` ⇒ 拿到的是 **2020-03-31 报告期**的预告（陈旧 6 年），再由 `_extract_latest_row` 按 code 过滤 ⇒ `earnings.forecast_summary` 要么空要么陈旧；`stock_yjbb_em`（默认 20200331）/`stock_yjkb_em`（默认 20211231）同病。`enable_fundamental_pipeline` 默认 True ⇒ 生产活路，消费者含 `core/pipeline.py:408`、`agent/tools/data_tools.py:460`（**RiskAgent 的 get_stock_info 工具**）、`services/alphasift_service.py:2162`。⇒ 单股分析体系里「业绩预亏」那条否决通路，长期喂的是空/陈旧预告字段——**比催化剂日历那条更活**。本轮未改（属另一条 WI 面），登记进 backlog §7 #10 待拍。
+**另一条附带发现的活 bug（单股基本面层，与催化剂日历无关）**：`data_provider/fundamental_adapter.py:343-348` 的候选串用 `stock_yjyg_em(symbol=code)`，而实测签名是 `stock_yjyg_em(date='20200331')`——**不接受 symbol** → TypeError → 落第二候选 `("stock_yjyg_em", {})` ⇒ 拿到的是 **2020-03-31 报告期**的预告（陈旧 6 年），再由 `_extract_latest_row` 按 code 过滤 ⇒ `earnings.forecast_summary` 要么空要么陈旧；`stock_yjbb_em`（默认 20200331）/`stock_yjkb_em`（默认 20211231）同病。`enable_fundamental_pipeline` 默认 True ⇒ 生产活路，消费者含 `core/pipeline.py:408`、`agent/tools/data_tools.py:460`（**RiskAgent 的 get_stock_info 工具**）、`services/alphasift_service.py:2162`。⇒ 单股分析体系里「业绩预亏」那条否决通路，长期喂的是空/陈旧预告字段——**比催化剂日历那条更活**。→ 负责人拍板「**立即另开 WI 修**」，已落地为 **WI-P1-11**（实测危害比这里估的更大：不止字段空，是整个基本面 bundle 的 3 s 预算被无效的全市场拉取吃光），见 §11.11。
 
 **由此得到的方案（三块，已分别落到 §6）**：
 - **WI-P1-10 业绩预告方向分流**：停止丢弃「预告类型」+ 按类型给 `direction ∈ {positive, negative}`（不再给 schema 域外值 drift），三态开关 `GOT_EARNINGS_DIRECTION`，净效果只允许「加分归零」；`category_tag` 保持 drift、`impact` 保持 2（否则会把个股事件升级成板块级否决，而取证表明个股级连「跑输基准」都判不出，更不足以驱动板块动作）。
@@ -607,6 +621,37 @@
 **证据的边界（不得越读）**：只检验了 T+1/3/5 的减基准符号，**不涉及 20 日以上长窗与 PEAD 漂移**，也不回答「已持仓遇到预亏该怎么办」；样本为 4 个报告期×分层 397 条，不是全市场全时段；符号检验不看幅度；同一股票多次公告在不同窗重复计入（视同独立事件，与解禁取证同口径）。
 
 **改动面**：本轮**零生产代码改动**。新增只读取证件 `scripts/audit_earnings_forecast_direction.py`（含覆盖校验与逐源重取）+ 守卫测试 `tests/test_earnings_forecast_direction_audit.py` **17 passed**（钉住口径复用、覆盖判定必须用区间内切片、逐源计分只看区间内、覆盖够即早停、坏源拉黑、合并组不吞类型、窄窗分档≤MAX_WINDOW_DAYS、超集旧档可复用而区间内残缺必拒、canonical 取净利润口径、太新事件剔除）；产物 `data/earnings_forecast_evidence.json`（本地、gitignored；其 `caveats` 数组为生成时 9 条，其后脚本又补 2 条：多重比较未修正 / 逐源拉黑阈值 3 次偏严格，**以本节为准**）。文档＝§1 矩阵新增 P1-10/P2-13 两行 + §6 WI-P1-10/WI-P2-13 两节 + §6 WI-P2-4 范围行打指针 + 本节 + backlog §7 新增拍板记录 #10 + CHANGELOG 置顶条目。
+
+### 11.11 WI-P1-11 落地：基本面适配层业绩接口取数修复（2026-10-06，**本轮改生产代码**）
+
+**为什么优先级是 P1、危害却比登记时估的大**：拍板时我只当它是「`earnings.forecast_summary` 一个字段空/陈旧」。端到端实测（`.review_tmp/probe_bundle_before.py`，复刻 `get_fundamental_bundle` 真实调用）把它升级成整块失效：
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| 600187 bundle | **8.83 s**、`earnings` 键 **[]**、errors 含 `stock_yjyg_em:TypeError` + `stock_yjkb_em:TypeError` | **9.84 s**（首股付全市场表拉取）、`forecast_type=扭亏` + `forecast_summary` 有真实预告文本 |
+| 600519 bundle | **6.47 s**、`earnings` 键 **[]**、同样两条 TypeError | **3.01 s**、`earnings` 留空——**这才是正确读数**（茅台近两个报告期没有业绩预告） |
+| 688137 / 688265（表已在缓存） | — | **2.46 s →`增亏`** / **2.43 s →`预减`** |
+| 缓存与降级 | 无 | 同轮后续股票命中进程内表缓存；errors 只剩既存的 `stock_gdfx_top_10_em:KeyError` |
+
+对照 `base.py:3079-3085` 给整个 bundle 的预算 `min(fundamental_fetch_timeout_seconds=3.0, remaining)`（`src/config.py:985`）与 `_run_with_timeout` 的「超时即丢弃结果」语义（`base.py:2499-2534`，daemon 线程 + join 超时）⇒ **修前这两只股的 bundle 从未被主线程拿到过**，被吃掉的不止预亏字段，而是整条 growth / earnings / institution 基本面上下文；`fundamental_retry_max=1` 意味着重试也救不回来。这就是它比催化剂日历那条「更活」的确切含义。
+
+**三次「修到一半发现自己错」（不修就留下新 bug）**：
+1. **`stock_yjbb_em` 不能作预告的降级源**。它是业绩报表不是预告，旧关键词列表在它的列序上首个命中的是「公告日期」——实测 600519 得到 `forecast_summary="2026-08-15"`（一个日期当摘要喂给 LLM）。加上单期 **11,449 行 / 10.8 s** 会吃光整个预算 ⇒ 预告链路只保留 `stock_yjyg_em`，「本股没有预告」就该留空。
+2. **`quick_report_summary` 这个 key 本身是假的**。yjkb 表 16 列里**没有摘要文本列**，无论怎么修取数它只会输出一个日期 ⇒ 删除该 key，改结构化 `earnings.quick_report {revenue, net_profit, net_profit_yoy, announce_date}`（grep 确认全仓无消费者依赖旧 key）。
+3. **逐期回退会把假错误写进 errors**。未公布的报告期在 akshare 内部报 `TypeError: 'NoneType' object is not subscriptable`（实测 yjkb/yjbb 的 20260930），若照原样上报则**每只股票都带一条假错**，`earnings` 块会被误标 failed。收紧为：只有「一个表都没拿到」才上报、且去重（第一版写成「成功即丢弃」，粒度不对）。
+
+**同族已实测、本轮未修（都需要先定口径，不是照抄这个修法）**：
+
+| 候选 | 实测行为 | 为何不在本 WI |
+|---|---|---|
+| `stock_institute_hold({})` | 默认 `symbol='20051'` ⇒ 拿到一张**陈旧季度表** | 要先定「按季度还是按报告期取数」，与 institution 块口径一起拍 |
+| `stock_gdfx_top_10_em` | 实测 `KeyError`（三档候选全灭）⇒ `top10_holder_change` 部分失效 | 需先定 `date` 参数口径（默认值是 20210630） |
+| `stock_individual_fund_flow({"symbol":…})` | 死候选（主候选 `{"stock":…}` 正常） | 有正常主候选兜住，属清理而非纠错 |
+| `stock_report_disclosure()` 无参 | 等价 `period='2021年报'`、不报错但恒空（§11.10 更正①） | 属催化剂日历那条 WI-P1-10 面 |
+
+**遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算，**预算调参需另拍**；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
+
+**改动面**：`data_provider/fundamental_adapter.py`（报告期取数 + 进程内表缓存 + `strict` 过滤口径 + `forecast_type` + 结构化 `quick_report` + 错误口径）+ `tests/test_fundamental_adapter.py` 新增 `TestReportPeriodTables` 12 例（含两例守卫：`source_never_passes_symbol_to_period_table_apis` 用 regex 扫本模块源码，`"<接口>",\s*\{\s*"symbol"` 必须零命中；`test_installed_akshare_period_apis_take_only_date` 在 akshare 存在时 inspect 断言三接口有 `date` 且**没有 `symbol`**——防止下次升级又把签名改回去而无人知）。验证：adapter + fundamental_context **42 passed / 3.4 s 零触网**；全目录收集基线对账（`git stash push` 这两个文件）＝**1941 items / 13 errors** → 改后 **1953 items / 13 errors**（新增 12 例、13 个收集错误全为既存如 `python-multipart` / yfinance 缺失）；消费者子集 **378 passed, 1 failed**，该失败 `test_multi_agent::test_agent_research_returns_timeout_response` 经 stash 对账为**既存**（基线同样 1 failed / 148 passed）。文档＝§1 矩阵新增 P1-11 行 + §6 WI-P1-11 全节 + §11.10 该段尾部把「待拍」改成本裁决指针 + 本节。
 
 ---
 > 本报告为实施设计说明，未含代码提交；逐 WI 进入 shadow 前仍需按 §8 流程出评审。
