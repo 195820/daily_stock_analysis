@@ -281,6 +281,9 @@ class PortfolioDecisionNode:
             # 不改任何 allocation 决策（由 _allocate 落 self）
             exposure_enforce_shadow=getattr(self, "_exposure_enforce_shadow", None),
             signal_size_shadow=getattr(self, "_signal_size_shadow", None),
+            # C-B2 启用前盘点留痕（【总计划】§4.2）：若阈值切 14 本应触发 reduce 的持仓清单，
+            # 纯观测不参与决策（由 _score_holdings 落 self）
+            mature_reduce_shadow=getattr(self, "_mature_reduce_shadow_hits", None),
             data_quality=data_quality,
         )
 
@@ -529,6 +532,8 @@ class PortfolioDecisionNode:
         results = []
         # P4：重置埋伏退出记录（每次 _score_holdings 调用重新收集）
         self._ambush_exits = []
+        # C-B2 启用前盘点观测（总计划 §4.2，纯留痕不改决策）：重置后重新收集
+        self._mature_reduce_shadow_hits = []
 
         accounts = portfolio.get("accounts", [])
         if not accounts:
@@ -823,6 +828,21 @@ class PortfolioDecisionNode:
                     hwm_gain_pct=_hwm_gain,
                     drawdown_from_hwm=_drawdown,
                 )
+                # C-B2 shadow：缺省阈值 30 未命中（day≤30）、但切 14 会命中 reduce（day>14）→ 仅留痕，
+                # 供启用前盘点统计非零冲击（不参与任何判定，关闭旧路径逐字节不变）
+                from src.got.catalyst_config import LIFECYCLE_MATURE_REDUCE_DAY
+                if (
+                    lifecycle_phase == "mature"
+                    and lifecycle_day
+                    and 14 < lifecycle_day <= LIFECYCLE_MATURE_REDUCE_DAY
+                    and action != "sell"  # sell 优先级更高，计入会高估 reduce 冲击
+                ):
+                    self._mature_reduce_shadow_hits.append({
+                        "symbol": symbol,
+                        "sector": sector_name,
+                        "lifecycle_day": lifecycle_day,
+                        "action_kept": action,
+                    })
 
             # 构建 reasoning，包含板块情报信息
             sector_intel_info = ""

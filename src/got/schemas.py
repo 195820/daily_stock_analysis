@@ -1240,6 +1240,14 @@ class PortfolioDecision(BaseModel):
                     "对比等分 vs score^γ 加权的仓位差，shadow 不改任何仓位。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
+    # ── C-B2 启用前盘点 shadow 留痕（【总计划】§4.2，2026-10-06）──
+    mature_reduce_shadow: Optional[list] = Field(
+        default=None,
+        description="若 GOT_MATURE_REDUCE_DAY 切 14 本应触发 reduce 的持仓清单: "
+                    "[{symbol, sector, lifecycle_day, action_kept}]，窗口 (14, 现阈值]。"
+                    "纯观测不参与任何判定，供 B2 阈值启用前盘点统计冲击。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
 
 
 # =============================================================================
