@@ -649,7 +649,7 @@
 | `stock_individual_fund_flow({"symbol":…})` | 死候选（主候选 `{"stock":…}` 正常） | 有正常主候选兜住，属清理而非纠错 |
 | `stock_report_disclosure()` 无参 | 等价 `period='2021年报'`、不报错但恒空（§11.10 更正①） | 属催化剂日历那条 WI-P1-10 面 |
 
-**遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算，**预算调参需另拍**；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
+**遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算（akshare 是「按报告期返回全市场表」，一个报告期只拉一次，所以**只有首股付这份钱**）⇒ 负责人拍「**先挂 backlog 观察，不动配置**」（backlog §7 #11）：先在真实逐日跑里统计 bundle 延迟分位与各块实际超时率，有读数再定是提预算还是把基本面取数从 3 s 主链路挪出；⚠️ **单股一次性路径（`alphasift_service.py:2162` / RiskAgent `get_stock_info`）不存在摊薄——它就是首股，可能长期拿不到基本面**，观察期统计必须与逐日批量路径分开计；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
 
 **改动面**：`data_provider/fundamental_adapter.py`（报告期取数 + 进程内表缓存 + `strict` 过滤口径 + `forecast_type` + 结构化 `quick_report` + 错误口径）+ `tests/test_fundamental_adapter.py` 新增 `TestReportPeriodTables` 12 例（含两例守卫：`source_never_passes_symbol_to_period_table_apis` 用 regex 扫本模块源码，`"<接口>",\s*\{\s*"symbol"` 必须零命中；`test_installed_akshare_period_apis_take_only_date` 在 akshare 存在时 inspect 断言三接口有 `date` 且**没有 `symbol`**——防止下次升级又把签名改回去而无人知）。验证：adapter + fundamental_context **42 passed / 3.4 s 零触网**；全目录收集基线对账（`git stash push` 这两个文件）＝**1941 items / 13 errors** → 改后 **1953 items / 13 errors**（新增 12 例、13 个收集错误全为既存如 `python-multipart` / yfinance 缺失）；消费者子集 **378 passed, 1 failed**，该失败 `test_multi_agent::test_agent_research_returns_timeout_response` 经 stash 对账为**既存**（基线同样 1 failed / 148 passed）。文档＝§1 矩阵新增 P1-11 行 + §6 WI-P1-11 全节 + §11.10 该段尾部把「待拍」改成本裁决指针 + 本节。
 
