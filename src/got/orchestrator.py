@@ -156,6 +156,8 @@ class GOTOrchestrator:
                     news_context=news_ctx,
                     sentiment_context=sentiment_ctx,
                     bar_complete=bar_complete,
+                    # 3-D 重放 harness：快照 entry/exit 参考日跟随目标日（生产当日二者相等，零行为变化）
+                    as_of=target_date,
                 )
 
                 logger.info(

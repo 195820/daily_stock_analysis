@@ -74,6 +74,7 @@ class PortfolioDecisionNode:
         news_context: NewsContext,
         sentiment_context: SentimentContext,
         bar_complete: bool = True,
+        as_of: Optional[date] = None,
     ) -> PortfolioDecision:
         """
         主入口：统一决策流水线
@@ -85,11 +86,14 @@ class PortfolioDecisionNode:
             capital_context: Node 3 资金面
             news_context: Node 4 消息面
             sentiment_context: Node 5 情绪面
+            as_of: 快照自然键/退出日参考日（缺省 = date.today()，旧行为逐字节不变；
+                   重放 harness 3-D 传历史日，解锁 ambush 标定回放）
 
         Returns:
             PortfolioDecision: 交易建议 + reasoning
         """
         logger.info("[Phase 2] 开始统一决策")
+        _as_of = as_of or date.today()
 
         # 获取当前持仓
         portfolio = self._get_portfolio_snapshot()
@@ -167,7 +171,7 @@ class PortfolioDecisionNode:
                     f"{exit_info['exit_signal']} — {exit_info['reason']}"
                 )
             # 关闭已退出的快照（is_open=False）
-            self._close_ambush_snapshots(ambush_exit_signals, portfolio)
+            self._close_ambush_snapshots(ambush_exit_signals, portfolio, as_of=_as_of)
 
         # Fix 2: 持仓论点快照写入（买入 + 漂移观察）
         thesis_buys, thesis_failed = self._write_thesis_snapshots(
@@ -180,7 +184,7 @@ class PortfolioDecisionNode:
 
         # P4：埋伏仓买入快照写入（买入催化剂快照）
         ambush_buys, ambush_failed = self._write_ambush_buy_snapshots(
-            allocation, unified_scoring, unified_context,
+            allocation, unified_scoring, unified_context, as_of=_as_of,
         )
         if ambush_buys:
             logger.info(f"[Phase 2] P4 埋伏买入快照：{len(ambush_buys)} 条")
@@ -2571,6 +2575,7 @@ class PortfolioDecisionNode:
         allocation: List[TradeAllocation],
         unified_scoring: List[UnifiedScoringResult],
         unified_context: UnifiedContext,
+        as_of: Optional[date] = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         """P4 埋伏仓买入快照写入
 
@@ -2578,6 +2583,8 @@ class PortfolioDecisionNode:
         1. 从 unified_scoring 找到该 symbol 的板块
         2. 若板块在 ambush_pool 中 → 写入催化剂快照到 SQLite
         3. 返回 (成功写入的快照列表, 失败的 symbol 列表)
+
+        as_of：entry_date 自然键参考日（缺省 today，重放 harness 传历史日）。
 
         降级：表不存在/写入失败 → 记录日志但不阻塞主流程。
         """
@@ -2611,7 +2618,7 @@ class PortfolioDecisionNode:
                         continue
 
                     candidate = ambush_pool_map[sector_name]
-                    today = date.today()
+                    today = as_of or date.today()
                     entry_price = alloc.price_range[0] if alloc.price_range else 0.0
 
                     # A-P0-6: 按自然键 (symbol, entry_date) 查询，命中则更新，未命中才插入
@@ -3040,12 +3047,14 @@ class PortfolioDecisionNode:
         self,
         exit_signals: List[Dict[str, Any]],
         portfolio: Dict[str, Any],
+        as_of: Optional[date] = None,
     ) -> None:
         """P4：关闭已退出的埋伏快照（is_open=False + exit 字段）
 
         Args:
             exit_signals: _ambush_exits 列表
             portfolio: 持仓快照（用于获取退出价格）
+            as_of: exit_date 参考日（缺省 today，重放 harness 传历史日）
         """
         if not exit_signals:
             return
@@ -3060,7 +3069,7 @@ class PortfolioDecisionNode:
         try:
             from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
             db = DatabaseManager()
-            today = date.today()
+            today = as_of or date.today()
             with db.get_session() as session:
                 for exit_info in exit_signals:
                     symbol = exit_info["symbol"]
