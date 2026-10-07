@@ -21,6 +21,7 @@ from data_provider.fundamental_adapter import (  # noqa: E402
     _extract_latest_row,
     _filter_rows_by_code,
     _parse_dividend_plan_to_per_share,
+    _pick_canonical_forecast_row,
     _recent_report_periods,
 )
 
@@ -42,6 +43,31 @@ def _yjyg_table(rows) -> pd.DataFrame:
                 "公告日期": "2026-08-19",
             }
             for i, r in enumerate(rows)
+        ]
+    )
+
+
+def _yjyg_indicators(rows) -> pd.DataFrame:
+    """多预测指标版预告表：rows=[(code, 预测指标, 预告类型, 业绩变动)]，同复刻真实列序。
+
+    真实接口就是「一股多行、每行一个指标」（同一公告日营收/归母/扣非各一行，
+    实测约 1/3 的 (股,日) 各指标类型不一致），_yjyg_table 的单指标形态盖不住这个。
+    """
+    return pd.DataFrame(
+        [
+            {
+                "序号": i + 1,
+                "股票代码": code,
+                "股票简称": "测试股",
+                "预测指标": indicator,
+                "业绩变动": text,
+                "业绩变动幅度": None,
+                "业绩变动原因": "略",
+                "预告类型": ftype,
+                "上年同期值": 1.0,
+                "公告日期": "2026-08-19",
+            }
+            for i, (code, indicator, ftype, text) in enumerate(rows)
         ]
     )
 
@@ -429,6 +455,53 @@ class TestReportPeriodTables(unittest.TestCase):
             params = inspect.signature(getattr(ak, func)).parameters
             self.assertIn("date", params, msg=func)
             self.assertNotIn("symbol", params, msg=func)
+
+
+class TestForecastCanonicalRow(unittest.TestCase):
+    """审核 Warning 1 收口：forecast_type 必须取净利润口径行，不拿「首个指标行」。
+
+    口径与取证脚本 audit_earnings_forecast_direction.py 的 PROFIT_PRIORITY 一致
+    （归母 > 扣非 > 净利润，首个命中即断），不另立第二套。
+    """
+
+    def setUp(self) -> None:
+        self.adapter = AkshareFundamentalAdapter()
+
+    def test_prefers_parent_net_profit_over_revenue_row(self) -> None:
+        df = _filter_rows_by_code(_yjyg_indicators([
+            ("600187", "营业收入", "预增", "预计营收增长"),
+            ("600187", "归属于上市公司股东的净利润", "首亏", "预计净利润亏损"),
+        ]), "600187", strict=True)
+        self.assertEqual(_pick_canonical_forecast_row(df)["预告类型"], "首亏")
+
+    def test_deducted_row_beats_plain_net_profit_row(self) -> None:
+        df = _yjyg_indicators([
+            ("600187", "净利润", "首亏", "x"),
+            ("600187", "扣除非经常性损益后的净利润", "预减", "y"),
+        ])
+        self.assertEqual(_pick_canonical_forecast_row(df)["预告类型"], "预减")
+
+    def test_falls_back_to_first_row_without_profit_indicator(self) -> None:
+        df = _yjyg_indicators([
+            ("600187", "营业收入", "预增", "x"),
+            ("600187", "每股收益", "预增", "y"),
+        ])
+        # 无净利口径行 → 退化取首条（不静默丢数据，与取证脚本同口径）
+        self.assertEqual(_pick_canonical_forecast_row(df)["预测指标"], "营业收入")
+
+    def test_bundle_forecast_type_consumes_profit_basis_row(self) -> None:
+        """端到端：多指标表喂进 get_fundamental_bundle，风险信号必须是净利口径的「首亏」。"""
+        multi = _yjyg_indicators([
+            ("600187", "营业收入", "预增", "预计营收增长"),
+            ("600187", "归属于上市公司股东的净利润", "首亏", "预计净利润亏损"),
+        ])
+        with patch.object(self.adapter, "_call_df_candidates",
+                          side_effect=[(None, None, []) for _ in range(4)]), \
+             patch.object(self.adapter, "_fetch_report_rows",
+                          side_effect=[(multi, "stock_yjyg_em"), (None, None)]):
+            result = self.adapter.get_fundamental_bundle("600187")
+        self.assertEqual(result["earnings"].get("forecast_type"), "首亏")
+        self.assertEqual(result["earnings"].get("forecast_summary"), "预计净利润亏损")
 
 
 if __name__ == "__main__":

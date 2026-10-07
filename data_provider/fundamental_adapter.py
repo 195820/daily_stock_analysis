@@ -275,6 +275,26 @@ def _recent_report_periods(as_of: Optional[datetime] = None,
     return [d.strftime("%Y%m%d") for d in recent[:max(1, count)]]
 
 
+# 预告表是「一股多行、每行一个预测指标」（营收/归母净利/扣非净利/每股收益…），
+# 同一公告日各指标预告类型实测约 1/3 冲突（取证脚本
+# audit_earnings_forecast_direction.py：type_conflict_share≈32.45%）。「业绩预亏」
+# 命题讲的是利润：若取到营业收入行，「营收预增 + 净利首亏」会被标成预增——
+# 故选行口径必须与取证脚本的 PROFIT_PRIORITY 一致（归母 > 扣非 > 净利润），
+# 不另立第二套。无净利口径行则退化取首条（不静默丢数据）。
+FORECAST_PROFIT_PRIORITY = ("归属于上市公司股东的净利润", "扣除非经常性损益后的净利润", "净利润")
+
+
+def _pick_canonical_forecast_row(df: pd.DataFrame) -> pd.Series:
+    """同一股票多条预告行时取净利润口径行；无该口径/无预测指标列时回退首行。"""
+    indicator_col = next((c for c in df.columns if str(c).strip() == "预测指标"), None)
+    if indicator_col is not None:
+        for want in FORECAST_PROFIT_PRIORITY:
+            hit = df[df[indicator_col].astype(str).str.contains(want, na=False, regex=False)]
+            if not hit.empty:
+                return hit.iloc[0]
+    return df.iloc[0]
+
+
 def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
@@ -458,7 +478,9 @@ class AkshareFundamentalAdapter:
         )
         result["errors"].extend(forecast_errors)
         if forecast_df is not None:
-            row = forecast_df.iloc[0]
+            # 多指标行必须按净利润口径选（见 _pick_canonical_forecast_row 注释），
+            # 直接 iloc[0] 会拿「首个指标行」——可能是营业收入行，预亏被标成预增。
+            row = _pick_canonical_forecast_row(forecast_df)
             result["earnings"]["forecast_summary"] = _safe_str(
                 _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
             )[:200]

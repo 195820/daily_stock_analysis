@@ -214,7 +214,7 @@
 - **触发**：§11.10 附带发现的活 bug，负责人裁决单开 WI 即修（backlog §7 #10）。实测危害比登记时估的更大，读数与同族未修项见 §11.11。
 - **根因（实测签名，不猜）**：`stock_yjyg_em / stock_yjbb_em / stock_yjkb_em` 三个 akshare 接口**只接受 `date`（报告期）**，旧候选传 `{"symbol": code}` 必然 `TypeError` → 回退空参 → 拿默认报告期（2020-03-31 / 2021-12-31，陈旧 4-6 年）再按代码过滤 → 绝大多数股票取不到行。
 - **改动面**（`data_provider/fundamental_adapter.py`，不新增依赖、不改决策语义）：
-  ① `_recent_report_periods()` 取最近 2 个已结束报告期（新→旧）；`_get_report_table()` 按 (接口, 报告期) 进程内缓存全市场表（TTL 1800s、上限 6 张、满则淘最旧）；`_fetch_report_rows()` 逐期回退 + 表内过滤本股。逻辑上「一只股票拉一次全市场表」变成「一个报告期拉一次」。
+  ① `_recent_report_periods()` 取最近 2 个已结束报告期（新→旧）；`_get_report_table()` 按 (接口, 报告期) 进程内缓存全市场表（TTL 1800s、上限 6 张、满则淘最旧）；`_fetch_report_rows()` 逐期回退 + 表内过滤本股。逻辑上「一只股票拉一次全市场表」变成「一个报告期拉一次」（〔审核订正 2026-10-07：仅对**非空表**成立，见 §11.11 审核订正段〕）。
   ② `_filter_rows_by_code(..., strict=True)`：全市场表专用口径——无代码列一律返回空表，**不做「取首行/整表」降级**（那等于把另一只股当本股）。默认口径不变。
   ③ 预告链路**只保留 `stock_yjyg_em`**，移除 `stock_yjbb_em` 降级：业绩报表不是预告，按旧关键词取列会捡到「公告日期」当摘要（实测 600519），且单期 11,449 行 / ~11 s 会吃光整个 bundle 的时间预算。本股无预告记录 → 留空就是正确读数。
   ④ 快报：`quick_report_summary`（该表里没有摘要文本列，旧实现只会输出一个日期）→ 改结构化 `earnings.quick_report {revenue, net_profit, net_profit_yoy, announce_date}`。
@@ -650,7 +650,12 @@
 | `stock_individual_fund_flow({"symbol":…})` | 死候选（主候选 `{"stock":…}` 正常） | 有正常主候选兜住，属清理而非纠错 |
 | `stock_report_disclosure()` 无参 | 等价 `period='2021年报'`、不报错但恒空（§11.10 更正①） | 属催化剂日历那条 WI-P1-10 面 |
 
-**遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算（akshare 是「按报告期返回全市场表」，一个报告期只拉一次，所以**只有首股付这份钱**）⇒ 负责人拍「**先挂 backlog 观察，不动配置**」（backlog §7 #11）：先在真实逐日跑里统计 bundle 延迟分位与各块实际超时率，有读数再定是提预算还是把基本面取数从 3 s 主链路挪出；⚠️ **单股一次性路径（`alphasift_service.py:2162` / RiskAgent `get_stock_info`）不存在摊薄——它就是首股，可能长期拿不到基本面**，观察期统计必须与逐日批量路径分开计；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
+**遗留（三件，都明确不属本 WI）**：(a) `fundamental_fetch_timeout_seconds=3.0` 与逐源延迟**不匹配**——修后首股仍 9.84 s 超时，只是后续股票降到 2.4~3.0 s 能进预算（akshare 是「按报告期返回全市场表」，一个报告期只拉一次，所以**只有首股付这份钱**；〔审核订正 2026-10-07：严格说是「非空表只拉一次」，未公布/空表期逐股重复拉取，见下方审核订正段〕）⇒ 负责人拍「**先挂 backlog 观察，不动配置**」（backlog §7 #11）：先在真实逐日跑里统计 bundle 延迟分位与各块实际超时率，有读数再定是提预算还是把基本面取数从 3 s 主链路挪出；⚠️ **单股一次性路径（`alphasift_service.py:2162` / RiskAgent `get_stock_info`）不存在摊薄——它就是首股，可能长期拿不到基本面**，观察期统计必须与逐日批量路径分开计；(b) 上表同族未修项；(c) `forecast_type` 的**消费**（方向分流 / 风险提示）属 WI-P1-10 与 WI-P2-13，本 WI 只负责把它取到并落到字段上。
+
+**审核订正（2026-10-07，ultra 评审 Warning 1/2/3 收口；负责人拍「W1 修 + W2 改口 + W3 只登记」）**：
+- **W1 已修（取数保真缺陷，准 Critical）**：预告表是「一股多行、每行一个预测指标」，旧实现 `forecast_df.iloc[0]` 拿的是**首个指标行**——若先命中营业收入行，「营收预增 + 净利首亏」会被标成 `forecast_type=预增`，恰好喂错 RiskAgent 预亏通路要避的信号（本取证自己早就算过冲突面 32.45%，却没应用到选行上）。修法：新增 `_pick_canonical_forecast_row`，口径与取证脚本 `PROFIT_PRIORITY` 一致（归母 > 扣非 > 净利润，首个命中即断，无净利口径行退化取首行不静默丢）；新增 `TestForecastCanonicalRow` 4 例（含端到端：多指标表喂进 bundle，forecast_type 必须是「首亏」）。adapter + context **46 passed / 3.7 s 零触网**。
+- **W2 表述限定（本轮改口，代码不动）**：「一个报告期只拉一次、只有首股付费」仅对**非空表**成立——失败/空表不写缓存（`test_get_report_table_..._empty_table_as_miss` 钉住了该行为，防瞬时空返钉死 TTL），代价是**未公布的报告期（如现 10 月初的 20260930）会被每只股票重复拉取**，逐日批量里是 O(股数) 次失败请求。负缓存（30~60 s 短 TTL，与 1800 s 正缓存分开）属后续优化，**已并入 backlog §7 #11 观察面**（观察期统计 bundle 延迟时本就要覆盖这份钱）。
+- **W3 登记不修（fail-open 权衡）**：adapter 每 manager 单例、`_run_with_timeout` 允许 8 并发，而 `_get_report_table` 的**实际拉取发生在锁外**（读锁查→释放→拉→写锁存）⇒ 首批并发股票惊群，同时发多份 2k~5k 行全市场表请求。非正确性 bug（最后写入有效），属瞬时 IO/延迟尖峰；若要消除需 per-key single-flight，本轮不做，随 #11 观察期一并看。
 
 **改动面**：`data_provider/fundamental_adapter.py`（报告期取数 + 进程内表缓存 + `strict` 过滤口径 + `forecast_type` + 结构化 `quick_report` + 错误口径）+ `tests/test_fundamental_adapter.py` 新增 `TestReportPeriodTables` 12 例（含两例守卫：`source_never_passes_symbol_to_period_table_apis` 用 regex 扫本模块源码，`"<接口>",\s*\{\s*"symbol"` 必须零命中；`test_installed_akshare_period_apis_take_only_date` 在 akshare 存在时 inspect 断言三接口有 `date` 且**没有 `symbol`**——防止下次升级又把签名改回去而无人知）。验证：adapter + fundamental_context **42 passed / 3.4 s 零触网**；全目录收集基线对账（`git stash push` 这两个文件）＝**1941 items / 13 errors** → 改后 **1953 items / 13 errors**（新增 12 例、13 个收集错误全为既存如 `python-multipart` / yfinance 缺失）；消费者子集 **378 passed, 1 failed**，该失败 `test_multi_agent::test_agent_research_returns_timeout_response` 经 stash 对账为**既存**（基线同样 1 failed / 148 passed）。文档＝§1 矩阵新增 P1-11 行 + §6 WI-P1-11 全节 + §11.10 该段尾部把「待拍」改成本裁决指针 + 本节。
 
