@@ -136,7 +136,6 @@ class CatalystCalendarBuilder:
 
     def __init__(self):
         self._concept_set: Optional[Set[str]] = None
-        self._stock_board_cache: Dict[str, List[str]] = {}
         self._llm = None
         # T2 批判者判 DROP 的 event_id 集合（影子模式下 events 仍原样返回上层，
         # 但 _save_events 落库/注册 P6 前必须过滤——audit_20260922 Q6-C①：
@@ -266,41 +265,18 @@ class CatalystCalendarBuilder:
     # =================================================================
 
     async def _full_build(self, start: date, end: date) -> List[CatalystEvent]:
-        """全量构建：结构化(财报+宏观) + 全球映射 + LLM 叙事（限售解禁不纳入）"""
+        """全量构建：宏观规则 + 全球映射 + LLM 叙事
+
+        个股级结构化事件不入历（2026-10-08 收口）：财报披露与限售解禁同案——
+        个股事件扇出到板块层属层次错配，稀释信息密度（1008 实测：7 条 drift 财报
+        挤占 22 格日历，飞龙股份一只扇出 4 板块）。财报/减持/解禁的个股级消费
+        走基本面 bundle → RiskAgent（仅持仓与推荐票）。历史取证：0825–0930 财报
+        通道因取数失真恒为零，下游无一处报缺，证明该通道无真实依赖。
+        """
         all_events: List[CatalystEvent] = []
 
-        # ── 结构化数据（并发获取） ──
-        structured = await asyncio.gather(
-            self._fetch_earnings_calendar(start, end),
-            self._fetch_lockup_calendar(start, end),
-            return_exceptions=True,
-        )
-
-        earnings_raw = structured[0] if not isinstance(structured[0], Exception) else []
-        lockup_raw = structured[1] if not isinstance(structured[1], Exception) else []
-
-        if isinstance(structured[0], Exception):
-            logger.warning("[CatalystCalendar] 财报日历获取失败: %s", structured[0])
-        if isinstance(structured[1], Exception):
-            logger.warning("[CatalystCalendar] 解禁日历获取失败: %s", structured[1])
-
-        # 宏观日历（纯规则，无 IO）
+        # ── 宏观日历（纯规则，无 IO） ──
         macro_raw = self._generate_macro_calendar(start, end)
-
-        # ── 批量映射：stock → sectors（并发，一次完成） ──
-        # lockup 不入催化剂日历（利空风险事件），仅映射 earnings 股票
-        all_stocks = earnings_raw
-        stock_sector_map = await self._batch_map_stocks(all_stocks, max_concurrent=8)
-
-        for raw in earnings_raw:
-            mapped = self._map_structured_event_fast(raw, "earnings", stock_sector_map)
-            all_events.extend(mapped)
-
-        # 限售解禁不纳入催化剂日历（利空风险事件，非正面催化信号）
-        # 未来由独立 risk_events 通道消费
-
-        # 聚合同板块同日期的多只股票事件（合并标题）
-        all_events = self._aggregate_structured_events(all_events)
 
         # 宏观事件直接生成（板块已在规则中指定）
         for raw in macro_raw:
@@ -333,17 +309,14 @@ class CatalystCalendarBuilder:
         # 候选域 = CONCEPT_UNIVERSE + 蓄水池板块（A2 最想喂饱的对象）
         all_events = await self._align_events_to_sectors(all_events, self._build_sector_universe())
 
-        # 去重：仅对叙事/全球事件（同 sector+date 保留最高 impact）
-        # 结构化/宏观事件已在聚合阶段处理，不参与全局去重
-        structured_macro = [e for e in all_events if e.source in ("macro_rule",) or e.source.startswith("akshare_")]
-        dedup_pool = [e for e in all_events if e.source in ("llm_narrative", "global_map")]
-        dedup_pool = self._deduplicate(dedup_pool)
-        all_events = structured_macro + dedup_pool
+        # 去重：叙事/全球事件（同 sector+date 保留最高 impact）；宏观事件不参与
+        # （原结构化白名单分支随财报/解禁入历路径一并退役，akshare_* 已无生成入口）
+        dedup_pool = [e for e in all_events if e.source != "macro_rule"]
+        all_events = [e for e in all_events if e.source == "macro_rule"] + self._deduplicate(dedup_pool)
 
         logger.info(
-            "[CatalystCalendar] 全量构建: earnings=%d lockup=%d macro=%d global=%d narrative=%d → 去重后 %d",
-            len(earnings_raw), len(lockup_raw), len(macro_raw),
-            len(global_events), len(narrative), len(all_events),
+            "[CatalystCalendar] 全量构建: macro=%d global=%d narrative=%d → 去重后 %d（个股级不入历）",
+            len(macro_raw), len(global_events), len(narrative), len(all_events),
         )
         return all_events
 
@@ -388,173 +361,6 @@ class CatalystCalendarBuilder:
         )
         return all_events
 
-    # =================================================================
-    # 结构化数据获取
-    # =================================================================
-
-    async def _fetch_earnings_calendar(self, start: date, end: date) -> List[Dict]:
-        """获取财报披露日历
-
-        优先 stock_yjyg_em（业绩预告，含披露日期），降级 stock_report_disclosure。
-        过滤 [start, end] 窗口内的记录。
-        """
-        def _fetch() -> List[Dict]:
-            import akshare as ak
-            import pandas as pd
-
-            # 尝试 stock_yjyg_em — 需要指定季度
-            results = []
-            for quarter in self._get_relevant_quarters(start, end):
-                try:
-                    df = ak.stock_yjyg_em(date=quarter)
-                    if df is None or df.empty:
-                        continue
-
-                    # 最后一列是披露日期
-                    date_col = df.columns[-1]
-                    code_col = None
-                    name_col = None
-                    for col in df.columns:
-                        col_str = str(col)
-                        if "代码" in col_str or "code" in col_str.lower():
-                            code_col = col
-                        elif "简称" in col_str or "名称" in col_str or "name" in col_str.lower():
-                            name_col = col
-
-                    # 解析日期并过滤
-                    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-                    window = df[(df[date_col] >= str(start)) & (df[date_col] <= str(end))]
-
-                    for _, row in window.iterrows():
-                        try:
-                            ed = row[date_col].date() if pd.notna(row[date_col]) else None
-                            if ed is None:
-                                continue
-                            results.append({
-                                "stock_code": str(row.get(code_col, "")) if code_col else "",
-                                "stock_name": str(row.get(name_col, "")) if name_col else "",
-                                "event_date": ed,
-                                "report_type": "earnings",
-                            })
-                        except (ValueError, TypeError, AttributeError):
-                            continue
-                except Exception as exc:
-                    logger.debug("[CatalystCalendar] stock_yjyg_em(%s) 失败: %s", quarter, exc)
-
-            # 降级：stock_report_disclosure
-            if not results:
-                try:
-                    df = ak.stock_report_disclosure()
-                    if df is not None and not df.empty:
-                        # 日期列：尝试多个候选
-                        date_col = None
-                        for col in df.columns:
-                            col_str = str(col)
-                            if "披露" in col_str or "首次" in col_str:
-                                date_col = col
-                                break
-
-                        if date_col:
-                            code_col = df.columns[0] if len(df.columns) > 0 else None
-                            name_col = df.columns[1] if len(df.columns) > 1 else None
-
-                            for _, row in df.iterrows():
-                                try:
-                                    raw_date = str(row[date_col])[:10]
-                                    ed = date.fromisoformat(raw_date)
-                                    if start <= ed <= end:
-                                        results.append({
-                                            "stock_code": str(row.get(code_col, "")) if code_col else "",
-                                            "stock_name": str(row.get(name_col, "")) if name_col else "",
-                                            "event_date": ed,
-                                            "report_type": "earnings",
-                                        })
-                                except (ValueError, TypeError):
-                                    continue
-                except Exception as exc:
-                    logger.debug("[CatalystCalendar] stock_report_disclosure 降级失败: %s", exc)
-
-            # 去重：同 stock_code+event_date 只保留一条
-            seen = set()
-            deduped = []
-            for r in results:
-                key = (r.get("stock_code", ""), r.get("event_date"))
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(r)
-
-            return deduped
-
-        return await asyncio.to_thread(_fetch)
-
-    @staticmethod
-    def _get_relevant_quarters(start: date, end: date) -> List[str]:
-        """根据窗口日期范围，生成需要查询的季度列表"""
-        quarters = set()
-        current = start
-        while current <= end:
-            year = current.year
-            month = current.month
-            if month <= 3:
-                quarters.add(f"{year}0331")
-                quarters.add(f"{year}0331")  # Q4 年报
-            elif month <= 6:
-                quarters.add(f"{year}0331")  # Q4 年报（4月补披）
-                quarters.add(f"{year}0630")  # Q1 季报
-            elif month <= 9:
-                quarters.add(f"{year}0630")  # Q2 中报
-            else:
-                quarters.add(f"{year}0930")  # Q3 季报
-            # 跨年
-            if month <= 4:
-                quarters.add(f"{year - 1}0930")
-                quarters.add(f"{year - 1}1231")
-            current += timedelta(days=90)
-        return sorted(quarters)
-
-    async def _fetch_lockup_calendar(self, start: date, end: date) -> List[Dict]:
-        """获取限售解禁日历
-
-        akshare stock_restricted_release_detail_em(start_date, end_date)
-        """
-        def _fetch():
-            import akshare as ak
-            try:
-                df = ak.stock_restricted_release_detail_em(
-                    start_date=start.strftime("%Y%m%d"),
-                    end_date=end.strftime("%Y%m%d"),
-                )
-            except Exception as exc:
-                logger.warning("[CatalystCalendar] 限售解禁 API 失败: %s", exc)
-                return []
-
-            if df is None or df.empty:
-                return []
-
-            # 列定位：按位置（列名编码不稳定）
-            # 预期结构：序号, 股票代码, 股票简称, 解禁时间, ...
-            code_col = df.columns[1] if len(df.columns) > 1 else None
-            name_col = df.columns[2] if len(df.columns) > 2 else None
-            date_col = df.columns[3] if len(df.columns) > 3 else None
-
-            results = []
-            for _, row in df.iterrows():
-                try:
-                    raw_date = str(row[date_col])[:10] if date_col else ""
-                    ed = date.fromisoformat(raw_date)
-                    results.append({
-                        "stock_code": str(row[code_col]) if code_col else "",
-                        "stock_name": str(row[name_col]) if name_col else "",
-                        "event_date": ed,
-                        "report_type": "lockup",
-                    })
-                except (ValueError, TypeError):
-                    continue
-
-            return results
-
-        return await asyncio.to_thread(_fetch)
-
     def _generate_macro_calendar(self, start: date, end: date) -> List[Dict]:
         """宏观日历：规则内置（PMI/CPI/社融/LPR）"""
         results = []
@@ -598,129 +404,6 @@ class CatalystCalendarBuilder:
         elif day_rule == "day_20":
             return date(year, month, 20)
         return None
-
-    # =================================================================
-    # 事件→板块映射
-    # =================================================================
-
-    async def _map_structured_event(
-        self, raw: Dict, event_type: str
-    ) -> List[CatalystEvent]:
-        """stock_code → 所属板块列表 → 与 CONCEPT_UNIVERSE 交集（逐只，已废弃）"""
-        stock_code = raw.get("stock_code", "")
-        if not stock_code:
-            return []
-        sectors = await self._map_stock_to_sectors(stock_code)
-        return self._build_structured_events(raw, event_type, sectors)
-
-    def _map_structured_event_fast(
-        self, raw: Dict, event_type: str, stock_sector_map: Dict[str, List[str]]
-    ) -> List[CatalystEvent]:
-        """使用预计算的批量映射生成事件"""
-        stock_code = raw.get("stock_code", "")
-        if not stock_code:
-            return []
-        clean = stock_code.replace("SH", "").replace("SZ", "").replace("BJ", "")
-        sectors = stock_sector_map.get(clean, [])
-        return self._build_structured_events(raw, event_type, sectors)
-
-    def _build_structured_events(
-        self, raw: Dict, event_type: str, sectors: List[str]
-    ) -> List[CatalystEvent]:
-        """根据已映射的板块列表生成 CatalystEvent"""
-        # 限售解禁不纳入催化剂日历（利空风险，非催化正面信号）
-        if event_type == "lockup":
-            return []
-
-        if not sectors:
-            return []
-
-        event_date = raw["event_date"]
-        stock_name = raw.get("stock_name", "")
-        stock_code = raw.get("stock_code", "")
-        source = f"akshare_{event_type}"
-        title = (
-            f"{stock_name}({stock_code}) {'财报披露' if event_type == 'earnings' else '限售解禁'}"
-        )
-
-        direction = "negative" if event_type == "lockup" else "drift"
-        category = "fade" if event_type == "lockup" else "drift"
-        impact = 2  # 个股级事件默认 ★★
-
-        return [
-            CatalystEvent(
-                event_id=_make_event_id(source, event_type, _normalize_sector_name(sector), event_date),
-                event_date=event_date,
-                event_type=event_type,
-                title=title,
-                sector=_normalize_sector_name(sector),
-                impact_level=impact,
-                direction=direction,
-                confidence=0.95,  # 结构化数据高置信
-                consensus_expectation="财报/解禁为确定性事件，影响待市场消化",
-                source=source,
-                category_tag=category,
-            )
-            for sector in sectors
-        ]
-    async def _map_stock_to_sectors(self, stock_code: str) -> List[str]:
-        """stock_code → 所属概念板块列表（只返回 CONCEPT_UNIVERSE 内的）
-
-        性能优化：并发获取 + 缓存。
-        """
-        clean = stock_code.replace("SH", "").replace("SZ", "").replace("BJ", "")
-        if not clean or len(clean) != 6:
-            return []
-
-        if clean in self._stock_board_cache:
-            boards = self._stock_board_cache[clean]
-        else:
-            boards = await self._fetch_stock_boards(clean)
-            self._stock_board_cache[clean] = boards
-
-        matched = [b for b in boards if b in self.concept_set]
-        return matched
-
-    async def _batch_map_stocks(self, stocks: List[Dict], max_concurrent: int = 8) -> Dict[str, List[str]]:
-        """批量映射多只股票→板块（并发控制 + 缓存复用）
-
-        Args:
-            stocks: [{"stock_code": "000001", ...}, ...]
-            max_concurrent: 最大并发数
-
-        Returns:
-            {stock_code: [sector_name, ...]}
-        """
-        sem = asyncio.Semaphore(max_concurrent)
-        mapping: Dict[str, List[str]] = {}
-
-        async def _map_one(stock: Dict):
-            code = stock.get("stock_code", "")
-            if not code or code in mapping:
-                return
-            async with sem:
-                sectors = await self._map_stock_to_sectors(code)
-                mapping[code] = sectors
-
-        await asyncio.gather(*[_map_one(s) for s in stocks])
-        return mapping
-
-    async def _fetch_stock_boards(self, stock_code: str) -> List[str]:
-        """通过 DataFetcherManager 查询股票所属板块"""
-        def _fetch():
-            from data_provider.base import DataFetcherManager
-            manager = DataFetcherManager()
-            boards = manager.get_belong_boards(stock_code)
-            return [
-                b.get("name", "") or b.get("board_name", "")
-                for b in (boards or [])
-            ]
-
-        try:
-            return await asyncio.to_thread(_fetch)
-        except Exception as exc:
-            logger.debug("[CatalystCalendar] 查询 %s 所属板块失败: %s", stock_code, exc)
-            return []
 
     # =================================================================
     # 全球事件映射
@@ -1674,7 +1357,7 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
     @staticmethod
     def _deduplicate(events: List[CatalystEvent]) -> List[CatalystEvent]:
-        """同 sector+date 保留 impact_level 最高的事件（仅用于非结构化事件）"""
+        """同 sector+date 保留 impact_level 最高的事件（宏观事件不参与，由调用侧分流）"""
         best: Dict[Tuple[str, date], CatalystEvent] = {}
         for event in events:
             key = (event.sector, event.event_date)
@@ -1682,44 +1365,3 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 best[key] = event
         return list(best.values())
 
-    @staticmethod
-    def _aggregate_structured_events(events: List[CatalystEvent]) -> List[CatalystEvent]:
-        """聚合同板块同日期的结构化事件（财报/解禁），合并标题列出多只股票"""
-        from collections import defaultdict
-        groups: Dict[Tuple[str, str, date], List[CatalystEvent]] = defaultdict(list)
-        non_structured = []
-
-        for e in events:
-            if e.source.startswith("akshare_"):
-                key = (e.source, e.sector, e.event_date)
-                groups[key].append(e)
-            else:
-                non_structured.append(e)
-
-        aggregated = []
-        for (source, sector, event_date), group in groups.items():
-            if len(group) == 1:
-                aggregated.append(group[0])
-            else:
-                # 合并标题：列出所有股票名
-                stock_names = [e.title for e in group]
-                merged_title = "；".join(stock_names[:3])
-                if len(stock_names) > 3:
-                    merged_title += f" 等{len(stock_names)}只"
-
-                representative = group[0]
-                aggregated.append(CatalystEvent(
-                    event_id=representative.event_id,
-                    event_date=event_date,
-                    event_type=representative.event_type,
-                    title=merged_title,
-                    sector=sector,
-                    impact_level=representative.impact_level,
-                    direction=representative.direction,
-                    confidence=representative.confidence,
-                    consensus_expectation=representative.consensus_expectation,
-                    source=source,
-                    category_tag=representative.category_tag,
-                ))
-
-        return aggregated + non_structured

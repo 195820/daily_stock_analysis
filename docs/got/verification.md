@@ -12,6 +12,21 @@
 
 ---
 
+## ‼️ 2026-10-08 状态变更（个股级结构化事件退出催化剂日历）
+
+**背景**：1008 全流程实测中财报披露通道「死而复生」（0825–0930 因 `stock_yjyg_em` 取数失真恒为零，六周下游无一处报缺）；当日 7 条 `akshare_earnings`（direction=drift）挤占 22 格日历，飞龙股份一只扇出 4 板块——与 WI-P2-4 移除解禁的三条理由（层次错配/稀释密度/无规模信息）逐字同案。
+
+**裁决（负责人 2026-10-08）**：财报披露与解禁同样不入催化剂日历；个股级财报/减持/解禁信息走基本面 bundle → RiskAgent（仅持仓与推荐票）。
+
+**实施**：`catalyst_calendar._full_build` 不再取数/映射/聚合个股事件，退役函数 9 个（`_fetch_earnings_calendar` / `_fetch_lockup_calendar` / `_get_relevant_quarters` / `_map_structured_event(_fast)` / `_build_structured_events` / `_map_stock_to_sectors` / `_batch_map_stocks` / `_fetch_stock_boards` / `_aggregate_structured_events`，净 −332 行）；全量构建日志改为 `macro/global/narrative（个股级不入历）`，消除 `lockup=88` 只取数被误读为入历的问题。
+
+**待验证判据**（本条只登记事实，达标与否由负责人判定）：
+- 存量 7 条 earnings（`expires_at=2026-10-13`）已经负责人指令**当日直接删除**（1008，连带 `catalyst_realizations` 7 条注册行，脚本 `.review_tmp/del_earnings_rows_1008.py`）；删后 DB 仅剩 macro_rule/global_map/llm_narrative 三源。**次一交易日（1009）即增量日，DB 已无个股存量，明日起日历不应再出现任何 akshare_\* 条目**（无需等到 ~10-14 下次全量重建）。
+- 验收：每日 `news.json → catalyst_calendar.events` 中 `source.startswith('akshare_')` 计数 = 0；若再现即为旁路复活。
+- 单测锚点：`tests/test_catalyst_calendar_stock_events.py`（5 例，含「增量日仍带存量」的反向登记——该例测的是桩内 DB 存量语义，与本次直接删库不矛盾）；消费侧回归 `test_node6_glue / test_node6_ambush_funnel / test_ambush_relations_wiring / test_lockup_risk_events` 共 67 例绿。
+
+---
+
 ## ‼️ 2026-09-17 状态变更（A5 影子期转正 → A6 阶段 1 接线）
 
 **项目负责人裁决**：8 交易日影子期实测相对规则侧 M1 +25.5 pp / 13.1×、M6 +31.4 pp，M4-b/c 7/7 PASS；**直接转正**。
