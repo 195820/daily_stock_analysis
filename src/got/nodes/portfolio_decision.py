@@ -69,6 +69,9 @@ class PortfolioDecisionNode:
         self._fts_action_flags: list = []
         self._fts_sizing_flags: list = []
         self._fts_shadow: Dict[str, Any] = {}
+        # FXG 家族级见顶上游排除闸门影子留痕（仅 GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=1 时非空，
+        # 作为 fxg 子块并入 shadow_fts.json；缺省 off 态为空 dict → 不产子块，逐字节不变）。
+        self._fxg_shadow: Dict[str, Any] = {}
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
@@ -1117,6 +1120,73 @@ class PortfolioDecisionNode:
             }
 
         return sector_intel_map
+
+    def _compute_fxg_exclusions(
+        self,
+        unified_context: UnifiedContext,
+        sector_intel_map: Dict[str, Dict[str, Any]],
+        actionable_names: Optional[set] = None,
+    ) -> tuple[set, set, list]:
+        """FXG 家族级见顶上游排除：计算应从选股池剔除的板块集合。
+
+        复用 FTS 已落地的 family_suppression 靶子，纯计算零 IO：
+        - 触发（三者同时）：fs.aggravated == True、fs.days_suppressed >= N
+          （env GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS，缺省 2）、fs.days_healthy == 0
+          （W-1：仅今日仍活跃见顶才硬剔，恢复期 latch 不剔，避免踏空）。
+        - 正向证据豁免（举证责任翻转，"未破位"不构成豁免）：成员板块
+          lifecycle_phase=='launch' 且 news_check=='catalyzed' 且 capital_check=='aligned'
+          → 不剔（同时兜住真·二波与 glue 误钉的健康板块）。
+        任何异常 → 返回空集（降级为不剔除，绝不阻塞 Phase 2）。
+
+        Returns:
+            (excluded_sectors, exempted_sectors, audit_rows)
+        """
+        excluded: set = set()
+        exempted: set = set()
+        audit: list = []
+        try:
+            try:
+                n_min = int(os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS", "2"))
+            except (TypeError, ValueError):
+                n_min = 2
+            n_min = max(0, n_min)
+            for fs in (getattr(unified_context, "family_suppression", None) or []):
+                if not getattr(fs, "aggravated", False):
+                    continue
+                if int(getattr(fs, "days_suppressed", 0) or 0) < n_min:
+                    continue
+                if int(getattr(fs, "days_healthy", 0) or 0) != 0:
+                    continue  # W-1：恢复期 latch（days_healthy>0）不做家族级硬剔
+                fam = getattr(fs, "name", "")
+                for sector in (getattr(fs, "members", None) or []):
+                    intel = (sector_intel_map or {}).get(sector, {})
+                    if (
+                        intel.get("lifecycle_phase") == "launch"
+                        and intel.get("news_check") == "catalyzed"
+                        and intel.get("capital_check") == "aligned"
+                    ):
+                        exempted.add(sector)
+                        audit.append({
+                            "sector": sector, "family": fam, "exempted": True,
+                            "reason": "launch+catalyzed+aligned",
+                        })
+                        continue
+                    if actionable_names is not None and sector not in actionable_names:
+                        # S-1：命名空间错配哨兵（members 板块名对不上 actionable_names）
+                        logger.warning(
+                            "[FXG] 成员板块 %r（家族 %s）不在 actionable_names，疑似命名空间错配",
+                            sector, fam,
+                        )
+                    excluded.add(sector)
+                    audit.append({
+                        "sector": sector, "family": fam, "exempted": False,
+                        "days_suppressed": int(getattr(fs, "days_suppressed", 0) or 0),
+                        "aggravated": True,
+                    })
+        except Exception as exc:  # noqa: BLE001 — 闸门旁路：降级为不剔除
+            logger.warning("[FXG] 排除集合计算失败（降级为不剔除）: %s", exc)
+            return set(), set(), []
+        return excluded, exempted, audit
 
     def _build_extended_lifecycle_map(
         self, sector_context: SectorContext
@@ -3379,6 +3449,9 @@ class PortfolioDecisionNode:
             fts["flagged_sectors"] = list(self._fts_sizing_flags)
             fts["sizing_hits"] = len(self._fts_sizing_flags)
             fts["action_hits"] = len(fts.get("flagged_stocks", []))
+            # S-2：仅 EXCLUDE_ENABLED=1（_fxg_shadow 非空）才并入 fxg 子块，off 态不产（逐字节不变）
+            if self._fxg_shadow:
+                fts["fxg"] = dict(self._fxg_shadow)
         if not (self._shadow_t1 or self._shadow_t1h or meg or fts):
             return
         day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
@@ -3391,12 +3464,52 @@ class PortfolioDecisionNode:
                 ("shadow_fts.json", fts),
             ):
                 if record:
-                    (day_dir / filename).write_text(
-                        json.dumps(record, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
+                    self._atomic_write_json(day_dir / filename, record)
         except OSError as exc:
             logger.warning("[Phase 2] 影子观测落盘失败（已忽略）: %s", exc)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, record: Any) -> None:
+        """原子写 JSON（tmp + os.replace），中断不留半截文件。"""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _save_candidate_pool_snapshot(
+        self,
+        universe: List[Any],
+        finalists: List[Any],
+        sector_intel_map: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """F-1：落 candidate_pool.json —— 持久化 universe（含被 Top-10 截断的 rank 11+ 候选）
+        与 finalists membership，使未来交易日可离线复算 FXG 剔除后的补位来源。
+        纯观测，随 FTS ENABLED=1 产出；异常由调用方吞掉，不阻塞 Phase 2。
+        """
+        finalist_codes = {getattr(s, "code", "") for s in (finalists or [])}
+
+        def _row(s: Any) -> Dict[str, Any]:
+            sector = getattr(s, "sector_name", "") or getattr(s, "sector", "") or ""
+            intel = (sector_intel_map or {}).get(sector, {})
+            return {
+                "symbol": getattr(s, "code", ""),
+                "name": getattr(s, "name", ""),
+                "sector_name": sector,
+                "family": intel.get("frame_group"),
+                "sector_score": getattr(s, "sector_score", None),
+                "is_finalist": getattr(s, "code", "") in finalist_codes,
+                "agent_verdict": getattr(s, "agent_verdict", "") or "",
+            }
+
+        record = {
+            "line": "candidate_pool",
+            "date": date.today().strftime("%Y%m%d"),
+            "universe_size": len(universe or []),
+            "finalist_size": len(finalists or []),
+            "universe": [_row(s) for s in (universe or [])],
+        }
+        day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_json(day_dir / "candidate_pool.json", record)
 
     def _collect_shadow_t1(self, finalists: List[Any]) -> None:
         """收集 T1 候选股终审的影子观测记录。
@@ -3715,6 +3828,10 @@ verdict 含义：
         sentiment_momentum = getattr(sentiment_context, 'sentiment_momentum', 0.0) or 0.0
         sector_ctx_dict = sector_context.model_dump(mode="json")
 
+        # FXG/FTS：sector_intel_map 为纯函数零 IO（只读 confirmed_sectors），上提到 actionable 块
+        # 之前，供 FXG 正向豁免判据与后续评分复用（评审 C-1）。
+        sector_intel_map = self._build_sector_intel_map(unified_context)
+
         # ── 关键过滤：只有 actionable 板块参与选股 ──
         # caution 板块（候补）不参与候选池提取，大幅减少候选股数量
         actionable_names = {
@@ -3725,6 +3842,43 @@ verdict 含义：
         # 升格后掉出 Node 2 名单的板块可能不在 confirmed_sectors 中
         for candidate in unified_context.ambush_pool:
             actionable_names.add(candidate.sector_name)
+
+        # ── FXG 家族级见顶上游排除（评审 C-2：在 actionable 补入之后、选股池构造之前）──
+        # 复用 FTS 的 family_suppression 靶子；触发=aggravated + days_suppressed>=N + days_healthy==0。
+        # veto → 从 actionable_names 真删（下游 mainline/ambush/universe/finalist 自动不含该族，促跨家族轮动）；
+        # shadow → 只留痕 self._fxg_shadow，不动池（off 态逐字节不变）；缺省 EXCLUDE_ENABLED=0 完全不进。
+        _fxg_gate = os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1"
+        _fxg_exclude_on = _fxg_gate and os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_ENABLED", "0") == "1"
+        _fxg_mode = os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_MODE", "shadow")
+        _fxg_veto = _fxg_exclude_on and _fxg_mode == "veto"
+        excluded_sectors: set = set()
+        if _fxg_exclude_on:
+            excluded_sectors, _fxg_exempted, _fxg_audit = self._compute_fxg_exclusions(
+                unified_context, sector_intel_map, actionable_names,
+            )
+            try:
+                _fxg_min_days = int(os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS", "2"))
+            except (TypeError, ValueError):
+                _fxg_min_days = 2
+            self._fxg_shadow = {
+                "line": "fxg", "executed": True, "mode": _fxg_mode, "min_days": _fxg_min_days,
+                "excluded_sectors": [a for a in _fxg_audit if not a.get("exempted")],
+                "exempted_sectors": [a for a in _fxg_audit if a.get("exempted")],
+                "evaluated": len(unified_context.confirmed_sectors or []),
+            }
+            if excluded_sectors:
+                if _fxg_veto:
+                    actionable_names -= excluded_sectors
+                    logger.info(
+                        "[FXG-veto] 家族级剔除 %d 个板块出选股池: %s",
+                        len(excluded_sectors), sorted(excluded_sectors),
+                    )
+                else:
+                    logger.info(
+                        "[FXG-shadow] 本应剔除 %d 个板块（未生效）: %s",
+                        len(excluded_sectors), sorted(excluded_sectors),
+                    )
+
         filtered_mainline = []
         for g in sector_ctx_dict.get("active_mainline", []):
             members = g.get("members")
@@ -3751,6 +3905,8 @@ verdict 含义：
         existing_ambush_names = {s.get("name") for s in sector_ctx_dict["ambush"]}
         self._bypass_ambush_sectors = set()
         for candidate in unified_context.ambush_pool:
+            if _fxg_veto and candidate.sector_name in excluded_sectors:
+                continue  # FXG veto：被剔家族板块不得经蓄水池升格旁路重新灌回选股池
             if candidate.sector_name not in existing_ambush_names:
                 sector_ctx_dict["ambush"].append({
                     "name": candidate.sector_name,
@@ -3780,9 +3936,6 @@ verdict 含义：
             },
         }
 
-        # 构建板块情报映射（从 Node 6 v3 的 confirmed_sectors）
-        sector_intel_map = self._build_sector_intel_map(unified_context)
-
         # 提取候选池 + 5 阶段漏斗筛选
         # 问财 THS 使用同步 Playwright，需在独立线程中运行
         universe = await asyncio.to_thread(screener._extract_got_universe, got_context)
@@ -3796,6 +3949,15 @@ verdict 含义：
 
         # 影子观测：T1 终审结果随 finalists 返回（ScreenerStock.agent_verdict），此前无人消费
         self._collect_shadow_t1(finalists)
+
+        # ── F-1 候选池快照落盘（评审 S-4）：持久化 universe + finalists（含被 Top-10 截断的
+        # rank 11+ 候选），使未来交易日可离线复算“FXG 剔除后 Top-10 补位来源”。
+        # 随 FTS ENABLED=1 产出、off 态不产（逐字节不变）；任何异常降级不阻塞。──
+        if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1":
+            try:
+                self._save_candidate_pool_snapshot(universe, finalists, sector_intel_map)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FXG] 候选池快照落盘失败（已忽略）: %s", exc)
 
         # ── 2026-08-18 新增：候选股板块交叉验证 ──
         # 用 efinance.get_belong_board() 验证问财返回的板块标签是否真实

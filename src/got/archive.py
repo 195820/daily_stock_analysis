@@ -1032,7 +1032,7 @@ def _render_shadow_fts(fts: "dict | None") -> list[str]:
     verb = "已降级" if mode == "veto" else "本应降级（未生效）"
     tag = "影子，只留痕" if mode != "veto" else "veto，已生效"
     _fam_txt = "、".join(
-        f"{f.get('name')}" + ("(破位)" if f.get("aggravated") else "")
+        f"{f.get('name')}" + ("(加重)" if f.get("aggravated") else "")
         + f"[压制第{f.get('days_suppressed', 0)}日]"
         for f in families
     ) or "无"
@@ -1044,7 +1044,7 @@ def _render_shadow_fts(fts: "dict | None") -> list[str]:
         for f in flagged:
             lines.append(
                 f"- **{_shadow_display_name(f.get('name'), f.get('symbol'))}**：板块={f.get('sector')} "
-                f"家族={f.get('family')}（见顶+破位，压制第{f.get('days_suppressed', 0)}日） "
+                f"家族={f.get('family')}（见顶+≥确认项，压制第{f.get('days_suppressed', 0)}日） "
                 f"{f.get('action_before')}→{f.get('action_wouldbe')}"
             )
     else:
@@ -1054,6 +1054,28 @@ def _render_shadow_fts(fts: "dict | None") -> list[str]:
             f"- 层A 板块 **{s.get('sector_name')}**（家族{s.get('family')}）："
             f"base {s.get('base_before')}→{s.get('base_wouldbe')}（{s.get('role')}）"
         )
+    # FXG 家族级上游排除段（仅 EXCLUDE_ENABLED=1 时 shadow_fts.json 带 fxg 子块）
+    fxg = fts.get("fxg") or {}
+    if fxg:
+        _ex = fxg.get("excluded_sectors") or []
+        _exm = fxg.get("exempted_sectors") or []
+        _fmode = fxg.get("mode", "shadow")
+        _ftag = "veto，已剔池" if _fmode == "veto" else "影子，只留痕"
+        _ex_fams = sorted({e.get("family") for e in _ex if e.get("family")})
+        lines.append(
+            f"**FXG 家族级上游排除**（{_ftag}，mode=`{_fmode}`，min_days={fxg.get('min_days')}）："
+            f"家族级剔除 {len(_ex)} 板块（家族：{'、'.join(_ex_fams) or '无'}），"
+            f"正向证据豁免 {len(_exm)} 板块。"
+        )
+        for e in _ex:
+            lines.append(
+                f"- 剔除板块 **{e.get('sector')}**（家族{e.get('family')}，"
+                f"aggravated，压制第{e.get('days_suppressed', 0)}日）"
+            )
+        for e in _exm:
+            lines.append(
+                f"- 豁免板块 **{e.get('sector')}**（家族{e.get('family')}）：{e.get('reason')}"
+            )
     lines.append("")
     return lines
 
@@ -1069,9 +1091,9 @@ def _render_shadow_section(
     meg_shadow: "dict | None" = None,
     fts_shadow: "dict | None" = None,
 ) -> list[str]:
-    """渲染「影子模式观测」段（reasoning.md 末尾，五条影子线各一段）。
+    """渲染「影子模式观测」段（reasoning.md 末尾，各影子线各一段）。
 
-    五条线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查。
+    各线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查 / MEG / FTS（含 FXG）。
     A5 语义粘合层已转正（A6），改由 Node 6 正文子块 `_render_a6_glue_formal` 承载；
     仅当 glue 降级时才在本段留一条降级观测行。code_to_name 保留签名位（已转正线不再用）。
     """

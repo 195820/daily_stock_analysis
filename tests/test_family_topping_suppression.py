@@ -301,6 +301,18 @@ class TestFtsActionGate(_FtsGateHarness):
         self.assertNotIn("FTS", res.reasoning)
         self.assertEqual(node._fts_shadow, {})
 
+    async def test_off_family_name_null_baseline(self):
+        """C-3 off 态基线：ENABLED=0 时 unified_scoring[].family_name 恒 None（逐字节不变）。"""
+        _node, res = await self._run(_make_stock(), _intel_fg(family="医药"), [_fs()],
+                                     {**_STEP3, "GOT_FAMILY_TOPPING_GATE_ENABLED": "0"})
+        self.assertIsNone(res.family_name)
+
+    async def test_on_family_name_present(self):
+        """C-3 对照：ENABLED=1 时 family_name 取 frame_group（层B join key 生效）。"""
+        _node, res = await self._run(_make_stock(), _intel_fg(family="医药"), [_fs()],
+                                     {**_STEP3, **_ON, "GOT_FAMILY_TOPPING_MODE": "shadow"})
+        self.assertEqual(res.family_name, "医药")
+
     async def test_shadow_flags_without_changing_action(self):
         """shadow：留痕（reasoning 有 FTS影子）但 action 逐字节不变（仍 buy_trend）。"""
         node, res = await self._run(_make_stock(), _intel_fg(), [_fs()],
@@ -439,6 +451,298 @@ class TestFtsShadowArtifact(unittest.TestCase):
         from src.got import archive
         self.assertEqual(archive._render_shadow_fts(None), [])
         self.assertEqual(archive._render_shadow_fts({}), [])
+
+
+# ══════════════════ FXG 家族级见顶上游排除闸门（commit 2）══════════════════
+def _fs_full(name="医药", aggravated=True, days_suppressed=2, days_healthy=0,
+            members=("创新药",)):
+    """带 members/days_healthy 的 FamilySuppression（FXG 触发/豁免判据用）。"""
+    return FamilySuppression(name=name, aggravated=aggravated,
+                             days_suppressed=days_suppressed, days_healthy=days_healthy,
+                             members=list(members))
+
+
+def _intel_fxg(lifecycle_phase="acceleration", news_check="neutral",
+               capital_check="neutral", family="医药"):
+    """sector_intel_map 值（FXG 正向豁免判据读 lifecycle_phase/news_check/capital_check）。"""
+    return {"classification": "actionable", "capital_check": capital_check,
+            "news_check": news_check, "sentiment_check": "low",
+            "lifecycle_phase": lifecycle_phase, "lifecycle_day": 1,
+            "momentum_state": "thrust", "rs_mom_decay_2d": 0.01, "frame_group": family}
+
+
+def _launch_aligned(family="医药"):
+    """正向三条件齐备（launch + catalyzed + aligned）→ 应豁免。"""
+    return _intel_fxg(lifecycle_phase="launch", news_check="catalyzed",
+                      capital_check="aligned", family=family)
+
+
+# ────────────────── _compute_fxg_exclusions 纯函数 ──────────────────
+class TestComputeFxgExclusions(unittest.TestCase):
+    def setUp(self):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        self.node = PortfolioDecisionNode(use_mock=True)
+
+    def _call(self, family_suppression, intel_map, actionable_names=None, env=None):
+        uc = _make_unified(family_suppression=family_suppression)
+        with patch.dict(os.environ, env or {}):
+            return self.node._compute_fxg_exclusions(uc, intel_map, actionable_names)
+
+    def test_trigger_excludes_all_members(self):
+        """aggravated + days_suppressed>=2 + days_healthy==0 → 整族 members 入 excluded。"""
+        excl, exem, audit = self._call(
+            [_fs_full(members=["创新药", "医药商业"])],
+            {"创新药": _intel_fxg(), "医药商业": _intel_fxg()}, {"创新药", "医药商业"})
+        self.assertEqual(excl, {"创新药", "医药商业"})
+        self.assertEqual(exem, set())
+        self.assertEqual(len(audit), 2)
+        self.assertTrue(all(a["aggravated"] and a["days_suppressed"] == 2 for a in audit))
+
+    def test_days_suppressed_below_n_not_excluded(self):
+        """days_suppressed<2（早段）→ 不剔（留给层B 软处理）。"""
+        excl, _, _ = self._call([_fs_full(days_suppressed=1)], {"创新药": _intel_fxg()}, {"创新药"})
+        self.assertEqual(excl, set())
+
+    def test_days_healthy_nonzero_not_excluded(self):
+        """W-1：days_healthy>0（恢复期 latch）→ 不做家族级硬剔。"""
+        excl, _, _ = self._call([_fs_full(days_suppressed=3, days_healthy=1)],
+                                {"创新药": _intel_fxg()}, {"创新药"})
+        self.assertEqual(excl, set())
+
+    def test_non_aggravated_not_excluded(self):
+        """非 aggravated（仅软压制）→ 不进 FXG 剔除。"""
+        excl, _, _ = self._call([_fs_full(aggravated=False)], {"创新药": _intel_fxg()}, {"创新药"})
+        self.assertEqual(excl, set())
+
+    def test_min_days_configurable_to_zero(self):
+        """MIN_DAYS=0 → 见顶首日即生效。"""
+        excl, _, _ = self._call([_fs_full(days_suppressed=0)], {"创新药": _intel_fxg()},
+                                {"创新药"}, {"GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS": "0"})
+        self.assertEqual(excl, {"创新药"})
+
+    def test_positive_evidence_exempt(self):
+        """正向三条件（launch+catalyzed+aligned）→ 豁免不剔。"""
+        excl, exem, audit = self._call([_fs_full(members=["创新药"])],
+                                       {"创新药": _launch_aligned()}, {"创新药"})
+        self.assertEqual(excl, set())
+        self.assertEqual(exem, {"创新药"})
+        self.assertTrue(audit[0]["exempted"])
+
+    def test_partial_evidence_not_exempt(self):
+        """缺 capital_check=aligned（launch+catalyzed 但资金未 aligned）→ 照剔不豁免。"""
+        intel = _intel_fxg(lifecycle_phase="launch", news_check="catalyzed", capital_check="neutral")
+        excl, exem, _ = self._call([_fs_full(members=["创新药"])], {"创新药": intel}, {"创新药"})
+        self.assertEqual(excl, {"创新药"})
+        self.assertEqual(exem, set())
+
+    def test_glue_mispinned_healthy_sector_exempt(self):
+        """glue 误钉健康板块走同一豁免通道（launch+catalyzed+aligned）。"""
+        excl, exem, _ = self._call([_fs_full(members=["误钉板块"])],
+                                   {"误钉板块": _launch_aligned()}, {"误钉板块"})
+        self.assertEqual(excl, set())
+        self.assertEqual(exem, {"误钉板块"})
+
+    def test_mixed_members_partial_exempt(self):
+        """同族一板块豁免、一板块剔（成员级粒度）。"""
+        excl, exem, _ = self._call([_fs_full(members=["创新药", "医药商业"])],
+                                   {"创新药": _launch_aligned(), "医药商业": _intel_fxg()},
+                                   {"创新药", "医药商业"})
+        self.assertEqual(excl, {"医药商业"})
+        self.assertEqual(exem, {"创新药"})
+
+    def test_missing_intel_not_exempt(self):
+        """members 板块不在 sector_intel_map（C-1 上提后可取到豁免字段；缺则不豁免）→ 照剔。"""
+        excl, exem, _ = self._call([_fs_full(members=["创新药"])], {}, {"创新药"})
+        self.assertEqual(excl, {"创新药"})
+        self.assertEqual(exem, set())
+
+    def test_s1_namespace_mismatch_warns_but_excludes(self):
+        """S-1：members 板块不在 actionable_names → 记 warning，但仍入 excluded。"""
+        with self.assertLogs("src.got.nodes.portfolio_decision", level="WARNING") as cm:
+            excl, _, _ = self._call([_fs_full(members=["创新药"])],
+                                    {"创新药": _intel_fxg()}, {"半导体"})
+        self.assertEqual(excl, {"创新药"})
+        self.assertTrue(any("命名空间错配" in m for m in cm.output))
+
+    def test_exception_degrades_to_empty(self):
+        """任何异常（days_suppressed 非数值）→ 降级空集，绝不阻塞 Phase2。"""
+        bad = types.SimpleNamespace(aggravated=True, days_suppressed="abc",
+                                    days_healthy=0, name="医药", members=["创新药"])
+        bad_uc = types.SimpleNamespace(family_suppression=[bad])
+        excl, exem, audit = self.node._compute_fxg_exclusions(
+            bad_uc, {"创新药": _intel_fxg()}, {"创新药"})
+        self.assertEqual((excl, exem, audit), (set(), set(), []))
+
+
+# ────────────────── FXG Phase2：actionable 补入后剔除 + ambush 旁路守卫 ──────────────────
+class _FxgPhase2Harness(unittest.IsolatedAsyncioTestCase):
+    """固定场景：家族 医药（aggravated, days_suppressed=2, members=[创新药]）经 ambush_pool
+    补入 actionable；半导体为存活候选。观测 captured['ambush']（旁路终值）+ node._fxg_shadow。"""
+
+    async def _run(self, env):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        from src.got.schemas import SectorIntel, AmbushCandidate, LifecycleInfo
+
+        node = PortfolioDecisionNode(use_mock=True)
+        intel_map = {"创新药": _intel_fxg(), "半导体": _intel_fxg(family="半导体")}
+        node._build_sector_intel_map = lambda uc: intel_map
+        node._adjust_score_by_sector_intel = lambda base, name, mm: base
+        node._compute_overheat_penalty = lambda name, mm, uc: 1.0
+        node._collect_shadow_t1 = lambda finalists: None
+        node._save_candidate_pool_snapshot = lambda *a, **k: None
+
+        async def _fake_verify(finalists, sim):
+            return finalists
+        node._verify_candidate_sectors = _fake_verify
+
+        stock = _make_stock(code="600000", name="浦发银行", sector_name="半导体")
+        captured = {}
+
+        def _fake_extract(got_context):
+            sc = got_context["sector_context"]
+            captured["ambush"] = sorted(s.get("name") for s in sc["ambush"])
+            return [{"code": stock.code}]
+
+        screener_mock = MagicMock()
+        screener_mock._extract_got_universe = _fake_extract
+        screener_mock._filter_got_finalists = lambda uni, ctx, n: [stock]
+
+        confirmed = [
+            SectorIntel(sector_name="创新药", classification="actionable",
+                        confidence=1.0, frame_group="医药", lifecycle=LifecycleInfo(phase="mature")),
+            SectorIntel(sector_name="半导体", classification="actionable",
+                        confidence=1.0, frame_group="半导体", lifecycle=LifecycleInfo(phase="acceleration")),
+        ]
+        unified = UnifiedContext(status="normal", unified_signal="neutral", overall_confidence=0.5,
+                                 final_position_limit=0.5, confirmed_sectors=confirmed,
+                                 ambush_pool=[AmbushCandidate(sector_name="创新药", catalyst_score=1.0,
+                                                              category_tag="drift")],
+                                 family_suppression=[_fs_full(members=["创新药"])])
+        with patch("src.services.stock_screener.StockScreenerPipeline", return_value=screener_mock), \
+             patch.dict(os.environ, env):
+            results = await node._score_candidates(
+                _make_sector_ctx(), _make_capital(), _make_news(),
+                _market_with_regime("transition"), unified, _make_sentiment(),
+            )
+        return node, captured, results
+
+
+class TestFxgPhase2Gate(_FxgPhase2Harness):
+
+    async def test_parent_off_no_shadow_no_bypass_guard(self):
+        """ENABLED=0：即便 EXCLUDE_ENABLED=1 也不进 FXG → _fxg_shadow 空、旁路不守卫（逐字节不变）。"""
+        node, cap, _ = await self._run({**_STEP3, "GOT_FAMILY_TOPPING_GATE_ENABLED": "0",
+                                        "GOT_FAMILY_TOPPING_EXCLUDE_ENABLED": "1"})
+        self.assertEqual(node._fxg_shadow, {})
+        self.assertIn("创新药", cap["ambush"])
+
+    async def test_exclude_disabled_no_fxg_subblock(self):
+        """S-2：EXCLUDE_ENABLED=0 → _fxg_shadow 空（不产 fxg 子块）。"""
+        node, cap, _ = await self._run({**_STEP3, **_ON, "GOT_FAMILY_TOPPING_EXCLUDE_ENABLED": "0"})
+        self.assertEqual(node._fxg_shadow, {})
+        self.assertIn("创新药", cap["ambush"])
+
+    async def test_shadow_records_but_keeps_pool(self):
+        """shadow：_fxg_shadow 记本应剔，但池不变（旁路仍补入被剔板块）。"""
+        node, cap, _ = await self._run({**_STEP3, **_ON, "GOT_FAMILY_TOPPING_EXCLUDE_ENABLED": "1",
+                                        "GOT_FAMILY_TOPPING_EXCLUDE_MODE": "shadow"})
+        self.assertEqual(node._fxg_shadow["mode"], "shadow")
+        self.assertEqual({e["sector"] for e in node._fxg_shadow["excluded_sectors"]}, {"创新药"})
+        self.assertIn("创新药", cap["ambush"])
+
+    async def test_veto_subtracts_and_blocks_bypass(self):
+        """C-2：veto → 减法在 ambush 补入之后 + 旁路守卫拦住 → 被剔板块不得回流选股池。"""
+        node, cap, _ = await self._run({**_STEP3, **_ON, "GOT_FAMILY_TOPPING_EXCLUDE_ENABLED": "1",
+                                        "GOT_FAMILY_TOPPING_EXCLUDE_MODE": "veto"})
+        self.assertEqual(node._fxg_shadow["mode"], "veto")
+        self.assertNotIn("创新药", cap["ambush"])
+        self.assertEqual({e["sector"] for e in node._fxg_shadow["excluded_sectors"]}, {"创新药"})
+
+
+# ────────────────── FXG 影子台账落盘 + 候选池快照 + archive 渲染 ──────────────────
+_FTS_RECORD = {
+    "line": "fts", "executed": True, "mode": "shadow", "sizing": True,
+    "suppressed_families": [{"name": "医药", "aggravated": True,
+                             "days_suppressed": 2, "days_healthy": 0}],
+    "evaluated": 3, "flagged_stocks": [],
+}
+_FXG_RECORD = {
+    "line": "fxg", "executed": True, "mode": "veto", "min_days": 2,
+    "excluded_sectors": [{"sector": "创新药", "family": "医药", "exempted": False,
+                          "days_suppressed": 2, "aggravated": True}],
+    "exempted_sectors": [{"sector": "医药商业", "family": "医药", "exempted": True,
+                          "reason": "launch+catalyzed+aligned"}],
+    "evaluated": 3,
+}
+
+
+class TestFxgShadowArtifact(unittest.TestCase):
+    def _write_and_read(self, fxg_shadow):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode(use_mock=True)
+        node._shadow_t1 = {}
+        node._shadow_t1h = {}
+        node._meg_shadow = {}
+        node._fts_shadow = dict(_FTS_RECORD)
+        node._fxg_shadow = dict(fxg_shadow) if fxg_shadow else {}
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                node._save_shadow_records()
+                p = Path("data/got_daily") / date.today().strftime("%Y%m%d") / "shadow_fts.json"
+                tmp_left = list(p.parent.glob("*.tmp")) if p.parent.exists() else []
+                rec = json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+            finally:
+                os.chdir(old)
+        return rec, tmp_left
+
+    def test_fxg_subblock_merged(self):
+        """EXCLUDE_ENABLED=1（_fxg_shadow 非空）→ shadow_fts.json 带 fxg 子块。"""
+        rec, tmp_left = self._write_and_read(_FXG_RECORD)
+        self.assertEqual(rec["fxg"]["mode"], "veto")
+        self.assertEqual(rec["fxg"]["excluded_sectors"][0]["sector"], "创新药")
+        self.assertEqual(rec["fxg"]["exempted_sectors"][0]["reason"], "launch+catalyzed+aligned")
+        self.assertEqual(tmp_left, [])  # 原子写不留 .tmp
+
+    def test_no_fxg_subblock_when_off(self):
+        """S-2：_fxg_shadow 空 → shadow_fts.json 不含 fxg 键（off 态逐字节不变）。"""
+        rec, _ = self._write_and_read({})
+        self.assertNotIn("fxg", rec)
+
+    def test_candidate_pool_snapshot(self):
+        """F-1：candidate_pool.json 落 universe（含 family/is_finalist）。"""
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode(use_mock=True)
+        s = _make_stock(code="600513", name="联环药业", sector_name="创新药")
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                node._save_candidate_pool_snapshot([s], [s], {"创新药": _intel_fxg()})
+                p = Path("data/got_daily") / date.today().strftime("%Y%m%d") / "candidate_pool.json"
+                rec = json.loads(p.read_text(encoding="utf-8"))
+            finally:
+                os.chdir(old)
+        self.assertEqual(rec["line"], "candidate_pool")
+        self.assertEqual(rec["universe"][0]["symbol"], "600513")
+        self.assertEqual(rec["universe"][0]["family"], "医药")
+        self.assertTrue(rec["universe"][0]["is_finalist"])
+
+    def test_render_fxg_section(self):
+        """archive：fts 带 fxg 子块 → reasoning 出 FXG 段（剔/豁免板块）。"""
+        from src.got import archive
+        fts = dict(_FTS_RECORD, fxg=dict(_FXG_RECORD))
+        lines = archive._render_shadow_fts(fts)
+        self.assertTrue(any("FXG 家族级上游排除" in l for l in lines))
+        self.assertTrue(any("剔除板块" in l and "创新药" in l for l in lines))
+        self.assertTrue(any("豁免板块" in l and "医药商业" in l for l in lines))
+
+    def test_render_no_fxg_section_when_absent(self):
+        """archive：无 fxg 子块 → reasoning 不含 FXG 段（off 态逐字节不变）。"""
+        from src.got import archive
+        lines = archive._render_shadow_fts(dict(_FTS_RECORD))
+        self.assertFalse(any("FXG" in l for l in lines))
 
 
 if __name__ == "__main__":
