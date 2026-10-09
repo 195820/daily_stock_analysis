@@ -3902,7 +3902,7 @@ verdict 含义：
                 lifecycle_day = intel.get('lifecycle_day')
                 momentum_state = intel.get('momentum_state')
                 rs_mom_decay_2d = intel.get('rs_mom_decay_2d')
-                family_name = intel.get('frame_group')  # FTS 层B join key（与 Node6 endurance.name 对齐）
+                family_name = intel.get('frame_group') if _fts_gate_on else None  # FTS 层B join key（与 Node6 endurance.name 对齐）；C-3：off 态恒 null 保逐字节不变
 
             # 使用生命周期优先级排序（吃鱼身+高切低策略）
             lifecycle_priority = self._lifecycle_priority_score(

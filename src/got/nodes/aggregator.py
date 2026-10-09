@@ -410,15 +410,20 @@ class AggregatorNode:
         # 缺省 GOT_FAMILY_TOPPING_GATE_ENABLED=0 时不产台账（family_suppression=[]，逐字节不变）。
         family_suppression = []
         if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1":
-            _prev_suppression = self._load_previous_family_suppression()
-            family_suppression = self._synthesize_family_suppression(
-                mainline_endurance, _prev_suppression,
-            )
-            if family_suppression:
-                logger.info(
-                    f"[Node 6] 家族见顶压制(FTS): {len(family_suppression)} 个家族 — "
-                    f"{[(e.name, 'aggravated' if e.aggravated else 'soft', e.days_suppressed) for e in family_suppression]}"
+            # C-2：FTS 为旁路闸门特性，任何合成异常一律降级为空台账，绝不击穿 Node 6 主链路。
+            try:
+                _prev_suppression = self._load_previous_family_suppression()
+                family_suppression = self._synthesize_family_suppression(
+                    mainline_endurance, _prev_suppression,
                 )
+                if family_suppression:
+                    logger.info(
+                        f"[Node 6] 家族见顶压制(FTS): {len(family_suppression)} 个家族 — "
+                        f"{[(e.name, 'aggravated' if e.aggravated else 'soft', e.days_suppressed) for e in family_suppression]}"
+                    )
+            except Exception as exc:  # noqa: BLE001 — 观测/闸门旁路：降级不阻塞
+                logger.warning("[Node 6] FTS 合成失败（已忽略，family_suppression 置空）: %s", exc)
+                family_suppression = []
 
         # ── 构建输出 ──
         data_quality = self._build_data_quality(market, sector, capital, news, sentiment, glue=glue)
@@ -4339,11 +4344,20 @@ class AggregatorNode:
         """
         from src.got.schemas import FamilySuppression
 
-        cooldown = int(os.getenv("GOT_FAMILY_TOPPING_COOLDOWN", "5"))
-        exit_healthy = int(os.getenv("GOT_FAMILY_TOPPING_EXIT_HEALTHY", "2"))
+        def _int_env(_name: str, _default: int) -> int:
+            # env 数值 clamp（防 COOLDOWN/EXIT_HEALTHY=0 使 latch 退化、MIN_CONFIRMS 负数塌缩）：
+            # 解析失败回落缺省并告警；成功则强制 ≥1。
+            try:
+                return max(1, int(os.getenv(_name, str(_default))))
+            except (TypeError, ValueError):
+                logger.warning("[FTS] %s 解析失败，回落缺省 %d", _name, _default)
+                return _default
+
+        cooldown = _int_env("GOT_FAMILY_TOPPING_COOLDOWN", 5)
+        exit_healthy = _int_env("GOT_FAMILY_TOPPING_EXIT_HEALTHY", 2)
         mode = os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow")
         # aggravated 硬确认门槛：破位之外还需 ≥N 个正交硬确认项（缺省 1，可收紧到 2）。
-        agg_min_confirms = int(os.getenv("GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS", "1"))
+        agg_min_confirms = _int_env("GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS", 1)
 
         today_endurance = {e.name: e for e in mainline_endurance}
         result: list = []
@@ -4372,7 +4386,7 @@ class AggregatorNode:
             for _tier_members in (e.tiers or {}).values():
                 members.extend(_tier_members)
             prev = prev_map.get(name)
-            days_suppressed = (prev.get("days_suppressed", 0) + 1) if prev else 0
+            days_suppressed = (int(prev.get("days_suppressed") or 0) + 1) if prev else 0
             result.append(FamilySuppression(
                 name=name,
                 endurance_band="topping_risk",
