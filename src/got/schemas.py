@@ -938,7 +938,8 @@ class FamilySuppression(BaseModel):
     endurance_band: str = Field(default="topping_risk", description="触发压制的续航区间（topping_risk）")
     aggravated: bool = Field(
         default=False,
-        description="是否加重（warning_signals 含破位信号）：True 时 Phase2 层B 硬降 buy→watch，False 仅层A 缩仓",
+        description="是否加重（破位 + ≥MIN_CONFIRMS 个正交硬确认项：资金rejected/严重过热≥0.5/老波≥6/拥挤）："
+                    "True 时 Phase2 层B 硬降 buy→watch，False 仅层A 缩仓",
     )
     warning_signals: list[str] = Field(default_factory=list, description="触发时的警示信号快照")
     members: list[str] = Field(default_factory=list, description="家族成员板块名（供 join/调试）")

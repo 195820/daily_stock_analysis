@@ -4,7 +4,7 @@
 覆盖：
 - FamilySuppression / UnifiedContext schema 缺省值（off 态字段为空）
 - _synthesize_family_suppression 跨日 latch 三态转移：新建 / 持续 / 健康迟滞退出 / 上限释放
-- aggravated 判据（warning_signals 含"破位信号"）
+- aggravated 判据（破位 + ≥MIN_CONFIRMS 个正交硬确认项：资金rejected/严重过热/老波/拥挤）
 - env 配置（COOLDOWN / EXIT_HEALTHY / MODE）
 
 与 MEG 正交：MEG 看单日板块 decay 断裂（snap），FTS 看家族级 endurance_band=topping_risk + 跨日 latch。
@@ -27,10 +27,12 @@ from src.got.schemas import (
 from src.got.nodes.aggregator import AggregatorNode
 
 
-def _endurance(name, band="topping_risk", warning_signals=None, tiers=None):
+def _endurance(name, band="topping_risk", warning_signals=None, tiers=None,
+               capital_stance="missing", max_overheat=0.0, crowded=False, wave_days=4):
     return MainlineEndurance(
-        name=name, wave_days=4, endurance_band=band,
+        name=name, wave_days=wave_days, endurance_band=band,
         warning_signals=warning_signals or [], tiers=tiers or {},
+        capital_stance=capital_stance, max_overheat=max_overheat, crowded=crowded,
     )
 
 
@@ -141,16 +143,59 @@ class TestSynthesizeFamilySuppression(unittest.TestCase):
                           _endurance("其他", band="inertia")], {})
         self.assertEqual(out, [])
 
-    # ── aggravated 判据 ──
-    def test_aggravated_when_break_signal(self):
+    # ── aggravated 判据（破位 + ≥1 硬确认）──
+    def test_aggravated_break_plus_capital_rejected(self):
+        """破位 + 资金 rejected → 1 硬确认 → aggravated（保留 20261009 医药立案）。"""
         out = self._call([_endurance("医药", warning_signals=[
-            "资金面未确认（rejected）", "破位信号（跌幅>3%或趋势下行）"])], {})
+            "资金面未确认（rejected）", "破位信号（跌幅>3%或趋势下行）"],
+            capital_stance="rejected")], {})
+        self.assertTrue(out[0].aggravated)
+
+    def test_break_without_confirm_not_aggravated(self):
+        """关键修正：仅破位、无任何正交硬确认 → 不 aggravated（旧判据会误判为加重）。"""
+        out = self._call([_endurance("医药", warning_signals=[
+            "无近期催化剂", "破位信号（跌幅>3%或趋势下行）"],
+            capital_stance="missing")], {})
+        self.assertFalse(out[0].aggravated)
+
+    def test_aggravated_break_plus_severe_overheat(self):
+        """破位 + 严重过热≥0.5 → aggravated。"""
+        out = self._call([_endurance("医药", warning_signals=[
+            "破位信号（跌幅>3%或趋势下行）", "严重过热（0.62）"],
+            max_overheat=0.62)], {})
+        self.assertTrue(out[0].aggravated)
+
+    def test_aggravated_break_plus_old_wave(self):
+        """破位 + 老波 wave_days≥6 → aggravated。"""
+        out = self._call([_endurance("医药", warning_signals=[
+            "破位信号（跌幅>3%或趋势下行）", "老波（wave_days=7）"],
+            wave_days=7)], {})
+        self.assertTrue(out[0].aggravated)
+
+    def test_aggravated_break_plus_crowded(self):
+        """破位 + 家族拥挤 → aggravated。"""
+        out = self._call([_endurance("医药", warning_signals=[
+            "破位信号（跌幅>3%或趋势下行）", "家族拥挤（≥3板块同族）"],
+            crowded=True)], {})
         self.assertTrue(out[0].aggravated)
 
     def test_not_aggravated_without_break(self):
+        """破位是必要条件：有硬确认但无破位 → 不 aggravated。"""
         out = self._call([_endurance("医药", warning_signals=[
-            "无近期催化剂", "资金面未确认（rejected）"])], {})
+            "资金面未确认（rejected）", "严重过热（0.70）"],
+            capital_stance="rejected", max_overheat=0.70)], {})
         self.assertFalse(out[0].aggravated)
+
+    def test_min_confirms_2_requires_two_confirms(self):
+        """MIN_CONFIRMS=2：破位+单确认不加重，破位+双确认才加重。"""
+        env = {"GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS": "2"}
+        single = self._call([_endurance("医药", warning_signals=[
+            "破位信号（跌幅>3%或趋势下行）"], capital_stance="rejected")], {}, env)
+        self.assertFalse(single[0].aggravated)
+        double = self._call([_endurance("医药", warning_signals=[
+            "破位信号（跌幅>3%或趋势下行）"],
+            capital_stance="rejected", crowded=True)], {}, env)
+        self.assertTrue(double[0].aggravated)
 
     # ── 持续 ──
     def test_persist_increments_days_suppressed(self):

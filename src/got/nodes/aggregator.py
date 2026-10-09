@@ -4333,14 +4333,17 @@ class AggregatorNode:
         - 今日非 topping + 前日已压 → days_healthy+=1, days_suppressed+=1；
           达 EXIT_HEALTHY（连续健康迟滞退出）或 COOLDOWN（最大锁定上限，防振荡永久锁）→ 释放
 
-        aggravated = warning_signals 含"破位信号"（唯一 +2 信号，代表顶部由"风险"转"确认"）：
-        Phase2 层B 对 aggravated 家族硬降 buy→watch，非 aggravated 仅层A 缩仓。
+        aggravated = 破位（顶部确认的必要条件）+ ≥GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS 个
+        正交硬确认项（资金 rejected / 严重过热≥0.5 / 老波≥6 / 拥挤）：Phase2 层B 对 aggravated
+        家族硬降 buy→watch，非 aggravated 仅层A 缩仓。（修正旧"含破位即加重"的分级塌缩）
         """
         from src.got.schemas import FamilySuppression
 
         cooldown = int(os.getenv("GOT_FAMILY_TOPPING_COOLDOWN", "5"))
         exit_healthy = int(os.getenv("GOT_FAMILY_TOPPING_EXIT_HEALTHY", "2"))
         mode = os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow")
+        # aggravated 硬确认门槛：破位之外还需 ≥N 个正交硬确认项（缺省 1，可收紧到 2）。
+        agg_min_confirms = int(os.getenv("GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS", "1"))
 
         today_endurance = {e.name: e for e in mainline_endurance}
         result: list = []
@@ -4349,7 +4352,22 @@ class AggregatorNode:
         for name, e in today_endurance.items():
             if e.endurance_band != "topping_risk":
                 continue
-            aggravated = any("破位信号" in s for s in (e.warning_signals or []))
+            # aggravated（Phase2 层B 硬降级 buy→watch 触发条件）= 破位（顶部确认的必要条件）
+            # + ≥agg_min_confirms 个正交硬确认项。修正原"含破位即加重"导致回测坐实
+            # aggravated 子集 == topping_risk 全集、层A(软)/层B(硬) 分级塌缩的问题。
+            # 硬确认项复用 MainlineEndurance 结构化字段（均随 unified.json 落盘，次日本地可读）：
+            #   资金 rejected（比 missing 更硬）/ 严重过热≥0.5 / 老波 wave_days≥6 / 家族拥挤。
+            _break = any("破位信号" in s for s in (e.warning_signals or []))
+            _confirms = 0
+            if getattr(e, "capital_stance", None) == "rejected":
+                _confirms += 1
+            if (getattr(e, "max_overheat", 0) or 0) >= 0.5:
+                _confirms += 1
+            if (getattr(e, "wave_days", 0) or 0) >= 6:
+                _confirms += 1
+            if getattr(e, "crowded", False):
+                _confirms += 1
+            aggravated = _break and _confirms >= agg_min_confirms
             members: list[str] = []
             for _tier_members in (e.tiers or {}).values():
                 members.extend(_tier_members)
