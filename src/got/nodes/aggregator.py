@@ -406,6 +406,20 @@ class AggregatorNode:
                 f"{[e.name for e in mainline_endurance]}"
             )
 
+        # ── 家族见顶持续压制（FTS）：消费 endurance_band=topping_risk + 跨日 latch ──
+        # 缺省 GOT_FAMILY_TOPPING_GATE_ENABLED=0 时不产台账（family_suppression=[]，逐字节不变）。
+        family_suppression = []
+        if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1":
+            _prev_suppression = self._load_previous_family_suppression()
+            family_suppression = self._synthesize_family_suppression(
+                mainline_endurance, _prev_suppression,
+            )
+            if family_suppression:
+                logger.info(
+                    f"[Node 6] 家族见顶压制(FTS): {len(family_suppression)} 个家族 — "
+                    f"{[(e.name, 'aggravated' if e.aggravated else 'soft', e.days_suppressed) for e in family_suppression]}"
+                )
+
         # ── 构建输出 ──
         data_quality = self._build_data_quality(market, sector, capital, news, sentiment, glue=glue)
         # P0-B B2: 护栏空转日志（lifecycle/crowded_families 等关键字段缺失时显式告警）
@@ -460,6 +474,7 @@ class AggregatorNode:
             ambush_veto_log=ambush_veto_log,
             crowded_families=getattr(sector, "crowded_families", []) or [],
             mainline_endurance=mainline_endurance,
+            family_suppression=family_suppression,
             cross_node_signals=cross_node_signals,
             # A6 阶段 2：资金背离诊断随规则模式退役，恒为 None（schema 字段保留）
             capital_divergence=None,
@@ -4275,6 +4290,103 @@ class AggregatorNode:
         )
 
         return endurance_list
+
+    @staticmethod
+    def _load_previous_family_suppression() -> dict[str, dict]:
+        """加载前日家族压制台账（FTS，从 data/got_daily/ 最近归档的 unified.json）。
+
+        照搬 `_load_previous_reservoir` 读法：`before=date.today()` 保证同日重跑读的是前一交易日，
+        days_suppressed 计数在同日多次运行下稳定不重复递增。
+
+        Returns:
+            {family_name: entry_dict}，失败/无归档返回空 dict。
+        """
+        import json
+        from src.got.archive import list_archive_dirs
+
+        date_dirs = list_archive_dirs(reverse=True, before=date.today())
+        for d in date_dirs:
+            unified_path = d / "unified.json"
+            if unified_path.exists():
+                try:
+                    with open(unified_path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    prev = data.get("family_suppression", []) or []
+                    return {e["name"]: e for e in prev if e.get("name")}
+                except Exception as e:
+                    logger.warning(f"[Node 6] 加载前日家族压制台账失败: {e}")
+                    return {}
+        return {}
+
+    @staticmethod
+    def _synthesize_family_suppression(
+        mainline_endurance: list,
+        prev_map: dict[str, dict],
+    ) -> list:
+        """合成家族见顶持续压制台账（FTS）。
+
+        与 MEG 正交、与大盘 regime 解耦：只消费 Node6 已算出的 endurance_band=topping_risk。
+
+        跨日 latch（days_suppressed = 连续处于压制台账的交易日数）：
+        - 今日 topping + 前日未压 → 新建 days_suppressed=0, days_healthy=0
+        - 今日 topping + 前日已压 → days_suppressed+=1, days_healthy=0（持续；actively topping 不因 COOLDOWN 释放）
+        - 今日非 topping + 前日已压 → days_healthy+=1, days_suppressed+=1；
+          达 EXIT_HEALTHY（连续健康迟滞退出）或 COOLDOWN（最大锁定上限，防振荡永久锁）→ 释放
+
+        aggravated = warning_signals 含"破位信号"（唯一 +2 信号，代表顶部由"风险"转"确认"）：
+        Phase2 层B 对 aggravated 家族硬降 buy→watch，非 aggravated 仅层A 缩仓。
+        """
+        from src.got.schemas import FamilySuppression
+
+        cooldown = int(os.getenv("GOT_FAMILY_TOPPING_COOLDOWN", "5"))
+        exit_healthy = int(os.getenv("GOT_FAMILY_TOPPING_EXIT_HEALTHY", "2"))
+        mode = os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow")
+
+        today_endurance = {e.name: e for e in mainline_endurance}
+        result: list = []
+
+        # ── 今日 topping_risk 的家族：进入/持续压制 ──
+        for name, e in today_endurance.items():
+            if e.endurance_band != "topping_risk":
+                continue
+            aggravated = any("破位信号" in s for s in (e.warning_signals or []))
+            members: list[str] = []
+            for _tier_members in (e.tiers or {}).values():
+                members.extend(_tier_members)
+            prev = prev_map.get(name)
+            days_suppressed = (prev.get("days_suppressed", 0) + 1) if prev else 0
+            result.append(FamilySuppression(
+                name=name,
+                endurance_band="topping_risk",
+                aggravated=aggravated,
+                warning_signals=list(e.warning_signals or []),
+                members=members,
+                days_suppressed=days_suppressed,
+                days_healthy=0,
+                mode=mode,
+            ))
+
+        # ── 前日已压制、今日不再 topping 的家族：latch 释放判定 ──
+        for name, prev in prev_map.items():
+            today_e = today_endurance.get(name)
+            if today_e is not None and today_e.endurance_band == "topping_risk":
+                continue  # 已在上一步处理
+            new_suppressed = int(prev.get("days_suppressed", 0)) + 1
+            new_healthy = int(prev.get("days_healthy", 0)) + 1
+            if new_healthy >= exit_healthy or new_suppressed >= cooldown:
+                continue  # 释放：连续健康达标 或 触最大锁定上限
+            result.append(FamilySuppression(
+                name=name,
+                endurance_band=prev.get("endurance_band", "topping_risk"),
+                aggravated=bool(prev.get("aggravated", False)),
+                warning_signals=list(prev.get("warning_signals", []) or []),
+                members=list(prev.get("members", []) or []),
+                days_suppressed=new_suppressed,
+                days_healthy=new_healthy,
+                mode=mode,
+            ))
+
+        return result
 
     @staticmethod
     def _has_critical(temporal: list[TemporalInconsistency]) -> bool:

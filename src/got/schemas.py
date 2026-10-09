@@ -926,6 +926,27 @@ class MainlineEndurance(BaseModel):
     exit_watch: str = Field(default="", description="次日观察点（如'RRG 翻 weakening 即离场信号'）")
 
 
+class FamilySuppression(BaseModel):
+    """家族见顶持续压制台账（FTS，Family Topping Suppression）。
+
+    与 MEG 正交：MEG 看单日板块 decay 断裂（snap），FTS 看家族级多信号累积见顶
+    （endurance_band=topping_risk），并带跨日 latch 实现"持续压制"。
+    由 Node 6 消费 MainlineEndurance 合成，随 UnifiedContext 落 unified.json，次日本人读回做 latch。
+    缺省 GOT_FAMILY_TOPPING_GATE_ENABLED=0 时不产台账（字段为空，逐字节不变）。
+    """
+    name: str = Field(..., description="家族/主线组名（与 endurance.name 对齐，亦即 frame_group）")
+    endurance_band: str = Field(default="topping_risk", description="触发压制的续航区间（topping_risk）")
+    aggravated: bool = Field(
+        default=False,
+        description="是否加重（warning_signals 含破位信号）：True 时 Phase2 层B 硬降 buy→watch，False 仅层A 缩仓",
+    )
+    warning_signals: list[str] = Field(default_factory=list, description="触发时的警示信号快照")
+    members: list[str] = Field(default_factory=list, description="家族成员板块名（供 join/调试）")
+    days_suppressed: int = Field(default=0, description="已连续被压制交易日数（latch 计数）")
+    days_healthy: int = Field(default=0, description="转健康后连续日数（达 EXIT_HEALTHY 提前释放）")
+    mode: str = Field(default="shadow", description="当日 FTS 模式快照：shadow / veto")
+
+
 class UnifiedContext(BaseModel):
     """Node 6 输出：GOT 最终输出（v3 分层架构）"""
     status: str = Field(..., description="normal / manual_review_required")
@@ -995,6 +1016,11 @@ class UnifiedContext(BaseModel):
     mainline_endurance: list[MainlineEndurance] = Field(
         default_factory=list,
         description="主线家族续航评估（对 active_mainline 家族逐一生成，警示分档+观察点）",
+    )
+    # ── 家族见顶持续压制台账（FTS：Node6 产出带跨日 latch，Phase2 分级消费）──
+    family_suppression: list[FamilySuppression] = Field(
+        default_factory=list,
+        description="被压制家族台账（topping_risk + 跨日 latch）；缺省 GOT_FAMILY_TOPPING_GATE_ENABLED=0 时为空",
     )
 
     # ── 跨节点时间线共振（v2.1 Phase 6）──
