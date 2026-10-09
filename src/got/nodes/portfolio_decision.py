@@ -59,6 +59,11 @@ class PortfolioDecisionNode:
         # 两条线的「跑没跑 / 为什么没跑 / 跑了得到什么」都记在这里，run() 末尾落盘。
         self._shadow_t1: Dict[str, Any] = {}
         self._shadow_t1h: Dict[str, Any] = {}
+        # MEG 动能衰竭门影子留痕（§7.7，仅 GOT_MOM_EXHAUST_GATE_ENABLED=1 时落 shadow_meg.json）：
+        # 层2 逐股拦截清单 / 层3 逐板块降仓清单 / 汇总 dict（供 reasoning.md 🧪 段渲染）。
+        self._meg_action_flags: list = []
+        self._meg_sizing_flags: list = []
+        self._meg_shadow: Dict[str, Any] = {}
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
@@ -357,6 +362,7 @@ class PortfolioDecisionNode:
         for candidate in unified.ambush_pool:
             ambush_type_map[candidate.sector_name] = candidate.category_tag
 
+        self._meg_sizing_flags = []  # 每次重算重置（观测用，避免重复调用叠加）
         sector_limits = {}
         if unified.confirmed_sectors:
             regime_m = REGIME_MULTIPLIER.get(regime, 0.65)
@@ -376,6 +382,30 @@ class PortfolioDecisionNode:
                     base = 0.0
                 else:  # fallback
                     base = 0.10
+
+                # ── MEG 层3仓位缩放（§7.5）：acceleration + snap → base 降到 caution 档 ──
+                # 波动率管理式缩放（Moreira-Muir/Barroso-Santa-Clara）：衰竭时缩暴露而非清仓。
+                # 缺省 off 不变；shadow 仅留痕；veto 生效。与层2正交（层2改 action，层3改仓位）。
+                if (
+                    os.getenv("GOT_MOM_EXHAUST_GATE_ENABLED", "0") == "1"
+                    and os.getenv("GOT_MOM_EXHAUST_SIZING", "1") == "1"
+                    and getattr(sector_intel, "momentum_state", None) == "snap"
+                    and (sector_intel.lifecycle.phase if sector_intel.lifecycle else None) == "acceleration"
+                ):
+                    _caution_base = 0.12 if role == "mainline" else 0.06
+                    if base > _caution_base:
+                        _szm = os.getenv("GOT_MOM_EXHAUST_MODE", "shadow")
+                        self._meg_sizing_flags.append({
+                            "sector_name": sector_name,
+                            "decay_2d": getattr(sector_intel, "rs_mom_decay_2d", None),
+                            "role": role, "base_before": round(base, 3),
+                            "base_wouldbe": _caution_base, "mode": _szm,
+                        })
+                        if _szm == "veto":
+                            logger.info(f"[MEG-veto-sizing] {sector_name} snap+accel base {base:.2f}→{_caution_base:.2f}")
+                            base = _caution_base
+                        else:
+                            logger.info(f"[MEG-shadow-sizing] {sector_name} snap+accel 本应 base {base:.2f}→{_caution_base:.2f}（未生效）")
 
                 # P4 催化剂类型系数：仅对埋伏板块生效
                 catalyst_coeff = 1.0
@@ -592,6 +622,7 @@ class PortfolioDecisionNode:
                 symbol, unified,
                 sector_strength_map=sector_strength_map,
                 strength_lookup=strength_lookup,
+                frame_group_lookup=frame_group_lookup,
             )
             sector_name = stock_sector_info.get("sector_name", "")
             holding_candidates.append({
@@ -621,6 +652,7 @@ class PortfolioDecisionNode:
             name = self._resolve_holding_name(symbol, position.get("name", symbol))
             pnl_pct = position.get("unrealized_pnl_pct", 0.0) or 0.0
             pnl_pct_decimal = pnl_pct / 100.0
+            reasoning = ""  # 初始化 reasoning 变量，避免后续 += 操作时 UnboundLocalError
 
             # ── C-B1/B3：本只持仓 HWM 回撤与持有天数（追踪仅用于非埋伏主线分支）──
             _hwm_info = hwm_map.get(symbol)
@@ -1048,6 +1080,8 @@ class PortfolioDecisionNode:
                 'lifecycle_day': lifecycle_day,
                 'overheat_severity': getattr(sector_intel, 'overheat_severity', None),
                 'frame_group': getattr(sector_intel, 'frame_group', None),
+                'momentum_state': getattr(sector_intel, 'momentum_state', None),
+                'rs_mom_decay_2d': getattr(sector_intel, 'rs_mom_decay_2d', None),
             }
 
         return sector_intel_map
@@ -3303,7 +3337,12 @@ class PortfolioDecisionNode:
         目录基准取「运行日期」，与 aggregator._save_glue_result 一致；
         Phase 2 只在生产运行（--got-replay 不经过 Phase 2），故 today() 可靠。
         """
-        if not (self._shadow_t1 or self._shadow_t1h):
+        meg = dict(self._meg_shadow) if self._meg_shadow else None
+        if meg:
+            meg["flagged_sectors"] = list(self._meg_sizing_flags)
+            meg["sizing_hits"] = len(self._meg_sizing_flags)
+            meg["action_hits"] = len(meg.get("flagged_stocks", []))
+        if not (self._shadow_t1 or self._shadow_t1h or meg):
             return
         day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
         try:
@@ -3311,6 +3350,7 @@ class PortfolioDecisionNode:
             for filename, record in (
                 ("shadow_t1.json", self._shadow_t1),
                 ("shadow_t1h.json", self._shadow_t1h),
+                ("shadow_meg.json", meg),
             ):
                 if record:
                     (day_dir / filename).write_text(
@@ -3745,6 +3785,7 @@ verdict 含义：
         _bear_day_gate = _bear_gate_on and _node1_regime == "bear"
         _bear_dip_mode = os.getenv("GOT_BEAR_DIP_MODE", "veto")  # veto=降 watch / soft=仅乘性降权保留
         _bear_gate_hits = 0
+        self._meg_action_flags = []  # 每轮重算重置（观测用）
         for stock in finalists:
             # 查找股票所属板块（从 stock 的 sector_name 字段）
             # 2026-08-18 修复：ScreenerStock 的属性是 sector_name，不是 sector
@@ -3807,11 +3848,15 @@ verdict 含义：
             # 提取生命周期信息
             lifecycle_phase = None
             lifecycle_day = None
+            momentum_state = None
+            rs_mom_decay_2d = None
             family_name = None
             if stock_sector and stock_sector in sector_intel_map:
                 intel = sector_intel_map[stock_sector]
                 lifecycle_phase = intel.get('lifecycle_phase')
                 lifecycle_day = intel.get('lifecycle_day')
+                momentum_state = intel.get('momentum_state')
+                rs_mom_decay_2d = intel.get('rs_mom_decay_2d')
 
             # 使用生命周期优先级排序（吃鱼身+高切低策略）
             lifecycle_priority = self._lifecycle_priority_score(
@@ -3892,6 +3937,31 @@ verdict 含义：
                         _bear_gate_hits += 1
                         base_reasoning += f" [Node1=bear 收手闸门: buy_dip 软降权×{_soft}(soft)]"
 
+            # ── MEG 动能衰竭门（§7.4 层2）：acceleration + snap → buy_trend 硬降级 ──
+            # 回测证真（§7.8.1）：snap-thrust T+5 超额差 -2.54%（p=0.001），立案案例 880952 芯片 9/23 命中 -9.41%。
+            # 非对称：只拦最激进的 buy_trend；缺省 off 态逐字节不变；shadow 仅留痕不改 action；veto 硬降 watch。
+            # 与 bear 门叠加：上游已打 watch 则 action=="buy_trend" 为假，自然不重复触发。
+            if (
+                os.getenv("GOT_MOM_EXHAUST_GATE_ENABLED", "0") == "1"
+                and lifecycle_phase == "acceleration"
+                and momentum_state == "snap"
+                and action == "buy_trend"
+            ):
+                _meg_mode = os.getenv("GOT_MOM_EXHAUST_MODE", "shadow")
+                _meg_decay = f"{rs_mom_decay_2d:.0%}" if rs_mom_decay_2d is not None else "NA"
+                self._meg_action_flags.append({
+                    "symbol": stock.code, "name": stock.name, "sector": stock_sector,
+                    "decay_2d": rs_mom_decay_2d, "mode": _meg_mode,
+                    "action_before": "buy_trend", "action_wouldbe": "watch",
+                })
+                if _meg_mode == "veto":
+                    action = "watch"
+                    base_reasoning += f" [MEG动能衰竭门: RS-Mom两日断裂{_meg_decay}, buy_trend→watch]"
+                    logger.info(f"[MEG-veto] {stock.code} {stock.name} 板块={stock_sector} decay_2d={_meg_decay} buy_trend→watch")
+                else:  # shadow：仅留痕，不改 action（上线前观测命中率/假阳性）
+                    base_reasoning += f" [MEG影子: 本应 buy_trend→watch, RS-Mom断裂{_meg_decay}]"
+                    logger.info(f"[MEG-shadow] {stock.code} {stock.name} 板块={stock_sector} decay_2d={_meg_decay} 本应 buy_trend→watch（未生效）")
+
             # 板块分类（用于输出可观测性）
             sector_classification = None
             if stock_sector and stock_sector in sector_intel_map:
@@ -3944,6 +4014,18 @@ verdict 含义：
                 f"[Phase 2] Node1=bear 收手闸门命中 {_bear_gate_hits} 单"
                 f"（dip_mode={_bear_dip_mode}，埋伏来源已豁免）"
             )
+
+        # MEG 影子留痕汇总（§7.7）：仅启用时落 self._meg_shadow，供 _save_shadow_records 写盘。
+        # 层3 sizing 由 _assess_risk 落 self._meg_sizing_flags，在 _save_shadow_records 合并。
+        if os.getenv("GOT_MOM_EXHAUST_GATE_ENABLED", "0") == "1":
+            self._meg_shadow = {
+                "line": "meg", "executed": True,
+                "mode": os.getenv("GOT_MOM_EXHAUST_MODE", "shadow"),
+                "sizing": os.getenv("GOT_MOM_EXHAUST_SIZING", "1") == "1",
+                "decay_th": os.getenv("GOT_MOM_EXHAUST_DECAY", "-0.30"),
+                "evaluated": len(finalists),
+                "flagged_stocks": list(self._meg_action_flags),
+            }
 
         return results
 

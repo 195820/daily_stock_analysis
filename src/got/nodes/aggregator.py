@@ -1896,6 +1896,8 @@ class AggregatorNode:
             reasoning=reasoning,
             overheat_severity=overheat_severity,
             frame_group=frame_group,
+            momentum_state=getattr(detail, "momentum_state", None) if detail else None,
+            rs_mom_decay_2d=getattr(detail, "rs_mom_decay_2d", None) if detail else None,
         )
 
     def _classify_all_sectors(

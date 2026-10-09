@@ -1322,6 +1322,9 @@ class SectorAnalysisNode:
                 if fail_count == 1:
                     near_miss = fail_list
 
+        # MEG 层1信号：动能衰竭三态（§7.3，零新增数据——复用 prev_trend.momentum_trajectory）
+        momentum_state, rs_mom_decay_2d = self._compute_momentum_state(rrg, prev_trend)
+
         return SectorDetail(
             code=sector_info["code"],
             name=sector_info["name"],
@@ -1337,6 +1340,8 @@ class SectorAnalysisNode:
             frame_group=sector_info.get("frame_group"),
             overheat_severity=overheat.severity,
             rrg=rrg,
+            momentum_state=momentum_state,
+            rs_mom_decay_2d=rs_mom_decay_2d,
             near_miss_conditions=near_miss,
             exit_pressure_days=exit_pressure_days,
             break_signals=break_signals,
@@ -1579,6 +1584,41 @@ class SectorAnalysisNode:
             rs_ratio_raw=round(rs_ratio, 3),
             rs_momentum_raw=round(rs_momentum, 3),
         )
+
+    @staticmethod
+    def _compute_momentum_state(
+        rrg: Optional[RRGQuadrant],
+        prev_trend: Optional[dict],
+    ) -> tuple[Optional[str], Optional[float]]:
+        """MEG 动能衰竭三态（§7.3 层1信号）。
+
+        decay_2d = (ema[t] - ema[t-2]) / ema[t-2]，与回测口径完全一致（DB 连续 rrg_momentum_ema）：
+        - ema[t]   = rrg.rs_momentum（_compute_rrg 刚算的当日 3 日 EMA 平滑值）
+        - ema[t-1] = prev_trend['momentum_trajectory'][-1]
+        - ema[t-2] = prev_trend['momentum_trajectory'][-2]（_load_all_sector_trends 已 limit(7) 载入）
+        三态：snap(decay_2d≤阈值) / stall(ema[t]<ema[t-1]) / thrust(其余)。
+        数据不足（无 t-2）返回 (None, None)，下游门自动豁免 → 缺省零行为变化。
+
+        回测证真（2026-10-08，§7.8.1）：acceleration+snap 板块 T+5 横截面超额 -3.07%、
+        snap-thrust 差 -2.54%（Welch t=-3.28, p=0.001），立案案例 880952 芯片 9/23 命中 -9.41%。
+        """
+        if rrg is None:
+            return None, None
+        ema_t = getattr(rrg, "rs_momentum", None)
+        traj = (prev_trend or {}).get("momentum_trajectory") or []
+        ema_t2 = traj[-2] if len(traj) >= 2 else None
+        ema_t1 = traj[-1] if len(traj) >= 1 else None
+        if ema_t is None or ema_t2 is None or ema_t2 == 0:
+            return None, None
+        decay_2d = (ema_t - ema_t2) / ema_t2
+        decay_th = float(os.getenv("GOT_MOM_EXHAUST_DECAY", "-0.30"))
+        if decay_2d <= decay_th:
+            state = "snap"
+        elif ema_t1 is not None and ema_t < ema_t1:
+            state = "stall"
+        else:
+            state = "thrust"
+        return state, round(decay_2d, 3)
 
     # =================================================================
     # 启动信号: 3 硬门槛 + 5 维加权（Node 2 v3: 降级为诊断指标）

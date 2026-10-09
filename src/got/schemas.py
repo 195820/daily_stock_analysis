@@ -327,6 +327,15 @@ class SectorDetail(BaseModel):
         default=None,
         description="RRG 四象限分类（Node 2 v3 状态机核心）",
     )
+    # ── MEG 动能衰竭三态（§7.3 层1信号，2026-10-08 回测证真后新增）──
+    momentum_state: Optional[str] = Field(
+        default=None,
+        description="动能衰竭三态：snap(两日断裂)/stall(滞涨)/thrust(推进)，基于 rrg_momentum_ema 两日衰减率",
+    )
+    rs_mom_decay_2d: Optional[float] = Field(
+        default=None,
+        description="RS-Momentum EMA 两日衰减率 (ema[t]-ema[t-2])/ema[t-2]，≤-0.30 判 snap",
+    )
     near_miss_conditions: Optional[list[str]] = Field(
         default=None,
         description="埋伏近失条件列表（差 1 条通过埋伏闸门时填充，供 Node 6 蓄水池观察）",
@@ -762,6 +771,9 @@ class SectorIntel(BaseModel):
     sentiment_detail: str = Field(default="", description="散户热度细节")
     # ── 生命周期 ─
     lifecycle: Optional[LifecycleInfo] = Field(default=None, description="生命周期信息（来自 Node 2）")
+    # ── MEG 动能衰竭三态（§7.3，透传自 Node 2 SectorDetail，2026-10-08 回测证真后新增）──
+    momentum_state: Optional[str] = Field(default=None, description="snap/stall/thrust（Node 2 动能衰竭三态）")
+    rs_mom_decay_2d: Optional[float] = Field(default=None, description="RS-Momentum EMA 两日衰减率（≤-0.30 判 snap）")
     # ── 聚合 ──
     composite_score: float = Field(default=0.0, ge=0.0, le=100.0, description="综合评分（lifecycle-aware）")
     confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="数据完整度 × 信号一致性")
