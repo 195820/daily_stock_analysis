@@ -64,6 +64,11 @@ class PortfolioDecisionNode:
         self._meg_action_flags: list = []
         self._meg_sizing_flags: list = []
         self._meg_shadow: Dict[str, Any] = {}
+        # FTS 家族见顶持续压制门影子留痕（仅 GOT_FAMILY_TOPPING_GATE_ENABLED=1 时落 shadow_fts.json）：
+        # 层B 逐股硬降清单 / 层A 逐板块缩仓清单 / 汇总 dict（供 reasoning.md 渲染）。
+        self._fts_action_flags: list = []
+        self._fts_sizing_flags: list = []
+        self._fts_shadow: Dict[str, Any] = {}
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
@@ -363,6 +368,14 @@ class PortfolioDecisionNode:
             ambush_type_map[candidate.sector_name] = candidate.category_tag
 
         self._meg_sizing_flags = []  # 每次重算重置（观测用，避免重复调用叠加）
+        self._fts_sizing_flags = []  # FTS 层A 缩仓留痕，每次重算重置
+        # FTS 家族见顶压制：family_name → FamilySuppression（缺省 ENABLED=0 时 unified.family_suppression 为空）
+        _fts_on = os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1"
+        _fts_sizing_on = _fts_on and os.getenv("GOT_FAMILY_TOPPING_SIZING", "1") == "1"
+        _fts_mode = os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow")
+        family_suppression_map = {
+            fs.name: fs for fs in (getattr(unified, "family_suppression", None) or [])
+        }
         sector_limits = {}
         if unified.confirmed_sectors:
             regime_m = REGIME_MULTIPLIER.get(regime, 0.65)
@@ -406,6 +419,25 @@ class PortfolioDecisionNode:
                             base = _caution_base
                         else:
                             logger.info(f"[MEG-shadow-sizing] {sector_name} snap+accel 本应 base {base:.2f}→{_caution_base:.2f}（未生效）")
+
+                # ── FTS 层A 缩仓（家族见顶持续压制）：frame_group ∈ 被压制家族 → base 降到 caution 档 ──
+                # 与 MEG 层3 同构（波动率管理式缩放），但触发源是家族级 endurance_band=topping_risk（含跨日 latch），
+                # 与大盘 regime 解耦。缺省 off 不变；shadow 仅留痕；veto 生效。与 MEG 层3 叠加时取更低 base。
+                _fg = getattr(sector_intel, "frame_group", None)
+                if _fts_sizing_on and _fg and _fg in family_suppression_map:
+                    _fts_caution_base = 0.12 if role == "mainline" else 0.06
+                    if base > _fts_caution_base:
+                        self._fts_sizing_flags.append({
+                            "sector_name": sector_name, "family": _fg,
+                            "role": role, "base_before": round(base, 3),
+                            "base_wouldbe": _fts_caution_base, "mode": _fts_mode,
+                            "days_suppressed": family_suppression_map[_fg].days_suppressed,
+                        })
+                        if _fts_mode == "veto":
+                            logger.info(f"[FTS-veto-sizing] {sector_name}(家族{_fg}) base {base:.2f}→{_fts_caution_base:.2f}")
+                            base = _fts_caution_base
+                        else:
+                            logger.info(f"[FTS-shadow-sizing] {sector_name}(家族{_fg}) 本应 base {base:.2f}→{_fts_caution_base:.2f}（未生效）")
 
                 # P4 催化剂类型系数：仅对埋伏板块生效
                 catalyst_coeff = 1.0
@@ -3342,7 +3374,12 @@ class PortfolioDecisionNode:
             meg["flagged_sectors"] = list(self._meg_sizing_flags)
             meg["sizing_hits"] = len(self._meg_sizing_flags)
             meg["action_hits"] = len(meg.get("flagged_stocks", []))
-        if not (self._shadow_t1 or self._shadow_t1h or meg):
+        fts = dict(self._fts_shadow) if self._fts_shadow else None
+        if fts:
+            fts["flagged_sectors"] = list(self._fts_sizing_flags)
+            fts["sizing_hits"] = len(self._fts_sizing_flags)
+            fts["action_hits"] = len(fts.get("flagged_stocks", []))
+        if not (self._shadow_t1 or self._shadow_t1h or meg or fts):
             return
         day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
         try:
@@ -3351,6 +3388,7 @@ class PortfolioDecisionNode:
                 ("shadow_t1.json", self._shadow_t1),
                 ("shadow_t1h.json", self._shadow_t1h),
                 ("shadow_meg.json", meg),
+                ("shadow_fts.json", fts),
             ):
                 if record:
                     (day_dir / filename).write_text(
@@ -3786,6 +3824,13 @@ verdict 含义：
         _bear_dip_mode = os.getenv("GOT_BEAR_DIP_MODE", "veto")  # veto=降 watch / soft=仅乘性降权保留
         _bear_gate_hits = 0
         self._meg_action_flags = []  # 每轮重算重置（观测用）
+        self._fts_action_flags = []  # FTS 层B 硬降留痕，每轮重算重置
+        # FTS 家族见顶持续压制（层B）：family_name → FamilySuppression（缺省 ENABLED=0 时为空）
+        _fts_gate_on = os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1"
+        _fts_gate_mode = os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow")
+        _fts_suppression_map = {
+            fs.name: fs for fs in (getattr(unified_context, "family_suppression", None) or [])
+        }
         for stock in finalists:
             # 查找股票所属板块（从 stock 的 sector_name 字段）
             # 2026-08-18 修复：ScreenerStock 的属性是 sector_name，不是 sector
@@ -3857,6 +3902,7 @@ verdict 含义：
                 lifecycle_day = intel.get('lifecycle_day')
                 momentum_state = intel.get('momentum_state')
                 rs_mom_decay_2d = intel.get('rs_mom_decay_2d')
+                family_name = intel.get('frame_group')  # FTS 层B join key（与 Node6 endurance.name 对齐）
 
             # 使用生命周期优先级排序（吃鱼身+高切低策略）
             lifecycle_priority = self._lifecycle_priority_score(
@@ -3962,6 +4008,32 @@ verdict 含义：
                     base_reasoning += f" [MEG影子: 本应 buy_trend→watch, RS-Mom断裂{_meg_decay}]"
                     logger.info(f"[MEG-shadow] {stock.code} {stock.name} 板块={stock_sector} decay_2d={_meg_decay} 本应 buy_trend→watch（未生效）")
 
+            # ── FTS 家族见顶持续压制门（层B）：家族被压制 + aggravated + buy → watch 硬降级 ──
+            # 触发源=Node6 家族级 endurance_band=topping_risk（+跨日 latch），与大盘 regime 解耦、与 MEG 正交。
+            # 非对称：只压新开买入；aggravated(含破位信号)才硬降，非 aggravated 仅层A 缩仓（在 _assess_risk）。
+            # 缺省 off 逐字节不变；shadow 仅留痕；veto 生效。与 bear/MEG 门叠加：上游已 watch 则 startswith(buy) 为假自然不重复触发。
+            if (
+                _fts_gate_on
+                and family_name
+                and family_name in _fts_suppression_map
+                and _fts_suppression_map[family_name].aggravated
+                and action.startswith("buy")
+            ):
+                _fts_fs = _fts_suppression_map[family_name]
+                self._fts_action_flags.append({
+                    "symbol": stock.code, "name": stock.name, "sector": stock_sector,
+                    "family": family_name, "aggravated": True, "mode": _fts_gate_mode,
+                    "days_suppressed": _fts_fs.days_suppressed,
+                    "action_before": action, "action_wouldbe": "watch",
+                })
+                if _fts_gate_mode == "veto":
+                    action = "watch"
+                    base_reasoning += f" [FTS家族见顶压制: {family_name} topping_risk+破位(压制第{_fts_fs.days_suppressed}日), buy→watch]"
+                    logger.info(f"[FTS-veto] {stock.code} {stock.name} 家族={family_name} buy→watch")
+                else:  # shadow：仅留痕，不改 action
+                    base_reasoning += f" [FTS影子: 本应 buy→watch, 家族{family_name}见顶+破位(压制第{_fts_fs.days_suppressed}日)]"
+                    logger.info(f"[FTS-shadow] {stock.code} {stock.name} 家族={family_name} 本应 buy→watch（未生效）")
+
             # 板块分类（用于输出可观测性）
             sector_classification = None
             if stock_sector and stock_sector in sector_intel_map:
@@ -4025,6 +4097,22 @@ verdict 含义：
                 "decay_th": os.getenv("GOT_MOM_EXHAUST_DECAY", "-0.30"),
                 "evaluated": len(finalists),
                 "flagged_stocks": list(self._meg_action_flags),
+            }
+
+        # FTS 影子留痕汇总：仅启用时落 self._fts_shadow，供 _save_shadow_records 写盘。
+        # 层A sizing 由 _assess_risk 落 self._fts_sizing_flags，在 _save_shadow_records 合并。
+        if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1":
+            self._fts_shadow = {
+                "line": "fts", "executed": True,
+                "mode": os.getenv("GOT_FAMILY_TOPPING_MODE", "shadow"),
+                "sizing": os.getenv("GOT_FAMILY_TOPPING_SIZING", "1") == "1",
+                "suppressed_families": [
+                    {"name": fs.name, "aggravated": fs.aggravated,
+                     "days_suppressed": fs.days_suppressed, "days_healthy": fs.days_healthy}
+                    for fs in (getattr(unified_context, "family_suppression", None) or [])
+                ],
+                "evaluated": len(finalists),
+                "flagged_stocks": list(self._fts_action_flags),
             }
 
         return results

@@ -724,6 +724,7 @@ GLUE_ARTIFACT = "agent_glue.json"
 SHADOW_T1_ARTIFACT = "shadow_t1.json"
 SHADOW_T1H_ARTIFACT = "shadow_t1h.json"
 SHADOW_MEG_ARTIFACT = "shadow_meg.json"
+SHADOW_FTS_ARTIFACT = "shadow_fts.json"
 
 
 def _shadow_display_name(name: str, symbol: str) -> str:
@@ -1014,6 +1015,49 @@ def _render_shadow_meg(meg: "dict | None") -> list[str]:
     return lines
 
 
+def _render_shadow_fts(fts: "dict | None") -> list[str]:
+    """FTS 家族见顶持续压制门（影子）：层B 逐股 buy→watch / 层A 逐板块缩仓。
+
+    仅当 shadow_fts.json 存在（GOT_FAMILY_TOPPING_GATE_ENABLED=1）才渲染；
+    缺省 off 态无产物 → 返回 []（reasoning.md 逐字节不变）。
+    触发源：Node6 家族级 endurance_band=topping_risk（+跨日 latch），与大盘 regime 解耦、与 MEG 正交。
+    """
+    if not fts:
+        return []
+    mode = fts.get("mode", "shadow")
+    evaluated = fts.get("evaluated", 0)
+    flagged = fts.get("flagged_stocks") or []
+    sectors = fts.get("flagged_sectors") or []
+    families = fts.get("suppressed_families") or []
+    verb = "已降级" if mode == "veto" else "本应降级（未生效）"
+    tag = "影子，只留痕" if mode != "veto" else "veto，已生效"
+    _fam_txt = "、".join(
+        f"{f.get('name')}" + ("(破位)" if f.get("aggravated") else "")
+        + f"[压制第{f.get('days_suppressed', 0)}日]"
+        for f in families
+    ) or "无"
+    lines = [
+        f"**FTS 家族见顶持续压制门**（{tag}，mode=`{mode}`）：被压制家族 {_fam_txt}；"
+        f"评估 {evaluated} 只候选，层B 命中 {len(flagged)} 只（buy→watch {verb}），层A 缩仓命中 {len(sectors)} 板块。"
+    ]
+    if flagged:
+        for f in flagged:
+            lines.append(
+                f"- **{_shadow_display_name(f.get('name'), f.get('symbol'))}**：板块={f.get('sector')} "
+                f"家族={f.get('family')}（见顶+破位，压制第{f.get('days_suppressed', 0)}日） "
+                f"{f.get('action_before')}→{f.get('action_wouldbe')}"
+            )
+    else:
+        lines.append("- 层B 本次无 aggravated 家族的新开买入被拦。")
+    for s in sectors:
+        lines.append(
+            f"- 层A 板块 **{s.get('sector_name')}**（家族{s.get('family')}）："
+            f"base {s.get('base_before')}→{s.get('base_wouldbe')}（{s.get('role')}）"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_shadow_section(
     *,
     glue: "dict | None",
@@ -1023,6 +1067,7 @@ def _render_shadow_section(
     unified: "dict | None" = None,
     sell_source_shadow: "dict | None" = None,
     meg_shadow: "dict | None" = None,
+    fts_shadow: "dict | None" = None,
 ) -> list[str]:
     """渲染「影子模式观测」段（reasoning.md 末尾，五条影子线各一段）。
 
@@ -1035,6 +1080,7 @@ def _render_shadow_section(
     lines += _render_shadow_disagreement(unified)
     lines += _render_shadow_sell_source(sell_source_shadow)
     lines += _render_shadow_meg(meg_shadow)
+    lines += _render_shadow_fts(fts_shadow)
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _render_shadow_t1h(t1h)
@@ -1131,6 +1177,7 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         unified=_unified_json,
         sell_source_shadow=_pd_json.get("sell_source_shadow"),
         meg_shadow=_read_json_quiet(day_dir / SHADOW_MEG_ARTIFACT),
+        fts_shadow=_read_json_quiet(day_dir / SHADOW_FTS_ARTIFACT),
     )
 
     reasoning_path.write_text("\n".join(lines), encoding="utf-8")
