@@ -157,5 +157,58 @@ class TestMaybeCaptureFxgBaseline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diag.get("exclude_enabled_after"), "1")
 
 
+async def _passthrough_verify(self_node, finalists, sector_intel_map):
+    return finalists
+
+
+# ────────── 集成冒烟：真实 _score_candidates（仅 mock 问财/校验器）经 helper 跑通 ──────────
+class TestFxgBaselineIntegrationSmoke(unittest.IsolatedAsyncioTestCase):
+    """不 mock _score_candidates 本身，只 mock 外部 I/O，验证独立实例 standalone 调用真能跑通、
+    落 fxg_baseline_scoring.json、不产 candidate_pool、env 隔离并复原。"""
+
+    async def test_helper_drives_real_score_candidates(self):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        from src.got.orchestrator import GOTOrchestrator
+        from tests.test_family_topping_suppression import (
+            _make_stock, _make_unified, _make_sector_ctx, _make_capital, _make_news,
+            _make_sentiment, _market_with_regime, _intel_fxg, _fs_full,
+        )
+
+        stock = _make_stock(code="600000", name="浦发银行", sector_name="半导体")
+        screener_mock = MagicMock()
+        screener_mock._extract_got_universe.return_value = [{"code": stock.code}]
+        screener_mock._filter_got_finalists.return_value = [stock]
+
+        intel = {"创新药": _intel_fxg(), "半导体": _intel_fxg(family="半导体")}
+        unified = _make_unified(family_suppression=[_fs_full(members=["创新药"])])
+        orch = GOTOrchestrator.__new__(GOTOrchestrator)
+
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, _FULL), \
+             patch("src.services.stock_screener.StockScreenerPipeline", return_value=screener_mock), \
+             patch.object(PortfolioDecisionNode, "_build_sector_intel_map", lambda self, uc: intel), \
+             patch.object(PortfolioDecisionNode, "_adjust_score_by_sector_intel", lambda self, b, n, mm: b), \
+             patch.object(PortfolioDecisionNode, "_compute_overheat_penalty", lambda self, n, mm, uc: 1.0), \
+             patch.object(PortfolioDecisionNode, "_collect_shadow_t1", lambda self, f: None), \
+             patch.object(PortfolioDecisionNode, "_verify_candidate_sectors", _passthrough_verify):
+            os.chdir(d)
+            try:
+                await orch._maybe_capture_fxg_baseline(
+                    unified, _market_with_regime("transition"), _make_sector_ctx(),
+                    _make_capital(), _make_news(), _make_sentiment(), date(2026, 10, 10))
+                p = Path("data/got_daily/20261010") / "fxg_baseline_scoring.json"
+                self.assertTrue(p.exists())
+                rec = json.loads(p.read_text(encoding="utf-8"))
+                self.assertEqual(rec["mode"], "baseline_off")
+                self.assertGreaterEqual(len(rec["rows"]), 1)
+                # 基线不产/不 clobber 正式 candidate_pool.json
+                self.assertFalse((p.parent / "candidate_pool.json").exists())
+                # 基线跑后 EXCLUDE_ENABLED 已复原为 1（不泄漏给真实 run）
+                self.assertEqual(os.environ.get("GOT_FAMILY_TOPPING_EXCLUDE_ENABLED"), "1")
+            finally:
+                os.chdir(old)
+
+
 if __name__ == "__main__":
     unittest.main()
