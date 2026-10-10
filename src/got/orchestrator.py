@@ -49,6 +49,63 @@ class GOTOrchestrator:
         self.sentiment_node = SentimentAnalysisNode(use_mock=use_mock)
         self.aggregator = AggregatorNode(use_mock=use_mock)
 
+    async def _maybe_capture_fxg_baseline(
+        self,
+        unified, market_ctx, sector_ctx, capital_ctx, news_ctx, sentiment_ctx,
+        target_date: date,
+    ) -> None:
+        """FXG veto 双跑：额外跑一次 FXG-off 基线 `_score_candidates`，落 fxg_baseline_scoring.json。
+
+        纯观测影子：捕获"FXG 若不生效、系统本会怎么选"的原模式评分，供一周后对照补位反事实。
+        仅当 GATE_ENABLED=1 且 EXCLUDE_ENABLED=1 且 EXCLUDE_MODE=veto 且
+        EXCLUDE_BASELINE_SHADOW=1 才触发；缺省全关 → 单跑，行为与现状逐字节一致。
+        关键：真实 run() 处于 orchestrator 外层 try（except 会落 status=failed 占位），
+        故本 helper 自带 try/except 吞掉一切基线侧异常、绝不 raise，纯观测不得击穿实盘决策。
+        """
+        if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") != "1":
+            return
+        if os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_ENABLED", "0") != "1":
+            return
+        if os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_MODE", "shadow") != "veto":
+            return
+        if os.getenv("GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW", "0") != "1":
+            return
+        try:
+            from pathlib import Path
+            from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+            # 独立实例：隔离 _fxg_shadow/_shadow_* 内存态；打桩 candidate_pool 写，绝不 clobber 正式 veto 版。
+            baseline_node = PortfolioDecisionNode(use_mock=False)
+            baseline_node._save_candidate_pool_snapshot = lambda *a, **k: None
+            # 基线跑置于 FXG off（=原模式；FTS 仍 shadow 不改决策）。顺序 await，env 隔离不泄漏。
+            prev = os.environ.get("GOT_FAMILY_TOPPING_EXCLUDE_ENABLED")
+            os.environ["GOT_FAMILY_TOPPING_EXCLUDE_ENABLED"] = "0"
+            try:
+                baseline_scoring = await baseline_node._score_candidates(
+                    sector_ctx, capital_ctx, news_ctx, market_ctx, unified,
+                    sentiment_context=sentiment_ctx,
+                )
+            finally:
+                if prev is None:
+                    os.environ.pop("GOT_FAMILY_TOPPING_EXCLUDE_ENABLED", None)
+                else:
+                    os.environ["GOT_FAMILY_TOPPING_EXCLUDE_ENABLED"] = prev
+            rows = [{
+                "symbol": s.symbol, "name": s.name,
+                "sector": s.sector_name, "family": s.family_name,
+                "is_holding": s.is_holding,
+                "action_recommendation": s.action_recommendation,
+                "composite_score": s.composite_score,
+            } for s in (baseline_scoring or [])]
+            record = {"line": "fxg_baseline", "mode": "baseline_off",
+                      "date": target_date.strftime("%Y%m%d"), "rows": rows}
+            day_dir = Path("data/got_daily") / target_date.strftime("%Y%m%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            PortfolioDecisionNode._atomic_write_json(day_dir / "fxg_baseline_scoring.json", record)
+            logger.info("[FXG-baseline] 剔前原模式基线已捕获：%d 行 → fxg_baseline_scoring.json", len(rows))
+        except Exception as exc:  # noqa: BLE001 — 纯观测，绝不冒泡到主链（否则真实 veto 决策被打成 failed）
+            logger.warning("[FXG-baseline] 基线捕获失败（已忽略，不影响真实决策）: %s", exc)
+
     async def run(self, check_date: Optional[date] = None) -> UnifiedContext:
         """
         执行 GOT 完整流程
@@ -145,6 +202,10 @@ class GOTOrchestrator:
             # ── Phase 2: 统一决策节点 ──
             try:
                 logger.info("[GOT] Phase 2: 开始统一决策")
+                # FXG veto 双跑：先捕获"剔前原模式"基线（纯观测、自兜异常），随后真实 veto run 一次。
+                await self._maybe_capture_fxg_baseline(
+                    unified, market_ctx, sector_ctx, capital_ctx, news_ctx, sentiment_ctx, target_date,
+                )
                 from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
                 decision_node = PortfolioDecisionNode(use_mock=False)
