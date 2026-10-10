@@ -33,16 +33,28 @@
 
 | 闸门 | 开关与缺省 | 影子产物 | 判据（读数工具） | 转正门槛 |
 |---|---|---|---|---|
-| **MEG 动能衰竭门**（acceleration 内动量断裂压制 `buy_trend`） | **仅 4 个真开关**：`GOT_MOM_EXHAUST_GATE_ENABLED=0`（缺省关）/ `GOT_MOM_EXHAUST_MODE=shadow` / `GOT_MOM_EXHAUST_DECAY=-0.30` / `GOT_MOM_EXHAUST_SIZING=1`。⚠️ 设计稿 §7.6 列的 `_PEAK_DD` / `_CONFIRM` **代码未实装**（`sector_analysis._compute_momentum_state` 只算 `decay_2d ≤ 阈值 → snap`，无 peak_dd OR 分支、无连续确认日数），不可当可调参数登记 | `data/got_daily/{date}/shadow_meg.json`（`evaluated` / `flagged_stocks` / 层3 sizing） | `scripts/meg_shadow_report.py`：① 命中率（逐日+累计 `action_hits/sizing_hits/hit_rate` + 被拦标的/板块频次）② `--forward N` 假阳性（拦截股 N 日前向收益 ≤0 为正确拦截，>0 为误杀） | 观测 ≥1 周后由负责人判读命中率与假阳性率再切 `MODE=veto`；回测证真基线（§7.8.1）：snap−thrust T+5 超额 −2.54%（Welch t=−3.28、p=0.001）、假阳性 12% |
+| **MEG 动能衰竭门**（acceleration 内动量断裂压制 `buy_trend`） | **仅 4 个真开关**：`GOT_MOM_EXHAUST_GATE_ENABLED=0`（缺省关）/ `GOT_MOM_EXHAUST_MODE=shadow` / `GOT_MOM_EXHAUST_DECAY=-0.30` / `GOT_MOM_EXHAUST_SIZING=1`。⚠️ 设计稿 §7.6 列的 `_PEAK_DD` / `_CONFIRM` **代码未实装**（`sector_analysis._compute_momentum_state` 只算 `decay_2d ≤ 阈值 → snap`，无 peak_dd OR 分支、无连续确认日数），不可当可调参数登记 | `data/got_daily/{date}/shadow_meg.json`（`evaluated` / `flagged_stocks` / 层3 sizing） | `scripts/meg_shadow_report.py`：① 命中率（逐日+累计 `action_hits/sizing_hits/hit_rate` + 被拦标的/板块频次）② `--forward N` 假阳性（拦截股 N 日前向收益 ≤0 为正确拦截，>0 为误杀） | 观测 ≥1 周后由负责人判读命中率与假阳性率再切 `MODE=veto`；回测证真基线（§7.8.1）：snap−thrust T+5 超额 −2.54%（Welch t=−3.28、p=0.001）、假阳性 12%。⚠️ **影子所验的不是设计稿完整版**：`decay_2d≤阈值` 单一判据之外，§7.3 的 `peak_dd` OR 分支与 `_CONFIRM` 连续确认均未实装也未回测 ⇒ 转正时授权范围应与影子实际验过的那一版对齐，不得把设计稿当成已验证对象 |
 | **FTS 家族见顶持续压制门**（跨日 latch，`buy→watch` + 仓位 sizing） | `GOT_FAMILY_TOPPING_GATE_ENABLED=0` / `GOT_FAMILY_TOPPING_MODE=shadow` / `GOT_FAMILY_TOPPING_SIZING=1` / `GOT_FAMILY_TOPPING_COOLDOWN=5` / `GOT_FAMILY_TOPPING_EXIT_HEALTHY=2` / `GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS=1`（子参变量名**不含 `_GATE` 中段**，按上列全名为准） | `data/got_daily/{date}/shadow_fts.json`（含 `suppressed_families` 台账与 `fxg` 子块） | 逐日读 `aggravated` / `days_suppressed` / `days_healthy` 与 `flagged_stocks`；**层A `sector_exposure_limits` 历史上无执行消费者**（FXG 根因，见下行），读数时不得把它当已生效防线 | 同归负责人判读；`89062d3`/`d5bf3ca` 为正确性前置修复（aggravated 语义确认 + 分级塌缩修复），**修复前读数不可作标定输入** |
-| **FXG 家族级见顶上游排除闸门**（在 `actionable_names` 构造阶段真剔池） | `GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=0`（需父 `GOT_FAMILY_TOPPING_GATE_ENABLED=1`）/ `GOT_FAMILY_TOPPING_EXCLUDE_MODE=shadow` / `GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS=2` / `GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW=0` | `shadow_fts.json` 的 `fxg` 子块 + `candidate_pool.json`；`EXCLUDE_BASELINE_SHADOW=1` 且 `EXCLUDE_MODE=veto` 时另落 `fxg_baseline_scoring.json`（剔前原模式基线） | `scripts/fxg_pair_report.py`：主口径=家族/板块池成员差集（①见顶家族被删 ②补位者），③前向 T+5/T+10 best-effort（取不到即 N/A） | **已拍 veto（2026-10-09~10 负责人裁定）**：切 veto 后连续 ≥1 周用 `fxg_pair_report.py` 证真**补位净正/中性**方可长期保留，否则回退 shadow |
+| **FXG 家族级见顶上游排除闸门**（在 `actionable_names` 构造阶段真剔池） | `GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=0`（需父 `GOT_FAMILY_TOPPING_GATE_ENABLED=1`）/ `GOT_FAMILY_TOPPING_EXCLUDE_MODE=shadow` / `GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS=2` / `GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW=0` | `shadow_fts.json` 的 `fxg` 子块 + `candidate_pool.json`；`EXCLUDE_BASELINE_SHADOW=1` 且 `EXCLUDE_MODE=veto` 时另落 `fxg_baseline_scoring.json`（剔前原模式基线）。⚠️ **对照是自建的、不缺**：基线由 `EXCLUDE_BASELINE_SHADOW=1` 与 veto **同一次跑内双跑**产生（veto 真剔池 + 独立实例再跑一遗 FXG-off 的原模式评分），所以下表「基线 0 份」只意味着**部署后尚未有过全流程实跑**，不意味着「开了却没有对照」 | `scripts/fxg_pair_report.py`：主口径=家族/板块池成员差集（①见顶家族被删 ②补位者），③前向 T+5/T+10 best-effort（取不到即 N/A） | **已拍 veto（2026-10-09~10 负责人裁定）**：切 veto 后连续 ≥1 周用 `fxg_pair_report.py` 证真**补位净正/中性**方可长期保留，否则回退 shadow。**取向已定：踏空优于接盘**（负责人原话「丢收益总比接盘亏要好」）⇒ 「回退 shadow」只在看中证伪后触发，**不因「暂无读数」提前回退**（无读数不等于被证伪） |
 
 **读数起算与局限（必读）**：
-1. 三道闸门的影子读数均自 **2026-10-09 部署日**起算（MEG/FTS 于 10-09 合入，FXG 于 10-10 合入并已切 veto），此前无产物。
+1. **影子读数的实际起算日（2026-10-10 实测更正；本条原写「三闸门读数均自 2026-10-09 部署日起算」不成立）**：扫 `data/got_daily/` 实测可数产物 = **MEG 1 天 / FTS 0 天 / FXG 0 天**（`shadow_meg.json` 仅 20261009；`shadow_fts.json` 与 `fxg_baseline_scoring.json` **至今一份都没有**）。原因**不是「写了不跑」**：20261009 那次运行的 `meta.json` 记 `git_commit=d391345` / `run_timestamp=13:55:03` / `bar_complete=false`（盘中跑），而 FTS 合入在其后（`3947500` 10-09 15:47、前置修复 `d5bf3ca` 22:14），FXG 基线更晚（`9074d7c` 10-10 09:03）；10-10 目录**只有 `candidate_pool.json`**（无完整全流程归档）。⇒ 「观测 ≥1 周」的计时实际从**下一个全流程交易日**才开始，当前无任何可用转正读数。
+   ⚠️ **但「盘中跑」不是缺陷，转正判读不得要求改成收盘跑**（上一版本节把 `bar_complete=false` 当成口径问题，已订正）：项目约定为**盘中（约 13:30）执行**，收盘跑是补跑/测试例外——`archive._is_bar_complete` docstring 自述「标记**收盘后补跑版**（如 0910 17:51）…与 **13:30 节奏配合**」，audit_20260922 Q4 亦裁定「降档标记 + `bar_complete` 接 P6」（产物侧已有 `TradeAllocation.intraday_snapshot` 与「⚠️ 盘中快照警告」）。⇒ **判读口径：按 `meta.json.bar_complete` 分组，盘中日作生产主口径，收盘补跑日单列不混池**。
+   真正残留的口径风险**不在时点而在量纲**：MEG 的 `decay_2d = (ema[t] - ema[t-2]) / ema[t-2]` 中当日项 `rrg.rs_momentum`（`sector_analysis.py:1590` 起）在盘中是**未定版值**，与 §7.8.1 回测所用的收盘日线不同构 ⇒ 影子期读数与回测读数不能直接对拍；修法属【架构计划】WI-P2-8（per-source availability，把「当日 bar 未走完」下沉为逐源 gate），不是调运行时点。
 2. `--got-replay` **不经过 Phase 2**，三闸门读数只能从实跑交易日归档累；非交易日 `main.py --got` 直接抛错。
 3. FXG 基线口径局限（脚本 docstring 已自述）：基线=**评分阶段** vs veto=**分配阶段**口径有别，且家族差集混入当日榜单自然漂移。
 4. MEG 回测仅覆盖 2026-05~10 单一下跌/轮动 regime（无牛市样本）；设计稿 §7.3 的 `peak_dd ≤ −0.40` OR 分支与 `_CONFIRM` 连续确认**均未实装也未回测**，影子期无法观测这两条——若转正评审需要它们，得先实装再重跑影子。`stall`(−2.80%) 与 `snap`(−3.07%) 均值超额接近，“stall 降仓 + snap 硬降”两级门属后续校准方向。
-5. 当前 `.env` 实态（仅登记口径，不作达标判定）：MEG `ENABLED=1 + MODE=shadow + SIZING=1`、FTS `GATE=1 + MODE=shadow`、FXG `EXCLUDE_ENABLED=1 + MODE=veto + BASELINE_SHADOW=1`。
+5. 当前 `.env` 实态（**2026-10-10 grep 复核与下表一致**；仅登记口径，不作达标判定）：MEG `ENABLED=1 + MODE=shadow + SIZING=1`、FTS `GATE=1 + MODE=shadow`、FXG `EXCLUDE_ENABLED=1 + MODE=veto + BASELINE_SHADOW=1`。
+
+### 三闸门实测读数（as of 2026-10-10，只读复算；工具已跑过，缺的是输入不是机制）
+
+| 闸门 | 唯一可读的一天 | 读数 | 出处与工具状态 |
+|---|---|---|---|
+| **MEG** | 20261009 | 评估 **5 只**候选，层2 命中 **0**、层3 缩仓 **0** 板块 ⇒ **无正例**，命中率与假阳性均不可判（≠“命中为 0 所以门无效”；回测基线的 snap 占比本就低，且当日为盘中跑、当日 EMA 项未定版） | `data/got_daily/20261009/shadow_meg.json`；`scripts/meg_shadow_report.py` 跑通，输出同结论（累计 5 / 0 / 0.0%） |
+| **FTS** | 无 | `shadow_fts.json` 0 份；`unified.family_suppression` 1008/1009 均 `None`（当时跑在 FTS 合入前）⇒ 台账零读数。但**靶子常在**：`mainline_endurance` 的 `topping_risk` 档 1008=「无归属」(wave 3)、1009=「医药」(wave 4) ⇒ 部署生效后的首日就有触发候选，不是“可能永远不打中” | `data/got_daily/{20261008,20261009}/unified.json` |
+| **FXG** | 无 | 基线文件 0 份⇒对照尚未产生（机制上由 `EXCLUDE_BASELINE_SHADOW=1` 与 veto 同跑自动产出）；`scripts/fxg_pair_report.py` 跑通并如实报「未找到含 `fxg_baseline_scoring.json` 的交易日」 | 脚本输出（工具健康，缺的是输入） |
+
+> 三行共同结论：**零读数 ≠ 零机制，也 ≠ 证伪**。唯一有意义的时钟是「自三闸门代码均部署完毕后的第一个全流程交易日起算 ≥1 周」（生产节奏为盘中约 13:30 跑，不需也不建议改跑收盘）；读数时按 `meta.json.bar_complete` 分组，盘中日作主口径、收盘补跑日单列。
 
 ---
 
@@ -433,7 +445,7 @@ C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据�
 
 > ⚠️ **本次比较的局限**：`_run1` 取自 **14:02（盘中，`bar_complete=false`）**、`_run2` 取自 **23:39（盘后）**，
 > 两次跑的数据环境并不相同 ⇒ 严格说这不是「同条件两跑」。上述 DB 级逐事件比对是比 R1 更精确的证据；
-> 要更纯净，需在盘后连跑两次。
+> 要更纯净，需在盘后连跑两次。**（注意：这是幂等测试对「同条件两跑」的要求，不是生产节奏——生产常态为盘中约 13:30 跑，不得据此建议生产改跑收盘）**
 
 ### 5.3 R6 是脚本硬编码的 SKIP
 

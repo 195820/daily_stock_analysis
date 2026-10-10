@@ -4,7 +4,14 @@
 > **版本**: v2.0（2026-08-31）  
 > **基于代码实际实现**（反映 2026-08-31 代码状态）  
 > **架构**: 半 GOTT 前半段图结构并行 + 后半段线性流水线决策 + 催化剂前瞻系统  
-> **时效注记（2026-09-29）**：本文正文基线为 0831 快照，未覆盖其后变更：A6 glue 转正与接线（0917）、规则评分模式退役（0926，`_cross_check_*` 三件套已删，漏命中改 neutral 垫底）、§7.1 regime 振荡修复（0926，迟滞豁免 + `transition_events`）、选股胜率优化 4 步（0917）、audit_20260922 两轮审核修复、排期轮批 1–5 影子态落地（0928：`market_theme.py` Step 2 / `disagreement.py` / Step 1.5 超限减仓 / `funnel_stats`）、C-P12/C-P13（`glue_pipeline.py` 休眠）。上述现状速览见根 `CLAUDE.md`，逐条实施记录见 `docs/CHANGELOG.md` [Unreleased] 与 `backlog.md`。
+> **时效注记（末次刷新 2026-10-10；初版 2026-09-29）**：本文正文基线为 **0831 快照**，未覆盖其后变更（只追清单、不改正文各节）：
+> - **0917–0929**：A6 glue 转正与接线、选股胜率优化 4 步、audit_20260922 两轮审核修复、规则评分模式退役（0926，`_cross_check_*` 三件套已删，漏命中改 neutral 垫底）、§7.1 regime 振荡修复（0926，迟滞豁免 + `transition_events`）、排期轮批 1–5 影子态（0928：`market_theme.py` Step 2 / `disagreement.py` / Step 1.5 超限减仓 / `funnel_stats` / `tradability.py` GATE-1）、C-P12/C-P13（`glue_pipeline.py` 休眠）、批次 5 审查修复（0929：`aggregator.run()` 缺 `import os` 使 3b/4b 影子字段自 0928 起从未真正产出，读数起算作废重起）。
+> - **10-01**：入场分道与持仓延续性工作流 A/B/C（commit `4be371b`：G4 缺资金流冻结放行 `GOT_AMBUSH_G4_FREEZE`、Node 1 熊市收手闸门、持仓延续性退出）。
+> - **10-06～07**：M3 人工抽查结案转正（误配率 2.8%，放弃 `--sample-mode full` 前置）；prompt 家族白名单同源化（`PROMPT_EXPOSED_FAMILIES`）；WI-P1-7(b) 家族兜底 embedding 首批 shadow 读数坐实现值不可达（enabled 冻结）；WI-P1-11 基本面取数修复（按报告期取全市场表 + 进程内缓存 + 新增 `earnings.forecast_type`，选行改净利润口径）。
+> - **10-08**：个股级结构化事件（财报披露/解禁）**退出催化剂日历**，退役 9 个取数与映射函数（净 −332 行）。
+> - **10-09～10**：买入侧三道新闸门 **MEG / FTS / FXG**（FXG 已切 veto），判据与产物登记在 [`verification.md`](verification.md) 顶部。
+>
+> **已知重点脱节区**（读本文时先看上述四档）：Node 6 规则侧三件套已删（正文仍描述其计算）、Phase 2 买入侧闸门未入文、催化剂日历不再含个股级事件、§12 开关清单与 `GOT_*` 实际环境变量已大幅滞后。现行行为以**代码 + [`backlog.md`](backlog.md) / [`verification.md`](verification.md) / [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]`** 为准；现状速览另见根 `CLAUDE.md`。
 
 ---
 
