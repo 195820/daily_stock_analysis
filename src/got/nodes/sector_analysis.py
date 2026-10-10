@@ -55,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 # 波次计数器（v3.5 S2：回撤结构判波）——常量与共享判波核心
-# 在线 _calc_wave_days 与 scripts/backfill_wave_days.py 共用 decide_wave_days，
-# 禁止各自维护分叉实现（审核 P1 修复，2026-09-01）。
+# decide_wave_days 是判波唯一口径：当前仅在线 _calc_wave_days 调用它；
+# ambush_split_plan §3.2 第 3 条的回填脚本 scripts/backfill_wave_days.py 至今未创建
+# （2026-10-10 核实），日后补齐时同样必须复用本函数，禁止另写分叉实现（审核 P1 修复，2026-09-01）。
 # =============================================================================
 
 # 主线族状态（波次存续域：降温/衰竭仍属"在波中"）
@@ -77,7 +78,7 @@ def decide_wave_days(
     anchor_record,
     gap_records: list,
 ) -> tuple[int, Optional[date], float]:
-    """波次判定核心（在线 _calc_wave_days 与回填脚本共用，决策 2）。
+    """波次判定核心（在线 _calc_wave_days 专用；回填脚本若补亦须复用本函数，决策 2）。
 
     语义：
     - 无前记录 / 今日经非主线族退出 → 重置 1（新波）

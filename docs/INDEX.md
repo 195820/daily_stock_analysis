@@ -100,7 +100,7 @@
 
 | 计划 | 状态 | 开工前置 |
 | --- | --- | --- |
-| [plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | 设计收口，**主体已实施**（子项进度已在 CHANGELOG 记账） | 实施前先对账，勿重复 |
+| [plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | **合稿两份计划**（v3 埋伏分支 + v3.5 波次化生命周期），**两块主体均已实施**（v3：09-28 核实｜v3.5 S2–S5：10-10 核实；S5 校准脚本在库，首跑待埋点满 40 交易日） | 实施前先对账，勿重复；残留仅「存量 NUL 幽灵行清理」与「`wave_days` 回填脚本」两项未落地 |
 | [plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | **已实施**（2026-09-17，4 步 + `GOT_WINRATE_*` 开关） | 待回测复验胜率改善 |
 | [plans/入场分道与持仓延续性_总计划_20260930.md](got/plans/%E5%85%A5%E5%9C%BA%E5%88%86%E9%81%93%E4%B8%8E%E6%8C%81%E4%BB%93%E5%BB%B6%E7%BB%AD%E6%80%A7_%E6%80%BB%E8%AE%A1%E5%88%92_20260930.md) | 工作流 A/B/C **已合入**（`4be371b`）｜ **待全流程实跑验收**（2026-10-10 核查：冻结开关已开但 `ambush_gate_funnel.final_pool` 仍为 0） | 交易日 conda 全流程实跑；资金流数据源修复后重调 G4 |
 | [plans/architecture_optimization_implementation_20260929.md](got/plans/architecture_optimization_implementation_20260929.md) | 2 GATE + 26 WI 明细实施报告（§11 逐条登记已落地/延后裁决） | GATE-1/GATE-2/P0-3/P0-4/P0-5/P1-7/P1-9/P1-11/P2-9(a) 已落；余见 §11.2 |
@@ -133,4 +133,5 @@
 ---
 
 *索引重排日期：2026-09-17（本次起 INDEX 为全量索引，新增文档须同步登记）*
+*修订：2026-10-10 口径不一致收口——`ambush_split_plan.md` 内嵌的 v3.5 节原挂「设计收口，待实施」，与同文件文首「主体已实施」与本索引互相矛盾；逐条代码实测后改为「S2–S5 已实施 + 两处从未落地」（见该文件 v3.5 状态头），本页与 `got/README.md` 同行同步；`sector_analysis.py` 对未创建脚本 `scripts/backfill_wave_days.py` 的死引用注释已订正（注释文案，零行为变更）。*
 *修订：2026-10-10 文档整理——docs/got 顶层 8 份完结过程稿移入 `got/archive/`（代码/测试/CHANGELOG 中的路径引用已同步改指）；仓库根目录 6 份 PLAN/审核/报告/审查稿移入 `got/archive/` 并加状态头（`FIX_SUMMARY.md` 同步改名，`.gitignore` 逐条忽略规则作废）；二区拆为「清单类 / plans 计划 / 已归档过程稿」三段并补齐六份计划状态。*

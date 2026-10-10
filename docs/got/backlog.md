@@ -128,6 +128,19 @@
 
 > 📌 第 2 项对 A5 影子期的连带影响见 [`verification.md`](verification.md) §1.2。
 
+### 1.G v3.5 波次化计划的未落地尾巴（2026-10-10 核实状态头时发现）
+
+【计划】[`plans/ambush_split_plan.md`](plans/ambush_split_plan.md) 内嵌的 v3.5 节原挂「设计收口，待实施」，与同文件文首「主体已实施」矛盾——**两边都不对**：S2–S5 核心已在线（`decide_wave_days` / `_wave_coeff` / `MainlineEndurance` 全链路 / `calibrate_wave_coeff.py` 均在库），但其中**两项子设计从未落地**（已逐条 grep 实测，不是标注过期）：
+
+| 项 | 出处 | 事实 | 处置 |
+|---|---|---|---|
+| 存量 NUL 幽灵行清理 | 该计划 §3.1 第 1 条 | `scripts/cleanup_nul_sector_names.py` **不存在**；只做成了**写入侧** `strip('\x00')`（`sector_analysis.py:3989`、`:4124`），防复发不销存量。**10-10 只读实测（`.review_tmp/_nul_scan2.py`/`_nul_scan3.py`，DB `mode=ro`）：存量仍在库——`node2_sector_trends.sector_name` 脏行 95 行 / 48 个 `(code,name)` 组合，脏行日期 2026-08-03…2026-09-01（写入侧修复后零新增，旁证防复发有效）；46/48 组合已有同名干净轨迹，仅 **2/48 组合的「最近一条」仍是脏名**；全库其余 name 类列（`news_intel`/`screener_results`/`catalyst_events` 等）PY 侧判定均 0 命中** | **真·待实施（低优先，危害面已收窄）**：要清的是那 95 行历史脏记录（它们使同板存在两条轨迹，且按 `sector_name` 取名的读路会拿到带 `\x00` 的值）；⚠️ **该表全仓无裁剪/过期清理路径（只按 `(sector_code, tracking_date)` upsert 累积），脏行不会自动衰减**。动库需人工确认（该计划 §六.5） |
+| `wave_days` 历史回填 | 该计划 §3.2 第 3 条 | `scripts/backfill_wave_days.py` **不存在**；代码注释曾把它写成既有实现（死引用），10-10 已订正为口径约束 | **建议改判「不做」**：波次口径自 09-01 起在线累积，旧逻辑产物回填值本就不得进校准样本（该计划结论 A），回填无使用方 |
+
+> 同节另两项非缺口：§3.5 校准首跑只等埋点满 **40 交易日**（当前 `data/wave_calibration.jsonl` 实测 1331 行 / 22 日，2026-09-01…2026-10-09）⇒ 属 [`verification.md`](verification.md) 那类「只等时间窗」；§1.4 搁置的报告建议 2/3/4/5 仍是明示搁置，不在此挂号。
+>
+> ⚠️ **测 NUL 的方法陷阱（上一轮差点拿假读数写账）**：SQLite 里 `WHERE col LIKE '%' || x'00' || '%'` **不是**「含零字节」判据——Blob 参与拼接后模式等价于 `'%'`，实测把 `node2_sector_trends` 全表 9459 行、乃至根与脏行无关的 `news_intel.name`（212/212）**全部报成命中**；上表的 95 行是改用 **Python 侧逐行 `"\x00" in value`** 复算的结果。另因绑参含 NUL 会被 sqlite3 直接拒（"the query contains a null character"），此类扫描只能取回值后在宿主语言判。
+
 ---
 
 ## 2. 0902 报告 15 项的**处置表**
@@ -524,5 +537,7 @@ python scripts/export_glue_family_audit.py                                      
 *修订：2026-09-28（批 4.1 CodeReview 后修复①②③）—— 三视角评审实证三项计算缺陷并修复：①Critical 重复卖单（Step 1.5 候选未排除 Step 1 已 sell/reduce 标的且取原始股数 → 同一 symbol 二次开卖 + proceeds 虚增，双向污染 enabled 与 shadow 读数）→ Step 1 维护 `remaining_qty` 真相；②零股负股数（`max(100,min(…))` 对 <100 股抬回一手）→ 去 max 改整笔清仓；③W1 抑制被整手尾差击穿（`position_gap>0` 抢先于 `elif`，实测同轮 sell+buy 并存）→ `over_limit_forced` 提为前置短路。单测 7→**11 例**（新增重复削减/reduce 余量/零股/取整超配 4 边界），关联回归 48+11 全绿。未修登记：Warning④ `.env.example` 开关区未录入、Warning⑤ W3 聚合口径削 `accounts[0]`（标为 enabled 转正硬前置）；建议项（`__init__` 初始化影子态/金丝雀补测/字段改名）及「R-B8 移出组」表述校准（校验脚本按显式字段清单取数，新字段本不在清单内）归负责人。**修复前影子读数不可作标定输入**。*
 
 *修订：2026-09-28（批 4.1 设计修正·默认关→真影子）—— 负责人指出「影子开关关了不跑，写它干啥」：初版 `GOT_SELL_SOURCE_ENABLED` 默认 OFF 使 Step 1.5 整段 `if` 不进，等于**零观察零作用**，与仓内 `_SHADOW` 惯例（跑但不生效，如 `AGENT_SEMANTIC_GLUE_SHADOW`）不符，属写了不跑的死分支。→ 重构为**三态**：新增 `GOT_SELL_SOURCE_SHADOW`（默认开）每日跑减仓检测、将「本会削谁/多少/是否撞家族宽限」落新增观测字段 `PortfolioDecision.sell_source_shadow`，**但不写 allocation、不改 `sell_proceeds`/`over_limit_forced`→ 决策逐字节零改动**；`GOT_SELL_SOURCE_ENABLED`（默认关）作为后续「转正」才开的生效开关。新增字段按 raw_position_ratio/#5a 先例标注移出 R-B8/幂等不变组。单测扩至 **7 例**（生效 3 + 影子 2 + 全关 1 + 默认影子 1）全绿；`test_phase2_audit_fixes.py`+`test_portfolio_decision_lot_rejection.py` 27 绿（含构造完整 decision 的路径，验证新字段接线无碍）。*
+
+*修订：2026-10-10（口径不一致收口轮，零代码行为变更）—— 核实【计划】`ambush_split_plan.md` 时发现同一文件两份状态头互相矛盾（文首 v3「主体已实施」vs 内嵌 v3.5「设计收口，待实施」），且与 `INDEX.md` / `got/README.md` 不同步。逐条代码实测后：① 该计划 v3.5 节状态头改写为「S2–S5 已实施（含代码位置与埋点实测读数）+ 两处从未落地」；② 本清单新增 **§1.G** 接住这两条尾巴（存量 NUL 幽灵行清理＝真·待实施低优先；`wave_days` 回填＝建议改判不做，旧回填值本不得进样本）；③ 【计划】另发现的两处口径假象一并销：`calibrate_wave_coeff.py` 属「在库等 40 交易日」而非「未写」；④ `sector_analysis.py` 模块头注释（`:58-60`）与 `decide_wave_days` docstring 对从未创建的 `scripts/backfill_wave_days.py` 的死引用注释已订正（纯注释）；`INDEX.md` / `got/README.md` 同行同步。本轮未动任何判定逻辑、未改开关值。*
 
 *修订：2026-10-10（文档治理整理轮，零代码/零行为变更）—— 本清单自身只改三处：① §8 新增 #9（文档目录漂移、已结）与 #10（影子线判据无人登记、已结）两行；② 八份完结过程稿移入 [`archive/`](archive/) 后，本文件内引用它们的地方改为 `archive/` 路径（含 [`decision_brief_20260926.md`](archive/decision_brief_20260926.md)、[`cp13_phase2_closeout_20260928.md`](archive/cp13_phase2_closeout_20260928.md) 等）；③ 顶层新增「文档治理规范」入 [`docs/AGENTS.md`](../AGENTS.md)，其中**影子线必登判据**直接约后新闸门的登记义务。另：本清单 §5 各行提及的 `.review_tmp/` 取证脚本与 [`archive/ULTRA_REVIEW_20260928_batch5.md`](archive/ULTRA_REVIEW_20260928_batch5.md)（原根目录）位置已同步。*
