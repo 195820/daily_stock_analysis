@@ -1,13 +1,17 @@
-# GOT 文档归档（2026-08 ~ 2026-09）
+# GOT 文档归档（2026-08 ~ 2026-10）
 > **原位置**：`docs/archive/got/README.md`（2026-09-17 文档结构重排移入当前位置）
 
-> 本目录存放 GOT 修复与规划线的**原始文档**：2026-09-14 从 `docs/` 根目录移入 `docs/archive/got/`，2026-09-17 文档重排平移至当前位置 `docs/got/archive/`，并收入原 `docs/custom/` 的 3 篇已完结 GOT 文档（见下表末三行）。
-> **文件内容一字未改**——包括节号（如 `agent_glue_plan_0903.md` §5.3），因此代码与脚本中的节号引用**仍然可解析**，只是路径前缀变为 `docs/got/archive/`。
+> 本目录存放 GOT 修复与规划线的**原始文档**：2026-09-14 从 `docs/` 根目录移入 `docs/archive/got/`，2026-09-17 文档重排平移至当前位置 `docs/got/archive/`，并收入原 `docs/custom/` 的 3 篇已完结 GOT 文档（见下表末三行）；**2026-10-10 再收 14 份已完结过程稿与根目录计划稿**（见下表「2026-10-10 新收」段）。
+> **正文与节号一字未改**（包括节号，如 `agent_glue_plan_0903.md` §5.3），因此代码与脚本中的**节号引用仍然可解析**。
+> ⚠️ 但**不是“文件一个字节都没动”**：2026-10-10 搬迁时对三份过程稿做了最小改动（`decision_brief_20260926.md` 加首屏归档注 + 修 3 处指回 backlog 的相对链接前缀；`cp12_prompt_variants_draft_20260926.md` / `cp13_phase2_closeout_20260928.md` 各改文档路径引用），对 6 份根目录稿只新增首屏状态头。三类改动均**不移动 `§X.Y` 节号**，故节号引用不受影响；带路径的引用（`docs/got/<file>.md`）已统一改指 `docs/got/archive/<file>.md`。
 >
-> **当前有效文档**（`docs/got/`）：
-> - [`verification.md`](../verification.md) —— 待验证 / 影子期
+> **当前有效文档**（`docs/got/` 顶层，仅四份清单类 + 一份待拍板简报）：
 > - [`backlog.md`](../backlog.md) —— 待实施
-> - [`../plans/`](../plans/) —— 待实施计划（埋伏分支拆分 / 选股胜率优化）
+> - [`verification.md`](../verification.md) —— 待验证 / 影子期
+> - [`architecture.md`](../architecture.md) —— 架构现状权威描述（含时效注记）
+> - [`README.md`](../README.md) —— GOT 文档导航
+> - [`decision_brief_openc3_20260928.md`](../decision_brief_openc3_20260928.md) —— **仍待拍板**（OPEN-C3 死分支三选一），故不入本目录
+> - [`../plans/`](../plans/) —— 待实施 / 待批准计划（六份，见 [`docs/INDEX.md`](../../INDEX.md) 二区）
 
 ---
 
@@ -32,6 +36,27 @@
 | `0827_got_diagnostic.md` | 2026-08-27（原 `docs/custom/`） | 0827 全流程诊断报告（5 问题 + 4 系统级归纳） | 其 P0 三项已实施（见 §2.4），待实施项已摘入 `backlog.md` |
 | `plan_got_timeseries_enhancement.md` | 2026-08-27（原 `docs/custom/`） | 时间线能力增强计划 v2.1 | ✅ 已实施并归档（commit `03bb3d1`，状态头已于 2026-09-17 收口） |
 | `got_timeseries_calibration.md` | 2026-08-27（原 `docs/custom/`） | 上述计划的试点报告（≤27 天样本） | 由 `scripts/backtest_got_timeseries.py` 生成，输出路径已改指本目录 |
+
+### 一之补 · 2026-10-10 文档整理新收 14 份
+
+| 文档 | 原位置 | 性质 | 被什么取代 / 收口 |
+|---|---|---|---|
+| `audit_20260922.md` | `docs/got/` | 09-22 当日运行审计（P0-P3 + Q1-Q9） | Q1-Q9 已由 `4ad12b6` 与后续轮次全部落地；**代码注释仍按名引用其 Q 编号（如 `audit_20260922 Q2-A2`），编号仍可在本目录同名文件查到** |
+| `decision_brief_20260926.md` | `docs/got/` | backlog §7 硬裁决项决策简报 | 七项裁决已于同日第二批全部拍板并实施（简报内已改登「拍板结果」） |
+| `cp12_prompt_variants_draft_20260926.md` | `docs/got/` | C-P12 prompt A/B 文案草案 + M2×M3 矩阵结论 | C-P12 已实施；矩阵供 C-P13 标定使用 |
+| `cp12_m3_audit_20260926.md` | `docs/got/` | C-P12 M3 分层抽样预审表 | ⚠️ **已被 2026-10-06 M3 终审取代**（误配率 2.8%、已结案转正），本表「待划勾」状态作废 |
+| `cp12_event_level_ab_20260926.md` | `docs/got/` | C-P12 事件级 A/B 覆盖对照 | 其两项质量发现已转入 C-P13 立项依据 |
+| `cp13_grounding_pipeline_research_20260926.md` | `docs/got/` | C-P13 接地式召回-验证 5 层管线设计笔记 | 阶段1 已落地并**休眠**（`glue_pipeline.py` replay-only）；**代码/测试中的 `docs/got/...` 路径已改指本目录** |
+| `cp13_stage1_matrix_20260927.md` | `docs/got/` | 阶段1 L1 冒烟 + 9 天矩阵读数 | 阶段六条全过 → 阶段1 结项 |
+| `cp13_phase2_closeout_20260928.md` | `docs/got/` | **阶段2 收口决策**（realized 口径证伪） | **解冻条件见本文 §6**（C-P13 挂起项的活引用，backlog §3.3 OPEN-C6 行指向此处） |
+| `埋伏冻结与持仓延续性_PLAN_20260930.md` | 仓库根目录 | 工作流 A/C 原始计划 | 已并入选计划 [`../plans/入场分道与持仓延续性_总计划_20260930.md`](../plans/%E5%85%A5%E5%9C%BA%E5%88%86%E9%81%93%E4%B8%8E%E6%8C%81%E4%BB%93%E5%BB%B6%E7%BB%AD%E6%80%A7_%E6%80%BB%E8%AE%A1%E5%88%92_20260930.md)，**勿按本文重复实施** |
+| `回测审核_入场分道与持仓延续性_20261001.md` | 仓库根目录（未入库） | 总计划独立重算审核（F1–F6） | F1–F6 已全部并入总计划正文；本件仅作审核留痕 |
+| `持仓板块漂移_PLAN_20260918.md` | 仓库根目录（曾被 `.gitignore` 逐条忽略） | 板块漂移误卖修复设计 | 已实施（commit `20cba78`），现行叙述以 [`backlog.md`](../backlog.md) §4.4 为准 |
+| `FIX_SUMMARY_sector_drift_20260918.md` | 仓库根目录（原 `FIX_SUMMARY.md`） | 同一修复的提交统计 | 行数/文件数已漂移，仅史料 |
+| `文档更新执行报告_20260918.md` | 仓库根目录（曾被 `.gitignore` 逐条忽略） | 09-18 一轮文档同步动作报告 | 当前文档结构真源以 [`../../INDEX.md`](../../INDEX.md) 为准 |
+| `ULTRA_REVIEW_20260928_batch5.md` | 仓库根目录（未入库） | 批次5 三视角审查报告 | **全部发现已修复落地**（见 [`backlog.md`](../backlog.md) §5 尾注）；原「归档去向待裁决」项就此收口 |
+
+> ❗ **与「作废」区分**：上表前 8 行是**完结的过程稿**（结论已被采纳或推翻）；后 6 行是**被取代的重复稿**（同一件事已有唯一现行叙述）。两者均不得再作为开工依据。
 
 ---
 
@@ -123,7 +148,7 @@
 3. **两条已被作者声明的"作废"**，引用前务必注意：
    - `got_impl_review_0911.md` §0–§10 的**红线达标总表已过期**（作者原话："记录的是修复轮之前的状态……勿单独引用"）；
    - `E3_fixes_summary.md` 的声明**与真实改动不符**（改 2 个文件 vs 实际 13 个 tracked + 1 个新模块）。
-4. **本目录不再更新**。当前有效的待验证项与待实施项分别见根目录两份新文档。
+4. **本目录不再更新**。当前有效的待实施项见 [`backlog.md`](../backlog.md)，待验证/影子期项见 [`verification.md`](../verification.md)，待实施计划见 [`../plans/`](../plans/)（导航入口 [`README.md`](../README.md)）。
 5. **2026-09-15 新增**：T1/T1-H 影子产物文件（`shadow_t1.json` / `shadow_t1h.json`），与 A5 的 `agent_glue.json` 对称，由 `portfolio_decision._save_shadow_records()` 落盘到 `data/got_daily/{date}/`，供 `archive._render_shadow_section()` 渲染到 `reasoning.md` 末尾。详见 [`verification.md`](../verification.md) §2 末尾。
 
 ---

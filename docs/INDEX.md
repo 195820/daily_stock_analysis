@@ -86,23 +86,32 @@
 
 ## 二区 · GOT 现行（`got/`）
 
+> 2026-10-10 文档整理：顶层只留**清单类 + 一份待拍板简报**，已完结的过程稿（0922 审计 / 0926 决策简报 / cp12 系列 / cp13 系列共 8 份）全部移入 [`got/archive/`](got/archive/)。
+
 | 文档 | 性质 |
 | --- | --- |
-| [got/README.md](got/README.md) | GOT 文档导航 + 待办排序总览 |
+| [got/README.md](got/README.md) | GOT 文档导航 + 待实施计划排序总览 |
 | [got/backlog.md](got/backlog.md) | **待实施**清单（六类处置、0902 15 项处置表、A6 转正与退役、需裁决事项） |
-| [got/verification.md](got/verification.md) | **待验证 / 影子期**清单（判据、实测值与出处，不落达标判定） |
-| [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；原根目录 `agent_cot_design.md`） |
-| [got/plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | 埋伏分支拆分设计（设计收口，待实施；原根目录 `plan.md`） |
-| [got/audit_20260922.md](got/audit_20260922.md) | 2026-09-22 当日运行审计报告（P0-P3 分级 + Q1-Q9 决策 + 修复锚点；含 `4ad12b6` 第二轮审核修复 Q1-Q9） |
-| [got/decision_brief_20260926.md](got/decision_brief_20260926.md) | 2026-09-26 决策简报（三类未结项分诊的待拍板项：选项/影响面/实测证据/建议，对应 backlog §7；已改登「拍板结果」） |
-| [got/decision_brief_openc3_20260928.md](got/decision_brief_openc3_20260928.md) | OPEN-C3 死分支决策简报（排期轮批 2 取证产出：建议删分支，待拍板） |
-| [got/cp12_prompt_variants_draft_20260926.md](got/cp12_prompt_variants_draft_20260926.md) | C-P12 prompt A/B 两版文案草案 + 拍板结果 + M2×M3 对照矩阵运行结论（含 0902 max_tokens 不对称披露） |
-| [got/cp12_m3_audit_20260926.md](got/cp12_m3_audit_20260926.md) | C-P12 M3 误配率分层抽样预审表（两变体各 10 条 relation，待负责人终审划勾） |
-| [got/cp12_event_level_ab_20260926.md](got/cp12_event_level_ab_20260926.md) | C-P12 事件级 A/B 覆盖对照表（逐日覆盖汇总 + 能源/油价类明细 + 覆盖分歧明细；暴露 0902 A 版退化循环与 B 版过度归属两项质量发现） |
-| [got/cp13_grounding_pipeline_research_20260926.md](got/cp13_grounding_pipeline_research_20260926.md) | C-P13 设计笔记：基于外网论文（THEME/CoVe/CAD/CausalStock/FinRipple/LangExtract）的事件→板块「接地式召回-验证」5 层管线方案（A/B 单旋钮架构天花板的整合修正，待拍板） |
-| [got/cp13_stage1_matrix_20260927.md](got/cp13_stage1_matrix_20260927.md) | C-P13 阶段1（L1+L2+L3）落地结论：L1 冒烟 K 标定（12→8）+ 9 天矩阵 M2×M3 读数 + 验收六条对照（点 2 未达归因摊派极端日，判读归负责人）+ 调用成本实测（OPEN-C7 回填） |
-| [got/cp13_phase2_closeout_20260928.md](got/cp13_phase2_closeout_20260928.md) | **C-P13 阶段2 收口决策**：realized 收益率标定 confidence 红线证伪（19 天池+反事实扩样到 1521，alpha≈0/conf rho−0.06/CoVe kept−dropped 仅 0.04pp）→ 阶段2 关闭、阶段1 接地管线休眠；关键纠偏：confidence 在 M3 归属口径有效（≠收益率），勿误记为无用 |
-| [got/plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | 选股胜率优化 4 步计划（9 月回测驱动；2026-09-17 已实施，待回测复验） |
+| [got/verification.md](got/verification.md) | **待验证 / 影子期**清单（判据、实测值与出处，不落达标判定；**2026-10-10 起含 MEG/FTS/FXG 三道买入侧新闸门判据**） |
+| [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；⚠️ 正文基线为 0831 快照，文首有时效注记） |
+| [got/decision_brief_openc3_20260928.md](got/decision_brief_openc3_20260928.md) | **当前唯一待拍板简报**（OPEN-C3 `persistence_regime` 死分支：接线/删分支/保留三选一），故不入归档 |
+
+### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，六份）
+
+| 计划 | 状态 | 开工前置 |
+| --- | --- | --- |
+| [plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | 设计收口，**主体已实施**（子项进度已在 CHANGELOG 记账） | 实施前先对账，勿重复 |
+| [plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | **已实施**（2026-09-17，4 步 + `GOT_WINRATE_*` 开关） | 待回测复验胜率改善 |
+| [plans/入场分道与持仓延续性_总计划_20260930.md](got/plans/%E5%85%A5%E5%9C%BA%E5%88%86%E9%81%93%E4%B8%8E%E6%8C%81%E4%BB%93%E5%BB%B6%E7%BB%AD%E6%80%A7_%E6%80%BB%E8%AE%A1%E5%88%92_20260930.md) | 工作流 A/B/C **已合入**（`4be371b`）｜ **待全流程实跑验收**（2026-10-10 核查：冻结开关已开但 `ambush_gate_funnel.final_pool` 仍为 0） | 交易日 conda 全流程实跑；资金流数据源修复后重调 G4 |
+| [plans/architecture_optimization_implementation_20260929.md](got/plans/architecture_optimization_implementation_20260929.md) | 2 GATE + 26 WI 明细实施报告（§11 逐条登记已落地/延后裁决） | GATE-1/GATE-2/P0-3/P0-4/P0-5/P1-7/P1-9/P1-11/P2-9(a) 已落；余见 §11.2 |
+| [plans/加速末期识别缺陷分析_20261008.md](got/plans/%E5%8A%A0%E9%80%9F%E6%9C%AB%E6%9C%9F%E8%AF%86%E5%88%AB%E7%BC%BA%E9%99%B7%E5%88%86%E6%9E%90_20261008.md) | 分析稿 + **MEG 已影子接线**（回测证真）；派生出 FTS / FXG 两道闸门 | 影子读数 ≥1 周后切 veto；三闸门判据见 [verification.md](got/verification.md) 顶部 |
+| [plans/竞品经验补强计划_20261006.md](got/plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md) | ⚠️ **规划稿，未批准实施**（批次 A–G 零落地：`news_pulse.py`/`output_review.py`/`data_consistency.py`/`backtest_standard.py` 均不存在） | 负责人批准 + 建议序 D0→D→G→A→B→C→E→F |
+
+> ℹ️ **MEG / FTS / FXG 三道买入侧闸门无独立计划文档**（判据在 [verification.md](got/verification.md)，设计与回测在 `plans/加速末期识别缺陷分析_20261008.md` §七）。新计划一律写入 `docs/got/plans/`，**仓库根目录不留 PLAN 稿**（见 [AGENTS.md](AGENTS.md) 文档治理条款）。
+
+### GOT 过程稿（已移入 [`got/archive/`](got/archive/)，不再更新）
+
+[audit_20260922.md](got/archive/audit_20260922.md) / [decision_brief_20260926.md](got/archive/decision_brief_20260926.md) / cp12_×3（[文案草案](got/archive/cp12_prompt_variants_draft_20260926.md)、[M3 预审表](got/archive/cp12_m3_audit_20260926.md)、[事件级对照](got/archive/cp12_event_level_ab_20260926.md)）/ cp13_×3（[设计笔记](got/archive/cp13_grounding_pipeline_research_20260926.md)、[阶段1 矩阵](got/archive/cp13_stage1_matrix_20260927.md)、[阶段2 收口](got/archive/cp13_phase2_closeout_20260928.md)）——原位置与取代关系见 [got/archive/README.md](got/archive/README.md) §一之补。
 
 ---
 
@@ -110,7 +119,7 @@
 
 ### GOT 历史文档（[`got/archive/`](got/archive/)）
 
-原始文档索引与「已实施并完成验收」清单见 [got/archive/README.md](got/archive/README.md)：0902 审核报告、0903 主方案（agent_glue）、0911 四层计划与复审、修订台账、Phase 6 草案、已验证完成日志，以及原 `docs/custom/` 的 3 篇已完结 GOT 文档（0827 诊断、时间线增强计划、试点报告）。
+原始文档索引与「已实施并完成验收」清单见 [got/archive/README.md](got/archive/README.md)：0902 审核报告、0903 主方案（agent_glue）、0911 四层计划与复审、修订台账、Phase 6 草案、已验证完成日志，原 `docs/custom/` 的 3 篇已完结 GOT 文档，以及 **2026-10-10 新收的 14 份**（cp12/cp13 系列、审计与决策简报、根目录 PLAN 稿与审查留痕）。
 
 ### 非 GOT 已完结计划（[`archive/plans/`](archive/plans/)）
 
@@ -124,3 +133,4 @@
 ---
 
 *索引重排日期：2026-09-17（本次起 INDEX 为全量索引，新增文档须同步登记）*
+*修订：2026-10-10 文档整理——docs/got 顶层 8 份完结过程稿移入 `got/archive/`（代码/测试/CHANGELOG 中的路径引用已同步改指）；仓库根目录 6 份 PLAN/审核/报告/审查稿移入 `got/archive/` 并加状态头（`FIX_SUMMARY.md` 同步改名，`.gitignore` 逐条忽略规则作废）；二区拆为「清单类 / plans 计划 / 已归档过程稿」三段并补齐六份计划状态。*

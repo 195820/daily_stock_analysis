@@ -204,9 +204,9 @@
 - **OPEN-C5** `agent_glue.json` 的当日覆盖语义与回填产物是否同语义
 - **OPEN-C6**（C-P13 阶段1 登记，2026-09-27）L1 的 K 值与 L5 的 τ 需在回放矩阵上联合网格标定（cp13 笔记 OPEN-1）——阶段1 初值 `GLUE_L1_TOP_K=12` 待矩阵标定；τ 标定属阶段2（L5 校准置信度），C-P13 红线 0.6 在阶段1 仍无真实概率可标
   - 2026-09-27 L1 冒烟（cp13_l1_smoke.py）：K=12 时 0903「房贷信贷」top-K 混入 0.251 噪声「短剧游戏」（真实相关项银行 0.439，分数分布自然截断带 ~0.27-0.30）；K=8 两病例全过且 0910 漏挂病例不误伤 → 默认值已降为 8，矩阵跑批后做终标定
-  - **【阶段2 收口（2026-09-28）】**：realized 收益率口径标定 confidence 红线 τ = **证伪关闭**（19 天池 alpha≈0 / conf rho −0.06 / CoVe kept−dropped 仅 0.04pp，详 `docs/got/cp13_phase2_closeout_20260928.md`）；**红线不采纳，K 终标定与 τ 一并随阶段1 休眠推迟**。纠偏：confidence 非无用——阶段1 人工 M3 显示 conf≥0.70 全真、牵强全≤0.50，尺子应换成 M3 归属口径（非收益率）再标。解冻条件见收口纪要 §6
+  - **【阶段2 收口（2026-09-28）】**：realized 收益率口径标定 confidence 红线 τ = **证伪关闭**（19 天池 alpha≈0 / conf rho −0.06 / CoVe kept−dropped 仅 0.04pp，详 `docs/got/archive/cp13_phase2_closeout_20260928.md`）；**红线不采纳，K 终标定与 τ 一并随阶段1 休眠推迟**。纠偏：confidence 非无用——阶段1 人工 M3 显示 conf≥0.70 全真、牵强全≤0.50，尺子应换成 M3 归属口径（非收益率）再标。解冻条件见收口纪要 §6
 - **OPEN-C7**（C-P13 阶段1 登记，2026-09-27）接地管线调用成本（cp13 笔记 OPEN-3）——阶段1 实测口径：每日 ≈ 1 次 base glue + 事件数次 L2（got_cp13_l2_generate）+ ceil(relations/10) 次 L3（got_cp13_l3_verify），待 0901–0914 矩阵跑批后用 `get_llm_usage_summary(by_call_type)` 回填实际量；仅回放可接受，生产化前需重新评估
-  - 2026-09-27 矩阵跑批实测回填（llm_usage DB 当日分列）：L2 **583 次**/547.9k tokens（事件量实测 20-120/日，高于 20-40 预估，0903 达 120）+ L3 **67 次**/89.4k + base glue 9 次/174.1k，合计 659 次/~811k，略超计划预算 <600（+10%）；墙钟 ~11 分钟（L2 并发 4 + embedding 按日缓存）；详见 `docs/got/cp13_stage1_matrix_20260927.md`
+  - 2026-09-27 矩阵跑批实测回填（llm_usage DB 当日分列）：L2 **583 次**/547.9k tokens（事件量实测 20-120/日，高于 20-40 预估，0903 达 120）+ L3 **67 次**/89.4k + base glue 9 次/174.1k，合计 659 次/~811k，略超计划预算 <600（+10%）；墙钟 ~11 分钟（L2 并发 4 + embedding 按日缓存）；详见 `docs/got/archive/cp13_stage1_matrix_20260927.md`
 
 ### 3.4 D 层（`archive/got_layer_d_plan_0911.md` §7.2）
 
@@ -386,7 +386,7 @@ OPEN-B1…B7 —— 见 §1.B。
 
 ## 7. 需裁决事项
 
-> 📄 **2026-09-26 决策简报**：本表中的硬裁决项（#1/#3/#4/#5/#6 + C-P13/OPEN-C1 重标）已逐项给出选项/影响面/实测证据/建议，详见 [`decision_brief_20260926.md`](decision_brief_20260926.md)。
+> 📄 **2026-09-26 决策简报**：本表中的硬裁决项（#1/#3/#4/#5/#6 + C-P13/OPEN-C1 重标）已逐项给出选项/影响面/实测证据/建议，详见 [`decision_brief_20260926.md`](archive/decision_brief_20260926.md)。
 > ✅ **2026-09-26 已拍板并实施（同日第二批）**：#1a / #3a / #4b / #5a / #6a / C-P13a / OPEN-C1a，逐项结果见下表「已拍板」标注与简报「拍板结果」节。
 
 | # | 项 | 性质 |
@@ -441,6 +441,8 @@ OPEN-B1…B7 —— 见 §1.B。
 | 6 | ~~**未纳入版本控制的验收脚本**~~ | ✅ **已结**（2026-09-26 核验）：`git ls-files scripts` 实测 **11 个 `verify_*.py` 全部已入库**（common / flow_archive / glue_metrics / layer_b_consistency / position_sizing / remote_data_sources / risk_fix / same_day_idempotency / t5_alignment / ths_integration / ths_syntax）。⚠️ `.gitignore` 的 `verify_*.py` 通配规则仍在，负向例外仅显式列了 4 个 0911 手具——其余 7 个系 force-add 收录，未来新建 verify 脚本仍会被静默忽略，规则本身是否收紧属治理决策，不在本清单裁决 |
 | 7 | ~~**未跟踪工具**~~ | ✅ **已结**（2026-09-14）：`scripts/export_glue_family_audit.py`（M3 人工抽查工具，702 行）已入库，commit `0ac5252` |
 | 8 | **附录 A 基线不可复现（R-D2 FAIL）** | `archive/got_layer_d_plan_0911.md` §附录 A 的四个子计数与实算不一致。**2026-09-26 收口复算**（A6 阶段 2 后）：① `divergent_trigger_days` 实算 **6** / 文档 **0**——退役后 `divergent` 改由 glue `capital_read=low` 产出，0917 起 6 日有触发，基线测的是规则时代，语义已换；② `ambush_pool_saturation_days` 实算 **8**（顶格日共 15 天）/ 文档 **≥10**——基线数据源未落盘（D-P2）仍无法复核；③ `dead_signal_count` 实算 **2**（E5/E11）/ 文档 **4**——基线早于 D-P14 删 E10；④ `dead_branch_count` 实算 = 文档 = **1** ✅。R-D2 维持「文档缺陷」定性：输入是过期基线而非代码状态，四项差异均可归因；建议下次触及 `got_layer_d_plan` 时整体重标基线，不单独立项 |
+| 9 | ~~**文档目录漂移**~~ | ✅ **已结**（2026-10-10 文档治理整理，详 [`docs/CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 置顶 [文档] 条）：四项同时收口——① `docs/got/` 顶层混放 8 份完结过程稿（audit/decision_brief/cp12/cp13）→ 已移 [`archive/`](archive/) 并逐处改指带路径引用（含 `src/got/`、`scripts/`、`tests/` 注释），顶层现只剩四份清单 + 一份**待拍板**简报（OPEN-C3）；② 仓库根目录双地存放 6 份 PLAN/审核/报告/审查稿（此中被 `.gitignore` 逐条忽略或从未入库）→ 已入 archive 并补状态头，`.gitignore` 两条规则作废；③ **唯一整块待批准计划 `竞品经验补强计划_20261006.md` 一直 untracked** → 已首次入库；④ 索引漏登（`got/README` 缺入场分道总计划与竞品补强两行、INDEX 二区未标 plans 状态、“§7 共 6 条开放裁决”与现状不符）→ 已重建。**防再漂移机制已入 [`docs/AGENTS.md`](../AGENTS.md)「文档治理规范」七条**（计划单一落点 / 过程稿完结即归档 / 状态头强制 / 索引同步义务 / **影子线必登判据** / 待拍板件例外 / 交付前死链自检） |
+| 10 | ~~**影子线判据无人登记**~~ | ✅ **已结**（2026-10-10）：MEG / FTS / FXG 三道买入侧影子闸门于 10-09~10 合入时，**只写了 CHANGELOG 与分析稿附录，未进 [`verification.md`](verification.md)**——按 §0.1 口径即「验收红线只能量已实施的东西」的反面案例（无判据无产物登记 = 实质无人验收）。现已在 [`verification.md`](verification.md) 顶部新增专节登记开关缺省值、影子产物、读数工具与转正门槛；后续新闸门适用 AGENTS.md 条款「只写 CHANGELOG 不算登记」 |
 
 ---
 
@@ -522,3 +524,5 @@ python scripts/export_glue_family_audit.py                                      
 *修订：2026-09-28（批 4.1 CodeReview 后修复①②③）—— 三视角评审实证三项计算缺陷并修复：①Critical 重复卖单（Step 1.5 候选未排除 Step 1 已 sell/reduce 标的且取原始股数 → 同一 symbol 二次开卖 + proceeds 虚增，双向污染 enabled 与 shadow 读数）→ Step 1 维护 `remaining_qty` 真相；②零股负股数（`max(100,min(…))` 对 <100 股抬回一手）→ 去 max 改整笔清仓；③W1 抑制被整手尾差击穿（`position_gap>0` 抢先于 `elif`，实测同轮 sell+buy 并存）→ `over_limit_forced` 提为前置短路。单测 7→**11 例**（新增重复削减/reduce 余量/零股/取整超配 4 边界），关联回归 48+11 全绿。未修登记：Warning④ `.env.example` 开关区未录入、Warning⑤ W3 聚合口径削 `accounts[0]`（标为 enabled 转正硬前置）；建议项（`__init__` 初始化影子态/金丝雀补测/字段改名）及「R-B8 移出组」表述校准（校验脚本按显式字段清单取数，新字段本不在清单内）归负责人。**修复前影子读数不可作标定输入**。*
 
 *修订：2026-09-28（批 4.1 设计修正·默认关→真影子）—— 负责人指出「影子开关关了不跑，写它干啥」：初版 `GOT_SELL_SOURCE_ENABLED` 默认 OFF 使 Step 1.5 整段 `if` 不进，等于**零观察零作用**，与仓内 `_SHADOW` 惯例（跑但不生效，如 `AGENT_SEMANTIC_GLUE_SHADOW`）不符，属写了不跑的死分支。→ 重构为**三态**：新增 `GOT_SELL_SOURCE_SHADOW`（默认开）每日跑减仓检测、将「本会削谁/多少/是否撞家族宽限」落新增观测字段 `PortfolioDecision.sell_source_shadow`，**但不写 allocation、不改 `sell_proceeds`/`over_limit_forced`→ 决策逐字节零改动**；`GOT_SELL_SOURCE_ENABLED`（默认关）作为后续「转正」才开的生效开关。新增字段按 raw_position_ratio/#5a 先例标注移出 R-B8/幂等不变组。单测扩至 **7 例**（生效 3 + 影子 2 + 全关 1 + 默认影子 1）全绿；`test_phase2_audit_fixes.py`+`test_portfolio_decision_lot_rejection.py` 27 绿（含构造完整 decision 的路径，验证新字段接线无碍）。*
+
+*修订：2026-10-10（文档治理整理轮，零代码/零行为变更）—— 本清单自身只改三处：① §8 新增 #9（文档目录漂移、已结）与 #10（影子线判据无人登记、已结）两行；② 八份完结过程稿移入 [`archive/`](archive/) 后，本文件内引用它们的地方改为 `archive/` 路径（含 [`decision_brief_20260926.md`](archive/decision_brief_20260926.md)、[`cp13_phase2_closeout_20260928.md`](archive/cp13_phase2_closeout_20260928.md) 等）；③ 顶层新增「文档治理规范」入 [`docs/AGENTS.md`](../AGENTS.md)，其中**影子线必登判据**直接约后新闸门的登记义务。另：本清单 §5 各行提及的 `.review_tmp/` 取证脚本与 [`archive/ULTRA_REVIEW_20260928_batch5.md`](archive/ULTRA_REVIEW_20260928_batch5.md)（原根目录）位置已同步。*

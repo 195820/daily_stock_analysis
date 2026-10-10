@@ -27,6 +27,25 @@
 
 ---
 
+## ‼️ 2026-10-10 补登（买入侧三道新闸门：MEG / FTS / FXG 影子判据入本清单）
+
+**背景**：三者此前只活在 [`docs/CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 与 [`plans/加速末期识别缺陷分析_20261008.md`](plans/%E5%8A%A0%E9%80%9F%E6%9C%AB%E6%9C%9F%E8%AF%86%E5%88%AB%E7%BC%BA%E9%99%B7%E5%88%86%E6%9E%90_20261008.md) 里，未进本清单——影子期无人登记判据等于无人管。本节只登记**判据与产物位置**，达标与否归负责人（遵 §0 收录范围）。
+
+| 闸门 | 开关与缺省 | 影子产物 | 判据（读数工具） | 转正门槛 |
+|---|---|---|---|---|
+| **MEG 动能衰竭门**（acceleration 内动量断裂压制 `buy_trend`） | **仅 4 个真开关**：`GOT_MOM_EXHAUST_GATE_ENABLED=0`（缺省关）/ `GOT_MOM_EXHAUST_MODE=shadow` / `GOT_MOM_EXHAUST_DECAY=-0.30` / `GOT_MOM_EXHAUST_SIZING=1`。⚠️ 设计稿 §7.6 列的 `_PEAK_DD` / `_CONFIRM` **代码未实装**（`sector_analysis._compute_momentum_state` 只算 `decay_2d ≤ 阈值 → snap`，无 peak_dd OR 分支、无连续确认日数），不可当可调参数登记 | `data/got_daily/{date}/shadow_meg.json`（`evaluated` / `flagged_stocks` / 层3 sizing） | `scripts/meg_shadow_report.py`：① 命中率（逐日+累计 `action_hits/sizing_hits/hit_rate` + 被拦标的/板块频次）② `--forward N` 假阳性（拦截股 N 日前向收益 ≤0 为正确拦截，>0 为误杀） | 观测 ≥1 周后由负责人判读命中率与假阳性率再切 `MODE=veto`；回测证真基线（§7.8.1）：snap−thrust T+5 超额 −2.54%（Welch t=−3.28、p=0.001）、假阳性 12% |
+| **FTS 家族见顶持续压制门**（跨日 latch，`buy→watch` + 仓位 sizing） | `GOT_FAMILY_TOPPING_GATE_ENABLED=0` / `GOT_FAMILY_TOPPING_MODE=shadow` / `GOT_FAMILY_TOPPING_SIZING=1` / `GOT_FAMILY_TOPPING_COOLDOWN=5` / `GOT_FAMILY_TOPPING_EXIT_HEALTHY=2` / `GOT_FAMILY_TOPPING_AGGRAVATED_MIN_CONFIRMS=1`（子参变量名**不含 `_GATE` 中段**，按上列全名为准） | `data/got_daily/{date}/shadow_fts.json`（含 `suppressed_families` 台账与 `fxg` 子块） | 逐日读 `aggravated` / `days_suppressed` / `days_healthy` 与 `flagged_stocks`；**层A `sector_exposure_limits` 历史上无执行消费者**（FXG 根因，见下行），读数时不得把它当已生效防线 | 同归负责人判读；`89062d3`/`d5bf3ca` 为正确性前置修复（aggravated 语义确认 + 分级塌缩修复），**修复前读数不可作标定输入** |
+| **FXG 家族级见顶上游排除闸门**（在 `actionable_names` 构造阶段真剔池） | `GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=0`（需父 `GOT_FAMILY_TOPPING_GATE_ENABLED=1`）/ `GOT_FAMILY_TOPPING_EXCLUDE_MODE=shadow` / `GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS=2` / `GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW=0` | `shadow_fts.json` 的 `fxg` 子块 + `candidate_pool.json`；`EXCLUDE_BASELINE_SHADOW=1` 且 `EXCLUDE_MODE=veto` 时另落 `fxg_baseline_scoring.json`（剔前原模式基线） | `scripts/fxg_pair_report.py`：主口径=家族/板块池成员差集（①见顶家族被删 ②补位者），③前向 T+5/T+10 best-effort（取不到即 N/A） | **已拍 veto（2026-10-09~10 负责人裁定）**：切 veto 后连续 ≥1 周用 `fxg_pair_report.py` 证真**补位净正/中性**方可长期保留，否则回退 shadow |
+
+**读数起算与局限（必读）**：
+1. 三道闸门的影子读数均自 **2026-10-09 部署日**起算（MEG/FTS 于 10-09 合入，FXG 于 10-10 合入并已切 veto），此前无产物。
+2. `--got-replay` **不经过 Phase 2**，三闸门读数只能从实跑交易日归档累；非交易日 `main.py --got` 直接抛错。
+3. FXG 基线口径局限（脚本 docstring 已自述）：基线=**评分阶段** vs veto=**分配阶段**口径有别，且家族差集混入当日榜单自然漂移。
+4. MEG 回测仅覆盖 2026-05~10 单一下跌/轮动 regime（无牛市样本）；设计稿 §7.3 的 `peak_dd ≤ −0.40` OR 分支与 `_CONFIRM` 连续确认**均未实装也未回测**，影子期无法观测这两条——若转正评审需要它们，得先实装再重跑影子。`stall`(−2.80%) 与 `snap`(−3.07%) 均值超额接近，“stall 降仓 + snap 硬降”两级门属后续校准方向。
+5. 当前 `.env` 实态（仅登记口径，不作达标判定）：MEG `ENABLED=1 + MODE=shadow + SIZING=1`、FTS `GATE=1 + MODE=shadow`、FXG `EXCLUDE_ENABLED=1 + MODE=veto + BASELINE_SHADOW=1`。
+
+---
+
 ## ‼️ 2026-09-17 状态变更（A5 影子期转正 → A6 阶段 1 接线）
 
 **项目负责人裁决**：8 交易日影子期实测相对规则侧 M1 +25.5 pp / 13.1×、M6 +31.4 pp，M4-b/c 7/7 PASS；**直接转正**。

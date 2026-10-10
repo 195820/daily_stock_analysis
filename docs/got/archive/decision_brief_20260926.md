@@ -1,9 +1,9 @@
 # 决策简报（2026-09-26）—— 三类未结项分诊·拍板登记与执行结果
 
-> **用途**：第三批产出。对「必须拍板」项逐条给出 **选项 / 影响面 / 实测证据 / 建议**，供项目负责人裁决。
+> **用途**：第三批产出（2026-10-10 文档整理时从 `docs/got/` 顶层移入 `docs/got/archive/`，七项裁决已全部拍板并实施，故不再属现行清单）。对「必须拍板」项逐条给出 **选项 / 影响面 / 实测证据 / 建议**，供项目负责人裁决。
 > ✅ **状态：同日已全部拍板并实施完毕，结果见文末「一页速览」表**（#1a / #3a / #4b / #5a / #6a / C-P13a / OPEN-C1a）。
 > 证据均为 2026-09-26 对 `data/got_daily/` 归档与当前代码的实测，非推断。
-> **配套**：明细见 [`backlog.md`](backlog.md) §1 / §7 / §9；执行计划见本轮分诊记录。
+> **配套**：明细见 [`backlog.md`](../backlog.md) §1 / §7 / §9；执行计划见本轮分诊记录。
 
 ---
 
@@ -19,7 +19,7 @@
 ## #3 `signal_dates` 口径：按次 vs 按日（挂起观察）
 
 - **位置**：`src/got/persistence.py:744-751`（去重只剔当日）；`signal_count_30d` 依赖该计数。
-- **现状**：R5 要求同 `(type, date)` 至多 1 条，实现**有意**按当日信号出现次数逐条落盘。二者口径冲突（详见 [`backlog.md`](backlog.md) §9 #5）。
+- **现状**：R5 要求同 `(type, date)` 至多 1 条，实现**有意**按当日信号出现次数逐条落盘。二者口径冲突（详见 [`backlog.md`](../backlog.md) §9 #5）。
 - **选项**：① 维持按次；② 改按日（同 (type,date) 只保 1 条）。
 - **影响面**：改按日会破坏 `signal_count_30d` 语义（行为变更）。
 - **实测证据**：R5 最晚重复日 09-10 将于 **10-11 滚出 30 日窗口**，R5 自动归零。
@@ -38,7 +38,7 @@
 ## #5 / #6 R-B8 判据与 replay 扩链路（验收体系取舍）
 
 - **R-B8 现状**：`scripts/verify_layer_b_consistency.py:158-160` 把 `unified.market_regime.*` 归入「应不变字段」清单。
-- **矛盾（[`backlog.md`](backlog.md) §9 #6 已证）**：`market_regime` 是**跨日状态机**输出，回放（`--got-replay` 从归档重算）语义下**必然变**，该不变性断言不可能 PASS。且 `--got-replay` 只跑 Node 6 ⇒ 验不到 B 层实际改的 Node 2（`family_keywords`/`sector_analysis`），也缺 Phase 2 的 `portfolio.*`（见 §1.F）。
+- **矛盾（[`backlog.md`](../backlog.md) §9 #6 已证）**：`market_regime` 是**跨日状态机**输出，回放（`--got-replay` 从归档重算）语义下**必然变**，该不变性断言不可能 PASS。且 `--got-replay` 只跑 Node 6 ⇒ 验不到 B 层实际改的 Node 2（`family_keywords`/`sector_analysis`），也缺 Phase 2 的 `portfolio.*`（见 §1.F）。
 - **选项（#5：`market_regime.*` 去留）**：① 移出「应不变」清单（承认状态机回放必变）；② 改判据为「回放前后**窗口对齐**」；③ **R-B8 只验 `unified.json` 的非状态字段**。
 - **选项（#6：是否扩 replay 链路）**：ⓐ 扩 `--got-replay` 跑 Node 2/Phase 2；ⓑ 收缩红线范围（R-B8/R-B9/R-C7 不追回放不可满足项）；ⓒ 只验非状态字段。
 - **影响面**：均为验收判据/口径取舍，不改策略行为。

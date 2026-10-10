@@ -2,13 +2,19 @@
 
 > GOT（多节点决策系统）相关文档的唯一入口。目录三区：**现行清单**（本目录顶层）、**待实施计划**（`plans/`）、**历史归档**（`archive/`）。
 > 架构现状的权威描述在 [`architecture.md`](architecture.md)（原仓库根 `agent_cot_design.md`，2026-09-17 移入）。
+>
+> **2026-10-10 文档整理后的顶层构成**：四份清单类文档 + 唯一一份**待拍板简报**（`decision_brief_openc3_20260928.md`）。已完结的过程稿（0922 审计、0926 决策简报、cp12 系列×3、cp13 系列×3）**已全部移入** [`archive/`](archive/)，带路径的引用已同步改指。
 
 ## 现行清单（持续更新）
 
 | 文档 | 性质 | 更新规则 |
 | --- | --- | --- |
 | [`backlog.md`](backlog.md) | **待实施**清单：四层未落地项、0902 报告 15 项处置表、OPEN 汇总、A6 转正与退役、后续 Phase、需裁决事项、文档层缺陷、红线自身缺陷 | 只收未实施项；实施后移出并归档出处 |
-| [`verification.md`](verification.md) | **待验证 / 影子期**清单：判据、实测值与出处，不落达标判定（达标与否归项目负责人） | 验证通过后条目移入 [`archive/verified_completion_log.md`](archive/verified_completion_log.md) |
+| [`verification.md`](verification.md) | **待验证 / 影子期**清单：判据、实测值与出处，不落达标判定（达标与否归项目负责人）；**含 MEG/FTS/FXG 三道买入侧新闸门判据（顶部 2026-10-10 补登节）** | 验证通过后条目移入 [`archive/verified_completion_log.md`](archive/verified_completion_log.md) |
+| [`architecture.md`](architecture.md) | 架构现状权威描述 | ⚠️ 正文基线为 0831 快照，文首时效注记列出未覆盖的后续变更（A6 转正/规则退役/三闸门等） |
+| [`decision_brief_openc3_20260928.md`](decision_brief_openc3_20260928.md) | **待拍板简报**（OPEN-C3 死分支三选一） | 拍板后移入 `archive/`，结论回写 `backlog.md` §3.3 |
+
+> ❗ **新增影子线必须登记判据**：只写 CHANGELOG 不进 `verification.md`，等于无人验收（MEG/FTS/FXG 就是例）。
 
 ## 待实施计划（按依赖排序）
 
@@ -17,12 +23,14 @@
 | 1 | **A6 阶段 2 · 退役**（backlog §4.2） | ✅ **已完工**（2026-09-26：规则评分模式三件套退役；负责人裁决放弃逐板块兜底（漏命中改 neutral 垫底）+ 提前跨过条件 2，单 commit 可回退） | —（已执行，详见 backlog §4.2「已执行动作」） |
 | 2 | [`plans/win_rate_optimization_plan.md`](plans/win_rate_optimization_plan.md) — 选股胜率优化 4 步（9 月回测驱动） | **已实施**（2026-09-17：4 步入码 + `GOT_WINRATE_*` 开关 + `tests/test_winrate_optimization.py` 16 测试，回归 309 passed；待 9 月后回测复验胜率改善） | 无（每步独立开关、独立可验证） |
 | 3 | [`plans/ambush_split_plan.md`](plans/ambush_split_plan.md) — 埋伏分支拆分 | 设计收口（18 项决策落定），待实施 | 注意其 P1/P2 子项已在 CHANGELOG 记为完成，实施前先对账 |
-| 4 | [`plans/加速末期识别缺陷分析_20261008.md`](plans/加速末期识别缺陷分析_20261008.md) — RRG 象限相位滞后于动量衰减（acceleration 内 mom_raw 两日 -34% 仍 actionable；`_lifecycle_priority_score` 仅按 day 降档、overheat §3.5 失明、B 闸门 bear-only 三线空档） | **MEG 影子接线完成**（2026-10-08 K 线回测证真 §7.8.1：snap−thrust T+5 超额 -2.54%、Welch p=0.001，案例 880952 命中 -9.41%；2026-10-09 三层落地 4 生产文件 + 25 单测通过/208 回归全绿，缺省 `GOT_MOM_EXHAUST_GATE_ENABLED=0` 逐字节不变，进入 shadow 观测期） | `scripts/meg_shadow_report.py` 聚合命中率/假阳性；观测 ≥1 周证真充分再切 `MODE=veto`；与 overheat §3.5 修复互补不合并 |
+| 4 | [`plans/加速末期识别缺陷分析_20261008.md`](plans/加速末期识别缺陷分析_20261008.md) — RRG 象限相位滞后于动量衰减（acceleration 内 mom_raw 两日 -34% 仍 actionable；`_lifecycle_priority_score` 仅按 day 降档、overheat §3.5 失明、B 闸门 bear-only 三线空档） | **MEG 影子接线完成**（2026-10-08 K 线回测证真 §7.8.1：snap−thrust T+5 超额 -2.54%、Welch p=0.001，案例 880952 命中 -9.41%；2026-10-09 三层落地，缺省 `GOT_MOM_EXHAUST_GATE_ENABLED=0` 逐字节不变）；**同一问题域已派生两道闸门：FTS 家族见顶持续压制门（shadow）与 FXG 家族级见顶上游排除闸门（已切 veto）**——三者均无独立计划文档，判据在 [`verification.md`](verification.md) 顶部 | `scripts/meg_shadow_report.py` 聚合命中率/假阳性；观测 ≥1 周证真充分再切 `MODE=veto`；FXG 切 veto 后连续 ≥1 周用 `scripts/fxg_pair_report.py` 证真补位净正/中性，否则回退 shadow；与 overheat §3.5 修复互补不合并 |
+| 4b | **入场分道三工作流**：[`plans/入场分道与持仓延续性_总计划_20260930.md`](plans/入场分道与持仓延续性_总计划_20260930.md) | 工作流 A/B/C 代码**已合入**（commit `4be371b`）｜ **待全流程实跑验收**（2026-10-10 核查：冻结开关已开但 `ambush_gate_funnel.final_pool` 仍为 0，§七 A 验收项未过） | 交易日 conda 全流程实跑；先归因埋伏池归零；资金流数据源修复后据 0914–0924 拒绝明细重调 G4 |
 | 5 | Phase 3b / 4b / 4d / 5b / 5c（backlog §5 排期轮） | **影子态落地**（2026-09-28 批次 5：5b TickFlow 探测证伪其作板块排名源→mootdx 先行定案；4b `market_theme.py` Step 2 / 3b `disagreement.py` 分歧摘要+RiskOverridePlan / 4d 前置 funnel_stats，均默认影子零决策改动；4.1 超限减仓三态开关已落，批 2 取证判 5c 样本 6<10 → DEFER） | enabled 转正归负责人 + 需影子期读数；相关性验收脚本 `.review_tmp/cp4b_correlation_acceptance.py` 为 4b 转正前置 |
 | 6 | Phase 6 盘中 0→1 确认闸门（[`archive/intraday_gate_plan_0907.md`](archive/intraday_gate_plan_0907.md)） | 草案 | 硬前置 Phase 6-0 数据地基（五档量/分时/竞价/盘中调度），地基未验收前不开影子期 |
-| 7 | [`plans/architecture_optimization_implementation_20260929.md`](plans/architecture_optimization_implementation_20260929.md) — GOT 架构优化明细实施报告（2 GATE + 26 WI） | **已审核修订**（2026-09-29：CodeReview 逐条核验 10 组代码事实断言，9 组属实；更正 `sector_strength_map`"死代码"误判（1 Critical）+ P2-8 漏 Node6 / P0-3↔P0-4 confidence 隔离（2 Warning）。关联分析蓝图：`.qoder/plans/GOT架构漏洞分析_33e2c2de.md`） | **GATE-1** 卖出侧可成交性投影层（C1）/ **GATE-2** 最优停止 pooled 分层标定；两者为 P0 系退出引擎的地基，须先落地 |
+| 7 | [`plans/architecture_optimization_implementation_20260929.md`](plans/architecture_optimization_implementation_20260929.md) — GOT 架构优化明细实施报告（2 GATE + 26 WI） | **逐条推进中**（§11.1 已落地：GATE-1/GATE-2/P0-3/P0-4/P0-5/P1-7(a)(b)/P1-9/P1-11/P2-9(a)，均为 off/shadow 态；§11.2 延后：P0-1/P0-2/P1-1…P1-6/P1-8/P1-10/P2 余项） | 各 WI shadow 读数达标后逐个 enabled；候选池归零红线用例必备 |
+| 8 | [`plans/竞品经验补强计划_20261006.md`](plans/竞品经验补强计划_20261006.md) — 9 个竞品比对后的 7 批次补强 A–G（证据链/反偏见/双源校验/异动归因/lite档/回测纪律/运行时自查） | ⚠️ **规划稿，未批准实施**（批次 A–G 零落地：`news_pulse.py`/`output_review.py`/`data_consistency.py`/`backtest_standard.py` 均不存在） | 负责人批准；建议序 D0→D→G(warn)→A→B→C→E→F |
 
-**需裁决事项**入口：[`backlog.md` §7](backlog.md)（6 条开放裁决）。
+**需裁决事项**入口：[`backlog.md` §7](backlog.md)——§7 现共 12 条，**其中 #11（bundle 预算与逐源延迟）已拍「挂起观察」、#12（家族兜底阈值重标定）已拍「另开 WI」待排期，其余均已拍板并实施**；另有 backlog §3.3 **OPEN-C3** 待拍板（简报在顶层）。
 
 ## 验收工器（红线复算入口）
 
@@ -30,6 +38,6 @@
 
 ## 历史归档（[`archive/`](archive/)，不再更新）
 
-原始文档索引与「已实施并完成验收」清单见 [`archive/README.md`](archive/README.md)。包含：0902 全链路审核、0903 主方案（agent_glue，§6.1 退役清单 / §11 路线图的权威出处）、0911 四层计划（A/B/C/D）与实施复审、修订台账、E3 总结（仅作史料）、状态盘点、已验证完成日志，以及原 `docs/custom/` 的 3 篇已完结 GOT 文档（0827 诊断、时间线增强计划 v2.1、试点报告）。
+原始文档索引与「已实施并完成验收」清单见 [`archive/README.md`](archive/README.md)。包含：0902 全链路审核、0903 主方案（agent_glue，§6.1 退役清单 / §11 路线图的权威出处）、0911 四层计划（A/B/C/D）与实施复审、修订台账、E3 总结（仅作史料）、状态盘点、已验证完成日志，原 `docs/custom/` 的 3 篇已完结 GOT 文档，以及 **2026-10-10 新收的 14 份**：cp12 系列×3、cp13 系列×3、审计与决策简报×2，以及从**仓库根目录**收回的 6 份（两份已取代 PLAN/审核稿、板块漂移 PLAN、FIX_SUMMARY 提交统计、文档更新执行报告、ULTRA_REVIEW 审查留痕）。
 
-> 代码与脚本中的 `docs/got/archive/xxx.md §X.Y` 节号引用在归档后仍然有效（文件内容与节号一字未改，仅路径前缀变化）。
+> 代码与脚本中的 `docs/got/archive/xxx.md §X.Y` **节号引用**在归档后仍然有效（正文与节号未改）。注意不等于“文件零改动”：本批搬迁对三份过程稿改了文档路径引用/相对链接前缀、对六份根目录稿新增了首屏状态头，逐份清单见 [`archive/README.md`](archive/README.md) 头部注记。

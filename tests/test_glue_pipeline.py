@@ -11,7 +11,7 @@
    留痕 prompt_variant="p" / pipeline_status；GLUE_REPLAY_VARIANT=pipeline_l1l3 目录隔离 +
    glue_pipeline_trace.json 落盘。
 
-依据：docs/got/cp13_grounding_pipeline_research_20260926.md §3/§5.3；
+依据：docs/got/archive/cp13_grounding_pipeline_research_20260926.md §3/§5.3；
 计划：C-P13 阶段1（L1+L2+L3，仅回放路径，生产链路零影响）。
 """
 

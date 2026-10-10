@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """C-P13 阶段1：事件→板块「接地式召回-验证」管线（L1 检索接地 + L2 逐事件生成 + L3 CoVe 剪枝）。
 
-依据 docs/got/cp13_grounding_pipeline_research_20260926.md §3/§5.3：
+依据 docs/got/archive/cp13_grounding_pipeline_research_20260926.md §3/§5.3：
 - L1（THEME, P1）：板块/事件 embedding 同一空间，cosine top-K 检索候选而非自由生成——
   候选有界化同时压「A 漏挂直接项」与「B 过度归属摊派」两端病灶；
 - L2（P1/P3/P7）：逐事件受约束生成，board_code 只允许落在该事件 top-K 内，

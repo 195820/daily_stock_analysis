@@ -1,6 +1,6 @@
 # C-P13 阶段2 收口决策纪要（2026-09-28）：realized 标定证伪 → 接地管线休眠
 
-出处：阶段2 立项 = 标定 LLM 自报 confidence 的「红线 0.6」（`docs/got/backlog.md` OPEN-C6 / cp13 笔记 OPEN-1、L5）；阶段1 结论见 `docs/got/cp13_stage1_matrix_20260927.md`。
+出处：阶段2 立项 = 标定 LLM 自报 confidence 的「红线 0.6」（`docs/got/backlog.md` OPEN-C6 / cp13 笔记 OPEN-1、L5）；阶段1 结论见 `docs/got/archive/cp13_stage1_matrix_20260927.md`。
 裁决：**阶段2 的 realized 收益率标定关闭为证伪负结果；C-P13 阶段1 接地管线转入休眠（合入保留、replay 门控不解除、不转正、不删除）。**
 
 ---

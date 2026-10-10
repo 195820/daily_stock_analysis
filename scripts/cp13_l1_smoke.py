@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """C-P13 阶段1 冒烟验证：L1 检索接地的已知病例核对（矩阵跑批的前置闸门）。
 
-背景（docs/got/cp13_grounding_pipeline_research_20260926.md §1/§5.3）：
+背景（docs/got/archive/cp13_grounding_pipeline_research_20260926.md §1/§5.3）：
 - A 版漏挂病例：0910「美伊冲突」→ 油运/航运关系为空；
 - B 版摊派病例：0903「房贷信贷」→ 24 板（含减肥药/短剧游戏）。
 L1 是整条管线的地基：若 top-K 检索本身漏掉直接项，管线就从「治漏挂」变成「制造漏挂」。

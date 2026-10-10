@@ -117,7 +117,7 @@
 
 ## 运行结论（2026-09-26 实测，M2×M3 对照矩阵）
 
-命令：`verify_glue_metrics.py --compare variant_a variant_b --m3-audit docs/got/cp12_m3_audit_20260926.md`
+命令：`verify_glue_metrics.py --compare variant_a variant_b --m3-audit docs/got/archive/cp12_m3_audit_20260926.md`
 
 | 日期 | A M2 | B M2 | Δ M2 | A 低置信占比 | B 低置信占比 | 备注 |
 |---|---|---|---|---|---|---|

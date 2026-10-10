@@ -8,7 +8,7 @@
    未知取值回退默认。
 3. 留痕：`agent_glue.json` 的 `prompt_variant` 字段随实际使用变体落盘（防「以为跑 B 实际跑 A」）。
 
-依据：docs/got/cp12_prompt_variants_draft_20260926.md（负责人 2026-09-26 拍板：
+依据：docs/got/archive/cp12_prompt_variants_draft_20260926.md（负责人 2026-09-26 拍板：
 A 保留澄清句；B 纳入任务1；窗口 0901–0910 + 0914）。
 """
 

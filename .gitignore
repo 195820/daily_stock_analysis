@@ -102,5 +102,5 @@ _review_diff*.txt
 /output.txt
 /backtest_september.py
 /run_phase2_only.py
-/持仓板块漂移_PLAN.md
-/文档更新执行报告.md
+# 2026-10-10 文档整理：根目录计划稿已移入 docs/got/archive/，原逐条忽略规则作废
+# （新实施计划一律写 docs/got/plans/，过程稿完结即入 archive/，不得退回根目录）
