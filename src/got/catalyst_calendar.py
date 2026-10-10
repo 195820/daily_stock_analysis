@@ -436,6 +436,13 @@ class CatalystCalendarBuilder:
                 keywords = mapping["global_keywords"]
                 if not any(kw.lower() in title_lower for kw in keywords):
                     continue
+                # 锚定词守卫：配置了 anchor_keywords 时，新闻须额外命中财报等事件语义，
+                # 防止公司名裸命中（合作伙伴表态/投资动态）伪造事件日期
+                anchor_kws = mapping.get("anchor_keywords")
+                if anchor_kws and not any(
+                    kw.lower() in title_lower for kw in anchor_kws
+                ):
+                    continue
                 news_date = date.fromisoformat(news.first_seen) if news.first_seen else date.today()
                 key = mapping["global_event"]
                 if key not in hits or news_date < hits[key][1]:

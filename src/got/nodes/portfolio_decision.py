@@ -72,6 +72,9 @@ class PortfolioDecisionNode:
         # FXG 家族级见顶上游排除闸门影子留痕（仅 GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=1 时非空，
         # 作为 fxg 子块并入 shadow_fts.json；缺省 off 态为空 dict → 不产子块，逐字节不变）。
         self._fxg_shadow: Dict[str, Any] = {}
+        # 工作流 B：bear 日收手闸门拦单逐单留痕（回放档 shadow_bear_gate.json，仅命中时非空；
+        # 缺省空 list → 不产文件，逐字节不变）。闸门本身缺省 on（GOT_BEAR_ENTRY_GATE），留痕非影子开关。
+        self._bear_gate_shadow: list = []
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
@@ -700,6 +703,13 @@ class PortfolioDecisionNode:
                     _days_held = _count_trade_days(_hwm_info["entry_date"], date.today())
                 except Exception:
                     _days_held = None
+            # WI-P-2：入场锚来源（真快照命中=thesis/ambush；无快照=none → 近似口径）
+            if thesis_map.get(symbol) is not None:
+                _entry_source = "thesis"
+            elif ambush_snapshot_map.get(symbol) is not None:
+                _entry_source = "ambush"
+            else:
+                _entry_source = "none"
 
             # 查找该股票所属板块（从 sector_context 的 confirmed_sectors 匹配）
             stock_sector_info = self._find_stock_sector(
@@ -774,6 +784,7 @@ class PortfolioDecisionNode:
             # 提取生命周期信息
             lifecycle_phase = None
             lifecycle_day = None
+            lifecycle_phase_source = None  # WI-P-3：来源标记 sector_intel/anchor/extended/none
             overheat_severity = None
             family_name = None
             anchor_name = stock_sector_info.get("relay_anchor_sector")
@@ -781,6 +792,7 @@ class PortfolioDecisionNode:
                 intel = sector_intel_map[sector_name]
                 lifecycle_phase = intel.get('lifecycle_phase')
                 lifecycle_day = intel.get('lifecycle_day')
+                lifecycle_phase_source = "sector_intel"
                 overheat_severity = intel.get('overheat_severity')
                 family_name = intel.get('frame_group')
             elif anchor_name and anchor_name in sector_intel_map:
@@ -788,6 +800,7 @@ class PortfolioDecisionNode:
                 intel = sector_intel_map[anchor_name]
                 lifecycle_phase = intel.get('lifecycle_phase')
                 lifecycle_day = intel.get('lifecycle_day')
+                lifecycle_phase_source = "anchor"
                 overheat_severity = intel.get('overheat_severity')
                 family_name = intel.get('frame_group')
             elif sector_name:
@@ -799,6 +812,7 @@ class PortfolioDecisionNode:
                 if ext_intel:
                     lifecycle_phase = ext_intel.get('lifecycle_phase')
                     lifecycle_day = ext_intel.get('lifecycle_day')
+                    lifecycle_phase_source = "extended"
                     overheat_severity = ext_intel.get('overheat_severity')
                     family_name = ext_intel.get('frame_group')
 
@@ -898,6 +912,7 @@ class PortfolioDecisionNode:
                     risk_assessment.stop_loss_threshold,
                     hwm_gain_pct=_hwm_gain,
                     drawdown_from_hwm=_drawdown,
+                    hwm_approx=bool(_hwm_info.get("approx")) if _hwm_info else False,
                 )
                 # C-B2 shadow：缺省阈值 30 未命中（day≤30）、但切 14 会命中 reduce（day>14）→ 仅留痕，
                 # 供启用前盘点统计非零冲击（不参与任何判定，关闭旧路径逐字节不变）
@@ -1065,6 +1080,10 @@ class PortfolioDecisionNode:
                     ambush_exit_reason=ambush_exit_reason,
                     days_held=_days_held,
                     drawdown_from_hwm=_drawdown,
+                    hwm_gain=_hwm_gain,
+                    hwm_approx=(bool(_hwm_info.get("approx")) if _hwm_info else None),
+                    entry_source=_entry_source,
+                    lifecycle_phase_source=lifecycle_phase_source,
                 )
             )
 
@@ -2421,6 +2440,7 @@ class PortfolioDecisionNode:
         stop_loss_threshold: float,
         hwm_gain_pct: Optional[float] = None,
         drawdown_from_hwm: Optional[float] = None,
+        hwm_approx: bool = False,
     ) -> tuple[str, str]:
         """生命周期驱动的卖出信号（论文依据：Morgan Stanley 2023, Dickinson 2011）
 
@@ -2433,6 +2453,8 @@ class PortfolioDecisionNode:
         - 硬止损/exhausted/过热三类强制卖出优先级不变，均先于追踪；
         - 曾盈利≥ARM 激活追踪后，自最髙收盘回撤≥REDUCE→reduce / ≥SELL→sell；
         - hwm_gain_pct / drawdown_from_hwm 任一为 None（K 线缺失/无入场价）→追踪 no-op、退回现逻辑。
+        - hwm_approx=True（近似 HWM：无入场快照时窗口最高点 + 成本反推）→ 追踪 no-op：
+          近似口径下 hwm_gain 对深套票形同恒真（P&L −17.6% 反推 +176%），激活即误清仓（WI-P-1）。
 
         Returns:
             (action, reason): sell/reduce/hold, 理由
@@ -2458,8 +2480,11 @@ class PortfolioDecisionNode:
             return "sell", f"过热严重度 {overheat_severity:.2f} > 0.7，建议清仓"
 
         # ── C-B1 移动止盈：曾盈利≥ARM 激活，按自高点回撤减仓/清仓（强制卖出之后、生命期减仓之前）──
+        # WI-P-1：hwm_approx=True（近似 HWM）时追踪 no-op——近似口径下 hwm_gain 由成本反推，
+        # 对深套票形同恒真，激活即把浮亏票当"高位回撤"误清仓；观测字段照常落盘（WI-P-2）。
         if (
             LIFECYCLE_TRAILING_STOP_ENABLED
+            and not hwm_approx
             and hwm_gain_pct is not None
             and drawdown_from_hwm is not None
             and hwm_gain_pct >= TRAILING_ARM_PCT
@@ -3452,7 +3477,7 @@ class PortfolioDecisionNode:
             # S-2：仅 EXCLUDE_ENABLED=1（_fxg_shadow 非空）才并入 fxg 子块，off 态不产（逐字节不变）
             if self._fxg_shadow:
                 fts["fxg"] = dict(self._fxg_shadow)
-        if not (self._shadow_t1 or self._shadow_t1h or meg or fts):
+        if not (self._shadow_t1 or self._shadow_t1h or meg or fts or self._bear_gate_shadow):
             return
         day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
         try:
@@ -3462,6 +3487,7 @@ class PortfolioDecisionNode:
                 ("shadow_t1h.json", self._shadow_t1h),
                 ("shadow_meg.json", meg),
                 ("shadow_fts.json", fts),
+                ("shadow_bear_gate.json", self._bear_gate_shadow or None),
             ):
                 if record:
                     self._atomic_write_json(day_dir / filename, record)
@@ -3985,6 +4011,7 @@ verdict 含义：
         _bear_day_gate = _bear_gate_on and _node1_regime == "bear"
         _bear_dip_mode = os.getenv("GOT_BEAR_DIP_MODE", "veto")  # veto=降 watch / soft=仅乘性降权保留
         _bear_gate_hits = 0
+        self._bear_gate_shadow = []  # 工作流 B 拦单留痕，每轮重算重置
         self._meg_action_flags = []  # 每轮重算重置（观测用）
         self._fts_action_flags = []  # FTS 层B 硬降留痕，每轮重算重置
         # FTS 家族见顶持续压制（层B）：family_name → FamilySuppression（缺省 ENABLED=0 时为空）
@@ -4133,16 +4160,34 @@ verdict 含义：
                 elif action == "buy_trend":
                     action = "watch"
                     _bear_gate_hits += 1
+                    self._bear_gate_shadow.append({
+                        "symbol": stock.code, "name": stock.name, "sector": stock_sector,
+                        "pool_source": getattr(stock, "pool_source", "") or "",
+                        "composite": adjusted_composite,
+                        "action_before": "buy_trend", "action_after": "watch", "mode": "hard",
+                    })
                     base_reasoning += " [Node1=bear 收手闸门: buy_trend→watch]"
                 elif action == "buy_dip":
                     if _bear_dip_mode == "veto":
                         action = "watch"
                         _bear_gate_hits += 1
+                        self._bear_gate_shadow.append({
+                            "symbol": stock.code, "name": stock.name, "sector": stock_sector,
+                            "pool_source": getattr(stock, "pool_source", "") or "",
+                            "composite": adjusted_composite,
+                            "action_before": "buy_dip", "action_after": "watch", "mode": "veto",
+                        })
                         base_reasoning += " [Node1=bear 收手闸门: buy_dip→watch]"
                     else:  # soft：仅乘性降权、保留 buy_dip 建议（上线后与 veto 对照）
                         _soft = float(os.getenv("GOT_BEAR_DIP_SOFT_FACTOR", "0.8"))
                         adjusted_composite = round(adjusted_composite * _soft, 4)
                         _bear_gate_hits += 1
+                        self._bear_gate_shadow.append({
+                            "symbol": stock.code, "name": stock.name, "sector": stock_sector,
+                            "pool_source": getattr(stock, "pool_source", "") or "",
+                            "composite": adjusted_composite,
+                            "action_before": "buy_dip", "action_after": "buy_dip", "mode": "soft",
+                        })
                         base_reasoning += f" [Node1=bear 收手闸门: buy_dip 软降权×{_soft}(soft)]"
 
             # ── MEG 动能衰竭门（§7.4 层2）：acceleration + snap → buy_trend 硬降级 ──
@@ -4243,6 +4288,19 @@ verdict 含义：
 
         # 工作流 B：闸门命中计数（可观测，供上线后 A/B 复盘；reasoning 已逐单落盘）
         self._bear_gate_hits = _bear_gate_hits
+        # 工作流 B 拦单留痕汇总：命中时落 self._bear_gate_shadow dict，供 _save_shadow_records 写盘
+        # （闸门缺省 on，留痕随命中自动产出，无独立影子开关）
+        if _bear_gate_hits:
+            # 先取逐单 list 再组装 dict：self._bear_gate_shadow 正被覆盖，原写法自引用恒取 []
+            flagged = self._bear_gate_shadow if isinstance(self._bear_gate_shadow, list) else []
+            self._bear_gate_shadow = {
+                "line": "bear_gate", "executed": True,
+                "regime": getattr(unified_context, "market_regime", None).regime
+                    if getattr(unified_context, "market_regime", None) is not None else None,
+                "dip_mode": _bear_dip_mode,
+                "hits": _bear_gate_hits,
+                "flagged_stocks": flagged,
+            }
         if _bear_day_gate:
             logger.info(
                 f"[Phase 2] Node1=bear 收手闸门命中 {_bear_gate_hits} 单"

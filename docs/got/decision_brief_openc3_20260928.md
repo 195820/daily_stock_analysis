@@ -1,5 +1,17 @@
 # 决策简报：OPEN-C3 `persistence_regime` 死分支处置（2026-09-28）
 
+> ⚠️ **【2026-10-10 更正头：本文核心事实链 F2/F3/F4 被复核实测推翻，建议 b 作废】**
+> 复核实测（详 backlog §3.3 OPEN-C3 二次更正）：
+> ① F3「生产端从不写该字段」错误——`sentiment_analysis.py:229` 自 03bb3d1（2026-08-28 v2.1）起写
+> `result.persistence_regime`（`_compute_ar1_persistence`）；
+> ② F4「48 归档日全 `<absent>`」测错了字段——测的是 `market_regime.persistence_regime`
+> （`MarketRegime` schema 无此字段），分支实际消费 `sentiment.persistence_regime`；
+> ③ 实测铁证：sentiment.json 0827/0910/1009 均为 `"low"`，`range_reversal` 信号在 18 个归档日
+> （0827–0924）真实触发，monitoring.json node5 历史自 0923 连续 7 日 `"low"`。
+> **结论：分支是活的，不删。** 本文以下「死分支」定性全部失效，仅留档供追溯取证过程错误。
+> 遗留真问题（待拍板）：`range_reversal`/`short_term_reversal` 目前无决策消费
+> （仅 `archive.py:564` emoji 渲染），是否接入决策面归负责人。
+
 > **性质**：排期批 2.2 产出。只给选项/影响面/实测证据/建议，**不做达标判定、不代拍板**。
 > **登记**：backlog §3.3 OPEN-C3 已同步更正为「永不触发死分支，非恒真」并指向本简报。
 > **取证**：`.review_tmp/sched28_forensics.py`（只读扫描 48 个归档日，输出 `.review_tmp/sched28_forensics_out.txt`）。

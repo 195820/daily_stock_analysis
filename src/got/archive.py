@@ -725,6 +725,7 @@ SHADOW_T1_ARTIFACT = "shadow_t1.json"
 SHADOW_T1H_ARTIFACT = "shadow_t1h.json"
 SHADOW_MEG_ARTIFACT = "shadow_meg.json"
 SHADOW_FTS_ARTIFACT = "shadow_fts.json"
+SHADOW_BEAR_GATE_ARTIFACT = "shadow_bear_gate.json"
 
 
 def _shadow_display_name(name: str, symbol: str) -> str:
@@ -814,6 +815,32 @@ def _render_glue_degraded_note(glue: "dict | None") -> list[str]:
         + "。"
     ]
     lines += [f"- ⚠️ {w}" for w in (glue.get("warnings") or [])]
+    lines.append("")
+    return lines
+
+
+def _render_shadow_bear_gate(bg: "dict | None") -> list[str]:
+    """工作流 B bear gate 拦单留痕：闸门生效（非影子开关），留痕为观测旁挂。
+
+    产物形态：{line, executed, regime, dip_mode, hits, flagged_stocks[]}；
+    无命中日 _save_shadow_records 不写该文件（读取侧按缺失降级）。
+    """
+    if not bg:
+        return ["**工作流 B bear gate**（闸门生效）：本次无产物（`shadow_bear_gate.json` 缺失，多为当日无拦单）。", ""]
+    flagged = bg.get("flagged_stocks") or []
+    if not bg.get("executed") or not flagged:
+        return ["**工作流 B bear gate**（闸门生效）：当日无拦单。", ""]
+    lines = [
+        f"**工作流 B bear gate**（闸门生效）：拦单 {bg.get('hits', len(flagged))} 单"
+        f"（regime=`{bg.get('regime')}`，dip_mode=`{bg.get('dip_mode')}`）。",
+        "",
+    ]
+    lines += [
+        f"- **{_shadow_display_name(s.get('name'), s.get('symbol'))}**"
+        f"（{s.get('sector', '')}/{s.get('pool_source', '')}，composite {s.get('composite')}）："
+        f"`{s.get('action_before')}` → `{s.get('action_after')}`（{s.get('mode')}）"
+        for s in flagged
+    ]
     lines.append("")
     return lines
 
@@ -1090,10 +1117,11 @@ def _render_shadow_section(
     sell_source_shadow: "dict | None" = None,
     meg_shadow: "dict | None" = None,
     fts_shadow: "dict | None" = None,
+    bear_gate_shadow: "dict | None" = None,
 ) -> list[str]:
     """渲染「影子模式观测」段（reasoning.md 末尾，各影子线各一段）。
 
-    各线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查 / MEG / FTS（含 FXG）。
+    各线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查 / MEG / FTS（含 FXG）/ 工作流 B bear gate 留痕。
     A5 语义粘合层已转正（A6），改由 Node 6 正文子块 `_render_a6_glue_formal` 承载；
     仅当 glue 降级时才在本段留一条降级观测行。code_to_name 保留签名位（已转正线不再用）。
     """
@@ -1103,6 +1131,7 @@ def _render_shadow_section(
     lines += _render_shadow_sell_source(sell_source_shadow)
     lines += _render_shadow_meg(meg_shadow)
     lines += _render_shadow_fts(fts_shadow)
+    lines += _render_shadow_bear_gate(bear_gate_shadow)
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _render_shadow_t1h(t1h)
@@ -1200,6 +1229,7 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         sell_source_shadow=_pd_json.get("sell_source_shadow"),
         meg_shadow=_read_json_quiet(day_dir / SHADOW_MEG_ARTIFACT),
         fts_shadow=_read_json_quiet(day_dir / SHADOW_FTS_ARTIFACT),
+        bear_gate_shadow=_read_json_quiet(day_dir / SHADOW_BEAR_GATE_ARTIFACT),
     )
 
     reasoning_path.write_text("\n".join(lines), encoding="utf-8")

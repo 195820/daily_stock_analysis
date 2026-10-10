@@ -1169,6 +1169,23 @@ class UnifiedScoringResult(BaseModel):
         default=None,
         description="自入场以来最高收盘的回撤幅度（正数=回撤比 0~1）；K 线缺失/不足=None（追踪 no-op）",
     )
+    # ── WI-P-2（持仓模块 T-3）：hwm 口径结构化观测，替代解析 reasoning 文本 ──
+    hwm_gain: Optional[float] = Field(
+        default=None,
+        description="自入场以来最高收盘相对成本收益（0~1 小数）；近似口径下为反推值仅作观测；K 线缺失=None",
+    )
+    hwm_approx: Optional[bool] = Field(
+        default=None,
+        description="HWM 是否近似口径（True=无入场快照：窗口最高点+成本反推；该口径下追踪止盈 no-op，WI-P-1）",
+    )
+    entry_source: Optional[str] = Field(
+        default=None,
+        description="入场锚来源：thesis=持仓论点快照 / ambush=埋伏仓位快照 / none=无快照（近似口径）",
+    )
+    lifecycle_phase_source: Optional[str] = Field(
+        default=None,
+        description="生命周期阶段来源：sector_intel=confirmed 直接命中 / anchor=中继锚点板块 / extended=Node2 全量降级 / none=三路全落空（None 阶段）",
+    )
 
 
 class TradeAllocation(BaseModel):

@@ -38,6 +38,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "id": 3,
         "global_event": "英伟达财报",
         "global_keywords": ["英伟达", "NVIDIA", "NVDA", "黄仁勋"],
+        # 锚定词守卫：新闻须含财报语义才可作为财报事件锚点（公司名裸命中会伪造财报日期）
+        "anchor_keywords": ["财报", "业绩", "earnings", "季报", "指引", "展望"],
         "a_share_sectors": ["AI算力", "CPO", "光模块", "PCB", "服务器", "半导体"],
         "base_impact_level": 3,
         "direction": "drift",

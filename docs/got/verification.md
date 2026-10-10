@@ -211,6 +211,15 @@ T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A
 - 重跑不堆积（`_append_phase2_reasoning()` 的覆盖写机制天然处理，影子段随 Node 7 段一并重建）
 - "未执行"必带原因（开关关闭 / 无可审目标 / 具体哪只持仓不满足哪条筛选条件）
 
+### bear gate 拦单留痕产物（2026-10-10 起）
+
+工作流 B（bear 期入场闸门，`GOT_BEAR_ENTRY_GATE`，缺省 on）在 `_score_candidates` 拦单时新增逐单留痕：
+
+- **`shadow_bear_gate.json`**：命中闸门的候选逐单 dict `{symbol, name, sector, pool_source, composite, action_before, action_after, mode}`，汇总 `{line: "bear_gate", executed, regime, dip_mode, hits, flagged_stocks}`；无命中日落 `{"executed": false}`。
+- 由 `_save_shadow_records()` 第 5 项落盘到 `data/got_daily/{date}/`，同走 `_render_shadow_section()` 渲染链。
+- **性质与 T1/T1-H 影子不同**：闸门本身是生效的（硬拦/veto/soft 三档真实改写候选动作），留痕只是**观测旁挂**（闸门缺省 on、留痕非影子开关），不存在"攒读数后转正"的开关翻转。
+- 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。
+
 详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
 
 ### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）

@@ -28,10 +28,10 @@ def _node():
 
 
 def _sell(node, pnl=0.05, phase="acceleration", day=3, overheat=None,
-          stop=-0.07, hwm_gain=None, drawdown=None):
+          stop=-0.07, hwm_gain=None, drawdown=None, hwm_approx=False):
     return node._lifecycle_sell_signal(
         pnl, phase, day, overheat, stop,
-        hwm_gain_pct=hwm_gain, drawdown_from_hwm=drawdown,
+        hwm_gain_pct=hwm_gain, drawdown_from_hwm=drawdown, hwm_approx=hwm_approx,
     )
 
 
@@ -108,6 +108,29 @@ class TestTrailingStop(unittest.TestCase):
             action, _ = _sell(node, pnl=0.05, phase="acceleration",
                               hwm_gain=None, drawdown=0.30)
         self.assertEqual(action, "hold")
+
+    def test_approx_hwm_deep_loss_noop(self):
+        """WI-P-1 守卫：近似 HWM（无入场快照）下深套票不得触发追踪动作。
+
+        缺陷复现口径（688689，2026-10-10 实测）：P&L −17.6%、自 60 日窗口高点回撤 56%、
+        成本反推 hwm_gain≈+1.76 ⇒ 恒过 ARM 激活条件。守卫后 approx=True 时追踪分支
+        必须整体 no-op。为隔离硬止损优先级（pnl<stop 会先命中），测试放宽止损线至
+        −20%，使追踪分支成为唯一可能产出 sell 的路径。
+        """
+        node = _node()
+        with patch.object(catalyst_config, "LIFECYCLE_TRAILING_STOP_ENABLED", True), \
+             patch.object(catalyst_config, "TRAILING_ARM_PCT", 0.10), \
+             patch.object(catalyst_config, "TRAILING_DRAWDOWN_REDUCE", 0.08), \
+             patch.object(catalyst_config, "TRAILING_DRAWDOWN_SELL", 0.12):
+            action, reason = _sell(node, pnl=-0.176, stop=-0.20, phase="acceleration",
+                                   hwm_gain=1.76, drawdown=0.561, hwm_approx=True)
+            self.assertEqual(action, "hold")
+            self.assertNotIn("移动止盈", reason)
+            # 对照：同样数值非近似口径（approx=False）仍正常触发（防守卫误伤真快照路径）
+            action_real, reason_real = _sell(node, pnl=-0.176, stop=-0.20, phase="acceleration",
+                                             hwm_gain=1.76, drawdown=0.561, hwm_approx=False)
+            self.assertEqual(action_real, "sell")
+            self.assertIn("移动止盈", reason_real)
 
 
 class TestMatureReduceDay(unittest.TestCase):
@@ -216,12 +239,29 @@ class TestUnifiedScoringSerialization(unittest.TestCase):
         r = UnifiedScoringResult(**self._base_kwargs())
         self.assertIsNone(r.days_held)
         self.assertIsNone(r.drawdown_from_hwm)
+        # WI-P-2/3：新观测字段缺省 None
+        self.assertIsNone(r.hwm_gain)
+        self.assertIsNone(r.hwm_approx)
+        self.assertIsNone(r.entry_source)
+        self.assertIsNone(r.lifecycle_phase_source)
 
     def test_populated_and_dump(self):
         r = UnifiedScoringResult(**self._base_kwargs(days_held=6, drawdown_from_hwm=0.09))
         dumped = r.model_dump(mode="python")
         self.assertEqual(dumped["days_held"], 6)
         self.assertAlmostEqual(dumped["drawdown_from_hwm"], 0.09, places=6)
+
+    def test_wip23_fields_populated_and_dump(self):
+        """WI-P-2/3：hwm 口径三字段 + lifecycle 来源标记序列化。"""
+        r = UnifiedScoringResult(**self._base_kwargs(
+            hwm_gain=0.30, hwm_approx=True, entry_source="none",
+            lifecycle_phase_source="extended",
+        ))
+        dumped = r.model_dump(mode="python")
+        self.assertAlmostEqual(dumped["hwm_gain"], 0.30, places=6)
+        self.assertTrue(dumped["hwm_approx"])
+        self.assertEqual(dumped["entry_source"], "none")
+        self.assertEqual(dumped["lifecycle_phase_source"], "extended")
 
 
 if __name__ == "__main__":

@@ -238,7 +238,7 @@ class GOTOrchestrator:
             except Exception as exc:
                 # Phase 2 失败不应阻断 Phase 1，但必须留下 status="failed" 占位产物，
                 # 保证"跑过就有文件"，回测/影子线可区分"停牌无数据"与"节点崩了"
-                logger.error("[GOT] Phase 2 失败: %s", exc)
+                logger.exception("[GOT] Phase 2 失败: %s", exc)
                 try:
                     from src.got.archive import archive_phase2
                     from src.got.schemas import (
