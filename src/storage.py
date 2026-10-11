@@ -1194,6 +1194,9 @@ class CatalystEventRecord(Base):
     source_news = Column(String(200), nullable=True)  # 来源新闻标题（LLM 叙事回声检测）
     # T5 多板块扇出（JSON 数组，空/NULL = 未对齐，仅 event.sector 生效）
     affected_sectors = Column(Text, nullable=True)
+    # A1（批次 A）证据链：证据档与来源链接（默认 reported，老库回读兼容）
+    evidence_tier = Column(String(12), default='reported')   # confirmed / reported / rumor
+    source_url = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
     expires_at = Column(Date, index=True)
@@ -1381,6 +1384,9 @@ class Node4RawNewsRecord(Base):
     appearance_count = Column(Integer, default=1)  # 跨日出现次数
     appearance_count_run_based = Column(Integer, default=0)  # A-P0-7: 旧口径（每次运行+1），与 appearance_count（按日去重）双写对比
     lifecycle_state = Column(String(20), default='active')  # active/fermenting/archived
+    # A1（批次 A）出处链：来源链接与发布时间（采集层透传，旧行 NULL→回读容错）
+    url = Column(String(500), nullable=True)
+    published_at = Column(String(32), nullable=True)
     # 时间戳
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
@@ -1745,7 +1751,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             )
 
     def _migrate_catalyst_events(self) -> None:
-        """幂等轻量迁移：为 catalyst_events 补齐 T5 扇出新列（affected_sectors）。
+        """幂等轻量迁移：为 catalyst_events 补齐 T5 扇出列（affected_sectors）与证据链列（evidence_tier/source_url）。
 
         模式同 _migrate_catalyst_realizations：PRAGMA table_info → ALTER TABLE。
         """
@@ -1753,6 +1759,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return
         new_columns = {
             "affected_sectors": "TEXT",
+            "evidence_tier": "VARCHAR(12)",
+            "source_url": "VARCHAR(500)",
         }
         try:
             with self._SessionLocal() as session:
@@ -1838,6 +1846,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             },
             "node4_raw_news": {
                 "appearance_count_run_based": "INTEGER DEFAULT 0",
+                # A1（批次 A）出处链：采集层透传 url / 发布时间（nullable，旧行 NULL 回读容错）
+                "url": "VARCHAR(500)",
+                "published_at": "VARCHAR(32)",
             },
         }
         try:

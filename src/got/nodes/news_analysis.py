@@ -27,6 +27,7 @@ from src.got.schemas import (
     DataQuality,
 )
 from src.got.news_feeds import fetch_all_news
+from src.got.catalyst_config import GOT_NEWS_EVIDENCE_GATING
 from src.storage import DatabaseManager, Node4EventRecord, Node4RawNewsRecord
 
 logger = logging.getLogger(__name__)
@@ -76,14 +77,14 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
    - sentiment: "positive"（利好）/ "negative"（利空）/ "neutral"（中性）
    - affected_sectors: 受影响板块列表（尽量映射到概念列表中的概念）
    - affected_stocks: 事件中明确提到的具体个股名称或代码列表（如"中际旭创"、"300750"）。没有提到具体个股则留空[]
-   - source_type: 事件的主要信息来源类型——"professional"（专业媒体/通讯社）或 "retail_forum"（散户论坛/社区讨论）。如果事件主要由[NGA论坛]等论坛标签的新闻首先提及或讨论，标记为"retail_forum"
+   - source_type: 事件的主要信息来源类型——"professional"（专业媒体/通讯社）或 "retail_forum"（散户论坛/社区讨论）。如果事件主要由[NGA论坛]等论坛标签的新闻首先提及或讨论，标记为"retail_forum"{src_index_req}
 2. 不要遗漏重要事件，也不要重复
 3. 同一事件被多家媒体报道时，合并为一个事件
 4. 如果当前新闻中的事件与历史事件相关（同一主题或因果关系），请在 summary 中标注"延续自：[历史事件标题]"
 5. 严格按 importance 排序，high 在前
 
 输出 JSON 格式（不要 markdown 代码块）：
-{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"}}]}}"""
+{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"{src_index_example}}]}}"""
 
 CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
 
@@ -332,7 +333,8 @@ class NewsAnalysisNode:
         self, raw_news: List[Dict],
     ) -> Tuple[List[NewsEvent], List[Dict], List[str]]:
         """3 次 LLM 调用：事件提取 → 概念发现 → 风险总结（串行，避免 API 并发空响应）。"""
-        news_text = self._format_news_for_prompt(raw_news)
+        gated = GOT_NEWS_EVIDENCE_GATING
+        news_text, ordered_items = self._format_news_for_prompt(raw_news, gated=gated)
         # A-2 (2026-10-11)：概念列表不再硬编码"科技成长"，改为从 CONCEPT_UNIVERSE
         # 子类标签派生（含周期/资源/消费/机械/医药扩展），使事件提取的
         # affected_sectors 不再只偏科技（glue 埋伏支路的上游事件供给）。
@@ -349,11 +351,16 @@ class NewsAnalysisNode:
                 concept_list=concept_list_str,
                 news_data=news_text,
                 historical_context=historical_context,
+                src_index_req=(
+                    "\n   - source_index: 该事件**出处**对应的新闻编号（新闻数据前 [#n] 的 n，1-based）；"
+                    "取最核心来源编号，无法定位则省略（系统按此编号回填真实 url/发布时间，勿自行生成 url）"
+                ) if gated else "",
+                src_index_example=", \"source_index\": 3" if gated else "",
             ),
             temperature=EVENT_EXTRACTION_TEMPERATURE,
             max_tokens=EVENT_EXTRACTION_MAX_TOKENS,
         )
-        events = self._parse_events(events_result)
+        events = self._parse_events(events_result, ordered_items)
 
         # 概念发现（注入历史上下文）
         concepts_result = await asyncio.to_thread(
@@ -395,8 +402,13 @@ class NewsAnalysisNode:
     _RESERVED_SOURCE_TYPES = ("nga_forum", "intelligence")
 
     @staticmethod
-    def _format_news_for_prompt(news_items: List[Dict], max_items: int = 50) -> str:
-        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA/Intelligence 保底）。"""
+    def _format_news_for_prompt(news_items: List[Dict], max_items: int = 50, *, gated: bool = False) -> Tuple[str, List[Dict]]:
+        """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA/Intelligence 保底）。
+
+        返回 (文本, 有序条目列表)：有序列表与文本中序号 1..N 严格对齐，供 `_parse_events`
+        按 LLM 输出的 source_index **确定性回连**真实 url/发布时间（防幻觉，禁 LLM 造 URL）。
+        gated=False（缺省）：素材行逐字同改造前，仅返回列表供回连（实际无 source_index 则回连 None）。
+        """
         top_items = list(news_items[:max_items])
 
         def _ensure_min(source_type: str, min_count: int) -> None:
@@ -444,8 +456,18 @@ class NewsAnalysisNode:
             else:
                 tag = source or "搜索"
 
-            lines.append(f"{i}. [{tag}] {title}\n   {snippet}")
-        return "\n".join(lines)
+            pub_date = item.get("published_date", "")
+            if gated:
+                # A2 素材行前缀：[#idx | 发布时间]——供 LLM 引用 source_index + 时效判断（url 不入 prompt，回连走代码侧）
+                head = f"{i}. [#{i}"
+                if pub_date:
+                    head += f" | {pub_date}"
+                head += f"|{tag}] {title}\n   {snippet}"
+                lines.append(head)
+            else:
+                # 改造前原行格式（零决策面变更）
+                lines.append(f"{i}. [{tag}] {title}\n   {snippet}")
+        return "\n".join(lines), top_items
 
     @staticmethod
     def _call_llm(prompt: str, *, temperature: float, max_tokens: int, max_retries: int = 3) -> str:
@@ -540,8 +562,13 @@ class NewsAnalysisNode:
             return None
 
     @staticmethod
-    def _parse_events(result) -> List[NewsEvent]:
-        """解析事件提取 LLM 输出。"""
+    def _parse_events(result, ordered_items: Optional[List[Dict]] = None) -> List[NewsEvent]:
+        """解析事件提取 LLM 输出。
+
+        A2 确定性回连：按 LLM 输出的 source_index（1-based）从 ordered_items 取**真实**
+        url/发布时间回填到 NewsEvent.source_url/timestamp；越界/缺失→留空（不伪造）。
+        LLM 不输出 url，防幻觉。
+        """
         if isinstance(result, Exception) or not result:
             return []
 
@@ -553,6 +580,14 @@ class NewsAnalysisNode:
         events = []
         for item in data["events"]:
             try:
+                # 按 source_index 确定性回连真实出处 url/发布时间（越界或缺失→None）
+                src_url = None
+                src_time = None
+                idx = item.get("source_index")
+                if ordered_items and isinstance(idx, int) and 1 <= idx <= len(ordered_items):
+                    ref = ordered_items[idx - 1] or {}
+                    src_url = (ref.get("url") or "").strip() or None
+                    src_time = (ref.get("published_date") or "").strip() or None
                 events.append(NewsEvent(
                     event_type=item.get("event_type", "industry"),
                     title=item.get("title", ""),
@@ -563,6 +598,8 @@ class NewsAnalysisNode:
                     affected_stocks=item.get("affected_stocks", []),
                     source_type=item.get("source_type", "professional"),
                     source_count=1,
+                    source_url=src_url,
+                    timestamp=src_time,
                 ))
             except Exception as exc:
                 logger.debug("[Node 4] 事件解析失败: %s — item=%s", exc, item)
@@ -795,6 +832,8 @@ class NewsAnalysisNode:
                     source = item.get("source", "unknown")
                     if not title:
                         continue
+                    url = (item.get("url") or "").strip() or None
+                    published_at = (item.get("published_date") or "").strip() or None
 
                     title_norm = self._normalize_title(title)
 
@@ -831,6 +870,11 @@ class NewsAnalysisNode:
                         existing.appearance_count_run_based = (existing.appearance_count_run_based or 0) + 1
 
                         existing.last_seen_date = today
+                        # A1 出处回填：旧行无 url/发布时间而本次采到则补齐（不覆盖已有值）
+                        if url and not getattr(existing, "url", None):
+                            existing.url = url
+                        if published_at and not getattr(existing, "published_at", None):
+                            existing.published_at = published_at
                         updated += 1
                     else:
                         session.add(Node4RawNewsRecord(
@@ -842,6 +886,8 @@ class NewsAnalysisNode:
                             last_seen_date=today,
                             appearance_count=1,
                             lifecycle_state='active',
+                            url=url,
+                            published_at=published_at,
                         ))
                         persisted += 1
 

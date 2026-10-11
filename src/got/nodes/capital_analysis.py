@@ -74,43 +74,9 @@ _INDUSTRY_WEIGHT = 0.35      # 行业板块权重
 # =============================================================================
 
 
-def _validate_data_freshness(df: pd.DataFrame, expected_date: str) -> dict:
-    """验证 akshare 返回的数据是否为当日（防反爬缓存）。
-
-    检查逻辑：
-    1. 如果 df 有 "日期" 列 → 精确匹配
-    2. 如果 df 有 "时间" 列 → 取最新时间戳的日期部分
-    3. 都没有 → 假设有效（无法验证时不阻塞）
-
-    Returns:
-        dict: {"is_fresh": bool, "stale_data": bool, "detail": str}
-    """
-    result = {"is_fresh": True, "stale_data": False, "detail": "无法验证（无日期列）"}
-
-    if df is None or df.empty:
-        result["detail"] = "空数据"
-        return result
-
-    # 精确日期匹配
-    if "日期" in df.columns:
-        dates = df["日期"].astype(str).str.strip()
-        latest = dates.iloc[-1][:10]  # 取最后一行的日期
-        result["is_fresh"] = latest == expected_date
-        result["stale_data"] = not result["is_fresh"]
-        result["detail"] = f"日期列最新={latest}, 期望={expected_date}"
-        return result
-
-    # 时间戳列
-    if "时间" in df.columns:
-        times = df["时间"].astype(str).str.strip()
-        latest_time = times.iloc[-1]
-        latest_date = latest_time[:10]
-        result["is_fresh"] = latest_date == expected_date
-        result["stale_data"] = not result["is_fresh"]
-        result["detail"] = f"时间列最新={latest_time}, 期望日期={expected_date}"
-        return result
-
-    return result
+# C2（批次 C）：新鲜度检查收为全局唯一权威实现（src/got/data_freshness.py），本节点
+# 直接复用别名——禁第二套口径。原模块级函数体已搬至该工具（并扩识别英文 date 列）。
+from src.got.data_freshness import check_data_freshness as _validate_data_freshness
 
 
 class CapitalAnalysisNode:

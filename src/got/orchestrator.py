@@ -133,6 +133,18 @@ class GOTOrchestrator:
         bar_complete = _is_bar_complete(target_date, datetime.now())
         logger.info(f"[GOT] bar_complete={bar_complete}")
 
+        # E1（批次 E）：轻量网络预检（观测，stash 供归档后合并进 meta.json；不据此降级）
+        self._net_preflight = None
+        if not self.use_mock:
+            try:
+                from src.got.catalyst_config import GOT_NET_PREFLIGHT
+                if GOT_NET_PREFLIGHT:
+                    from src.got.net_preflight import run_net_preflight
+                    # S1：预检内含阻塞式 HTTP（ThreadPoolExecutor+result(timeout)），移出事件循环。
+                    self._net_preflight = await asyncio.to_thread(run_net_preflight)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[GOT] 网络预检失败（已忽略）: %s", exc)
+
         # Step 2: 并行执行两路
         tech_path_task = self._run_tech_path()
         data_path_task = self._run_data_path(bar_complete)
@@ -199,7 +211,24 @@ class GOTOrchestrator:
                 # 存档失败不应阻断 GOT 主流程
                 logger.warning("[GOT] 历史档存档失败（已忽略）: %s", exc)
 
+            # E1：将网络预检观测合并进 meta.json（回读-改-写，失败不阻断；同 funnel_stats 口径）
+            if self._net_preflight is not None:
+                try:
+                    from pathlib import Path
+                    import json as _json
+                    _meta_path = Path("data/got_daily") / target_date.strftime("%Y%m%d") / "meta.json"
+                    if _meta_path.exists():
+                        _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                        if isinstance(_meta, dict):
+                            _meta["net_preflight"] = self._net_preflight
+                            _tmp = _meta_path.with_name(f"meta.json.{os.getpid()}.tmp")
+                            _tmp.write_text(_json.dumps(_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                            _tmp.replace(_meta_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[GOT] net_preflight 合并进 meta.json 失败（已忽略）: %s", exc)
+
             # ── Phase 2: 统一决策节点 ──
+            decision = None
             try:
                 logger.info("[GOT] Phase 2: 开始统一决策")
                 # FXG veto 双跑：先捕获"剔前原模式"基线（纯观测、自兜异常），随后真实 veto run 一次。
@@ -278,6 +307,98 @@ class GOTOrchestrator:
                     logger.info(f"[GOT] P6 兑现检测: 新兑现 {realized} 个事件")
             except Exception as exc:
                 logger.warning("[GOT] P6 兑现检测失败（已忽略）: %s", exc)
+
+            # 批次 D：持仓异动归因通道（news_pulse，一期纯观测，GOT_NEWS_PULSE_ENABLED 默认关）
+            # Phase 2 完成后追加一步，与 P6 同模式 try/except 不阻断；仅在 decision 产出时跑。
+            if decision is not None:
+                try:
+                    from src.got.catalyst_config import (
+                        GOT_NEWS_PULSE_ENABLED,
+                        GOT_NEWS_PULSE_MAX_STOCKS,
+                        GOT_NEWS_PULSE_THRESHOLD,
+                    )
+                    if GOT_NEWS_PULSE_ENABLED:
+                        from data_provider.base import DataFetcherManager
+                        from src.agent.llm_adapter import LLMToolAdapter
+                        from src.got.news_pulse import run_news_pulse
+                        from src.storage import persist_llm_usage
+
+                        run_news_pulse(
+                            decision=decision,
+                            news_ctx=news_ctx,
+                            sector_ctx=sector_ctx,
+                            market_ctx=market_ctx,
+                            target_date=target_date,
+                            manager=DataFetcherManager(),
+                            llm=LLMToolAdapter(),
+                            enabled=GOT_NEWS_PULSE_ENABLED,
+                            threshold=GOT_NEWS_PULSE_THRESHOLD,
+                            max_stocks=GOT_NEWS_PULSE_MAX_STOCKS,
+                            persist_usage=persist_llm_usage,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[GOT] news_pulse 异动归因观测失败（已忽略）: %s", exc)
+
+            # 批次 G：产出前运行时自查（一期只 warn，零行为影响；GOT_OUTPUT_REVIEW 默认开）
+            # 绝不阻断主流程/归档；decision 为 None（Phase 2 失败）时 phase2 检查自然降级为空。
+            try:
+                from src.got.catalyst_config import GOT_OUTPUT_REVIEW
+                from src.got.output_review import run_output_review
+
+                run_output_review(
+                    decision=decision,
+                    contexts={
+                        "market": market_ctx, "sector": sector_ctx, "capital": capital_ctx,
+                        "news": news_ctx, "sentiment": sentiment_ctx, "unified": unified,
+                    },
+                    target_date=target_date,
+                    enabled=GOT_OUTPUT_REVIEW,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[GOT] 产出前自查失败（已忽略）: %s", exc)
+
+            # 批次 B：轻量反偏见层 antibias（Phase 2 后一次小 LLM 调用，一期纯影子，落 shadow_antibias.json）
+            # 不参与排序/不进 warnings；与 P6/news_pulse/G 同模式 try/except 不阻断；仅 decision 产出时跑。
+            if decision is not None:
+                try:
+                    from src.got.catalyst_config import (
+                        GOT_ANTIBIAS_MAX_SECTORS,
+                        GOT_ANTIBIAS_SHADOW,
+                    )
+                    if GOT_ANTIBIAS_SHADOW:
+                        from src.agent.llm_adapter import LLMToolAdapter
+                        from src.got.antibias import run_antibias
+                        from src.storage import persist_llm_usage
+
+                        run_antibias(
+                            decision=decision,
+                            target_date=target_date,
+                            llm=LLMToolAdapter(),
+                            shadow=GOT_ANTIBIAS_SHADOW,
+                            max_sectors=GOT_ANTIBIAS_MAX_SECTORS,
+                            persist_usage=persist_llm_usage,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[GOT] antibias 反偏见观测失败（已忽略）: %s", exc)
+
+            # 批次 C1：数值双源交叉验证（抽样、一期纯观测，落 consistency.json；GOT_CONSISTENCY_SAMPLE=0 关）
+            # 不改任何决策输入；与 P6/news_pulse/G/B 同模式 try/except 不阻断；仅 decision 产出时跑。
+            if decision is not None:
+                try:
+                    from src.got.catalyst_config import GOT_CONSISTENCY_SAMPLE, GOT_CONSISTENCY_TOL
+                    if GOT_CONSISTENCY_SAMPLE > 0:
+                        from data_provider.base import DataFetcherManager
+                        from src.got.data_consistency import run_consistency_check
+
+                        run_consistency_check(
+                            decision=decision,
+                            target_date=target_date,
+                            sample_n=GOT_CONSISTENCY_SAMPLE,
+                            tol=GOT_CONSISTENCY_TOL,
+                            manager=DataFetcherManager(),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[GOT] 双源交叉验证观测失败（已忽略）: %s", exc)
 
         return unified
 

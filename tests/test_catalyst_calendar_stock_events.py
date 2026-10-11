@@ -37,8 +37,12 @@ def _make_event(**kw):
     return CatalystEvent(**base)
 
 
-def _stub_io(builder, sectors=("半导体",), legacy=()):
-    """切断全量构建的全部 IO 边：宏观规则桩 + 新闻/全球/叙事/对齐置空。"""
+def _stub_io(builder, sectors=("券商",), legacy=()):
+    """切断全量构建的全部 IO 边：宏观规则桩 + 新闻/全球/叙事/对齐置空。
+
+    缺省扇出用“券商”（属 GOT_MACRO_FANOUT_ENABLED 关闭时的旧白名单），保证宏观桩在
+    默认门控下仍入历（本测验证宏观路径不静默归零 + 不产 akshare_*）。
+    """
     builder._generate_macro_calendar = lambda s, e: [{
         "event_date": s,
         "title": "测试宏观事件",

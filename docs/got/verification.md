@@ -58,6 +58,57 @@
 
 ---
 
+## ‼️ 2026-10-11 补登（外网对标实施计划：项一/项二/项三 影子判据与本清单登记）
+
+**背景**：[`外网对标实施_PLAN.md`](../../外网对标实施_PLAN.md) 六项拍板均为推荐方案（§7）。本节登记其中需长期影子观察的两项判据与一项数据迁移状态；达标与否归负责人（遵 §0 收录范围）。
+
+| 项 | 开关与缺省 | 产物/观测位置 | 转正门槛（采纳 §7 建议值） | 当前状态 |
+|---|---|---|---|---|
+| **项一：埋伏候选事件→板块映射盲区**（修法 ②+②b） | ②（口径归一 + 扇出）**受 `GOT_MACRO_FANOUT_ENABLED=false` 门控**（审查 W1 修正：原无门控会即时改宏观排序=决策面变更，现缺省关仅旧白名单 券商/银行/房地产 扇出，行为同项一前）；②b（macro 走 T5）开关 `GOT_MACRO_SECTOR_ALIGN_ENABLED=false`（缺省关） | 观测字段 `ambush_gate_funnel.relations_supplement.legacy_miss_and_no_relations_hit`（基线现值 10/14）；macro 事件 `affected_sectors` 不再 NULL | **题材类候选零事件率 <30%**（基线 ~100%）且 `still_missed` 较基线**降 ≥50%**，连续 ≥10 交易日 | ⚙ 两开关均缺省关（严格影子先行）；翻 GOT_MACRO_FANOUT_ENABLED=true 后待全流程实跑产读数。⚠️ **门槛标定必须等项二 direction 干净化后**（已满：direction 已净化） |
+| **项二：OPEN-D10 `direction` 语义净化**（修源头①） | 非影子特性，为**直接 bugfix**（无开关）：`direction` 统一价格语义，事件类型只用 `category_tag` | `scripts/migrate_direction_semantics.py`（默认 dry-run；**`--apply` 翻转即重算、幂等可二次跑修复**，审查 W3）；单测 `tests/test_node4_realization.py::TestCheckDirection` 4 例 | 两表 `direction` 取值 ∈ {{positive, negative, binary}}；direction_accuracy 口径复算 | ✅ 代码 5 处已改；迁移 **`--apply` 已执行**（catalyst_events 19 行 + catalyst_realizations 280 行→binary，重算后 direction_accuracy 27.9%→39.0%）。❗ GLOBAL_TO_A_SHARE_MAP 13 条为建议重标，已写入代码（待负责人事后复核可选调） |
+
+### 项三：Phase 4d §4.3 AlphaSift 影子接线（3a/3b 拆分）
+
+**3a（已实施）——funnel_stats 接进生产链路**：
+- 此前 `funnel_stats` 只在 `run_got_mode` 计算/落 `data/got_screener/{date}.json`，生产 Phase 2 直调 `_extract_got_universe`+`_filter_got_finalists` 不经该路径 ⇒ `meta.json.funnel_stats` 恒缺、**D-3 基线 0 天**。
+- 现于 `portfolio_decision._score_candidates` 补算 `screener._compute_funnel_stats(universe, finalists)` → 落 `PortfolioDecision.funnel_stats`（纯观测，try/except 全包）→ `archive_phase2` 回读-改-写合并进 `data/got_daily/{date}/meta.json` 的 `funnel_stats` 键（归档层零新文件）。
+- **D-3 基线起算日 = 3a 部署后的下一个全流程交易日**（此前 0 天）；`meta.json.funnel_stats` 非空即视为接线成功。`test_got_funnel_stats.py` 4 绿。
+
+**3b（未开工——受阻，需负责人拍板后另起 WI）**：
+- **前置未满足（§3.2 计划自述）**：3b 前置 = 3a 完成 **+ D-3 基线攒满 ≥10 交易日**。3a 当日才接线，基线 0 天，影子转正窗口尚未起算。
+- **接口缺口（本轮代码核验发现，与计划描述不符）**：`AlphaSiftService.screen(*, strategy, market, max_results)`（`src/services/alphasift_service.py:384`）——① **无 `context`/`sector_filter` 入参**（计划 §3.2 设想的 `screen(strategy=auto, context={sector_filter: actionable_sectors})` 不存在）；② 硬闸 `_ensure_alphasift_enabled`——`ALPHASIFT_ENABLED=false`（生产缺省）时直接抛 403，与「ALPHASIFT_SHADOW=true 跑但不生效」的真影子语义冲突；③ 失败抛 `HTTPException` 而非返回 `{error}`，旁挂需全包裹兜底；④ **P6 ground-truth join** 需给 `catalyst_realizations` 加 `source: primary|alphasift_shadow` 维度且从**板块级**兑现追踪扩到**个股级** PEAD 多窗口收益——属新子系统，非小改。
+- **结论**：3b 非「直接实施」可得，需先就上述 ①②④ 三项做设计拍板（影子如何绕过 enabled 闸、sector_filter 从何注入、个股级兑现追踪是否复用现基建），并待 D-3 基线满 10 日。当前保持未开工，登记备查。
+
+### 项四：竞品经验补强计划批次 A–G
+
+- 本体为独立计划文档 [`docs/got/plans/竞品经验补强计划_20261006.md`](plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md)，已过 UltraReview、批准序 D0→D→G→A→B→C2→C1→E1→E3→E2→F。**逐批实施逐批验**（每批独立 WI/commit），不并入本外网对标实施计划的单次改动。本清单不代判，进度归该计划自身登记面。
+
+---
+
+## ‼️ 2026-10-11 补登（竞品经验补强计划：批次 D0/D/G/A/B 影子判据入本清单）
+
+**背景**：[`竞品经验补强计划_20261006.md`](plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md) 已批准全量按序实施（外网对标计划 §7 拍板 5）。本轮已落 **D0→D→G→A→B**（均为影子/观测先行、零决策面变化）；判据登记如下，达标归负责人。
+
+| 批次 | 开关与缺省 | 影子产物 | 转正门槛 | 当前状态 |
+|---|---|---|---|---|
+| **D0** 个股当日涨幅批量取数 | 无开关（`TencentFetcher.get_stock_quick_change` 为取数原语） | —（供 D 消费） | — | 已落，5 单测 | 
+| **D** news_pulse 持仓异动归因 | `GOT_NEWS_PULSE_ENABLED=0`（缺省**关**）/ `GOT_NEWS_PULSE_THRESHOLD=7.0` / `GOT_NEWS_PULSE_MAX_STOCKS=3` | `data/got_daily/{date}/news_pulse.json` | 先手动跑一周验输出质量（归因表含排除项/性质四选一/盘中收盘两口径）；推送接线另立子项 | 代码+测试就位（6 例），默认关未跑 |
+| **G** output_review 产出自查 | `GOT_OUTPUT_REVIEW=1`（缺省**开**，warn 态零行为） | `data/got_daily/{date}/review.json` | 一期只 warn；critical 项升为**阻断**需两周零误报人工确认（且阻断只拦推送/终端，归档照常） | 已落（一期 warn），10 例 |
+| **A** 证据链与出处 | 无独立总开关；一期 `EVIDENCE_TIER_MULTIPLIER` confirmed==reported==1.0（**零行为变化**）；Node4 抽取 prompt 的 url/时间接地受 `GOT_NEWS_EVIDENCE_GATING=false` 门控（审查 W2：开启会改 LLM 输入，缺省关=prompt 逐字同改造前） | `catalyst_events.evidence_tier/source_url` + `node4_raw_news.url/published_at` 列（已实 DB 迁移） | 二期启用 rumor<1.0 折扣前，先历史归档重放 pool 成员对比 + 人工确认（防换池）；开接地前先同输入 golden 抽取对照 | 已落（催化剂侧 tier+乘数零变化 + 新闻侧回连机制，默认关），13 例；rumor 未标→零变化 |
+| **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80% | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
+| **C1** 双源交叉验证 | `GOT_CONSISTENCY_SAMPLE=10`（缺省 10，**0=关**）/ `GOT_CONSISTENCY_TOL=1.0` | `data/got_daily/{date}/consistency.json` | 不改任何决策输入；二期可接推送/告警 | 已落（源A=manager 实时 / 源B=腾讯批量 D0，比当日 change_pct；资金无二源→诚实标注），10 例 |
+| **C2** 全局 is_stale | 无开关（`src/got/data_freshness.py`） | —（工具） | — | 已抽为唯一权威实现，capital_analysis 改为引用（禁二口径）+ 扩识别英文 `date` 列；**Node 1/2/5 行情消费点接入为待办子项** |
+| **E1** 网络预检 | `GOT_NET_PREFLIGHT=true`（缺省开，纯观测） | `meta.json.net_preflight`（回读-改-写） | 不据此降级；lite 自动降级延后到 lite/full 历史差异读数后 | 已落（GET 探活4域），4 例；**lite 手动/自动降级为独立子项（未实现）** |
+| **E3** 逐股无缓存点提速 | 无开关（`manager.get_belong_boards` 当日缓存） | — | — | 已落（get_belong_boards 当日滚动缓存，仅缓存非空，跨日失效）+ `NewsEvent.source_type` 死枚举对齐；6 例 |
+| **F** 回测纪律 | 无运行期开关（`GOT_SCORING_FORMULA_VERSION` 仅调参时 bump） | `run_card.json`（离线）/ meta.json `scoring_formula_version` | — | 已落（`src/got/backtest_discipline.py` 纯函数 + `scripts/backtest_standard.py` 强制卡片 + F3 版本戳入归档）；5 例 |
+
+**关键实现决策（与计划原文的偏差，诚实登记）**：
+- **B 落点**：计划写“SectorIntel 新字段”，但 SectorIntel 属 Node 6、其 `unified.json` 在 Phase 1 已归档（早于 Phase 2），Phase 2 回填不会持久化 ⇒ 改用与 `shadow_t1/meg/fts` 同构的**独立影子产物**（零 schema 改动、避免死字段）。
+- **A 一期零变化**：计划 §A2 字面“llm_narrative/global 缺省 rumor”会即时折扣叙事事件；但 news 侧逐事件 tier 接地未完（依赖 LLM 真实产出），故未接地时统一归 reported（==1.0），**保证一期零决策变化**（与 §A4“乘数一期零变化”断言一致）；rumor 标注待二期接地后生效。
+- 本批新增环境变量（D/G/B + 外网对标项一 GOT_MACRO_SECTOR_ALIGN_ENABLED）已集中定义于 `catalyst_config.py` 并同步 `.env.example`（G4）。
+
+---
+
 ## ‼️ 2026-09-17 状态变更（A5 影子期转正 → A6 阶段 1 接线）
 
 **项目负责人裁决**：8 交易日影子期实测相对规则侧 M1 +25.5 pp / 13.1×、M6 +31.4 pp，M4-b/c 7/7 PASS；**直接转正**。
@@ -221,6 +272,19 @@ T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A
 - 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。
 
 详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
+
+### GATE-1 tradability 影子留痕（2026-10-11 起）
+
+GATE-1（卖出可成交性投影层，`GOT_TRADABILITY_GATE`，缺省 off）在 `_allocate` 对每张卖单/买入候选做可成交性检查：
+
+- **`portfolio_decision.json` 的 `tradability_shadow` 字段**：`{mode, pending_exits, note}`；shadow 下 `pending_exits` 为被拦截项清单（symbol/name/reason/intent/quantity），无拦截时字段为 null（mode 记录在 note 语义外，读数时 mode 仅为确认开关态）。
+- **allocation 级 `pending_exit`/`blocked_reason`**：被拦截卖单打标（enabled 顺延清单同记）。
+- **读数方式**：读当日 `data/got_daily/{date}/portfolio_decision.json` 的 `tradability_shadow` 字段与各 allocation 的 `pending_exit`/`blocked_reason`。
+- **转正门槛（建议，数值归负责人）**：影子期 ≥10 个交易日；期间 `quote_unavailable` 占比 <10%；无误拦截实证（被拦卖单次日实际可成交）。满足后经负责人批准切 enabled。
+- **性质**：本层是三态影子开关（off→shadow→enabled，存在"攒读数后转正"翻转），与 bear gate 的"闸门生效+留痕旁挂"性质不同。
+- 拦截口径（tradability.py）：跌停封板→`limit_down`（现价≤跌停价且 high 贴住→全天未开板；盘中开板视为可成交）；当日建仓→`t_plus_1`；涨停一字→`limit_up`（buy 方向）。
+- 降级红线：行情缺失/超时/异常一律放行不拦截，仅留 `quote_unavailable` 告警标签。
+- 单测：`tests/test_gate1_tradability_wiring.py`（17 个用例：三态行为 + 降级红线）。
 
 ### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）
 

@@ -506,11 +506,15 @@ class NewsEvent(BaseModel):
     affected_stocks: list[str] = Field(default_factory=list, description="事件中明确提到的个股名称或代码")
     timestamp: Optional[str] = None
     source_count: int = Field(default=1, ge=1)
-    source_type: str = Field(default="search", description="cls / eastmoney / cctv / caixin / search")
+    source_type: str = Field(default="search", description="事件级：professional/retail_forum（LLM 提取）；采集源级：sina/cls/wallstreetcn/eastmoney/newsnow/nga_forum/ths_hot（E3 死枚举对齐，原记载 cctv/caixin/search 无生产者）")
     # 生命周期追踪字段（跨日记忆）
     lifecycle_state: Optional[str] = Field(default=None, description="emerging / fermenting / peak / fading / archived")
     mention_count: Optional[int] = Field(default=None, description="跨日累计出现次数")
     first_seen: Optional[str] = Field(default=None, description="首次出现日期（YYYY-MM-DD）")
+    # A1（竞品补强批次 A）证据链：来源链接与证据档（默认 None，向后兼容）。
+    # ⚠ source_url 的生产端回填（news_analysis 三步确定性回连 + news_feeds 透传）为后续子项。
+    source_url: Optional[str] = Field(default=None, description="新闻出处链接（采集层透传）")
+    evidence_tier: Optional[str] = Field(default=None, description="证据档：confirmed/reported/rumor")
 
 
 class CatalystEvent(BaseModel):
@@ -521,13 +525,16 @@ class CatalystEvent(BaseModel):
     title: str = Field(..., description="事件描述")
     sector: str = Field(..., description="映射到的 A 股板块名")
     impact_level: int = Field(default=1, ge=1, le=3, description="1=★ 2=★★ 3=★★★")
-    direction: str = Field(default="positive", description="positive / negative / binary")
+    direction: str = Field(default="positive", description="价格方向：positive / negative / binary（二元事件）。与 category_tag（事件类型 drift/fade/binary）正交，不得填 drift/fade")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="< 0.7 不入评分")
     consensus_expectation: str = Field(default="", description="共识预期（必填）")
     source: str = Field(..., description="akshare_earnings / akshare_lockup / macro_rule / llm_narrative / global_map")
     category_tag: str = Field(default="", description="drift / fade / binary（退出策略分型依据）")
     is_global: bool = Field(default=False, description="是否来自全球事件映射")
     source_news: Optional[str] = Field(default=None, description="来源新闻标题（LLM 叙事事件用于回声检测）")
+    # A1（竞品补强批次 A）证据链：证据档与来源链接（带默认值保归档/老库回读向后兼容）。
+    evidence_tier: str = Field(default="reported", description="证据档：confirmed(交易所一手/宏观)|reported(权威传导)|rumor(无源传闻)")
+    source_url: Optional[str] = Field(default=None, description="事件出处链接（一期多为空）")
     affected_sectors: list[str] = Field(
         default_factory=list,
         description="T5: LLM 语义对齐后的受影响板块列表（叙事/global 事件多板块扇出）。"
@@ -1264,6 +1271,14 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="板块暴露绑定信息: {sum_limits, position_limit, ratio, "
                     "buy_allocation_count, binding_count, note}（binding_count 仅可观测留痕，不参与决策）",
+    )
+    # ── 4d/D-3 前置：候选池归零率基线观测（项三 3a，外网对标 2026-10-11）──
+    # 由 Phase 2 直调 screener._compute_funnel_stats 计算（universe 入 vs finalists 出），
+    # 纯留痕不进任何判定；archive_phase2 消费后合并进 meta.json，使生产链路 D-3 基线可累积。
+    funnel_stats: Optional[dict] = Field(
+        default=None,
+        description="候选池归零率基线观测: {actionable_sector_count, picked_sector_count, "
+                    "zero_pick_sectors, zero_pick_rate, round_survival_counts}（仅留痕，不进判定）",
     )
     # ── P1-4 / OPEN-1 W2 卖出来源观测留痕（排期批 4.1，2026-09-28）──
     sell_source_shadow: Optional[dict] = Field(

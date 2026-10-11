@@ -14,6 +14,10 @@
 # 2. 命中后展开 a_share_sectors 关键词 → 与 CONCEPT_UNIVERSE 交集 → 确定实际板块名
 # 3. base_impact_level 为基线，LLM 可调一档但须给理由
 # 4. 同板块同窗口命中多事件取最高等级、不叠加
+# 5. 【OPEN-D10 字段分工】direction = 价格方向（positive/negative/binary），供
+#    aggregator 利空排除与 P6 兑现方向判定消费；事件类型（drift/fade/binary）只用
+#    category_tag。二者为正交维度，不得混用（历史 13 条曾把类型塞进 direction，
+#    导致 _check_direction 对 drift/fade 恒判 False、35% 样本误判）。
 
 GLOBAL_TO_A_SHARE_MAP = [
     {
@@ -42,7 +46,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "anchor_keywords": ["财报", "业绩", "earnings", "季报", "指引", "展望"],
         "a_share_sectors": ["AI算力", "CPO", "光模块", "PCB", "服务器", "半导体"],
         "base_impact_level": 3,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -51,7 +55,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["OpenAI", "Google I/O", "Meta", "GPT", "Gemini", "Llama", "AI发布会"],
         "a_share_sectors": ["AI应用", "传媒", "游戏", "AI算力"],
         "base_impact_level": 2,
-        "direction": "fade",
+        "direction": "positive",
         "category_tag": "fade",
     },
     {
@@ -60,7 +64,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["苹果", "Apple", "iPhone", "苹果发布会", "WWDC"],
         "a_share_sectors": ["消费电子", "果链", "光学光电子"],
         "base_impact_level": 2,
-        "direction": "fade",
+        "direction": "positive",
         "category_tag": "fade",
     },
     {
@@ -69,7 +73,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["特斯拉", "Tesla", "Optimus", "马斯克", "FSD", "Robotaxi"],
         "a_share_sectors": ["汽车零部件", "人形机器人", "自动驾驶"],
         "base_impact_level": 2,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -78,7 +82,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["台积电", "TSMC", "ASML", "光刻机"],
         "a_share_sectors": ["半导体设备", "中芯"],
         "base_impact_level": 2,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -87,7 +91,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["礼来", "Eli Lilly", "诺和诺德", "Novo Nordisk", "GLP-1", "减肥药"],
         "a_share_sectors": ["创新药", "CXO", "多肽"],
         "base_impact_level": 2,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -107,7 +111,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["铜价", "LME", "伦铜", "COMEX铜", "铜库存"],
         "a_share_sectors": ["铜", "矿山", "有色"],
         "base_impact_level": 2,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -116,7 +120,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["金价", "黄金", "地缘", "避险", "COMEX黄金", "伦敦金"],
         "a_share_sectors": ["黄金", "军工"],
         "base_impact_level": 2,
-        "direction": "drift",
+        "direction": "positive",
         "category_tag": "drift",
     },
     {
@@ -125,7 +129,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["SK海力士", "三星", "HBM", "存储芯片", "DRAM", "NAND"],
         "a_share_sectors": ["存储芯片", "先进封装", "接口芯片", "PCB"],
         "base_impact_level": 3,
-        "direction": "drift",
+        "direction": "binary",
         "category_tag": "drift",
     },
     {
@@ -134,7 +138,7 @@ GLOBAL_TO_A_SHARE_MAP = [
         "global_keywords": ["SpaceX", "星舰", "Starship", "星链", "Starlink"],
         "a_share_sectors": ["商业航天", "卫星互联网", "军工电子"],
         "base_impact_level": 2,
-        "direction": "fade",
+        "direction": "positive",
         "category_tag": "fade",
         "note": "偏主题情绪，跳票=落空退出",
     },
@@ -170,6 +174,17 @@ AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 �
 
 import os
 SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "false").lower() == "true"   # T5: 事件→板块对齐层（2026-09-01 转正；影子观察已验证无异常，回滚设 SECTOR_ALIGN_SHADOW=true）
+# 项一②b（外网对标 2026-10-11）：macro_rule 事件是否也走 T5 语义对齐（扇出感知当日埋伏候选/蓄水池）。
+# 默认关=影子先行（不加 macro 进对齐目标，行为同现状）；置 true 开启实验，转正人工改默认。
+# 回滚：GOT_MACRO_SECTOR_ALIGN_ENABLED=false。
+GOT_MACRO_SECTOR_ALIGN_ENABLED = os.environ.get("GOT_MACRO_SECTOR_ALIGN_ENABLED", "false").lower() == "true"
+# 项一②（外网对标）：宏观扇出扩到资源/周期/消费类真实板块名（旧伪类目“周期/消费”从不命中 concept_set）。
+# 这会给 PMI/CPI 日多个板块注入宏观催化分——属决策面变更，故缺省**关**（严格影子先行，行为同现状：
+# 只按下列“旧真实板块白名单”扇出）；置 true 启用扩扇出，运维需先比对 PMI/CPI 日板块排序漂移。
+# 回滚：GOT_MACRO_FANOUT_ENABLED=false。
+GOT_MACRO_FANOUT_ENABLED = os.environ.get("GOT_MACRO_FANOUT_ENABLED", "false").lower() == "true"
+# 开关关闭时仅保留的“旧口径真实板块”（历史唯一能命中 concept_set 的三个宏观扇出目标）。
+MACRO_FANOUT_LEGACY_BOARDS = frozenset({"券商", "银行", "房地产"})
 NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
 AGENT_STOCK_REVIEW_ENABLED = os.environ.get("AGENT_STOCK_REVIEW_ENABLED", "false").lower() == "true"  # T1: Agent 终审
 AGENT_STOCK_REVIEW_SHADOW = os.environ.get("AGENT_STOCK_REVIEW_SHADOW", "true").lower() == "true"  # T1: 影子模式（跑审查但不执行降级）
@@ -204,6 +219,47 @@ GLUE_MAX_TOKENS = int(os.environ.get("GLUE_MAX_TOKENS", "16000"))
 # A6 灰度总开关：控制 4 个消费点（_build_sector_intel / refine_events_map / _llm_refine_sectors.adjustments /
 # _synthesize_mainline_endurance）是否走 glue 分支。false = 完全回退到影子期行为。
 GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"
+
+# =============================================================================
+# 竞品经验补强（计划 2026-10-06）批次 D：持仓异动归因通道（news_pulse，一期纯观测）
+# =============================================================================
+# 默认关：先手动跑一周验证输出质量（计划 §D 纪律）。转正（推送接线）另立子项。
+# 回滚：GOT_NEWS_PULSE_ENABLED=0。
+GOT_NEWS_PULSE_ENABLED = os.environ.get("GOT_NEWS_PULSE_ENABLED", "0") == "1"
+GOT_NEWS_PULSE_THRESHOLD = float(os.environ.get("GOT_NEWS_PULSE_THRESHOLD", "7.0"))  # 触发幅度（|当日涨跌%|）
+GOT_NEWS_PULSE_MAX_STOCKS = int(os.environ.get("GOT_NEWS_PULSE_MAX_STOCKS", "3"))    # 单次运行硬上限（LLM 成本）
+
+# =============================================================================
+# 批次 G：产出前运行时自查 gate（output_review，一期只 warn 不阻断）
+# =============================================================================
+# 默认开（warn 态，零行为影响：只写日志 + 落 review.json）；回滚 GOT_OUTPUT_REVIEW=0。
+# 阻断态（拦推送/终端总结，归档照常）需两周零误报后人工新增 ENABLE_BLOCKING 类开关。
+GOT_OUTPUT_REVIEW = os.environ.get("GOT_OUTPUT_REVIEW", "1") == "1"
+
+# =============================================================================
+# 批次 B：轻量反偏见层 antibias（Phase 2 后对 actionable 板块一次小 LLM 调用，一期纯影子）
+# =============================================================================
+# 产 counter_thesis（板块 5 日回撤 8% 最可能的 1 条反方原因）+ red_line_hit（红线自报），
+# 落 shadow_antibias.json。一期不参与排序/不进 warnings。缺省开（只观测，有 LLM 成本）。
+# 回滚：GOT_ANTIBIAS_SHADOW=false。
+GOT_ANTIBIAS_SHADOW = os.environ.get("GOT_ANTIBIAS_SHADOW", "true").lower() == "true"
+GOT_ANTIBIAS_MAX_SECTORS = int(os.environ.get("GOT_ANTIBIAS_MAX_SECTORS", "8"))  # 单次 LLM 覆盖板块上限
+
+# =============================================================================
+# 批次 C1：数值双源交叉验证（抽样、非逐日全量，一期纯观测）
+# =============================================================================
+# 每日抽样 N 只持仓/候选做双源比对（源A=manager 实时行情 / 源B=腾讯批量涨跌幅），
+# 偏差/不一致 → 落 consistency.json，**不改任何决策输入**。缺省 10；设 0=关闭。
+# 回滚：GOT_CONSISTENCY_SAMPLE=0。阈值：符号相反或 |Δ|>GOT_CONSISTENCY_TOL（默认 1.0pp）报 alert。
+GOT_CONSISTENCY_SAMPLE = int(os.environ.get("GOT_CONSISTENCY_SAMPLE", "10"))
+GOT_CONSISTENCY_TOL = float(os.environ.get("GOT_CONSISTENCY_TOL", "1.0"))
+
+# =============================================================================
+# 批次 E1：轻量网络预检（一期仅观测，落 meta.json net_preflight，不据此降级）
+# =============================================================================
+# 缺省开（短超时 GET，纯观测零决策影响）；回滚 GOT_NET_PREFLIGHT=false。
+# lite 手动/自动降级为独立子项（计划 §E1：自动降级延后到 lite/full 历史差异读数产出后）。
+GOT_NET_PREFLIGHT = os.environ.get("GOT_NET_PREFLIGHT", "true").lower() == "true"
 
 # =============================================================================
 # C-P13 阶段1：事件→板块「接地式召回-验证」管线（L1 检索接地 + L2 逐事件生成 + L3 CoVe 剪枝）
@@ -283,6 +339,38 @@ LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
 # 影响等级→权重映射
 IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 
+# F3（批次 F）：评分/阈值公式版本戳（UZI consensus_formula.version 模式）。权重/阈值表
+# 任何调参必须 bump 本值并写入归档 meta.json，供回测按版本分组（与 git commit 互补：
+# commit 定位代码，version 定位参数谱系；防“多版本逻辑混池统计导致结论失真”事故复发）。
+SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-11.1")
+
+# =============================================================================
+# 批次 A（竞品补强）：证据链与出处（一期只降不升，防换池）
+# =============================================================================
+# A2——按生产实际 source 字面量静态映射默认证据档（akshare/macro=交易所一手/宏观→confirmed；
+# global/narrative=传导/LLM→reported）。source 字面量必须 ⊆ 生产实际取值集合（配单测断言防死代码）。
+# ⚠ 一期未接入 LLM 逐事件 tier 输出（news 侧三步回连为后续子项），global/narrative 暂取 reported，
+#   不标 rumor → 一期零决策变化。
+CATALYST_SOURCE_TIER = {
+    "akshare_earnings": "confirmed",
+    "akshare_lockup": "confirmed",
+    "macro_rule": "confirmed",
+    "global_map": "reported",
+    "llm_narrative": "reported",
+}
+# 证据档默认（未知 source 回退）
+CATALYST_TIER_DEFAULT = "reported"
+# 档位序（防倒挂断言用：confirmed > reported > rumor）
+CATALYST_TIER_ORDER = ("confirmed", "reported", "rumor")
+# 一期未接 LLM 逐事件 tier 接地（source_index 回连会改变 Node 4 抽取 prompt 输入、影响非确定性输出），
+# 故默认**关**：关闭时抽取 prompt 与素材行逐字同改造前（零决策面变更），仅回连机制代码就位（source_index 缺失→自然 None）。
+# 置 true 启用 url/时间接地（影子期需先做同输入 golden 抽取对照回归确认 major_events 漂移可接受）。
+# 回滚：GOT_NEWS_EVIDENCE_GATING=false。
+GOT_NEWS_EVIDENCE_GATING = os.environ.get("GOT_NEWS_EVIDENCE_GATING", "false").lower() == "true"
+# A3——证据档→催化分乘数。一期 confirmed==reported==1.0（主力事件不变、不换池）；
+# rumor<1.0 仅为二期无源事件标注预留（一期无事件被标 rumor，故零行为变化）。
+EVIDENCE_TIER_MULTIPLIER = {"confirmed": 1.0, "reported": 1.0, "rumor": 0.8}
+
 # 临近系数：事件距当前交易日的衰减
 # 3~10 交易日 = 1.0（正常窗口）
 # 1~2 交易日 = 0.6（anticipation 大半走完）
@@ -291,13 +379,17 @@ ANTICIPATION_DECAY_NORMAL = 1.0
 ANTICIPATION_THRESHOLD_DAYS = 2  # ≤2 交易日视为"临近"
 
 # 宏观日历规则（月度事件近似日期）
+# 【项一② 2026-10-11】affected_sectors 统一走 Node 2 口径真实板块名（旧值「周期/消费」为伪类目，
+# 从不命中 concept_set 致宏观催化恒无效）；只补可修的题材类缺口（有色/钢铁/化工/机械/黄金/消费），
+# 不覆盖结构性事件源缺口板块（煤炭/旅游/运输/电信等，§7 拍板接受现状走纯技术通道）。
+# direction 恒 binary（宏观数据结果未知）；事件类型用 category_tag。
 MACRO_CALENDAR_RULES = [
     {
         "event_type": "macro",
         "title": "官方制造业PMI",
         "day_rule": "month_end",      # 月末最后一天或次日
         "impact_level": 2,
-        "affected_sectors": ["券商", "周期"],
+        "affected_sectors": ["券商", "有色金属", "钢铁", "化工", "工程机械"],
         "direction": "binary",
         "category_tag": "binary",
     },
@@ -306,7 +398,7 @@ MACRO_CALENDAR_RULES = [
         "title": "CPI/PPI",
         "day_rule": "mid_month",      # 每月 9-12 日
         "impact_level": 2,
-        "affected_sectors": ["周期", "消费"],
+        "affected_sectors": ["有色金属", "化工", "钢铁", "黄金概念", "白酒", "乳业"],
         "direction": "binary",
         "category_tag": "binary",
     },

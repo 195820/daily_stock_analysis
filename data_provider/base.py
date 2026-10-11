@@ -824,6 +824,11 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        # E3（批次 E）：所属板块当日清单缓存（逐股 get_belong_board 热点，盘内基本不变）。
+        if not hasattr(self, "_belong_boards_cache") or self._belong_boards_cache is None:
+            self._belong_boards_cache = {}
+        if not hasattr(self, "_belong_boards_cache_lock") or self._belong_boards_cache_lock is None:
+            self._belong_boards_cache_lock = RLock()
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -2295,10 +2300,19 @@ class DataFetcherManager:
         Get stock membership boards through capability probing.
 
         Keep this at manager layer to avoid changing BaseFetcher abstraction.
+
+        E3（批次 E）：同一自然日内的板块归属基本不变，加**当日滚动缓存**避免 Phase 2
+        逐股重拉（仅缓存非空结果；空结果不缓存以便后续重试，不改变失败语义）。
         """
         stock_code = normalize_stock_code(stock_code)
         if _market_tag(stock_code) != "cn":
             return []
+        self._ensure_concurrency_guards()
+        day_key = time.strftime("%Y-%m-%d")
+        with self._belong_boards_cache_lock:
+            cached = self._belong_boards_cache.get(stock_code)
+            if cached and cached[0] == day_key:
+                return [dict(b) for b in cached[1]]
         for fetcher in self._fetchers:
             if not hasattr(fetcher, "get_belong_board"):
                 continue
@@ -2307,6 +2321,8 @@ class DataFetcherManager:
                 boards = self._normalize_belong_boards(raw_data)
                 if boards:
                     logger.info(f"[{fetcher.name}] 获取所属板块成功: {stock_code}, count={len(boards)}")
+                    with self._belong_boards_cache_lock:
+                        self._belong_boards_cache[stock_code] = (day_key, [dict(b) for b in boards])
                     return boards
             except Exception as e:
                 logger.debug(f"[{fetcher.name}] 获取所属板块失败: {e}")
@@ -3661,6 +3677,18 @@ class DataFetcherManager:
     ) -> dict[str, float]:
         """批量获取板块当日涨跌幅（快筛用）。"""
         return self._try_fetchers_for_method("get_board_quick_change", "板块快筛涨跌", codes, concurrency)
+
+    def get_stock_quick_change(
+        self,
+        codes: list[str],
+        concurrency: int = 20,
+    ) -> dict[str, dict]:
+        """批量获取个股当日涨跌幅（D0 持仓异动归因取数，单请求多 symbol）。
+
+        由腾讯批量行情实现（`TencentFetcher.get_stock_quick_change`）；其他 fetcher 未提供
+        则自动跳过。与 get_board_quick_change 同一降级代理机制。
+        """
+        return self._try_fetchers_for_method("get_stock_quick_change", "个股快筛涨跌", codes, concurrency) or {}
 
     def get_board_constituents(
         self,

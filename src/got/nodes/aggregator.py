@@ -48,6 +48,7 @@ from src.got.schemas import (
 )
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
+    EVIDENCE_TIER_MULTIPLIER,
     ANTICIPATION_DECAY_NEAR,
     ANTICIPATION_DECAY_NORMAL,
     ANTICIPATION_THRESHOLD_DAYS,
@@ -3507,6 +3508,17 @@ class AggregatorNode:
             proximity = ANTICIPATION_DECAY_NORMAL  # 1.0
 
         main_score = impact_weight * proximity * top_event.confidence
+
+        # A3（批次 A 证据链）：证据档→催化分乘数。一期 confirmed/reported=1.0（零变化），
+        # rumor<1.0 为二期无源事件预留；rumor 且无 url 仅打低证据日志（不改决策）。
+        tier_mult = EVIDENCE_TIER_MULTIPLIER.get(top_event.evidence_tier, 1.0)
+        if tier_mult < 1.0 or (top_event.evidence_tier == "rumor" and not top_event.source_url):
+            logger.info(
+                "[Node 6][低证据] %s/%s evidence_tier=%s url=%s 乘数=%.2f",
+                getattr(top_event, "sector", "?"), getattr(top_event, "title", "?")[:24],
+                top_event.evidence_tier, "有" if top_event.source_url else "无", tier_mult,
+            )
+        main_score *= tier_mult
 
         # 冗余加成：第 2 个及以上合格催化剂
         redundancy_count = len(sorted_events) - 1

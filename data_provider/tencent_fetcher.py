@@ -259,3 +259,63 @@ class TencentFetcher(BaseFetcher):
         except Exception as e:
             logger.debug(f"[TencentFetcher] get_stock_name 失败: {e}")
         return None
+
+    def get_stock_quick_change(
+        self,
+        codes: list[str],
+        concurrency: int = 20,
+    ) -> dict[str, dict]:
+        """批量获取个股当日涨跌幅（D0 持仓异动归因取数，单次 HTTP 多 symbol）。
+
+        对标 Node 2 `get_board_quick_change` 的批量契约：**单次请求取全部标的**（腾讯
+        qt.gtimg.cn 支持 `q=sym1,sym2,...` 逗号拼接），非逐股循环；`concurrency` 仅为与
+        板块快筛同签名，本实现不用并发。获取失败/无此标的**缺席结果、不抛异常**，
+        调用方按缺源处理（news_pulse 三维归因据此诚实降级）。
+
+        Returns:
+            {入参 code: {"change_pct": float|None, "price": float|None, "name": str}}
+            腾讯字段序（split('~') 后）：[1]名称 [3]最新价 [32]涨跌幅%；短 payload 跳过。
+        """
+        if not codes:
+            return {}
+        # symbol → 原始入参 code（返回键沿用调用方的 code，便于回查）
+        sym_to_code: dict[str, str] = {}
+        for c in codes:
+            sym = _to_tencent_symbol(c)
+            if sym:
+                sym_to_code[sym] = c
+        if not sym_to_code:
+            return {}
+
+        url = _QUOTE_ENDPOINT + ",".join(sym_to_code.keys())
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=_TENCENT_HTTP_TIMEOUT)
+            raw = resp.read().decode("gbk", errors="ignore")
+        except Exception as e:
+            logger.debug(f"[TencentFetcher] get_stock_quick_change HTTP 失败: {e}")
+            return {}
+
+        results: dict[str, dict] = {}
+        for line in raw.split(";"):
+            m = re.match(r'v_(\w+)="([^"]*)"', line.strip())
+            if not m:
+                continue
+            sym, payload = m.group(1), m.group(2)
+            code = sym_to_code.get(sym)
+            if not code:
+                continue
+            fields = payload.split("~")
+            if len(fields) < 33:
+                continue
+            try:
+                change_pct = float(fields[32]) if fields[32] else None
+                price = float(fields[3]) if fields[3] else None
+            except (ValueError, TypeError):
+                continue
+            results[code] = {
+                "change_pct": change_pct,
+                "price": price,
+                "name": fields[1].strip(),
+            }
+        return results

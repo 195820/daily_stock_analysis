@@ -25,6 +25,10 @@ from src.got.catalyst_config import (
     CATALYST_FULL_REFRESH_INTERVAL,
     IMPACT_WEIGHT,
     MACRO_CALENDAR_RULES,
+    CATALYST_SOURCE_TIER,
+    CATALYST_TIER_DEFAULT,
+    GOT_MACRO_FANOUT_ENABLED,
+    MACRO_FANOUT_LEGACY_BOARDS,
 )
 from src.got.board_aliases import normalize_sector_name as _normalize_sector_name
 
@@ -34,6 +38,32 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # 工具函数
 # =============================================================================
+
+def resolve_macro_fanout_sectors(
+    raw_sectors: List[str],
+    concept_set: Set[str],
+    *,
+    fanout_enabled: bool,
+    normalize=_normalize_sector_name,
+) -> List[str]:
+    """宏观扇出目标解析（归一 + 门控）——纯函数，供 _full_build 与单测复用。
+
+    1. 每个扇出名先过 normalize（唯一归一入口，防第二套口径）。
+    2. 仅保留命中 concept_set 的名称。
+    3. fanout_enabled=False 时只保留 MACRO_FANOUT_LEGACY_BOARDS（行为同项一前）；
+       True 时保留全部命中项（启用资源/周期/消费类扩扇出）。
+    去重保序返回。
+    """
+    out: List[str] = []
+    for raw in raw_sectors:
+        sector = normalize(raw)
+        if sector not in concept_set:
+            continue
+        if not fanout_enabled and sector not in MACRO_FANOUT_LEGACY_BOARDS:
+            continue
+        out.append(sector)
+    return list(dict.fromkeys(out))
+
 
 def _flatten_concept_universe() -> Set[str]:
     """展开 CONCEPT_UNIVERSE 为板块名集合（用于匹配过滤）"""
@@ -298,22 +328,27 @@ class CatalystCalendarBuilder:
         macro_raw = self._generate_macro_calendar(start, end)
 
         # 宏观事件直接生成（板块已在规则中指定）
+        # 【项一② 2026-10-11】扇出名过 normalize 归一 + concept_set 命中；扩扇出（资源/周期/消费类）
+        # 受 GOT_MACRO_FANOUT_ENABLED 门控（缺省关→仅旧白名单，行为同项一前）；affected_sectors 回填消 NULL。
         for raw in macro_raw:
-            for sector in raw.get("affected_sectors", []):
-                if sector in self.concept_set:
-                    all_events.append(CatalystEvent(
-                        event_id=_make_event_id("macro_rule", "macro", sector, raw["event_date"]),
-                        event_date=raw["event_date"],
-                        event_type="macro",
-                        title=raw["title"],
-                        sector=sector,
-                        impact_level=raw.get("impact_level", 2),
-                        direction=raw.get("direction", "binary"),
-                        confidence=1.0,
-                        consensus_expectation="宏观经济数据发布，影响待确认",
-                        source="macro_rule",
-                        category_tag=raw.get("category_tag", "binary"),
-                    ))
+            for sector in resolve_macro_fanout_sectors(
+                raw.get("affected_sectors", []), self.concept_set,
+                fanout_enabled=GOT_MACRO_FANOUT_ENABLED,
+            ):
+                all_events.append(CatalystEvent(
+                    event_id=_make_event_id("macro_rule", "macro", sector, raw["event_date"]),
+                    event_date=raw["event_date"],
+                    event_type="macro",
+                    title=raw["title"],
+                    sector=sector,
+                    impact_level=raw.get("impact_level", 2),
+                    direction=raw.get("direction", "binary"),
+                    confidence=1.0,
+                    consensus_expectation="宏观经济数据发布，影响待确认",
+                    source="macro_rule",
+                    category_tag=raw.get("category_tag", "binary"),
+                    affected_sectors=[sector],
+                ))
 
         # ── 全球映射 + LLM 叙事（消费 Node 4 历史事件） ──
         news_events = self._load_recent_news_events(days=7)
@@ -538,11 +573,29 @@ class CatalystCalendarBuilder:
         self, news_events: List[NewsEvent], start: date, end: date
     ) -> List[CatalystEvent]:
         """从 Node 4 历史事件中筛选前瞻性事件，LLM 判断板块映射与置信度"""
-        # 筛选有价值的输入事件（emerging/fermenting/peak 状态）
+        # 时效锚（A3，零新字段）：以 NewsEvent.first_seen 为锚，first_seen 超 72h（≈3 日）的新闻
+        # 不再作为**新**催化剂锚定（仅滤新增锚定，不改已入日历事件生命周期）；first_seen 缺失/不可
+        # 解析 → stale_unknown 观测标记（仅日志，不淘汰，避免烧毁叙事通道）。
+        cutoff = start - timedelta(days=3)
+        def _anchor_ok(e: NewsEvent) -> bool:
+            fs = getattr(e, "first_seen", None)
+            if not fs:
+                return True  # first_seen 缺失：保留（已计入 stale_unknown 观测）
+            try:
+                d = datetime.strptime(fs[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return True
+            return d >= cutoff
+        _stale_unknown = sum(1 for e in news_events if not getattr(e, "first_seen", None))
+        if _stale_unknown:
+            logger.info("[催化剂日历] stale_unknown 观测：%d 条新闻无 first_seen（保留不淘汰）", _stale_unknown)
+
+        # 筛选有价值的输入事件（emerging/fermenting/peak 状态，且未超 72h 锚定窗）
         candidates = [
             e for e in news_events
             if e.lifecycle_state in ("emerging", "fermenting", "peak")
             and e.impact_level in ("high", "medium")
+            and _anchor_ok(e)
         ]
 
         if not candidates:
@@ -576,7 +629,7 @@ class CatalystCalendarBuilder:
     "title": "事件描述",
     "sector": "板块名（必须在合法列表中）",
     "impact_level": 2,
-    "direction": "positive/negative/binary/drift/fade",
+    "direction": "positive/negative/binary",
     "confidence": 0.8,
     "consensus_expectation": "市场对此事件的共识预期是什么",
     "category_tag": "drift/fade/binary",
@@ -637,6 +690,8 @@ class CatalystCalendarBuilder:
 2. confidence 必须给出（0-1），不确定则给低分（<0.7 的不入评分但会标"参考"）
 3. consensus_expectation 必填——"市场预期什么？"，说不出则 confidence 给 0.5
 4. category_tag 必须标注：drift（量化基本面，事件后继续漂移）/ fade（软叙事，事件日即退）/ binary（高不确定二元事件）
+4b. direction 只标注**价格方向**（positive=看涨 / negative=看跌 / binary=结果决定方向的二元事件），
+    **严禁填 drift/fade**（那是事件类型，归 category_tag）。结果未知的财报/数据发布→ binary。
 5. sector 必须来自合法列表，不编造板块名
 6. **宁缺毋滥**：没有高置信前瞻性催化剂就输出空数组
 7. **不要输出已发生事件的回声**（参见时态判断表格）
@@ -721,6 +776,15 @@ class CatalystCalendarBuilder:
 
                 title = item.get("title", "叙事型催化")
                 direction = item.get("direction", "positive")
+                # OPEN-D10 字段分工守卫：direction 只允许价格语义，LLM 若仍回填
+                # drift/fade（事件类型）则强制降为 binary，类型保留在 category_tag，
+                # 防污染 _check_direction / _determine_pead_direction 的兑现判定。
+                if direction in ("drift", "fade"):
+                    logger.debug(
+                        "[CatalystCalendar] direction 污染修正: %s→binary (title=%s)",
+                        direction, title[:30],
+                    )
+                    direction = "binary"
                 source_news = item.get("source_news")
 
                 # D1 回声检测：title 与 source_news 高度相似（全方向，2026-08-28 移除 negative 限制）
@@ -833,14 +897,19 @@ class CatalystCalendarBuilder:
         【P2-1 长期口径（裁决 #8，2026-09-28）】对齐 prompt 不要求区分正/负面
         （只输出板块名列表，无方向字段）——已明示接受为长期口径，见 schemas.CatalystEvent.affected_sectors。
         """
-        from src.got.catalyst_config import SECTOR_ALIGN_SHADOW
+        from src.got.catalyst_config import SECTOR_ALIGN_SHADOW, GOT_MACRO_SECTOR_ALIGN_ENABLED
 
-        # 筛选需要对齐的事件（叙事 + 全球，且 affected_sectors 为空）
-        targets = [
-            e for e in events
-            if e.source in ("llm_narrative", "global_map")
-            and not e.affected_sectors
-        ]
+        # 筛选需要对齐的事件：
+        # - 叙事 + 全球：仅 affected_sectors 为空时对齐（存量已回填不重复）
+        # - 项一②b：macro_rule 事件（现恒带 [sector]）在开关开启时也纳入，扇出感知当日候选/蓄水池
+        def _is_align_target(e: CatalystEvent) -> bool:
+            if e.source in ("llm_narrative", "global_map"):
+                return not e.affected_sectors
+            if e.source == "macro_rule" and GOT_MACRO_SECTOR_ALIGN_ENABLED:
+                return True
+            return False
+
+        targets = [e for e in events if _is_align_target(e)]
         if not targets:
             return events
 
@@ -935,7 +1004,14 @@ class CatalystCalendarBuilder:
                         )
                 else:
                     # 正式模式：写入 affected_sectors
-                    event.affected_sectors = new_sectors
+                    # macro 事件保留自身名义板块（[sector] ∪ 对齐结果，去重），避免对齐后丢失本桶；
+                    # 叙事/全球仍直接取对齐结果。
+                    if event.source == "macro_rule":
+                        event.affected_sectors = list(
+                            dict.fromkeys([event.sector] + new_sectors)
+                        )
+                    else:
+                        event.affected_sectors = new_sectors
 
             logger.info(
                 "[T5对齐] %d 个事件对齐，%d 个多板块扇出（影子=%s）",
@@ -1201,6 +1277,14 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
         with db.get_session() as session:
             for event in persisted:
+                # A2 证据档：按 source 静态映射（一期未接 LLM 逐事件 tier，global/narrative=reported）。
+                # 已知 source 一律按表赋值（否则 CatalystEvent 默认 reported 会掩盖 macro→confirmed）；
+                # 未知 source 保留事件自带值（二期 LLM 逐事件 tier 接入后生效）。
+                # 同时回写内存 event，供同轮 aggregator 排序消费（_compute_catalyst_score 读 evidence_tier）。
+                eff_tier = CATALYST_SOURCE_TIER.get(
+                    event.source, event.evidence_tier or CATALYST_TIER_DEFAULT
+                )
+                event.evidence_tier = eff_tier
                 # T5 扇出序列化（空列表 → NULL，表示未对齐）
                 sectors_payload = (
                     json.dumps(event.affected_sectors, ensure_ascii=False)
@@ -1228,6 +1312,8 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                     existing.is_global = event.is_global
                     existing.source_news = event.source_news
                     existing.affected_sectors = sectors_payload
+                    existing.evidence_tier = eff_tier
+                    existing.source_url = event.source_url
                     # 缺陷②：不再刷新 expires_at——保留首次入库时的到期日，
                     # 使旧事件按原窗口自然过期（仅靠 INSERT 设定到期日）。
                     existing.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1248,6 +1334,8 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                         is_global=event.is_global,
                         source_news=event.source_news,
                         affected_sectors=sectors_payload,
+                        evidence_tier=eff_tier,
+                        source_url=event.source_url,
                         expires_at=_expiry_for(event, target_date),
                     )
                     session.add(new_record)
@@ -1334,6 +1422,9 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 consensus_expectation=r.consensus_expectation or "",
                 source=r.source,
                 category_tag=r.category_tag or "",
+                # A1 回读：旧记录无 evidence_tier 列/NULL → 默认 reported（向后兼容）
+                evidence_tier=(getattr(r, "evidence_tier", None) or CATALYST_TIER_DEFAULT),
+                source_url=getattr(r, "source_url", None),
                 is_global=r.is_global or False,
                 source_news=r.source_news,
                 # T5 扇出回填：旧记录无该列/空值 → 空列表，增量路径不会重复对齐已有值的事件；

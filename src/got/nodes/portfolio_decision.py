@@ -304,6 +304,8 @@ class PortfolioDecisionNode:
             # C-B2 启用前盘点留痕（【总计划】§4.2）：若阈值切 14 本应触发 reduce 的持仓清单，
             # 纯观测不参与决策（由 _score_holdings 落 self）
             mature_reduce_shadow=getattr(self, "_mature_reduce_shadow_hits", None),
+            # 4d/D-3 前置：候选池归零率基线观测（项三 3a，纯留痕）——由 _score_candidates 落 self。
+            funnel_stats=getattr(self, "_last_funnel_stats", None),
             data_quality=data_quality,
         )
 
@@ -3972,6 +3974,17 @@ verdict 含义：
         finalists = await asyncio.to_thread(
             screener._filter_got_finalists, universe, got_context, 10
         )
+
+        # ── 项三 3a（外网对标 2026-10-11）：funnel_stats 接进生产链路 ──
+        # 生产 Phase 2 直调 _extract_got_universe + _filter_got_finalists，不经 run_got_mode，
+        # 导致 screener._last_funnel_trace 无人消费、meta.json.funnel_stats 恒缺（D-3 基线 0 天）。
+        # 此处补算 universe(入) vs finalists(出) 的板块级归零率，落 self 供 run() 写入 decision
+        # → archive_phase2 合并进 meta.json。纯观测，异常降级不影响选股决策。
+        try:
+            self._last_funnel_stats = screener._compute_funnel_stats(universe, finalists)
+        except Exception as fe:  # noqa: BLE001 - 观测失败不进决策主流程
+            self._last_funnel_stats = None
+            logger.warning("[Phase 2] funnel_stats 观测计算失败（已忽略）: %s", fe)
 
         # 影子观测：T1 终审结果随 finalists 返回（ScreenerStock.agent_verdict），此前无人消费
         self._collect_shadow_t1(finalists)

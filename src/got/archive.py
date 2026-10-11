@@ -622,6 +622,13 @@ def _build_meta(
         "bar_complete": _is_bar_complete(run_date, now),
     }
 
+    # F3（批次 F）：评分/阈值公式版本戳写入归档，供回测按版本分组（防多版本混池统计）。
+    try:
+        from src.got.catalyst_config import SCORING_FORMULA_VERSION
+        meta["scoring_formula_version"] = SCORING_FORMULA_VERSION
+    except Exception:  # noqa: BLE001 - 版本戳缺失不阻断归档
+        pass
+
     if start_time:
         meta["duration_seconds"] = round(
             (now - start_time).total_seconds(), 1
@@ -1282,6 +1289,23 @@ def archive_phase2(
         )
         raise
     os.replace(tmp_path, output_path)
+
+    # 1b. 项三 3a（外网对标 2026-10-11）：将 Phase 2 的 funnel_stats 合并进 meta.json。
+    # archive_daily_run 先于 Phase 2 写 meta.json（当时 Node 尚未选股，无 funnel_stats），
+    # 此处回读-改-写（原子），使生产链路候选池归零率基线可逐日累积（D-3）。仅留痕，失败不阻断。
+    if getattr(decision, "funnel_stats", None):
+        meta_path = output_dir / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            if isinstance(meta, dict):
+                meta["funnel_stats"] = decision.funnel_stats
+                _meta_tmp = meta_path.with_name(f"meta.json.{os.getpid()}.tmp")
+                _meta_tmp.write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                os.replace(_meta_tmp, meta_path)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("[archive] funnel_stats 合并进 meta.json 失败（已忽略）: %s", e)
 
     # 2. 生成独立的交易建议 MD 文档
     trading_md_path = output_dir / "trading_recommendations.md"

@@ -193,6 +193,37 @@ class TestDeterminePeadDirection(unittest.TestCase):
         self.assertEqual(result, "aligned")
 
 
+class TestCheckDirection(unittest.TestCase):
+    """测试 _check_direction 三合法值判定（OPEN-D10 验收：direction 已收窄为价格语义）。"""
+
+    def setUp(self):
+        from src.got.catalyst_realization import CatalystRealizationTracker
+        self.tracker = CatalystRealizationTracker()
+
+    def test_positive(self):
+        """positive：正收益命中，零/负收益不命中。"""
+        self.assertTrue(self.tracker._check_direction("positive", 1.0))
+        self.assertFalse(self.tracker._check_direction("positive", 0.0))
+        self.assertFalse(self.tracker._check_direction("positive", -1.0))
+
+    def test_negative(self):
+        """negative：负收益命中，正收益不命中。"""
+        self.assertTrue(self.tracker._check_direction("negative", -1.0))
+        self.assertFalse(self.tracker._check_direction("negative", 1.0))
+
+    def test_binary(self):
+        """binary：|r|>2% 视为命中，小波动不命中（边界 2.0 不算）。"""
+        self.assertTrue(self.tracker._check_direction("binary", 3.0))
+        self.assertTrue(self.tracker._check_direction("binary", -3.0))
+        self.assertFalse(self.tracker._check_direction("binary", 1.0))
+        self.assertFalse(self.tracker._check_direction("binary", 2.0))
+
+    def test_illegal_type_semantic_returns_false(self):
+        """drift/fade 不再是合法 direction（事件类型归 category_tag），应恒 False。"""
+        self.assertFalse(self.tracker._check_direction("drift", 5.0))
+        self.assertFalse(self.tracker._check_direction("fade", 5.0))
+
+
 class TestFindEventDateIndex(unittest.TestCase):
     """测试 _find_event_date_index 日期查找。"""
 
