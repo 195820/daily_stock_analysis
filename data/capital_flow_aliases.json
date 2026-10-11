@@ -1,0 +1,87 @@
+{
+  "_comment": "板块资金流查找别名表：Node 2 候选板块名（mootdx TDX 命名）→ 东财 sector_flow_all 板块名（代理板）。按列表顺序尝试，取第一个命中。人工维护，新增盲区板块时补充。2026-10-11 A-2 扩表：新增 ~60 条周期/消费/资源/机械/医药对照（目标板已逐一验证存在于 20261009 sector_flow_all 473 板宇宙）。",
+  "aliases": {
+    "航空": {
+      "targets": ["大飞机"],
+      "source": "manual",
+      "verified": "2026-08-28",
+      "note": "THS 航空(航空装备)在东财无同名板，用大飞机概念做资金面代理"
+    },
+    "军民融合": {
+      "targets": ["军工电子", "军工装备"],
+      "source": "manual",
+      "verified": "2026-08-28",
+      "note": "东财无军民融合板，用军工子板做资金面代理"
+    },
+    "船舶": {
+      "targets": ["中船系", "国产航母"],
+      "source": "manual",
+      "verified": "2026-08-28",
+      "note": "东财概念表无船舶板，用中船系/国产航母做资金面代理"
+    },
+
+    "乳制品": {"targets": ["乳业"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 乳制品 vs THS 乳业"},
+    "化纤": {"targets": ["化学纤维"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 化纤 vs THS 化学纤维"},
+    "焦炭加工": {"targets": ["煤炭开采加工"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 焦炭加工 vs THS 煤炭开采加工"},
+    "煤炭": {"targets": ["煤炭开采加工", "煤炭概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 煤炭 → 采掘加工+概念双代理"},
+    "煤炭开采": {"targets": ["煤炭开采加工"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 煤炭开采 vs THS 煤炭开采加工"},
+    "石油": {"targets": ["石油加工贸易"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 石油 vs THS 石油加工贸易"},
+    "石油加工": {"targets": ["石油加工贸易"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 石油加工 vs THS 石油加工贸易"},
+    "港口": {"targets": ["港口航运"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 港口 vs THS 港口航运"},
+    "铁路": {"targets": ["高铁"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 铁路 vs THS 高铁概念"},
+    "运输服务": {"targets": ["港口航运"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 运输服务 vs THS 港口航运代理"},
+    "水务": {"targets": ["水利"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 水务 vs THS 水利"},
+    "水力发电": {"targets": ["电力", "雅下水电概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 水力发电 → 电力行业+水电概念"},
+    "酒店餐饮": {"targets": ["旅游及酒店"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 酒店餐饮 vs THS 旅游及酒店"},
+    "旅游服务": {"targets": ["旅游及酒店", "旅游概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 旅游服务 → 行业+概念双代理"},
+    "酿酒": {"targets": ["白酒"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 酿酒 vs THS 白酒"},
+    "软饮料": {"targets": ["饮料制造"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 软饮料 vs THS 饮料制造"},
+    "超市连锁": {"targets": ["零售"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 超市连锁 → 更泛的零售（仅近代理）"},
+    "商品城": {"targets": ["零售"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 商品城 → 更泛的零售（仅近代理）"},
+    "综合类": {"targets": ["综合"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 综合类 vs THS 综合"},
+
+    "铅锌": {"targets": ["金属锌", "金属铅"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 铅锌 → 细分金属板双代理"},
+    "铜": {"targets": ["金属铜"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 铜 vs THS 金属铜"},
+    "黄金": {"targets": ["黄金概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 黄金 vs THS 黄金概念"},
+    "特种钢": {"targets": ["特钢概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 特种钢 vs THS 特钢概念"},
+    "玻璃": {"targets": ["玻璃基板"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 玻璃 vs THS 玻璃基板（近代理）"},
+    "建材": {"targets": ["建筑材料"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 建材 vs THS 建筑材料"},
+    "分散染料": {"targets": ["染料"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 分散染料 vs THS 染料"},
+    "染料涂料": {"targets": ["染料"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 染料涂料 vs THS 染料"},
+    "稀缺资源": {"targets": ["小金属", "能源金属"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 稀缺资源 → 小金属/能源金属代理"},
+
+    "电信运营": {"targets": ["通信服务"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 电信运营 vs THS 通信服务"},
+    "电气设备": {"targets": ["电网设备", "风电设备"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 电气设备 → 电网/风电设备代理"},
+    "影视音像": {"targets": ["影视院线"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 影视音像 vs THS 影视院线"},
+    "传媒娱乐": {"targets": ["文化传媒"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 传媒娱乐 vs THS 文化传媒"},
+    "汽车服务": {"targets": ["汽车服务及其他"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 汽车服务 vs THS 汽车服务及其他"},
+    "远程办公": {"targets": ["云办公"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 远程办公 vs THS 云办公"},
+    "华为鸿蒙": {"targets": ["鸿蒙概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 华为鸿蒙 vs THS 鸿蒙概念"},
+    "混合现实": {"targets": ["MR(混合现实)"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 混合现实 vs THS MR(混合现实)"},
+    "折叠屏": {"targets": ["柔性屏(折叠屏)"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 折叠屏 vs THS 柔性屏(折叠屏)"},
+    "飞行汽车": {"targets": ["飞行汽车(eVTOL)"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 飞行汽车 vs THS 飞行汽车(eVTOL)"},
+    "人形机器": {"targets": ["人形机器人"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 人形机器 vs THS 人形机器人"},
+    "华为算力": {"targets": ["算力租赁"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 华为算力 vs THS 算力租赁"},
+    "Web3概念": {"targets": ["Web3.0"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX Web3概念 vs THS Web3.0"},
+    "CXO概念": {"targets": ["CRO概念"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX CXO概念 vs THS CRO概念"},
+
+    "钠电池": {"targets": ["钠离子电池"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 钠电池 vs THS 钠离子电池"},
+    "钙钛矿电": {"targets": ["钙钛矿电池"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 钙钛矿电 vs THS 钙钛矿电池"},
+    "TOPCon电": {"targets": ["TOPCON电池"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX TOPCon电 vs THS TOPCON电池"},
+    "动力电池": {"targets": ["电池", "动力电池回收"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 动力电池 → 电池行业+回收概念"},
+
+    "农用机械": {"targets": ["农机"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 农用机械 vs THS 农机"},
+    "机械基件": {"targets": ["工程机械"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 机械基件 → 工程机械代理"},
+    "工业机械": {"targets": ["工程机械"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 工业机械 → 工程机械代理"},
+    "化工机械": {"targets": ["工程机械"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 化工机械 → 工程机械代理"},
+    "纺织机械": {"targets": ["工程机械"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 纺织机械 → 工程机械代理"},
+    "机床制造": {"targets": ["工业母机"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 机床制造 vs THS 工业母机"},
+    "专用机械": {"targets": ["专用设备"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 专用机械 vs THS 专用设备"},
+    "通用机械": {"targets": ["通用设备"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 通用机械 vs THS 通用设备"},
+    "装修装饰": {"targets": ["建筑装饰"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 装修装饰 vs THS 建筑装饰"},
+
+    "生物制药": {"targets": ["生物制品"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 生物制药 vs THS 生物制品"},
+    "免疫治疗": {"targets": ["细胞免疫治疗"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 免疫治疗 vs THS 细胞免疫治疗"},
+    "医药": {"targets": ["中药"], "source": "a2_plan", "verified": "2026-10-11", "note": "TDX 医药（泛） → 中药代理（弱代理，plan 拍板）"}
+  }
+}

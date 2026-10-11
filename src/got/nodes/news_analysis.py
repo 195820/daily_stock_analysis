@@ -333,7 +333,10 @@ class NewsAnalysisNode:
     ) -> Tuple[List[NewsEvent], List[Dict], List[str]]:
         """3 次 LLM 调用：事件提取 → 概念发现 → 风险总结（串行，避免 API 并发空响应）。"""
         news_text = self._format_news_for_prompt(raw_news)
-        concept_list_str = "科技成长（AI、半导体、机器人、新能源）"
+        # A-2 (2026-10-11)：概念列表不再硬编码"科技成长"，改为从 CONCEPT_UNIVERSE
+        # 子类标签派生（含周期/资源/消费/机械/医药扩展），使事件提取的
+        # affected_sectors 不再只偏科技（glue 埋伏支路的上游事件供给）。
+        concept_list_str = self._build_concept_list_str()
 
         # 加载历史事件用于 LLM prompt 注入（跨日记忆）
         historical_events = self._load_historical_events_for_prompt(days=7)
@@ -936,6 +939,27 @@ class NewsAnalysisNode:
         """生成事件 ID（基于标题和日期的哈希）。"""
         content = f"{title}|{today.isoformat()}"
         return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _build_concept_list_str() -> str:
+        """A-2 (2026-10-11)：从 CONCEPT_UNIVERSE 的 _CATEGORY_GROUP 子类标签派生概念列表文案。
+
+        旧硬编码"科技成长（AI、半导体、机器人、新能源）"使事件提取偏向科技，
+        周期/消费/资源事件被 concept_set 闸门静默丢弃。本helper 延迟导入
+        sector_analysis（news_analysis 顶层 import 它会形成循环依赖：
+        sector_analysis 不 import news_analysis，故运行时才解析即安全）。
+        失败时降级回旧硬编码文案，保证 Node 4 不因词表异常中断。
+        """
+        try:
+            from src.got.nodes.sector_analysis import _CATEGORY_GROUP
+
+            labels = sorted(set(_CATEGORY_GROUP.values()))
+            if labels:
+                return "全市场精选概念（" + "、".join(labels) + "）"
+        except Exception as exc:
+            logger.warning("[news_analysis] 概念列表派生失败，降级硬编码: %s", exc)
+        return "科技成长（AI、半导体、机器人、新能源）"
+
 
     @staticmethod
     def _sentiment_to_float(sentiment: str) -> float:

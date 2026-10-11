@@ -224,8 +224,8 @@ CONCEPT_UNIVERSE: dict[str, dict[str, list[str]]] = {
     },
     # === 科技防守 ===
     "tech_defensive": {
-        "innovative_drug": ["创新药", "生物医药", "CXO概念", "医疗器械", "减肥药", "医美概念"],
-        "power_grid": ["电力", "特高压", "智能电网", "绿色电力", "虚拟电厂", "核电概念"],
+        "innovative_drug": ["创新药", "生物医药", "CXO概念", "医疗器械", "减肥药", "医美概念", "生物制品", "细胞免疫治疗", "中药"],
+        "power_grid": ["电力", "特高压", "智能电网", "绿色电力", "虚拟电厂", "核电概念", "电网设备"],
         "energy_storage": ["储能", "光伏概念", "锂电池概念", "氢能源", "风电"],
     },
     # === 金融 ===
@@ -251,6 +251,30 @@ CONCEPT_UNIVERSE: dict[str, dict[str, list[str]]] = {
         "healthcare_consumer": ["医美概念"],
         "travel": ["旅游", "旅游概念", "酒店餐饮"],
         "silver_economy": ["养老概念", "养老金持"],
+        # A-2 (2026-10-11)：消费/周期/资源词补齐——
+        # Node 4 事件提取 affected_sectors 与 T5/narrative 扇出此前只偏科技，
+        # 周期/消费候选（煤炭/石油/乳业等）不在 concept_set → 事件静默丢弃。
+        # 以下名称取自东财 sector_flow_all / TDX 候选实际命名，同步服务
+        # catalyst_calendar 的 concept_set 闸门（macro_rule/T5/narrative 匹配）。
+        "food_daily": ["乳业", "食品加工", "预制菜", "休闲食品", "调味品", "零售", "饮料制造"],
+        "coal_oil": ["煤炭概念", "煤炭开采加工", "石油加工贸易", "焦炭"],
+        "ports_transport": ["港口航运", "航运概念", "运输服务", "物流"],
+        "utilities": ["水利", "电力"],
+    },
+    # === 周期（A-2 扩展） ===
+    "cyclical_ext": {
+        "metals": ["金属铜", "金属锌", "金属铅", "小金属", "能源金属", "工业金属", "贵金属"],
+        "coal_steel_ext": ["煤炭", "焦炭", "特钢概念", "建筑材料", "装修装饰", "建筑装饰"],
+        "chemicals": ["化学纤维", "化学制药", "化学制品", "染料"],
+        "machinery": ["工程机械", "工业母机", "专用设备", "通用设备", "农机"],
+        "oil_gas": ["石油加工", "油气开采", "油服工程", "油运"],
+    },
+    # === 金融/电信/传媒（A-2 扩展） ===
+    "telecom_media": {
+        "telecom": ["通信服务", "电信运营"],
+        "media": ["文化传媒", "影视院线", "网络游戏", "互联网服务"],
+        "auto_service": ["汽车服务及其他"],
+        "misc": ["高铁", "综合"],
     },
     # === 军工 ===
     "military": {
@@ -318,6 +342,20 @@ _CATEGORY_GROUP: dict[str, str] = {
     "healthcare_consumer": "医美",
     "travel": "旅游酒店",
     "silver_economy": "养老",
+    # 消费/周期扩展（A-2）
+    "food_daily": "食品零售",
+    "coal_oil": "煤炭石油",
+    "ports_transport": "港口运输",
+    "utilities": "公用事业",
+    "metals": "金属资源",
+    "coal_steel_ext": "煤钢建材",
+    "chemicals": "化工化纤",
+    "machinery": "机械设备",
+    "oil_gas": "油气油服",
+    "telecom": "通信服务",
+    "media": "文化传媒",
+    "auto_service": "汽车服务",
+    "misc": "综合/misc",
     # 军工
     "aerospace": "军工航天",
 }

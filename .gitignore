@@ -54,6 +54,8 @@ env/
 
 # 数据和日志
 /data/
+# 例外：手工维护的板块别名桥配置（A-2 P0-1，丢失=永久损失；先例：verify_*.py 负向例外）
+!data/capital_flow_aliases.json
 logs/
 reports/
 *.db
