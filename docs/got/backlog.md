@@ -344,15 +344,19 @@ OPEN-B1…B7 —— 见 §1.B。
 
 > ℹ️ 原阶段 1 观察期「不可提前删三件套」的告警已被负责人「提前跨过条件 2」裁决覆盖；删除依据是全局回退已失效 + glue 命中板块覆写后规则值本就丢弃，对命中板块零行为变更，唯一受影响者为漏命中/降级板块（改 neutral 垫底）。
 
-### 4.3 回滚开关
+### 4.3 「回滚开关」——⚠️ 2026-10-12 复核：**已无可用回滚路径**（本节原是一张错表，已按实装重写）
 
-`GOT_A6_ENABLED=false` 一个环境变量即回到影子期行为（glue 归档但不消费），零代码回退。两个开关组合形成三态：
+本节原写「`GOT_A6_ENABLED=false` 一个环境变量即回到影子期行为（glue 归档但不消费），零代码回退」，并配了一张三态表（true/false → 影子期；ENABLED=false → 完全禁用 `status=S6_disabled`）。**逐行核代码后：四个说法都不成立**：
 
-| `AGENT_SEMANTIC_GLUE_ENABLED` | `GOT_A6_ENABLED` | 行为 |
+| 开关组合 | 本节原称 | 实装（代码事实） |
 |---|---|---|
-| true | true | **A6 生效**（glue 主导 4 个消费点） |
-| true | false | **影子期**（glue 归档不消费） |
-| false | – | **完全禁用**（glue 不跑，`status=S6_disabled`） |
+| `GOT_A6_ENABLED=false` | 回到影子期（归档不消费） | `aggregator.run()` 入口 [`:259`](../../src/got/nodes/aggregator.py) 直接 `raise RuntimeError("glue 已转正，不允许关闭")` ⇒ **硬崩不是回退** |
+| `AGENT_SEMANTIC_GLUE_ENABLED=false` | 完全禁用、`status=S6_disabled` | 同文件 `:1305-1306` 同一句式 `raise` ⇒ **同样硬崩**（S6_disabled 只存在于 replay/无候选路径） |
+| `AGENT_SEMANTIC_GLUE_SHADOW=true` | 不消费 | 只在 `:1432` 打一行日志、`:1445` 给 `agent_glue.json` 加 `[SHADOW]` 标记；Pass 1.5 的 `_apply_glue_override_to_raw_data` 在 `:1562` **无条件被调用**，helper 内 `:1661` 的 `if not GOT_A6_ENABLED` 守卫根本走不到 |
+
+**根本原因（为何连“拆了 raise 也算不上回滚”）**：规则侧三件套已随 **A6 阶段 2（2026-09-26）退役**，`_apply_glue_override_to_raw_data` 的 docstring 自述未命中/降级时“capital_check/news_check=neutral、sentiment_check=missing”⇒ 即便允许关闭，得到的也不是影子期而是**三件套中性垫底的退化态**。所以上文 §4.2 「单 commit 可回退」的准确含义只能理解为 **`git revert` 代码层回退**，而非运行期开关回退。
+
+**因此（2026-10-12 负责人选 A：承认不可回滚）**：不改代码行为（保留 fail-fast 守卫是刻意的：宁叫 Node 6 响亮地失败，也不让它拿着中性值默默算错），只把注释/模板/本节改为真话：`catalyst_config.py` 两处注释 + `.env.example` 新增【A6 / glue 全家】登记块 + 本节 + `test_a6_wiring.py::TestC3` docstring 同步更正，并补一条 run() 级守卫测试锁住“false 即 raise”的真语义（防下一个会话又把这句谎言写回去）。
 
 ---
 
@@ -513,7 +517,8 @@ OPEN-B1…B7 —— 见 §1.B。
 | 11 | **离线复算碰到半截损坏归档会静默少一天**（2026-10-10 发现） | `data/got_daily/20260917/portfolio_decision.json` 物理截断（13,578 B，在 `"timestamp":` 处无值无闭合，`json.load` 直接 `JSONDecodeError`；本轮取证脚本就在此中断）。属 `_atomic_write_json`（tmp + `os.replace`）改造前的历史遗留。处置：**不改历史文件（改了就是改证据），但任何扫归档的脚本必须 try/except + 显式记「该日不可读」**，否则多日统计会静默丢样本而得错结论（先例：回测复用磁盘缓存未校验覆盖完整性→假阴性误判证伪）。其余历史日是否同类截断尚未扫——低优先，下次大型复算顺手带出 |
 | 12 | **20261010 孤儿归档 + `date.today()` 双写入点**（2026-10-11 审查发现）：`data/got_daily/20261010/` 仅含 1 个文件 `candidate_pool.json`（周六 23:19 产出），无 meta/node JSON——生产链路周六会被 `NonTradingDayError` 拦（`orchestrator.py` 交易日检查在 Phase 2 之前），必为**绕过 orchestrator 的手动调用残片**；1009 侧同源：`candidate_pool.json` mtime 10-09 **23:59:58**，与引入该快照函数的提交 `49274d9`（10-10 00:00:55）仅差 57 秒，同为带外验证运行。根因：`portfolio_decision.py` 两处直写 `data/got_daily/` 用 `date.today()` 而非上游 `target_date`——`:3484`（`_save_shadow_records` shadow_* 五件套）与 `:3531/:3538`（`_save_candidate_pool_snapshot`）。且残片内容因 F-1（§1.A 表尾）全为废数据。〔verification.md:41 已有事实记载（10-10 目录仅 1 文件）但未定性缺陷，本条补齐定性〕 | 处置方向（归负责人拍板）：① 两写入点统一改传 `run_date`/`target_date`（与 Phase 1 归档同源）；② 归档层加孤儿文件检测告警；③ 最小改动：仅给 `_save_candidate_pool_snapshot` 加 date 参数。两份残片保留不删（证据 + 修复落地日起新档自愈）。详 [`reports/got_audit_20261011.md`](../../reports/got_audit_20261011.md) §2.2 |
 | 13 | **排期批 4/5 影子五线无判据登记（§8 #10 同谱系复发）**（2026-10-11 审查发现）：`sell_source_shadow` / `risk_override_shadow` / `exposure_enforce_shadow` / `signal_size_shadow` / `mature_reduce_shadow` 五条影子线自 0928 随批 4.1/5 上线，`verification.md` 全文 grep 零判据节——早于 10-10「影子线必登判据」条款上线，属条款未回溯的漏网。实测读数（六归档日）：`risk_override` 6/6 present；`sell_source` 仅 1008/1009 present、其余 null；`exposure_enforce` 0930/1008/1009 present；`signal_size` 仅 0930 present；`mature_reduce` 1008/1009 空列表 `[]`、其余 null——**`[]` vs `null` 的语义差异**（跑了没命中 vs 没跑）未在任何文档定义 | 按「影子线必登判据」条款把五线判据补进 [`verification.md`](verification.md)（产物键、读数方式、null/[] 语义、转正门槛；数值归负责人）；本条挂号在册直至补登完成。详 [`reports/got_audit_20261011.md`](../../reports/got_audit_20261011.md) §2.3 |
-| 14 | **`GOT_A6_ENABLED` 缺 `.env.example` 登记**（2026-10-11 审查发现）：`.env` 15 个生效 `GOT_*` 键逐一对照，其余 14 个（含 10-09 新增的 MEG/FTS/FXG 全家 + `GOT_TRADABILITY_GATE`/`GOT_AMBUSH_G4_FREEZE`）均以「注释默认值 + 说明」形态在 `.env.example` 在册；**仅 `GOT_A6_ENABLED`（`.env:869=true`，A6 阶段 1 转正的主链路门、fail-fast 回滚键）完全缺席**——新环境按 example 部署会静默失去 A6 消费（`GOT_A6_ENABLED` 缺省 true 由 `catalyst_config.py` 兜底，故实际后果是回滚键不可见而非链路失效） | 低成本补登：`.env.example` 开关区加一行注释（缺省 true + `false` 即回滚到影子期行为 + 指向 §4.3 回滚开关文档）。可与下次动 `.env.example` 的批次顺手带 |
+| 14 | **`GOT_A6_ENABLED` 缺 `.env.example` 登记**（2026-10-11 审查发现）：`.env` 15 个生效 `GOT_*` 键逐一对照，其余 14 个（含 10-09 新增的 MEG/FTS/FXG 全家 + `GOT_TRADABILITY_GATE`/`GOT_AMBUSH_G4_FREEZE`）均以「注释默认值 + 说明」形态在 `.env.example` 在册；**仅 `GOT_A6_ENABLED`（`.env:869=true`，A6 阶段 1 转正的主链路门、fail-fast 回滚键）完全缺席**——新环境按 example 部署会静默失去 A6 消费（`GOT_A6_ENABLED` 缺省 true 由 `catalyst_config.py` 兜底，故实际后果是回滚键不可见而非链路失效） | ✅ **已实施（2026-10-12，A1 #2 选 A）**：`.env.example` GOT Track B 段头新增【A6 / glue 全家】块——实际发现缺的不止一个键，`AGENT_SEMANTIC_GLUE_ENABLED/_SHADOW/_IN_REPLAY` 三个也从未在册，已一并补登（全为注释行，不改任何默认值）。登记措辞按 §4.3 重写后的真话写（“不是回滚键，设 false 即 raise”） |
+| 15 | **A6「回滚开关」的四处同文矛盾**（2026-10-12 实施 #14 时发现，属文档说谎而非代码 bug）：同一句假承诺写在 ① `catalyst_config.py:207`（“false 或 SHADOW=true 均可回到影子期『归档不消费』”）② `catalyst_config.py:220`（“false = 完全回退到影子期行为”）③ [`backlog.md` §4.3](backlog.md) 整张三态表（含“ENABLED=false → `status=S6_disabled`”）④ `tests/test_a6_wiring.py::TestC3` docstring（“验证单 env 变量回滚即可回到影子期”）。实装：`aggregator.py:259` 对 `not GOT_A6_ENABLED` 直接 raise，`:1305` 对 `not AGENT_SEMANTIC_GLUE_ENABLED` 同样 raise，SHADOW 只影响日志与 `[SHADOW]` 标记不拦消费（`:1432`/`:1562`/`:1661`）；而规则三件套已随 A6 阶段 2 退役 ⇒ **已无影子期可回**。C3 测试绿是因为它直调 `_build_sector_intel` 绕开了 `run()` 守卫——与同日 Node 4 prompt 崩溃同谱系（承诺只在被绕开入口的路径上成立） | ✅ **已收口（2026-10-12 负责人选 A：承认不可回滚）**：四处文字全部改为真话 + 新增 `test_run_rejects_a6_disabled` 锁住“false 即 raise”语义。**保留 fail-fast 本身不改**（选 B“重建退路”已否决：规则三件套不在，退路通向的是中性垫底态，等于把 09-26 裁决推翻）；若日后真需热回滚，前置是先重建规则侧兜底（属大改） |
 
 ---
 
@@ -610,3 +615,5 @@ python scripts/export_glue_family_audit.py                                      
 *修订（2026-10-12，全流程实跑读数订正 + 三项新挂号，零生产代码改动；本文档顶部的 10-11 审查轮未提交改动一并收录）*——10-12 盘中全流程（09:49→10:06）是本批闸门/影子线的首个完整归档日，据此把三处账本与实态对齐：**§1.H**——「工作流 B 拦单留痕」由 ✅ 已实施**改判真·待实施**（当日日志 10:02 命中 1 单 / 10:06 命中 0 单，`shadow_bear_gate.json` 零产物；`portfolio_decision.py:4027` 每轮重置 + `:4306` 仅命中时组装 + `:3492` `or None` 不写 ⇒ 多轮场景下留痕必丢；B 的唯一验收指标依旧算不出）；**§1.A** F-1 补硬证据（`candidate_pool.json` 今日 `universe_size=61` + **61 行全空**、3 只真实 finalists 也全标 `is_finalist=false`）；**§9 新增 #7**——批次 B antibias 的转正判据无「有样本」前提（无买入/持有标的时 `_collect_actionable_sectors` 返空、零产物零告警，与 R2「把市场事件当验收条件」同谱系）。同时起算日订正已回写 [`verification.md`](verification.md) 顶部新增 10-12 节（三闸门 MEG 2 / FTS 1 / FXG 1、GATE-1 首日、**D-3 基线起算日 = 2026-10-12**、`akshare_*` 计数=0 验收通过），[`got/README.md`](README.md) 三行同步（其中第 8 行原记「竞品补强 A–G 零落地、四文件均不存在」为 10-11 下午已过期未同步，已按实态改为一期已实施）。另记一条流程隐患供负责人裁决（不属代码缺陷故不入上表）：**本次 P0 能进主干，是因为批次 A–F 的 9 个新测试无一个执行真实 prompt 拼装（全部 mock 在 `_call_llm` 之外）**，而「影子先行零决策影响」的断言缺一个端到实跑做卡——本次 `EVENT_EXTRACTION_PROMPT.format()` 在 `GOT_NEWS_EVIDENCE_GATING` 缺省关时也崩（崩在模板解析而非分支内容），恰好说明 off 态断言未经真实路径验证。修法方向：把「合入含 prompt/schema 变更的批次后至少跑一次 `--got` 全流程」列为硬前置（归入 docs/AGENTS.md 还是归验收脚本，由负责人定）。本批修复见 commit `e691fac`；取证脚本 `.review_tmp/read_20261012.py` + `scan_prompt_braces.py`（只读、不入库）。*
 
 *修订（2026-10-12，A1 裁决首批：§1.G `wave_days` 回填作废）*——负责人对「1.G v3.5 未落地尾巴」给出裁决：**`wave_days` 历史回填不做，按作废处理**。依据与本清单原判定一致（旧逻辑产物不得进校准样本 + 回填无使用方），本项**从待实施面正式移出、不再排期**；同批把 §1.G 表头「两项从未落地」改为历史性描述（① NUL 清理已于 10-10 实施、② 回填于今日作废），并同步该计划两处原文（§3.2 第 3 条加作废注记、v3.5 状态头的「两处从未落地」整条改为已全部收口）与 [`got/README.md`](README.md) 第 3 行「残留两项未落地」旧说法。⇒ **v3.5 波次化计划无待实施项**，只剩 S5 校准等埋点满足 40 个交易日（属 [`verification.md`](verification.md) 那类等时间窗）。A1 其余条目待逐条拍板；其中 **#2（`GOT_A6_ENABLED` 登记）在实施前发现更严问题**——配置注释声称的两条 A6 回滚路径均不成立（设 false 直报 RuntimeError、SHADOW 只改日志不拦消费，[`aggregator.py:259`](../../src/got/nodes/aggregator.py) / `:1432` / `:1661`），且规则三件套已随 A6 阶段 2 退役 ⇒ 已无「影子期行为」可回，待负责人选「改注释承认不可回滚」或「重建退路」。
+
+*修订（2026-10-12，A1 #2 落地：负责人选 A——承认 A6 不可运行期回滚）*——零行为变更，只把谎言改成真话并上锁：**§4.3 整节重写**（原三态表逐行对照实装，并仍保留在案供追溯）、**§8 #14 改已实施**（`.env.example` 实际缺的不止 A6 一个键，`AGENT_SEMANTIC_GLUE_ENABLED/_SHADOW/_IN_REPLAY` 从未在册，已整块补登且全为注释行）、**§8 新增 #15** 记下本次发现的四处同文矛盾（`catalyst_config.py:207`/`:220`、本节旧表、`test_a6_wiring.py::TestC3` docstring）。代码侧只改注释（`catalyst_config.py` 两处）；测试侧除更正 C3 docstring 外，新增 `tests/test_aggregator_run_smoke.py::test_run_rejects_a6_disabled`（run() 级 `pytest.raises` 钉住“false 即 raise”，谁静默拆掉守卫就必须先改本用例）。回归：test_aggregator_run_smoke + test_a6_wiring = 11 passed。**选 B（拆 raise 重建退路）已否决**：规则三件套不在，退路通向的是中性垫底态，等于推翻 09-26 裁决；日后若确需热回滚，前置条件是先重建规则侧兜底（属持仓/评分大改范畴）。

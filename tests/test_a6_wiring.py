@@ -202,10 +202,14 @@ class TestC2DegradedSectorFallback(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────
 
 class TestC3ShadowPeriodEquivalence(unittest.TestCase):
-    """A6=false + 有 glue 的输出，必须与 A6=false + 无 glue 完全一致（影子期行为）。
+    """A6=false 时 glue 分支整段跳过——**仅验证 helper 层的跳过逻辑，不等于生产可回滚**。
 
-    替代原 R-C7 逐字段一致测试：验证「单 env 变量回滚即可回到影子期」的
-    关键承诺 —— 关掉 A6，glue 分支必须整段跳过。
+    ⚠　2026-10-12 语义更正（原 docstring 写“验证「单 env 变量回滚即可回到影子期」的关键承诺”，
+    那句话不成立）：本用例直接调 `_build_sector_intel`，**绕开了 `run()` 入口的 fail-fast 守卫**
+    （`aggregator.py:259` 对 `not GOT_A6_ENABLED` 直接 raise RuntimeError）。另因规则侧三件套已随
+    A6 阶段 2（2026-09-26）退役，“影子期行为”已不存在——关掉 A6 得到的是三件套 neutral/missing
+    垫底态。真实语义由 `tests/test_aggregator_run_smoke.py::test_run_rejects_a6_disabled` 锁定；
+    详见 [`docs/got/backlog.md`](../docs/got/backlog.md) §4.3 与 §8 #15。
     """
 
     _COMPARED_FIELDS = (

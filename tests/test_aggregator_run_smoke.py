@@ -104,3 +104,37 @@ def test_run_smoke_produces_unified_context_with_batch5_shadow():
     assert "conflict_type" in unified.conflict_summary_shadow
     assert unified.market_theme_shadow is not None, "4b 市场结构影子字段不应为空"
     assert "status" in unified.market_theme_shadow
+
+
+def test_run_rejects_a6_disabled():
+    """run() 级语义锁：`GOT_A6_ENABLED=false` 是 **fail-fast，不是回滚**（2026-10-12）。
+
+    背景：`catalyst_config.py` 与【backlog】§4.3 曾四处声称“设 false 即可回到影子期
+    『归档不消费』”。逐行核代码不成立：`aggregator.run()` 入口对 `not GOT_A6_ENABLED`
+    直接 raise RuntimeError；`AGENT_SEMANTIC_GLUE_ENABLED=false` 同一句式 raise；
+    `AGENT_SEMANTIC_GLUE_SHADOW=true` 只改日志与 `[SHADOW]` 标记、不拦 Pass 1.5 消费。
+    且规则侧三件套已随 A6 阶段 2（2026-09-26）退役 ⇒ 已无“影子期行为”可回。
+
+    另 `test_a6_wiring.py::TestC3` 直接调 `_build_sector_intel` 而绕开了本守卫，所以它绿
+    并不能证明可回滚——本用例负责把“真实入口行为”钉住：若日后有人静默去掉 raise 或反向
+    开放热回退，本用例先响，强制他回去同步 §4.3 / §8 #15 与回滚叙述。
+    """
+    import asyncio
+
+    import pytest
+
+    from src.got.nodes.aggregator import AggregatorNode
+
+    node = AggregatorNode(use_mock=False)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("src.got.nodes.aggregator.GOT_A6_ENABLED", False)
+        with pytest.raises(RuntimeError, match="GOT_A6_ENABLED"):
+            asyncio.run(node.run(
+                _market_ctx(),
+                SectorContext(),
+                _capital_ctx(),
+                _news_ctx(),
+                _sentiment_ctx(),
+                replay_mode=True,
+            ))
+

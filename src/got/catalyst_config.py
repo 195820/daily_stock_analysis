@@ -204,7 +204,14 @@ REFINE_MAX_SECTORS = 20              # 总量上限（基础片 + 埋伏候选�
 LLM_CALL_TIMEOUT_S = 60              # 单次 LLM 调用超时（秒）；glue 单次 max_tokens≈5000 需留足
 AGENT_SEMANTIC_GLUE_ENABLED = os.environ.get("AGENT_SEMANTIC_GLUE_ENABLED", "true").lower() == "true"
 # A6 阶段 1（2026-09-17）：SHADOW 默认翻为 false，glue 结果正式接入 _build_sector_intel 及下游消费路径。
-# 回滚：GOT_A6_ENABLED=false 或 AGENT_SEMANTIC_GLUE_SHADOW=true 均可回到影子期「归档不消费」行为。
+# ⚠️ 2026-10-12 复核更正：本行原写「回滚：GOT_A6_ENABLED=false 或 AGENT_SEMANTIC_GLUE_SHADOW=true
+# 均可回到影子期『归档不消费』行为」——**两条均不成立，切勿照原话操作**：
+#   · GOT_A6_ENABLED=false 会在 aggregator.run() 入口直接 raise RuntimeError（fail-fast，不是回退）；
+#   · AGENT_SEMANTIC_GLUE_SHADOW=true 只影响日志与 agent_glue.json 的 [SHADOW] 标记，
+#     不拦 Pass 1.5 的三件套替换（_apply_glue_override_to_raw_data 无条件被调用）；
+#   · AGENT_SEMANTIC_GLUE_ENABLED=false 同样 raise（glue 已是三件套唯一来源，关掉 = 让 Node 6 无数据可用）。
+# 规则侧三件套已随 A6 阶段 2（2026-09-26）退役 ⇒ 已无「影子期行为」可回；撤销 A6 只能 git revert 转正提交。
+# 详见 docs/got/backlog.md §4.3（已改写为真态）与 §8 #15。
 AGENT_SEMANTIC_GLUE_SHADOW = os.environ.get("AGENT_SEMANTIC_GLUE_SHADOW", "false").lower() == "true"
 # C-P3: replay_mode 下允许运行 glue（默认关闭，保持 0903 A1「不产生任何持久化副作用」契约）
 AGENT_SEMANTIC_GLUE_IN_REPLAY = os.environ.get("AGENT_SEMANTIC_GLUE_IN_REPLAY", "false").lower() == "true"
@@ -216,8 +223,9 @@ GLUE_PROMPT_VARIANT = os.environ.get("GLUE_PROMPT_VARIANT", "").strip().lower()
 # B 版（全量归属）输出体量更大，0902 实测撞 16000 顶被截断（finish_reason=length）；
 # 需要时仅对回放日临时调高，且 A/B 同侧重跑须用同一值以保对照公平。
 GLUE_MAX_TOKENS = int(os.environ.get("GLUE_MAX_TOKENS", "16000"))
-# A6 灰度总开关：控制 4 个消费点（_build_sector_intel / refine_events_map / _llm_refine_sectors.adjustments /
-# _synthesize_mainline_endurance）是否走 glue 分支。false = 完全回退到影子期行为。
+# A6 总开关：控制 4 个消费点（_build_sector_intel / refine_events_map / _llm_refine_sectors.adjustments /
+# _synthesize_mainline_endurance）是否走 glue 分支。⚠️ 缺省 true 且**不可热回退**：置 false 时 run() 直接
+# raise RuntimeError，它不是回滚键（见上方 2026-10-12 更正）；仓内保留该变量仅作 fail-fast 守卫与测试标。
 GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"
 
 # =============================================================================
