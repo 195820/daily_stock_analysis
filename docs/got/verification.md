@@ -44,15 +44,25 @@
 
 | 影子线 | 开关 | 产物/读数位置 | null vs `[]` 语义（实测推断，待负责人确认） | 六归档日实测（0928–1009） |
 |---|---|---|---|---|
-| **4.1 超限减仓卖出来源** | `GOT_SELL_SOURCE_ENABLED=0` + `GOT_SELL_SOURCE_SHADOW=1`（缺省影子态） | `portfolio_decision.json` 顶层 `sell_source_shadow`：本会削谁/多少/是否撞家族宽限 | `null`=当日 Step 1 后未超 `position_limit`（未进 Step 1.5 检测）；非 null 列表=检测跑了，行内有被削候选 | present 仅 1008/1009（7 条）；0928–0930 null |
-| **3b 风险覆写计划** | `GOT_DISAGREEMENT_SHADOW=1`（缺省开；`GOT_DISAGREEMENT_ENABLED=0` 时 plan 仅观测不进 T3） | `portfolio_decision.json` 顶层 `risk_override_shadow` | `null`=3b 开关未跑或当日无矛盾；非 null=有 RiskOverridePlan 观测 | 6/6 日 present（各 5 条） |
-| **敞口强制（Step 1.5 变体）** | 归批 5 敞口执行观测 | `portfolio_decision.json` 顶层 `exposure_enforce_shadow` | 同上惯例 | present 0930/1008/1009（各 5 条）；0928/0929 null |
-| **信号仓位缩放观测** | 归批 5 | `portfolio_decision.json` 顶层 `signal_size_shadow` | 同上惯例 | present 仅 0930（6 条） |
-| **成熟期减仓观测（T-2）** | 归批 5 | `portfolio_decision.json` 顶层 `mature_reduce_shadow` | **三态已定稿（2026-10-12 A1 #3 / WI-P-6）**：字段由裸 list 改为 dict `{hits, holdings_seen, skipped_reason}`——`null`=本次未调 `_score_holdings`；`skipped_reason=no_accounts/no_holdings`=跑了但无可观测对象（**hits 必空，不得读作“没有到期持仓”**）；`holdings_seen>0 且 hits 空`=真读数。⚠　10-12 前为裸 list，旧归档（1008/1009 的 `[]`）与新 dict **不得直接对拍**。返工钩子见 [`plans/持仓模块重构_待分析与待实施清单_20261010.md`](plans/%E6%8C%81%E4%BB%93%E6%A8%A1%E5%9D%97%E9%87%8D%E6%9E%84_%E5%BE%85%E5%88%86%E6%9E%90%E4%B8%8E%E5%BE%85%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95_20261010.md) §三 WI-P-6 与 §六 | 1008/1009 旧形状 `[]`（当时无法区分无持仓与无命中）；0928–0930 null；10-12 起为新 dict |
+| **4.1 超限减仓卖出来源** | `GOT_SELL_SOURCE_ENABLED=0` + `GOT_SELL_SOURCE_SHADOW=1`（缺省影子态） | `portfolio_decision.json` 顶层 `sell_source_shadow`：本会削谁/多少/是否撞家族宽限 | `null`=当日 Step 1 后未超 `position_limit`（未进 Step 1.5 检测）；非 null 列表=检测跑了，行内有被削候选 | present 仅 1008/1009（7 条）；0928–0930 null。**〔2026-10-12 裁决：冻结，不再积算天数；去留归持仓大改 WI-P-7〕** |
+| **3b 风险覆写计划** | `GOT_DISAGREEMENT_SHADOW=1`（缺省开；`GOT_DISAGREEMENT_ENABLED=0` 时 plan 仅观测不进 T3） | `portfolio_decision.json` 顶层 `risk_override_shadow` | `null`=3b 开关未跑或当日无矛盾；非 null=有 RiskOverridePlan 观测。**本线不冻结，门槛已定（见下）** | 6/6 日 present（各 5 条）。**〔10-12 复核〕** present 白名单=0928/0929/0930/1008/1009/1012 共 **6 个有效样本日**（glue 均 `status=ok`）；`conflict_type` **仅 2 种取值**（`partial_bullish_with_degraded_inputs`×4 / `mixed_with_degraded_inputs`×2），11 类冲突分类只覆盖到 2 类 |
+| **敞口强制（Step 1.5 变体）** | 归批 5 敞口执行观测 | `portfolio_decision.json` 顶层 `exposure_enforce_shadow` | 同上惯例 | present 0930/1008/1009（各 5 条）；0928/0929 null。**〔10-12 裁决：冻结；去留归 WI-P-7〕** |
+| **信号仓位缩放观测** | 归批 5 | `portfolio_decision.json` 顶层 `signal_size_shadow` | 同上惯例 | present 仅 0930（6 条），其余日 `null`（空仓/无买入分配 ⇒ 无差值可算）。**〔10-12 裁决：冻结；去留归 WI-P-7〕** |
+| **成熟期减仓观测（T-2）** | 归批 5 | `portfolio_decision.json` 顶层 `mature_reduce_shadow` | **三态已定稿（2026-10-12 A1 #3 / WI-P-6）**：字段由裸 list 改为 dict `{hits, holdings_seen, skipped_reason}`——`null`=本次未调 `_score_holdings`；`skipped_reason=no_accounts/no_holdings`=跑了但无可观测对象（**hits 必空，不得读作“没有到期持仓”**）；`holdings_seen>0 且 hits 空`=真读数。⚠　10-12 前为裸 list，旧归档（1008/1009 的 `[]`）与新 dict **不得直接对拍**。返工钩子见 [`plans/持仓模块重构_待分析与待实施清单_20261010.md`](plans/%E6%8C%81%E4%BB%93%E6%A8%A1%E5%9D%97%E9%87%8D%E6%9E%84_%E5%BE%85%E5%88%86%E6%9E%90%E4%B8%8E%E5%BE%85%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95_20261010.md) §三 WI-P-6 与 §六 | 1008/1009 旧形状 `[]`（当时无法区分无持仓与无命中）；0928–0930 null；10-12 起为新 dict。**〔10-12 裁决：冻结；三态定稿不等于将转正，去留归 WI-P-7〕** |
 
 > ⚠️ **读数起算更正（2026-10-11 复核修正，推翻原注记）**：批 5 曾有 Critical #1（`aggregator.run()` 裸 `os.getenv` 缺模块级 `import os`，`912cf68` 09-29 修复）。原注记「0928/0929 归档的 3b/4b 影子字段不可作标定输入（run() 必崩，产物为空/不存在）」**与盘上证据不符**：0928 归档（21:47:59，meta `git_commit=ae432ab`、`bar_complete=true`、时长 1202.6s）已含非空 `conflict_summary_shadow` / `market_theme_shadow`，`reasoning.md` 亦渲染 🧭 段——若按提交序（ae432ab 无 `import os`）执行，run() 在 3b 影子分支入口（缺省开）必崩、产不出该档；唯一自洽解释是修复当晚已落**工作树**（先跑后提交，与批 4.1 残片 `candidate_pool.json` 23:59:58 同款），0929 归档 meta 已记 `git_commit=912cf68`。**断窗（合入 `3d71945` 09-28 18:23 → 修复落树）内无归档落入 ⇒ 现存 0928/0929 的 3b/4b 影子读数均为真跑产物、可作标定输入**；backlog 轮批 5 注记同日更正。
 
-**转正门槛**：未定——五线均无登记（这正是本节补的缺口），数值归负责人。参考同清单 GATE-1 惯例（≥10 交易日 + 无误拦截实证）。
+**转正门槛（2026-10-12 负责人裁决，取代本行原写的“未定——五线均无登记”）——拆成两侧**：
+
+**① 3b `risk_override_shadow`：已定门槛，影子期到期即可测**（本线不属持仓侧，继续爬坡）：
+- **有效样本日**：`risk_override_shadow` 非 null 且当日 `agent_glue.status=ok`（降级/回放日不计）；**需累计 ≥10 个**（现 6 个，差 4）。
+- **测法（先写后跑）**：按 **11 类冲突分类分层**抽查，每类 ≥2 条（全量归档只出现过 2 类 ⇒ 不足类用合成上下文补测，并如实标“未见于生产样本”，不得只测已出现的两类就算过）；负责人逐条判“分类 + `decision_path_hint` 是否成立”，**一致率 ≥80%**。
+- **硬红线**：零条“实际应买入/应减仓被判成 `veto_buy`”的严重误判（enabled 后该判定会把 `buy_budget` 归零，错一次就是直接资金影响）。
+- ❌ **不得拿“与现行 `contradictions[]` 差异 0”当判据**：那是两套口径互比，一致只说明没打架，不说明分类对（参 M3 结案：分层人工终审才是尺子）。
+
+**② 其余四条（`sell_source` / `exposure_enforce` / `signal_size` / `mature_reduce`）：全部冻结，不再积算转正天数**——它们都是持仓/卖出侧观测，去留归持仓模块大改裁决（**[`plans/持仓模块重构_待分析与待实施清单_20261010.md`](plans/%E6%8C%81%E4%BB%93%E6%A8%A1%E5%9D%97%E9%87%8D%E6%9E%84_%E5%BE%85%E5%88%86%E6%9E%90%E4%B8%8E%E5%BE%85%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95_20261010.md) WI-P-7**）。原因为什么不是“再等等”而是“自等”：四条的样本前提全在持仓大改手里（W3 多账户口径、conf_w/ECE 未校准、空仓日无买入分配、T-2 生命期标签断供）——继续天数只会得出一堆 `null`，并制造“已在观察”的假安心。冻结前已产生的读数保留在案，但不作转正依据。
+
+> 本节不再参考 GATE-1 的“≥10 交易日”惯例套在持仓四条上——GATE-1 每日都有卖单候选所以天数有意义，持仓四条没标的就零样本（同 §9 #7 antibias 与 §1.H bear gate 的“计时器不动”病）。
 
 ---
 
