@@ -301,9 +301,9 @@ LLM 可调一档但须给理由；② 支持反向（利空）映射；
 > - **S3 生命周期折扣** ✅ `WAVE_LIFECYCLE_COEFF` + `_wave_coeff`（`aggregator.py:125-149`），与决策 5 逐字一致（6–7 → ×0.90、≥8 → ×0.85、不做 fresh boost）；决策 6「不叠加过热系数」亦照原样（`:124` 注释点名）。
 > - **S4 主线续航评估** ✅ 全链路在位：`MainlineEndurance` + `_synthesize_mainline_endurance`（`aggregator.py:4022`，`run()` 尾部 `:400` 调用）→ Phase 2「📊 主线续航评估」章节（`archive.py:1320`）→ 见顶风险家族注入 `PortfolioDecision.warnings`（`portfolio_decision.py:5212`）→ 控制台展示（`main.py:1494`）。**并长出了本节未预见的下游**：FTS / FXG 两道买入侧闸门直接消费 `endurance_band=topping_risk`（判据见 [`../verification.md`](../verification.md) 顶部）。
 > - **S5 校准** 🟡 脚本 `scripts/calibrate_wave_coeff.py` **在库**，但 §3.5 首跑门槛「埋点 ≥40 个交易日」**尚未满足**（当前 22 日）⇒ 属等时间窗，不是缺实现。
-> - ⚠️ **两处从未落地（真·待实施，勿当过期标注）**：① §3.1 幽灵行清理脚本 `scripts/cleanup_nul_sector_names.py` **不存在**——只做成了**写入侧** NUL 剥离（`sector_analysis.py:3989`、`:4124`），存量 `\x00` 幽灵行**实测仍在库**：95 行 / 48 个 `(code,name)` 组合，脏行日期 2026-08-03…09-01（写入侧生效后零新增），其中仅 2/48 组合的「最近一条」仍是脏名——读数与清理口径见 [`../backlog.md`](../backlog.md) §1.G；② §3.2 第 3 条回填脚本 `scripts/backfill_wave_days.py` **不存在**（`sector_analysis.py:58-60` 的模块头注释原把它写成「与在线实现共用」的既有模块，属代码注释里的死引用，同日已订正为「至今未创建 + 日后补齐亦须复用 `decide_wave_days`」）。回填缺口的实际影响有限：波次口径自 09-01 起在线累积，历史波次不重建。
+> - ✅ **原「两处从未落地」已全部收口（2026-10-12）**：① §3.1 幽灵行清理 —— **已实施（2026-10-10，commit `70e4748`）**：95 脏行全清（46 组合删脏行、有干净孪生；2 组合改名保留 `880856 定增股`/`880823 微盘股`），复查 0 脏行，库备份 `data/stock_analysis.db.bak_nul_20261010`；写入侧 `strip('\x00')`（`sector_analysis.py` 两处）保持不变防复发。② §3.2 第 3 条回填脚本 `scripts/backfill_wave_days.py` —— **2026-10-12 负责人裁决「不做，按作废处理」**：波次口径自 09-01 起在线累积，旧逻辑产物本就不得进校准样本（该计划结论 A），且回填值无任何使用方；`sector_analysis.py` 模块头注释已于 10-10 订正为「至今未创建」，死引用已消。⇒ **v3.5 节无待实施尾巴**，仅剩 S5 校准等埋点满足 40 个交易日（属 [`../verification.md`](../verification.md) 那类等时间窗）。口径与清理读数详见 [`../backlog.md`](../backlog.md) §1.G。
 >
-> 日期：2026-09-01（设计）/ 2026-10-10（状态核实）
+> 日期：2026-09-01（设计）/ 2026-10-10（状态核实）/ 2026-10-12（§3.2 第 3 条回填经负责人裁决作废）
 > 背景：① 动量偏见实证——种业（day=9，过热 0.45）以 100 分霸榜 #1，
 > 旅游（day=1，过热 0.07）仅列 #13 caution（详见 `reports/momentum_bias_research_20260901.md`）；
 > ② 用户提出将"主线续航评估"（还能走几天/梯队分层/离场观察点）固化进 GOT；
@@ -430,6 +430,7 @@ LLM 可调一档但须给理由；② 支持反向（利空）映射；
    - 前日非主线族状态或无记录 → 重置 1
 3. **回填**：`scripts/backfill_wave_days.py` 按时间序全量重算（幂等可重跑）。
    注意：08-17 前数据为旧逻辑产物，回填值仅作连续性需要，不作为校准样本。
+   **❌〔2026-10-12 负责人裁决：本条作废、不实施——旧口径产物不得进样本，且回填值无使用方；勿按本条开工。收口说明见文首状态头与 [`../backlog.md`](../backlog.md) §1.G〕**
 4. **输出**：`SectorDetail` 新增 `wave_days` 字段；`LifecycleInfo.days_since_launch` 保持不动（兼容）。
 5. **埋点**：`_save_sector_trends` 写库后，额外追加一行到 `data/wave_calibration.jsonl`
    （{date, sector, wave_days, strength, wave_peak}），次日运行补齐前日记录的板块涨跌幅，
