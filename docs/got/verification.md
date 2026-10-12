@@ -27,7 +27,7 @@
 | **项三 3a / D-3 基线** | `meta.json.funnel_stats` **首次非空**：actionable 7 / 有入选 3 / **零入选率 0.571**（创新药、有色、生物疫苗、银行），逐轮存活 61→55→55→36→20→15→6→3 | 0 → **1 天** | **D-3 归零率基线起算日 = 2026-10-12**（取代原「≥1013 首验后才起算」的表述） |
 | **个股级事件退日历** | 42 事件按源 `macro_rule 10 / global_map 21 / llm_narrative 11`，**`akshare_*` 计数 = 0** | 验收首次可读 | 10-08 裁决的判据今日首次通过；再现即旁路复活 |
 | **批次 G / C1 / E1 / F** | `review.json` 在产；`consistency.json`（抽样 3 / 告警 0 / 缺源 0）；`net_preflight` 4/4 ok；`scoring_formula_version=2026-10-11.1` | 首日 | 一期批次首次有生产读数 |
-| **影子五线** | `risk_override`/`sell_source`（缺口 ¥3,541、削 0 只）/`exposure_enforce`（`mode=n/a`）present；**`signal_size_shadow=null`**；**`mature_reduce_shadow=[]`** | 逐日累计 | 今日正好把 §「五线判据」里待确认的 **`[]`（跑了没命中）vs `null`（未产样本）** 语义实例化了一遍，仍待负责人固化 |
+| **影子五线** | `risk_override`/`sell_source`（缺口 ¥3,541、削 0 只）/`exposure_enforce`（`mode=n/a`）present；**`signal_size_shadow=null`**；**`mature_reduce_shadow=[]`**（旧形状）| 逐日累计 | 当日把五线判据里待确认的 **`[]`（跑了没命中）vs `null`（未产样本）** 语义实例化了一遍；**其中 `mature_reduce_shadow` 已于同日定稿为三态 dict（A1 #3 / WI-P-6），其余四线门槛仍待填（A1 #4）** |
 
 ### 两条零产物：定性完全不同，别混为一谈
 
@@ -48,7 +48,7 @@
 | **3b 风险覆写计划** | `GOT_DISAGREEMENT_SHADOW=1`（缺省开；`GOT_DISAGREEMENT_ENABLED=0` 时 plan 仅观测不进 T3） | `portfolio_decision.json` 顶层 `risk_override_shadow` | `null`=3b 开关未跑或当日无矛盾；非 null=有 RiskOverridePlan 观测 | 6/6 日 present（各 5 条） |
 | **敞口强制（Step 1.5 变体）** | 归批 5 敞口执行观测 | `portfolio_decision.json` 顶层 `exposure_enforce_shadow` | 同上惯例 | present 0930/1008/1009（各 5 条）；0928/0929 null |
 | **信号仓位缩放观测** | 归批 5 | `portfolio_decision.json` 顶层 `signal_size_shadow` | 同上惯例 | present 仅 0930（6 条） |
-| **成熟期减仓观测（T-2）** | 归批 5 | `portfolio_decision.json` 顶层 `mature_reduce_shadow` | `[]`=检测跑了、无标的满足成熟减仓条件；`null`=未跑（0928–0930 形态）——**该两态语义须由负责人确认后固化** | 1008/1009 空列表 `[]`；0928–0930 null |
+| **成熟期减仓观测（T-2）** | 归批 5 | `portfolio_decision.json` 顶层 `mature_reduce_shadow` | **三态已定稿（2026-10-12 A1 #3 / WI-P-6）**：字段由裸 list 改为 dict `{hits, holdings_seen, skipped_reason}`——`null`=本次未调 `_score_holdings`；`skipped_reason=no_accounts/no_holdings`=跑了但无可观测对象（**hits 必空，不得读作“没有到期持仓”**）；`holdings_seen>0 且 hits 空`=真读数。⚠　10-12 前为裸 list，旧归档（1008/1009 的 `[]`）与新 dict **不得直接对拍**。返工钩子见 [`plans/持仓模块重构_待分析与待实施清单_20261010.md`](plans/%E6%8C%81%E4%BB%93%E6%A8%A1%E5%9D%97%E9%87%8D%E6%9E%84_%E5%BE%85%E5%88%86%E6%9E%90%E4%B8%8E%E5%BE%85%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95_20261010.md) §三 WI-P-6 与 §六 | 1008/1009 旧形状 `[]`（当时无法区分无持仓与无命中）；0928–0930 null；10-12 起为新 dict |
 
 > ⚠️ **读数起算更正（2026-10-11 复核修正，推翻原注记）**：批 5 曾有 Critical #1（`aggregator.run()` 裸 `os.getenv` 缺模块级 `import os`，`912cf68` 09-29 修复）。原注记「0928/0929 归档的 3b/4b 影子字段不可作标定输入（run() 必崩，产物为空/不存在）」**与盘上证据不符**：0928 归档（21:47:59，meta `git_commit=ae432ab`、`bar_complete=true`、时长 1202.6s）已含非空 `conflict_summary_shadow` / `market_theme_shadow`，`reasoning.md` 亦渲染 🧭 段——若按提交序（ae432ab 无 `import os`）执行，run() 在 3b 影子分支入口（缺省开）必崩、产不出该档；唯一自洽解释是修复当晚已落**工作树**（先跑后提交，与批 4.1 残片 `candidate_pool.json` 23:59:58 同款），0929 归档 meta 已记 `git_commit=912cf68`。**断窗（合入 `3d71945` 09-28 18:23 → 修复落树）内无归档落入 ⇒ 现存 0928/0929 的 3b/4b 影子读数均为真跑产物、可作标定输入**；backlog 轮批 5 注记同日更正。
 

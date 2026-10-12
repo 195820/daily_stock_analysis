@@ -301,8 +301,10 @@ class PortfolioDecisionNode:
             # 不改任何 allocation 决策（由 _allocate 落 self）
             exposure_enforce_shadow=getattr(self, "_exposure_enforce_shadow", None),
             signal_size_shadow=getattr(self, "_signal_size_shadow", None),
-            # C-B2 启用前盘点留痕（【总计划】§4.2）：若阈值切 14 本应触发 reduce 的持仓清单，
-            # 纯观测不参与决策（由 _score_holdings 落 self）
+            # C-B2 启用前盘点留痕（【总计划】§4.2）：若阈值切 14 本应触发 reduce 的持仓清单。
+            # 2026-10-12 A1 #3 起为 dict（hits/holdings_seen/skipped_reason 三态），纯观测不参与决策；
+            # 语义定义见 docs/got/verification.md 影子五线表，持仓大改时须返工（持仓文档 WI-P-6）
+            # （由 _score_holdings 落 self）
             mature_reduce_shadow=getattr(self, "_mature_reduce_shadow_hits", None),
             # 4d/D-3 前置：候选池归零率基线观测（项三 3a，纯留痕）——由 _score_candidates 落 self。
             funnel_stats=getattr(self, "_last_funnel_stats", None),
@@ -606,14 +608,30 @@ class PortfolioDecisionNode:
         results = []
         # P4：重置埋伏退出记录（每次 _score_holdings 调用重新收集）
         self._ambush_exits = []
-        # C-B2 启用前盘点观测（总计划 §4.2，纯留痕不改决策）：重置后重新收集
-        self._mature_reduce_shadow_hits = []
+        # C-B2 启用前盘点观测（总计划 §4.2，纯留痕不改决策）：重置后重新收集。
+        # 2026-10-12 A1 #3：由裸 list 改为自描述 dict，以区分三态（原 `[]` 同时对应
+        # 「无持仓」与「有持仓但窗口内无命中」两种语义，读数无法归因——同 antibias 零产物病）：
+        #   · 字段=null      → 本次 Phase 2 根本没调 `_score_holdings`（属性未初始化）
+        #   · skipped_reason → 跑了但无可观测对象（no_accounts / no_holdings），hits 必空
+        #   · holdings_seen>0 且 hits 空 → **真读数**：有持仓、无标的落入 14<day≤30 成熟窗口
+        # 持仓模块大改（truth-source / 入场锚 / 退出分层）时本三态须一并重新审视，
+        # 见 docs/got/plans/持仓模块重构_待分析与待实施清单_20261010.md §三 WI-P-6。
+        self._mature_reduce_shadow_hits = {
+            "hits": [],
+            "holdings_seen": 0,
+            "skipped_reason": None,
+        }
 
         accounts = portfolio.get("accounts", [])
         if not accounts:
+            self._mature_reduce_shadow_hits["skipped_reason"] = "no_accounts"
             return results
 
         positions = accounts[0].get("positions", [])
+        self._mature_reduce_shadow_hits["holdings_seen"] = len(positions)
+        if not positions:
+            # 无持仓：本轮成熟期盘点无可评估对象（与「有持仓但都不在窗口」不同义）
+            self._mature_reduce_shadow_hits["skipped_reason"] = "no_holdings"
 
         # 构建板块 → 强度映射（从 sector_context）
         sector_strength_map = self._build_sector_strength_map(sector_context)
@@ -925,7 +943,7 @@ class PortfolioDecisionNode:
                     and 14 < lifecycle_day <= LIFECYCLE_MATURE_REDUCE_DAY
                     and action != "sell"  # sell 优先级更高，计入会高估 reduce 冲击
                 ):
-                    self._mature_reduce_shadow_hits.append({
+                    self._mature_reduce_shadow_hits["hits"].append({
                         "symbol": symbol,
                         "sector": sector_name,
                         "lifecycle_day": lifecycle_day,

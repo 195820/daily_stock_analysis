@@ -1321,13 +1321,18 @@ class PortfolioDecision(BaseModel):
                     "对比等分 vs score^γ 加权的仓位差，shadow 不改任何仓位。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
-    # ── C-B2 启用前盘点 shadow 留痕（【总计划】§4.2，2026-10-06）──
-    mature_reduce_shadow: Optional[list] = Field(
+    # ── C-B2 启用前盘点 shadow 留痕（【总计划】§4.2，2026-10-06；2026-10-12 A1 #3 改三态 dict）──
+    mature_reduce_shadow: Optional[dict] = Field(
         default=None,
-        description="若 GOT_MATURE_REDUCE_DAY 切 14 本应触发 reduce 的持仓清单: "
-                    "[{symbol, sector, lifecycle_day, action_kept}]，窗口 (14, 现阈值]。"
-                    "纯观测不参与任何判定，供 B2 阈值启用前盘点统计冲击。"
-                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+        description="若 GOT_MATURE_REDUCE_DAY 切 14 本应触发 reduce 的盘点观测："
+                    "{hits: [{symbol, sector, lifecycle_day, action_kept}], holdings_seen: int, "
+                    "skipped_reason: Optional[str]}，窗口 (14, 现阈值]。"
+                    "三态语义（定稿于 docs/got/verification.md 影子五线表）："
+                    "null=本次未调 _score_holdings；skipped_reason=no_accounts/no_holdings ⇒ 跑了但无可观测对象"
+                    "（hits 必空，不得读作「没有到期持仓」）；holdings_seen>0 且 hits 空 ⇒ 真读数。"
+                    "纯观测不参与任何判定；持仓模块大改时须返工（持仓文档 WI-P-6）。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】"
+                    "【形状变更：2026-10-12 前为裸 list，旧归档（1008/1009 的 []）不得与新 dict 直接对拍】",
     )
 
 
