@@ -12,6 +12,50 @@
 
 ---
 
+## ‼️ 2026-10-12 全流程实跑：多条影子线今日才真正起算 + 两条零产物定性
+
+**背景**：2026-10-12 盘中全流程（09:49→10:06，510.1s，`bar_complete=false`，`git_commit=5a4f29f`）是 10-09~10-11 合入的那批闸门/影子线**第一次有完整归档的一天**（09:37 那一跑在 Node 4 崩溃、零产物，见本批 commit `e691fac`）。本节只登记读数，达标判定归负责人（遵 §0 收录范围）。取证脚本 `.review_tmp/read_20261012.py`（只读、不入库）。
+
+### 今日真正起算的线
+
+| 线 | 今日读数 | 可数天数变化 | 说明 |
+|---|---|---|---|
+| **MEG** | `shadow_meg.json`：evaluated **3**、层2 命中 0、层3 缩仓 0 | 1 → **2 天**（1009、1012） | 仍无正例，命中率/假阳性不可判 |
+| **FTS** | `shadow_fts.json` **首份**：evaluated 3、`suppressed_families=[]`、层B 命中 0；`unified.family_suppression=[]` | 0 → **1 天** | 10-10 记的「0 天」自此失效；今天 `topping_risk` 档未进压制台账（家族未跨日 latch 到 aggravated） |
+| **FXG** | veto `evaluated 25`、剔池 0、豁免 0；**`fxg_baseline_scoring.json` 首份**（`mode=baseline_off` 对照 3 行） | 0 → **1 天** | 自建对照机制首次真实跑通；「≥1 周」时钟自 10-12 起算 |
+| **GATE-1 tradability** | `tradability_shadow.mode="shadow"`、`pending_exits=[]` | 0 → **1 天** | WI-P-4 的「下一交易日确认 mode==shadow」今日闭环；**账户空仓无卖单 ⇒ 今日无 `quote_unavailable` 样本** |
+| **项三 3a / D-3 基线** | `meta.json.funnel_stats` **首次非空**：actionable 7 / 有入选 3 / **零入选率 0.571**（创新药、有色、生物疫苗、银行），逐轮存活 61→55→55→36→20→15→6→3 | 0 → **1 天** | **D-3 归零率基线起算日 = 2026-10-12**（取代原「≥1013 首验后才起算」的表述） |
+| **个股级事件退日历** | 42 事件按源 `macro_rule 10 / global_map 21 / llm_narrative 11`，**`akshare_*` 计数 = 0** | 验收首次可读 | 10-08 裁决的判据今日首次通过；再现即旁路复活 |
+| **批次 G / C1 / E1 / F** | `review.json` 在产；`consistency.json`（抽样 3 / 告警 0 / 缺源 0）；`net_preflight` 4/4 ok；`scoring_formula_version=2026-10-11.1` | 首日 | 一期批次首次有生产读数 |
+| **影子五线** | `risk_override`/`sell_source`（缺口 ¥3,541、削 0 只）/`exposure_enforce`（`mode=n/a`）present；**`signal_size_shadow=null`**；**`mature_reduce_shadow=[]`** | 逐日累计 | 今日正好把 §「五线判据」里待确认的 **`[]`（跑了没命中）vs `null`（未产样本）** 语义实例化了一遍，仍待负责人固化 |
+
+### 两条零产物：定性完全不同，别混为一谈
+
+1. **`shadow_bear_gate.json` 缺失＝留痕被抹，不是「当日无拦单」**。日志铁证：10:02:11「Node1=bear 收手闸门**命中 1 单**（dip_mode=veto，埋伏来源已豁免）」、10:06:10 第二轮「命中 0 单」，而 `shadow_bear_gate.json` 未落盘、`reasoning.md` 渲染成「本次无产物…多为当日无拦单」（该解释在此案下**是错的**）。机制：`portfolio_decision.py:4027` 每轮 `_score_candidates` 重置 `self._bear_gate_shadow = []`，`:4306` 只在命中时组装 dict，`:3492` 落盘处 `or None` ⇒ **最后一轮的 `[]` 覆盖前一轮命中**。Phase 2 一天跑两轮是常态（今日实测），所以 backlog §1.H 记的「拦单留痕已实施闭环」在生产上不成立，**B 的误伤率照样算不出来**。修法（跨轮按 `date+symbol` 累积去重 / 落盘时合并当日各轮）与判据对齐已回写 backlog §1.H 改判为真·待实施。
+2. **`shadow_antibias.json` 缺失＝结构性无输入，不是缺陷**。批次 B 缺省开，但 `antibias._collect_actionable_sectors` 只取 `is_holding` 或 action ∈ (`buy_trend`, `buy_dip`, `hold`)；今日 `unified_scoring` 3 行**全 `watch` 且空仓** ⇒ 返回空、函数 `return None` 不落盘（无任何日志/告警）。⇒ B 的转正判据「影子 ≥10 交易日 + `counter_thesis` 非空率 >80%」在空仓 / 全 watch 的行情日**一天样本都攒不到**，判据必须补「仅在有买入/持有标的的交易日计样本」，否则又是一个不动的计时器（同 FXG「暂无读数 ≠ 证伪」谱系）。已登 backlog §9 #7。
+
+> ⚠️ **本节不改动下面各节的历史记载**，只作起算日订正：下文「三闸门读数起算」中「MEG 1 天 / FTS 0 天 / FXG 0 天」「至今一份都没有」与「≥1013 首验后才起算」均自 2026-10-12 起过期。
+
+---
+
+## ‼️ 2026-10-11 补登（排期批 4/5 影子五线判据——「影子线必登判据」条款回溯）
+
+**背景**：`sell_source_shadow` / `risk_override_shadow` / `exposure_enforce_shadow` / `signal_size_shadow` / `mature_reduce_shadow` 五条影子线自 0928 随排期批 4.1/5 上线，早于 10-10「影子线必登判据」条款，属条款未回溯的漏网（backlog §8 #13 挂号）。本节按条款补登**产物位置与读数口径**；转正门槛数值归负责人。审查取证：[`reports/got_audit_20261011.md`](../../reports/got_audit_20261011.md) §2.3（报告不入库）。
+
+| 影子线 | 开关 | 产物/读数位置 | null vs `[]` 语义（实测推断，待负责人确认） | 六归档日实测（0928–1009） |
+|---|---|---|---|---|
+| **4.1 超限减仓卖出来源** | `GOT_SELL_SOURCE_ENABLED=0` + `GOT_SELL_SOURCE_SHADOW=1`（缺省影子态） | `portfolio_decision.json` 顶层 `sell_source_shadow`：本会削谁/多少/是否撞家族宽限 | `null`=当日 Step 1 后未超 `position_limit`（未进 Step 1.5 检测）；非 null 列表=检测跑了，行内有被削候选 | present 仅 1008/1009（7 条）；0928–0930 null |
+| **3b 风险覆写计划** | `GOT_DISAGREEMENT_SHADOW=1`（缺省开；`GOT_DISAGREEMENT_ENABLED=0` 时 plan 仅观测不进 T3） | `portfolio_decision.json` 顶层 `risk_override_shadow` | `null`=3b 开关未跑或当日无矛盾；非 null=有 RiskOverridePlan 观测 | 6/6 日 present（各 5 条） |
+| **敞口强制（Step 1.5 变体）** | 归批 5 敞口执行观测 | `portfolio_decision.json` 顶层 `exposure_enforce_shadow` | 同上惯例 | present 0930/1008/1009（各 5 条）；0928/0929 null |
+| **信号仓位缩放观测** | 归批 5 | `portfolio_decision.json` 顶层 `signal_size_shadow` | 同上惯例 | present 仅 0930（6 条） |
+| **成熟期减仓观测（T-2）** | 归批 5 | `portfolio_decision.json` 顶层 `mature_reduce_shadow` | `[]`=检测跑了、无标的满足成熟减仓条件；`null`=未跑（0928–0930 形态）——**该两态语义须由负责人确认后固化** | 1008/1009 空列表 `[]`；0928–0930 null |
+
+> ⚠️ **读数起算更正（2026-10-11 复核修正，推翻原注记）**：批 5 曾有 Critical #1（`aggregator.run()` 裸 `os.getenv` 缺模块级 `import os`，`912cf68` 09-29 修复）。原注记「0928/0929 归档的 3b/4b 影子字段不可作标定输入（run() 必崩，产物为空/不存在）」**与盘上证据不符**：0928 归档（21:47:59，meta `git_commit=ae432ab`、`bar_complete=true`、时长 1202.6s）已含非空 `conflict_summary_shadow` / `market_theme_shadow`，`reasoning.md` 亦渲染 🧭 段——若按提交序（ae432ab 无 `import os`）执行，run() 在 3b 影子分支入口（缺省开）必崩、产不出该档；唯一自洽解释是修复当晚已落**工作树**（先跑后提交，与批 4.1 残片 `candidate_pool.json` 23:59:58 同款），0929 归档 meta 已记 `git_commit=912cf68`。**断窗（合入 `3d71945` 09-28 18:23 → 修复落树）内无归档落入 ⇒ 现存 0928/0929 的 3b/4b 影子读数均为真跑产物、可作标定输入**；backlog 轮批 5 注记同日更正。
+
+**转正门槛**：未定——五线均无登记（这正是本节补的缺口），数值归负责人。参考同清单 GATE-1 惯例（≥10 交易日 + 无误拦截实证）。
+
+---
+
 ## ‼️ 2026-10-08 状态变更（个股级结构化事件退出催化剂日历）
 
 **背景**：1008 全流程实测中财报披露通道「死而复生」（0825–0930 因 `stock_yjyg_em` 取数失真恒为零，六周下游无一处报缺）；当日 7 条 `akshare_earnings`（direction=drift）挤占 22 格日历，飞龙股份一只扇出 4 板块——与 WI-P2-4 移除解禁的三条理由（层次错配/稀释密度/无规模信息）逐字同案。
@@ -38,7 +82,7 @@
 | **FXG 家族级见顶上游排除闸门**（在 `actionable_names` 构造阶段真剔池） | `GOT_FAMILY_TOPPING_EXCLUDE_ENABLED=0`（需父 `GOT_FAMILY_TOPPING_GATE_ENABLED=1`）/ `GOT_FAMILY_TOPPING_EXCLUDE_MODE=shadow` / `GOT_FAMILY_TOPPING_EXCLUDE_MIN_DAYS=2` / `GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW=0` | `shadow_fts.json` 的 `fxg` 子块 + `candidate_pool.json`；`EXCLUDE_BASELINE_SHADOW=1` 且 `EXCLUDE_MODE=veto` 时另落 `fxg_baseline_scoring.json`（剔前原模式基线）。⚠️ **对照是自建的、不缺**：基线由 `EXCLUDE_BASELINE_SHADOW=1` 与 veto **同一次跑内双跑**产生（veto 真剔池 + 独立实例再跑一遗 FXG-off 的原模式评分），所以下表「基线 0 份」只意味着**部署后尚未有过全流程实跑**，不意味着「开了却没有对照」 | `scripts/fxg_pair_report.py`：主口径=家族/板块池成员差集（①见顶家族被删 ②补位者），③前向 T+5/T+10 best-effort（取不到即 N/A） | **已拍 veto（2026-10-09~10 负责人裁定）**：切 veto 后连续 ≥1 周用 `fxg_pair_report.py` 证真**补位净正/中性**方可长期保留，否则回退 shadow。**取向已定：踏空优于接盘**（负责人原话「丢收益总比接盘亏要好」）⇒ 「回退 shadow」只在看中证伪后触发，**不因「暂无读数」提前回退**（无读数不等于被证伪） |
 
 **读数起算与局限（必读）**：
-1. **影子读数的实际起算日（2026-10-10 实测更正；本条原写「三闸门读数均自 2026-10-09 部署日起算」不成立）**：扫 `data/got_daily/` 实测可数产物 = **MEG 1 天 / FTS 0 天 / FXG 0 天**（`shadow_meg.json` 仅 20261009；`shadow_fts.json` 与 `fxg_baseline_scoring.json` **至今一份都没有**）。原因**不是「写了不跑」**：20261009 那次运行的 `meta.json` 记 `git_commit=d391345` / `run_timestamp=13:55:03` / `bar_complete=false`（盘中跑），而 FTS 合入在其后（`3947500` 10-09 15:47、前置修复 `d5bf3ca` 22:14），FXG 基线更晚（`9074d7c` 10-10 09:03）；10-10 目录**只有 `candidate_pool.json`**（无完整全流程归档）。⇒ 「观测 ≥1 周」的计时实际从**下一个全流程交易日**才开始，当前无任何可用转正读数。
+1. **影子读数的实际起算日（2026-10-10 实测更正；本条原写「三闸门读数均自 2026-10-09 部署日起算」不成立）**：扫 `data/got_daily/` 实测可数产物 = **MEG 1 天 / FTS 0 天 / FXG 0 天**（`shadow_meg.json` 仅 20261009；`shadow_fts.json` 与 `fxg_baseline_scoring.json` **至今一份都没有**）。原因**不是「写了不跑」**：20261009 那次运行的 `meta.json` 记 `git_commit=d391345` / `run_timestamp=13:55:03` / `bar_complete=false`（盘中跑），而 FTS 合入在其后（`3947500` 10-09 15:47、前置修复 `d5bf3ca` 22:14），FXG 基线更晚（`9074d7c` 10-10 09:03）；10-10 目录**只有 `candidate_pool.json`**（无完整全流程归档）。⇒ 「观测 ≥1 周」的计时实际从**下一个全流程交易日**才开始，当前无任何可用转正读数。**〔2026-10-12 订正：该「下一个全流程交易日」已到达，`shadow_fts.json` 与 `fxg_baseline_scoring.json` 首份均落盘 ⇒ 三闸门时钟自 2026-10-12 起算，本行原读数作废，见顶部节〕**
    ⚠️ **但「盘中跑」不是缺陷，转正判读不得要求改成收盘跑**（上一版本节把 `bar_complete=false` 当成口径问题，已订正）：项目约定为**盘中（约 13:30）执行**，收盘跑是补跑/测试例外——`archive._is_bar_complete` docstring 自述「标记**收盘后补跑版**（如 0910 17:51）…与 **13:30 节奏配合**」，audit_20260922 Q4 亦裁定「降档标记 + `bar_complete` 接 P6」（产物侧已有 `TradeAllocation.intraday_snapshot` 与「⚠️ 盘中快照警告」）。⇒ **判读口径：按 `meta.json.bar_complete` 分组，盘中日作生产主口径，收盘补跑日单列不混池**。
    真正残留的口径风险**不在时点而在量纲**：MEG 的 `decay_2d = (ema[t] - ema[t-2]) / ema[t-2]` 中当日项 `rrg.rs_momentum`（`sector_analysis.py:1590` 起）在盘中是**未定版值**，与 §7.8.1 回测所用的收盘日线不同构 ⇒ 影子期读数与回测读数不能直接对拍；修法属【架构计划】WI-P2-8（per-source availability，把「当日 bar 未走完」下沉为逐源 gate），不是调运行时点。
 2. `--got-replay` **不经过 Phase 2**，三闸门读数只能从实跑交易日归档累；非交易日 `main.py --got` 直接抛错。
@@ -73,6 +117,7 @@
 - 此前 `funnel_stats` 只在 `run_got_mode` 计算/落 `data/got_screener/{date}.json`，生产 Phase 2 直调 `_extract_got_universe`+`_filter_got_finalists` 不经该路径 ⇒ `meta.json.funnel_stats` 恒缺、**D-3 基线 0 天**。
 - 现于 `portfolio_decision._score_candidates` 补算 `screener._compute_funnel_stats(universe, finalists)` → 落 `PortfolioDecision.funnel_stats`（纯观测，try/except 全包）→ `archive_phase2` 回读-改-写合并进 `data/got_daily/{date}/meta.json` 的 `funnel_stats` 键（归档层零新文件）。
 - **D-3 基线起算日 = 3a 部署后的下一个全流程交易日**（此前 0 天）；`meta.json.funnel_stats` 非空即视为接线成功。`test_got_funnel_stats.py` 4 绿。
+- **〔2026-10-11 审查注记〕** 六归档日（0928–1010）`meta.json` 实测全无 `funnel_stats` 键 + 写入点 grep（`_score_candidates`/`archive_phase2` 全仓仅定义处命中）双证：3a 接线代码已提交（`5a4f29f`，10-11 13:54）但**生产基线实测仍 0 天**——「D-3 基线起算日 = 3a 部署后下一个全流程交易日」的计时尚未开始，≥1013 生产日首验 `meta.json.funnel_stats` 非空后才起算。取证：[`reports/got_audit_20261011.md`](../../reports/got_audit_20261011.md) §2.1（报告不入库）。**〔2026-10-12 首验通过：`meta.json.funnel_stats` 已非空（actionable 7 / 有入选 3 / 零入选率 0.571），D-3 基线起算日 = 2026-10-12，本行「≥1013 才起算」作废；读数见顶部 10-12 节〕**
 
 **3b（未开工——受阻，需负责人拍板后另起 WI）**：
 - **前置未满足（§3.2 计划自述）**：3b 前置 = 3a 完成 **+ D-3 基线攒满 ≥10 交易日**。3a 当日才接线，基线 0 天，影子转正窗口尚未起算。
@@ -95,7 +140,7 @@
 | **D** news_pulse 持仓异动归因 | `GOT_NEWS_PULSE_ENABLED=0`（缺省**关**）/ `GOT_NEWS_PULSE_THRESHOLD=7.0` / `GOT_NEWS_PULSE_MAX_STOCKS=3` | `data/got_daily/{date}/news_pulse.json` | 先手动跑一周验输出质量（归因表含排除项/性质四选一/盘中收盘两口径）；推送接线另立子项 | 代码+测试就位（6 例），默认关未跑 |
 | **G** output_review 产出自查 | `GOT_OUTPUT_REVIEW=1`（缺省**开**，warn 态零行为） | `data/got_daily/{date}/review.json` | 一期只 warn；critical 项升为**阻断**需两周零误报人工确认（且阻断只拦推送/终端，归档照常） | 已落（一期 warn），10 例 |
 | **A** 证据链与出处 | 无独立总开关；一期 `EVIDENCE_TIER_MULTIPLIER` confirmed==reported==1.0（**零行为变化**）；Node4 抽取 prompt 的 url/时间接地受 `GOT_NEWS_EVIDENCE_GATING=false` 门控（审查 W2：开启会改 LLM 输入，缺省关=prompt 逐字同改造前） | `catalyst_events.evidence_tier/source_url` + `node4_raw_news.url/published_at` 列（已实 DB 迁移） | 二期启用 rumor<1.0 折扣前，先历史归档重放 pool 成员对比 + 人工确认（防换池）；开接地前先同输入 golden 抽取对照 | 已落（催化剂侧 tier+乘数零变化 + 新闻侧回连机制，默认关），13 例；rumor 未标→零变化 |
-| **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80% | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
+| **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80%。**〔10-12 实测补条件：`_collect_actionable_sectors` 只取 `is_holding` 或 action∈(buy_trend,buy_dip,hold)；10-12 三个候选全 `watch` 且空仓 ⇒ 函数 `return None`、零产物零告警 ⇒ 「≥10 交易日」必须只计**有买入/持有标的**的日，否则计时器不动（backlog §9 #7）〕** | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
 | **C1** 双源交叉验证 | `GOT_CONSISTENCY_SAMPLE=10`（缺省 10，**0=关**）/ `GOT_CONSISTENCY_TOL=1.0` | `data/got_daily/{date}/consistency.json` | 不改任何决策输入；二期可接推送/告警 | 已落（源A=manager 实时 / 源B=腾讯批量 D0，比当日 change_pct；资金无二源→诚实标注），10 例 |
 | **C2** 全局 is_stale | 无开关（`src/got/data_freshness.py`） | —（工具） | — | 已抽为唯一权威实现，capital_analysis 改为引用（禁二口径）+ 扩识别英文 `date` 列；**Node 1/2/5 行情消费点接入为待办子项** |
 | **E1** 网络预检 | `GOT_NET_PREFLIGHT=true`（缺省开，纯观测） | `meta.json.net_preflight`（回读-改-写） | 不据此降级；lite 自动降级延后到 lite/full 历史差异读数后 | 已落（GET 探活4域），4 例；**lite 手动/自动降级为独立子项（未实现）** |
@@ -266,10 +311,10 @@ T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A
 
 工作流 B（bear 期入场闸门，`GOT_BEAR_ENTRY_GATE`，缺省 on）在 `_score_candidates` 拦单时新增逐单留痕：
 
-- **`shadow_bear_gate.json`**：命中闸门的候选逐单 dict `{symbol, name, sector, pool_source, composite, action_before, action_after, mode}`，汇总 `{line: "bear_gate", executed, regime, dip_mode, hits, flagged_stocks}`；无命中日落 `{"executed": false}`。
+- **`shadow_bear_gate.json`**：命中闸门的候选逐单 dict `{symbol, name, sector, pool_source, composite, action_before, action_after, mode}`，汇总 `{line: "bear_gate", executed, regime, dip_mode, hits, flagged_stocks}`。**〔2026-10-12 更正：原写「无命中日落 `{"executed": false}`」与实现不符——`_save_shadow_records` 走 `self._bear_gate_shadow or None`，**仅命中时落盘**，无命中日不产文件；且同日多轮 `_score_candidates` 只保留最后一轮，命中会被后一轮的重置抹掉（10-12 实测：10:02 命中 1 单 → 归档无产物）。判据随 backlog §1.H 的修复一并重定〕**
 - 由 `_save_shadow_records()` 第 5 项落盘到 `data/got_daily/{date}/`，同走 `_render_shadow_section()` 渲染链。
 - **性质与 T1/T1-H 影子不同**：闸门本身是生效的（硬拦/veto/soft 三档真实改写候选动作），留痕只是**观测旁挂**（闸门缺省 on、留痕非影子开关），不存在"攒读数后转正"的开关翻转。
-- 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。
+- 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。**⚠️ 该降级文案会误导向**：10-12 实测「有拦单但留痕被后一轮抹去」也会渲染成同一句「多为当日无拦单」⇒ 不得拿这句当作「当日无拦单」的证据，需回查日志 `Node1=bear 收手闸门命中 N 单`。
 
 详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
 
@@ -284,7 +329,8 @@ GATE-1（卖出可成交性投影层，`GOT_TRADABILITY_GATE`，缺省 off）在
 - **性质**：本层是三态影子开关（off→shadow→enabled，存在"攒读数后转正"翻转），与 bear gate 的"闸门生效+留痕旁挂"性质不同。
 - 拦截口径（tradability.py）：跌停封板→`limit_down`（现价≤跌停价且 high 贴住→全天未开板；盘中开板视为可成交）；当日建仓→`t_plus_1`；涨停一字→`limit_up`（buy 方向）。
 - 降级红线：行情缺失/超时/异常一律放行不拦截，仅留 `quote_unavailable` 告警标签。
-- 单测：`tests/test_gate1_tradability_wiring.py`（17 个用例：三态行为 + 降级红线）。
+- 单测：`tests/test_gate1_tradability_wiring.py`（**26** 个用例：三态行为 + 降级红线；本行原记 17 个，2026-10-12 `--collect-only` 实测为 26）。
+- **首日读数（2026-10-12）**：`portfolio_decision.json` 的 `tradability_shadow` = `{mode: "shadow", pending_exits: []}` ⇒ 接线成功；**但账户空仓、当日无卖单 ⇒ `quote_unavailable` 占比与「误拦截」两条门槛无样本**，需等有卖单的交易日才能累。详见顶部节。
 
 ### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）
 
@@ -667,3 +713,7 @@ ls -la data/got_screener/ | tail
 *修订：2026-10-06（第十二轮，M3 首次读齐）—— §6 **M3 由「未测」改为首次实测**：负责人逐行判完分层口径 36 样本 → 误配率 **2.8%**（无关系 1 / 弱关系 4 / 强关系 31）、Wilson95 [0.49%, 14.17%]、逐日连续 5 日达标 `status=met`。⚠️ **分层初筛 ≠ 转正**（§8.1 要求 `--sample-mode full` 复跑，本轮未跑；**该前置已于第十三轮作废**）。唯一「无关系」误配（低空经济→智能驾驶，20260921/0929 两个抽查日稳定复现的系统性偏置）已做对症收口：`family_keywords.py` 军工族新增关键词 "低空"——依据是 `aggregator.py:1075` 任务2「家族归属（仅对落「其他」的板块）」，规则侧命中后 glue 不再有裁量权。**本轮含在线决策变更**（非纯观测）：`低空经济` 的 `frame_group` 由「其他」变「军工」，拥挤计数 / 主线聚合 / Node 6 家族中继会跟着动。读数表、机制发现、prompt 12 族 vs `CONTROLLED_FAMILIES` 14 族漂移、电气设备弱关系为何不改的论证均见架构实施计划 **§11.8**。守卫测试 `test_dikong_resolves_to_military_family`；同跑 92 + 180 passed、`_audit_keyword_overlaps()` 仍 `[]`。*
 
 *修订：2026-10-06（第十三轮，M3 结案转正）—— 负责人裁决 **M3 直接转正，放弃 §8.1 的 `--sample-mode full` 复跑前置**，§6 M3 行改为「✅ 已结案转正」。裁决依据是实测而不是嫌麻烦：分层样本难点占 26/36＝72.2%，而总体仅 36/65＝55.4% ⇒ 2.8% 是**偏高**读数（拿偏高读数作验收属保守方向）；按层外推全量口径 ≈2.2%，两读数同处 15% 红线内且与红线差一个数量级，复跑不改变结论。同时更正第十二轮的代价估计：全量分母是 **65 行/5 日（日均约 13 条）**，本就在 §8.1 自己写的「≤10 分钟/日」预算内（早前说的 120 行是含 glue 弃权/双空的总候选，不入分母）。结案后 stratified 降为**日常预警**（单日 1 条无关系即 14.3% 贴线，全量口径仅 7.7% ⇒ 破线需人工复核、不自动回滚）。`scripts/build_m3_review_package.py` 三处口径文案同步（抽样/判据/计分公式不动，`--score` 复跑仍 2.8%），新增守卫测试 `test_process_note_records_promotion_decision`（防 full 复跑前置被写回去）——test_m3_review_package **18 passed**。本项只结 M3：不动任何生产开关，M1/M2/M4-a 仍是未达的水位监控项。详见【架构计划】§11.8。*
+
+*修订：2026-10-11（GOT 项目架构审查轮注记两处，只读零代码）—— ① 新增顶部「排期批 4/5 影子五线判据」补登节（backlog §8 #13 挂号回填）：五线（sell_source / risk_override / exposure_enforce / signal_size / mature_reduce_shadow）产物键、null vs `[]` 语义（mature_reduce 的 `[]`=跑了没命中实测推断、待负责人确认固化）、六归档日读数、转正门槛留空归负责人；**Critical #1 警告经盘上复核更正**：0928/0929 归档实测含非空 3b/4b 影子字段（0928 21:47 真跑、修复当晚先落工作树、0929 meta 已记 `912cf68`），断窗内无归档落入，故早期样本不作废、读数可作标定输入（详见节内更正注记）。② 项三 3a 节补审查注记：funnel_stats 3a 接线已提交（`5a4f29f`）但六归档日 meta 实测无键、D-3 基线 0 天未起算，≥1013 首验后才计。取证报告 [`reports/got_audit_20261011.md`](../../reports/got_audit_20261011.md)（不入库）。
+
+*修订（2026-10-12，全流程实跑读数订正轮，零代码改动）*——新增顶部「2026-10-12 全流程实跑」节，并把四处被实测推翻的原文就地更正：① 三闸门读数起算由「MEG 1 / FTS 0 / FXG 0、至今一份都没有」→ **10-12 起 FTS/FXG 各有首份产物**（`shadow_fts.json` + `fxg_baseline_scoring.json`），时钟正式起算；② 项三 3a 的「≥1013 首验后才起算」→ **10-12 已首验通过**，D-3 基线起算日=10-12；③ GATE-1 首日 `mode=shadow` 已确认（WI-P-4 尾项闭环），但空仓无卖单 ⇒ `quote_unavailable`/误拦截两门槛无样本；单测数 17→**26**（`--collect-only` 实测）；④ **bear gate 留痕判据与实现不符就地更正**——原记「无命中日落 `{"executed": false}`」，实现是仅命中时落盘且多轮只保留最后一轮（10-12 实测 10:02 命中 1 单、归档无产物），且降级文案会把这种情况说成「当日无拦单」；已回写 backlog §1.H 改判真·待实施。另登记批次 B 的零产物定性（`_collect_actionable_sectors` 在无买入/持有标的时返空 ⇒ 转正判据需补计样本前提，backlog §9 #7）。本跑同时发现并修复 Node 4 prompt 模板大括号转义缺陷（commit `e691fac`），09:37 那一跑零归档即因此。取证脚本 `.review_tmp/read_20261012.py` + `scan_prompt_braces.py`（不入库）。*
