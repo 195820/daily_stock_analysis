@@ -84,7 +84,7 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
 5. 严格按 importance 排序，high 在前
 
 输出 JSON 格式（不要 markdown 代码块）：
-{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"{src_index_example}}]}}"""
+{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"{src_index_example}}}]}}"""
 
 CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
 
