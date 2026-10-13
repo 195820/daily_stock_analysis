@@ -1193,6 +1193,15 @@ class UnifiedScoringResult(BaseModel):
         default=None,
         description="生命周期阶段来源：sector_intel=confirmed 直接命中 / anchor=中继锚点板块 / extended=Node2 全量降级 / none=三路全落空（None 阶段）",
     )
+    # ── 埋伏道拆分 v2 拦点#6：入场分道标识 ──
+    # 词表说明：生产 passthrough 携带 screener 内部词表 "active_mainline"/"ambush"；
+    # default "mainline" 仅为 Schema 兜底缺省（无 stock 来源时），所有闸门均判 == "ambush"，
+    # 兜底值永不等价 ambush → 语义安全。禁止在 passthrough 处 remap（保持 house vocabulary 原样）。
+    sector_type: str = Field(
+        default="mainline",
+        description="入场分道: active_mainline/ambush（screener 内部词表，生产 passthrough 原样）；mainline 为 Schema 兜底缺省（埋伏道拆分 v2 拦点#6）",
+    )
+
 
 
 class TradeAllocation(BaseModel):
@@ -1334,6 +1343,24 @@ class PortfolioDecision(BaseModel):
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】"
                     "【形状变更：2026-10-12 前为裸 list，旧归档（1008/1009 的 []）不得与新 dict 直接对拍】",
     )
+    # ── 埋伏道拆分 v2 拦点#5：screener 侧埋伏道产物透传 ──
+    ambush_lane_shadow: Optional[dict] = Field(
+        default=None,
+        description="埋伏道拆分 v2 产物: {mode, lane_finalists, note}（screener 侧埋伏道过闸名单）。"
+                    "纯观测，不参与判定。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    ambush_lane_trace: Optional[dict] = Field(
+        default=None,
+        description="埋伏道拆分 v2 拦点追踪: {g_a1_pass, g_a1_soft_pass, g_a1_flow_negative, "
+                    "g_a1_dde_degraded, g_a2_no_catalyst, g_a2_low_confidence, g_a2_position_unsafe, "
+                    "g_a3_knife, g_a4_selected, cross_lane_collision, lane_overflow_n, lane_error, "
+                    "action_gate_lifted, action_gate_watch, bear_gate_watch, capital_gate_watch, "
+                    "sector_verify_miss, meg_fts_overheat_triggers}（Node 7 侧拦点命中统计）。"
+                    "纯观测，不参与判定。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+
 
 
 # =============================================================================

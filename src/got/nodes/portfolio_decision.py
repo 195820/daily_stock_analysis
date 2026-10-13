@@ -308,6 +308,10 @@ class PortfolioDecisionNode:
             mature_reduce_shadow=getattr(self, "_mature_reduce_shadow_hits", None),
             # 4d/D-3 前置：候选池归零率基线观测（项三 3a，纯留痕）——由 _score_candidates 落 self。
             funnel_stats=getattr(self, "_last_funnel_stats", None),
+            # ── 埋伏道拆分 v2：lane shadow/trace 透传（拦点#5）──
+            # 由 _score_candidates 落 self；ACTIVE=false 时仍记录 trace（纯观测）
+            ambush_lane_shadow=getattr(self, "_ambush_lane_shadow", None),
+            ambush_lane_trace=getattr(self, "_ambush_lane_trace", None),
             data_quality=data_quality,
         )
 
@@ -3993,6 +3997,30 @@ verdict 含义：
             screener._filter_got_finalists, universe, got_context, 10
         )
 
+        # ── 埋伏道拆分 v2：读取 screener 侧 lane shadow/trace（拦点#5/#6）──
+        # ACTIVE 门控：GOT_AMBUSH_SPLIT_ACTIVE 默认 "0"，false 时零决策改动仅 trace
+        _ambush_split_active = os.getenv("GOT_AMBUSH_SPLIT_ACTIVE", "0") == "1"
+        _lane_shadow = getattr(screener, "_ambush_lane_shadow", None)
+        _screener_lane_trace = getattr(screener, "_ambush_lane_trace", None) or {}
+        # 构建 lane_qualified：埋伏道过闸名单（板块+股票码），供拦点#1/#2 豁免消费
+        _lane_qualified = {"sectors": [], "codes": []}
+        if _lane_shadow and _lane_shadow.get("lane_finalists"):
+            _lane_qualified["sectors"] = list({
+                f.get("sector") for f in _lane_shadow["lane_finalists"] if f.get("sector")
+            })
+            _lane_qualified["codes"] = [
+                f.get("code") for f in _lane_shadow["lane_finalists"] if f.get("code")
+            ]
+        # Node 7 侧 trace 累加器（screener 侧 trace + pd 侧拦点命中）
+        _pd_lane_trace: dict = dict(_screener_lane_trace)
+        _pd_lane_trace.setdefault("action_gate_lifted", [])
+        _pd_lane_trace.setdefault("action_gate_watch", [])
+        _pd_lane_trace.setdefault("bear_gate_watch", [])
+        _pd_lane_trace.setdefault("capital_gate_watch", [])
+        _pd_lane_trace.setdefault("sector_verify_miss", [])
+        _pd_lane_trace.setdefault("meg_fts_overheat_triggers", [])
+
+
         # ── 项三 3a（外网对标 2026-10-11）：funnel_stats 接进生产链路 ──
         # 生产 Phase 2 直调 _extract_got_universe + _filter_got_finalists，不经 run_got_mode，
         # 导致 screener._last_funnel_trace 无人消费、meta.json.funnel_stats 恒缺（D-3 基线 0 天）。
@@ -4075,15 +4103,30 @@ verdict 含义：
                     f"系数={overheat_penalty:.2f}"
                 )
                 adjusted_sector_score *= overheat_penalty
+                # ── 拦点#9 meg_fts_overheat_triggers trace（过热降权）──
+                _stock_sector_type_early = getattr(stock, "sector_type", "mainline")
+                if _stock_sector_type_early == "ambush" and stock.code in _lane_qualified["codes"]:
+                    _pd_lane_trace["meg_fts_overheat_triggers"].append({
+                        "code": stock.code, "gate": "OVERHEAT", "penalty": overheat_penalty,
+                    })
+
 
             # 缺失维度跳过 + 权重归一化
+            # ── 拦点#8 composite 折算：埋伏票以 ambush_rank_score×100 替换 tech 维度 ──
+            _stock_sector_type = getattr(stock, "sector_type", "") or "mainline"
+            _tech_input = stock.tech_wave_score
+            if _ambush_split_active and _stock_sector_type == "ambush":
+                _ambush_rank = getattr(stock, "ambush_rank_score", None)
+                if _ambush_rank is not None:
+                    _tech_input = _ambush_rank * 100.0
             dimension_scores = {
                 "capital": capital_score,
                 "news": news_score,
                 "sector": adjusted_sector_score,
-                "tech": stock.tech_wave_score,
+                "tech": _tech_input,
                 "risk": stock.risk_score_safe,
             }
+
             dimension_available = {
                 "capital": stock.capital_available,
                 "news": stock.news_available,
@@ -4151,6 +4194,20 @@ verdict 含义：
                     base_reasoning,
                 )
 
+            # ── 拦点#1 action 级联豁免：埋伏道过闸票 priority 抬升到 buy_dip 线 ──
+            # ACTIVE 时：sector_type=="ambush" && code in lane_qualified codes → priority = max(priority, 55)
+            # Shadow 时：仅 trace 记录被 action gate 拦下的埋伏票
+            _is_lane_qualified = (
+                _stock_sector_type == "ambush"
+                and stock.code in _lane_qualified["codes"]
+            )
+            if _ambush_split_active and _is_lane_qualified and lifecycle_priority <= 50:
+                lifecycle_priority = max(lifecycle_priority, 55)
+                _pd_lane_trace["action_gate_lifted"].append(stock.code)
+            elif not _ambush_split_active and _stock_sector_type == "ambush" and lifecycle_priority <= 50:
+                # Shadow mode: trace 记录本应被 lift 但 ACTIVE=false 未生效的票
+                _pd_lane_trace["action_gate_watch"].append(stock.code)
+
             # 动作建议：基于生命周期优先级
             # 资金确认闸门（Step 3）：capital < 35 时降级为 watch（不禁止入选，只禁止激进买入建议）
             # 依据：9月失败股 capital 18-56 仍获 buy_trend（湘佳股份 capital=18.2 → T+3 -7.92%）
@@ -4161,6 +4218,15 @@ verdict 含义：
                 or not stock.capital_available
                 or capital_score >= CAPITAL_GATE
             )
+            # ── 拦点#3 capital_gate_watch trace ──
+            # 埋伏道票被 capital gate 拦下时留痕（保持共用，G-A1 已含资金证据）
+            if (
+                _stock_sector_type == "ambush"
+                and stock.code in _lane_qualified["codes"]
+                and not capital_ok
+            ):
+                _pd_lane_trace["capital_gate_watch"].append(stock.code)
+
             if os.getenv("GOT_WINRATE_STEP3_ENABLED", "1") == "1":
                 if lifecycle_priority > 60 and lifecycle_phase in ["launch", "acceleration"] and capital_ok:
                     action = "buy_trend"
@@ -4179,17 +4245,39 @@ verdict 含义：
 
             # Q9-B（audit_20260922）：板块验证失败候选保留在 unified_scoring 供观察，
             # 但 action 强制标 watch（身份不可信 → 禁止任何 buy* 建议）
-            if not getattr(stock, "sector_available", True) and action.startswith("buy"):
+            _sector_available = getattr(stock, "sector_available", True)
+            if not _sector_available and action.startswith("buy"):
                 action = "watch"
+            # ── 拦点#4 sector_verify_miss trace ──
+            if (
+                _stock_sector_type == "ambush"
+                and stock.code in _lane_qualified["codes"]
+                and not _sector_available
+            ):
+                _pd_lane_trace["sector_verify_miss"].append({
+                    "code": stock.code, "sector": stock_sector,
+                })
+
 
             # ── 工作流 B：bear 日收手闸门（仅压新开买入建议，不动持仓；豁免埋伏来源 §3.3）──
             # 与既有「板块验证失败→watch」叠加：上游已打 watch 则 startswith(buy) 为假自然不重复触发。
             if _bear_day_gate and action.startswith("buy"):
                 _is_ambush = bool(stock_sector) and stock_sector in self._bypass_ambush_sectors
-                if _is_ambush:
+                # ── 拦点#2 bear gate 豁免扩展（2026-10-13 转正：埋伏道过闸板块无条件豁免，
+                #    §3.3 bear 日埋伏为左侧正超额，与 buy_trend@bear 毒药格是两种东西）──
+                _is_lane_ambush = (
+                    _stock_sector_type == "ambush"
+                    and stock_sector in _lane_qualified["sectors"]
+                )
+                if _is_ambush or _is_lane_ambush:
                     pass  # 豁免：bear 日埋伏为左侧正超额，与 buy_trend@bear 毒药格是两种东西
                 elif action == "buy_trend":
+                    # ── 拦点#2 trace（2026-10-13 豁免转正后语义）：bear 日被闸压 watch 的
+                    #    未豁免 ambush 型票（过闸板块已在上方豁免），供供给面与排序分析观测 ──
+                    if _stock_sector_type == "ambush":
+                        _pd_lane_trace["bear_gate_watch"].append(stock.code)
                     action = "watch"
+
                     _bear_gate_hits += 1
                     self._bear_gate_shadow.append({
                         "symbol": stock.code, "name": stock.name, "sector": stock_sector,
@@ -4202,6 +4290,10 @@ verdict 含义：
                     if _bear_dip_mode == "veto":
                         action = "watch"
                         _bear_gate_hits += 1
+                        # ── 拦点#2 trace（buy_dip 分支对称补记，2026-10-13）：未豁免 ambush 型票
+                        #    被 veto 压 watch 时与 buy_trend 分支同口径留痕 ──
+                        if _stock_sector_type == "ambush":
+                            _pd_lane_trace["bear_gate_watch"].append(stock.code)
                         self._bear_gate_shadow.append({
                             "symbol": stock.code, "name": stock.name, "sector": stock_sector,
                             "pool_source": getattr(stock, "pool_source", "") or "",
@@ -4245,6 +4337,12 @@ verdict 含义：
                 else:  # shadow：仅留痕，不改 action（上线前观测命中率/假阳性）
                     base_reasoning += f" [MEG影子: 本应 buy_trend→watch, RS-Mom断裂{_meg_decay}]"
                     logger.info(f"[MEG-shadow] {stock.code} {stock.name} 板块={stock_sector} decay_2d={_meg_decay} 本应 buy_trend→watch（未生效）")
+                # ── 拦点#9 meg_fts_overheat_triggers trace ──
+                if _stock_sector_type == "ambush" and stock.code in _lane_qualified["codes"]:
+                    _pd_lane_trace["meg_fts_overheat_triggers"].append({
+                        "code": stock.code, "gate": "MEG", "mode": _meg_mode,
+                    })
+
 
             # ── FTS 家族见顶持续压制门（层B）：家族被压制 + aggravated + buy → watch 硬降级 ──
             # 触发源=Node6 家族级 endurance_band=topping_risk（+跨日 latch），与大盘 regime 解耦、与 MEG 正交。
@@ -4271,6 +4369,12 @@ verdict 含义：
                 else:  # shadow：仅留痕，不改 action
                     base_reasoning += f" [FTS影子: 本应 buy→watch, 家族{family_name}见顶+破位(压制第{_fts_fs.days_suppressed}日)]"
                     logger.info(f"[FTS-shadow] {stock.code} {stock.name} 家族={family_name} 本应 buy→watch（未生效）")
+                # ── 拦点#9 meg_fts_overheat_triggers trace（FTS 门）──
+                if _stock_sector_type == "ambush" and stock.code in _lane_qualified["codes"]:
+                    _pd_lane_trace["meg_fts_overheat_triggers"].append({
+                        "code": stock.code, "gate": "FTS", "mode": _fts_gate_mode,
+                    })
+
 
             # 板块分类（用于输出可观测性）
             sector_classification = None
@@ -4287,9 +4391,10 @@ verdict 含义：
                         "capital": capital_score,
                         "news": news_score,
                         "sector": adjusted_sector_score,
-                        "tech": stock.tech_wave_score,
+                        "tech": _tech_input,
                         "risk": stock.risk_score_safe,
                     },
+
                     action_recommendation=action,
                     confidence=0.7,
                     reasoning=(
@@ -4309,6 +4414,8 @@ verdict 含义：
                         if stock_sector and stock_sector in self._bypass_ambush_sectors
                         else ""
                     ),
+                    # ── 拦点#6：入场分道标识 ──
+                    sector_type=_stock_sector_type,
                 )
             )
 
@@ -4366,7 +4473,12 @@ verdict 含义：
                 "flagged_stocks": list(self._fts_action_flags),
             }
 
+        # ── 埋伏道拆分 v2：存储 lane shadow/trace 供 run() 写入 PortfolioDecision ──
+        self._ambush_lane_shadow = _lane_shadow
+        self._ambush_lane_trace = _pd_lane_trace
+
         return results
+
 
     # ── Step 3: 组合优化 ──
 

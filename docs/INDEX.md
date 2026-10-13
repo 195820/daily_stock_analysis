@@ -115,6 +115,12 @@
 
 [audit_20260922.md](got/archive/audit_20260922.md) / [decision_brief_20260926.md](got/archive/decision_brief_20260926.md) / cp12_×3（[文案草案](got/archive/cp12_prompt_variants_draft_20260926.md)、[M3 预审表](got/archive/cp12_m3_audit_20260926.md)、[事件级对照](got/archive/cp12_event_level_ab_20260926.md)）/ cp13_×3（[设计笔记](got/archive/cp13_grounding_pipeline_research_20260926.md)、[阶段1 矩阵](got/archive/cp13_stage1_matrix_20260927.md)、[阶段2 收口](got/archive/cp13_phase2_closeout_20260928.md)）——原位置与取代关系见 [got/archive/README.md](got/archive/README.md) §一之补。
 
+### 专项报告（[`reports/`](reports/)，诊断与预演类）
+
+| 报告 | 内容 |
+| --- | --- |
+| [reports/20261012_黄金票出局根因与窗口修复预演.md](reports/20261012_黄金票出局根因与窗口修复预演.md) | 选股器资金面板块流半场窗口错配（当日 90 键 vs 3d 477 键）+ 匹配弱于聚合器双重缺陷诊断；bg_9 窗口反事实（3d 窗口黄金 10 只进 Top20）+ monkeypatch 端到端只读预演（黄金进 R2 短名单、死于 R3 波段技术闸门）；修复方案待拍板 |
+
 ---
 
 ## 三区 · 归档（历史，不再更新）

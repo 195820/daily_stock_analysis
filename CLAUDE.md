@@ -292,7 +292,7 @@ run(use_mock=False)
 
 **催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（D1回声守卫+D2周末守卫+T5语义对齐+T2叙事校验）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排（P5）→ P6 兑现追踪（PEAD多窗口验证）
 
-**影子观测旁挂**（2026-09-28 排期轮批 5，默认开·零决策改动，转正归负责人）：`GOT_MARKET_THEME_SHADOW` 市场结构落归档「🧭」段；`GOT_DISAGREEMENT_SHADOW` 分歧摘要落 `conflict_summary_shadow`；`GOT_SELL_SOURCE_SHADOW` 超限减仓检测落 `sell_source_shadow`；`funnel_stats` 漏斗归零率留痕
+**影子观测旁挂**（2026-09-28 排期轮批 5，默认开·零决策改动，转正归负责人）：`GOT_MARKET_THEME_SHADOW` 市场结构落归档「🧭」段；`GOT_DISAGREEMENT_SHADOW` 分歧摘要落 `conflict_summary_shadow`；`GOT_SELL_SOURCE_SHADOW` 超限减仓检测落 `sell_source_shadow`；`funnel_stats` 漏斗归零率留痕；`GOT_AMBUSH_SPLIT` 埋伏道拆分（ENABLED=1 抽道+四闸门+trace 全开；action gate lift 仍 ACTIVE 门控默认影子，bear 闸埋伏道豁免已于 2026-10-13 转正无条件生效）
 
 ### 节点 Schema 数据流
 
@@ -304,7 +304,7 @@ run(use_mock=False)
 | **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
 | **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
 | **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/pinned_days/transition_events/transition_count), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档）, `conflict_summary_shadow`/`decision_path_hint`（Phase 3b 分歧摘要） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
-| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测） | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测）, `ambush_lane_shadow`/`ambush_lane_trace`（埋伏道拆分产物）；**埋伏道 Node 7 接线点**：action 判定抬 priority≥55（`GOT_AMBUSH_SPLIT_ACTIVE` 门控，默认影子）+ bear gate 豁免扩展（2026-10-13 转正·无条件，不随 ACTIVE） | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
 
 ### 持久化层总览
 
@@ -375,9 +375,9 @@ run(use_mock=False)
 | Round 0 | 去除涨停股（无法买入） | ~30-40 |
 | Round 0b | ≥8%涨幅软过滤（追高风险） | ~25-35 |
 | Round 1 | 排除 exhausted 板块 + 多窗口停滞过滤（4死区） | ~20-30 |
-| Round 1.5 | 停滞过滤（量价停滞+动量停滞+宽度停滞+趋势停滞） | ~18-28 |
+| Round 1.5 | 停滞过滤（量价停滞+动量停滞+宽度停滞+趋势停滞）；**埋伏道拆分后 ambush 票走独立道（G-A1~A4），不进主线 R1–R4** | ~18-28 |
 | Round 2 | 资金面评分 Top 20（DDE 百分位 + 板块资金流） | 20 |
-| Round 3 | 波段技术评分 Top 15（8 维连续评分：MA20/布林/RSI/MACD 等） | 15 |
+| Round 3 | 波段技术评分 Top 15（8 维连续评分：MA20/布林/RSI/MACD 等）；**仅主线道票参与，埋伏道票已绕过** | 15 |
 | Round 4 | 风险评分：Top 6 主线(risk>50) + ≤2只保底(risk>35) | 6-8 |
 | **P5** | **催化剂关联度重排**（仅 ambush 板块, confidence≥0.7） | 不变 |
 | Round 5 | 板块分散（每板块最多 1 只）→ Top N | 2-3 |

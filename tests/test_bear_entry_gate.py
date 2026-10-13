@@ -77,7 +77,8 @@ def _market_with_regime(regime):
 
 class _BearGateHarness(unittest.IsolatedAsyncioTestCase):
 
-    async def _run(self, stock, intel, regime, env, ambush_pool=None, phase="launch"):
+    async def _run(self, stock, intel, regime, env, ambush_pool=None, phase="launch",
+                   lane_shadow=None):
         from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
         node = PortfolioDecisionNode(use_mock=True)
@@ -93,6 +94,8 @@ class _BearGateHarness(unittest.IsolatedAsyncioTestCase):
         screener_mock = MagicMock()
         screener_mock._extract_got_universe.return_value = [{"code": stock.code}]
         screener_mock._filter_got_finalists.return_value = [stock]
+        if lane_shadow is not None:
+            screener_mock._ambush_lane_shadow = lane_shadow
 
         with patch("src.services.stock_screener.StockScreenerPipeline", return_value=screener_mock), \
              patch.dict(os.environ, env):
@@ -124,6 +127,38 @@ class TestBearEntryGate(_BearGateHarness):
         self.assertEqual(res.action_recommendation, "buy_trend")
         self.assertEqual(res.pool_source, "bypass_ambush")
         self.assertEqual(node._bear_gate_hits, 0)
+
+    async def test_bear_lane_ambush_exempt_independent_of_active(self):
+        """2026-10-13 转正：lane 过闸板块票 bear 日豁免，不依赖 GOT_AMBUSH_SPLIT_ACTIVE。"""
+        stock = _make_stock(sector_name="半导体", sector_type="ambush")
+        lane_shadow = {"lane_finalists": [{"code": "600999", "sector": "半导体"}]}
+        node, res = await self._run(stock, _intel("launch", 1), "bear",
+                                    {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1",
+                                     "GOT_AMBUSH_SPLIT_ACTIVE": "0"},
+                                    lane_shadow=lane_shadow)
+        self.assertEqual(res.action_recommendation, "buy_trend")
+        self.assertEqual(node._bear_gate_hits, 0)
+        self.assertNotIn("收手闸门", res.reasoning)
+        self.assertEqual(node._ambush_lane_trace["bear_gate_watch"], [])
+
+    async def test_bear_lane_trace_trend_branch(self):
+        """未豁免 ambush 型票 bear 日 buy_trend→watch 记 bear_gate_watch（trend 分支）。"""
+        stock = _make_stock(sector_name="半导体", sector_type="ambush")
+        node, res = await self._run(stock, _intel("launch", 1), "bear",
+                                    {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1"})
+        self.assertEqual(res.action_recommendation, "watch")
+        self.assertEqual(node._bear_gate_hits, 1)
+        self.assertEqual(node._ambush_lane_trace["bear_gate_watch"], [stock.code])
+
+    async def test_bear_lane_trace_dip_branch(self):
+        """buy_dip veto 分支对称补记 bear_gate_watch（2026-10-13 缺口修复）。"""
+        stock = _make_stock(sector_name="半导体", sector_type="ambush")
+        node, res = await self._run(stock, _intel("mature", 3), "bear",
+                                    {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1",
+                                     "GOT_BEAR_DIP_MODE": "veto"}, phase="mature")
+        self.assertEqual(res.action_recommendation, "watch")
+        self.assertEqual(node._bear_gate_hits, 1)
+        self.assertEqual(node._ambush_lane_trace["bear_gate_watch"], [stock.code])
 
     async def test_transition_unchanged(self):
         stock = _make_stock()

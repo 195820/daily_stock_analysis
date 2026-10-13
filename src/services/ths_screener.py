@@ -208,11 +208,12 @@ class THSScreenerService:
                 or self._find_float_field(row, '涨跌幅')
             )
             dde_net = self._find_float_field(row, 'dde大单净量')
-            # 审核修复 2.2：5日累计 DDE 列（键名形如「近5个交易日的dde大单净量合计:xxx」，
-            # startswith 匹配不到，需 contains 匹配；与单日列区分开）
+            # 审核修复 2.2：5日累计 DDE 列。问财键名已漂移（2026-10-12 实测）：
+            # 旧形「近5个交易日的dde大单净量合计:xxx」→ 新形「区间dde大单净量总和[20260929-20261012]」，
+            # startswith 匹配不到，需 contains 匹配；两种措辞都认，与单日列区分开
             dde_5d_sum = 0.0
             for k, v in row.items():
-                if 'dde大单净量合计' in k:
+                if 'dde大单净量合计' in k or '区间dde大单净量总和' in k:
                     dde_5d_sum = self._safe_float(v)
                     break
             turnover = self._safe_float(

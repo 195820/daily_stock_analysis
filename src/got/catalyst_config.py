@@ -344,6 +344,26 @@ TRAILING_DRAWDOWN_SELL = float(os.environ.get("GOT_TRAILING_DD_SELL", "0.12"))  
 # 缺省 30＝不改生产；上线前盘点确认冲击可接受后置 14（§4.2 C-B2），并按 day 分箱积累 2–3 月回归校准。
 LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
 
+# =============================================================================
+# 埋伏道拆分（ambush-lane-split-revision v2）
+# =============================================================================
+# 开关：GOT_AMBUSH_SPLIT_ENABLED=1 启用分道逻辑（默认开）；false 回滚到 A4 单道原始逻辑
+# GOT_AMBUSH_SPLIT_ACTIVE=1 启用 Node 7 豁免（影子先行，默认关）
+GOT_AMBUSH_SPLIT_ENABLED = os.environ.get("GOT_AMBUSH_SPLIT_ENABLED", "1") == "1"
+GOT_AMBUSH_SPLIT_ACTIVE = os.environ.get("GOT_AMBUSH_SPLIT_ACTIVE", "0") == "1"
+
+# G-A4: 埋伏道 TopK（同板块去重后取前 N）
+AMBUSH_LANE_TOPK = 3
+# G-A2: 催化剂窗口（日历日，约 10 交易日）
+AMBUSH_LANE_CATALYST_WINDOW_DAYS = 14
+# G-A2: 板块位置安全带（20日高点 + MA20 带状区间）
+AMBUSH_LANE_SAFETY_HIGH = 1.03   # close ≤ 20d-high × 1.03
+AMBUSH_LANE_SAFETY_LOW = 0.92    # close ≥ MA20 × 0.92
+# G-A4: 吸筹强度权重（板块 3d 流百分位）
+AMBUSH_LANE_ABSORPTION_WEIGHT = 0.2
+# G-A3: 防接刀量比阈值（volume_ratio ≥ 3.0 且当日下跌 → fail）
+AMBUSH_LANE_VOLUME_RATIO_KNIFE = 3.0
+
 # 影响等级→权重映射
 IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 

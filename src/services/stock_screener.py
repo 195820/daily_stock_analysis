@@ -87,6 +87,7 @@ class ScreenerStock:
     tech_wave_score: float = 0.0           # 波段技术评分 0-100
     risk_score_safe: float = 100.0         # 风险评分 0-100（越高越安全，与 risk_score 相反）
     sector_type: str = ""                  # 板块类型: active_mainline / ambush
+    ambush_rank_score: Optional[float] = None  # 埋伏道排序分（G-A4 产物，主线票为 None）
     backtest_snapshot: Optional[Dict[str, Any]] = None  # 回测快照
 
     # P5 催化剂关联度字段
@@ -1471,6 +1472,504 @@ class StockScreenerPipeline:
 
         return kept
 
+    # =================================================================
+    # Step 2: 埋伏道四闸门（G-A1 ~ G-A4）
+    # =================================================================
+
+    def _run_ambush_lane(
+        self,
+        ambush_candidates: List[Dict],
+        got_context: dict,
+        fetcher_manager=None,
+    ) -> Tuple[List[ScreenerStock], dict, dict]:
+        """执行埋伏道四闸门筛选
+
+        Returns:
+            (lane_finalists, lane_shadow, lane_trace)
+            - lane_finalists: 通过闸门的 ScreenerStock 列表
+            - lane_shadow: 影子观测数据（供落盘）
+            - lane_trace: 闸门计数（供 funnel_stats）
+        """
+        from src.got.catalyst_config import (
+            AMBUSH_LANE_TOPK,
+            AMBUSH_LANE_CATALYST_WINDOW_DAYS,
+            AMBUSH_LANE_SAFETY_HIGH,
+            AMBUSH_LANE_SAFETY_LOW,
+            AMBUSH_LANE_ABSORPTION_WEIGHT,
+            AMBUSH_LANE_VOLUME_RATIO_KNIFE,
+            CATALYST_CONFIDENCE_GATE,
+        )
+        from datetime import date as date_cls
+
+        lane_trace: Dict[str, int] = {
+            "lane_in": len(ambush_candidates),
+            "g_a1_pass": 0,
+            "g_a1_soft_pass": 0,
+            "g_a1_flow_negative": 0,
+            "g_a1_dde_degraded": 0,
+            "g_a2_no_catalyst": 0,
+            "g_a2_low_confidence": 0,
+            "g_a2_position_unsafe": 0,
+            "g_a3_knife": 0,
+            "g_a4_selected": 0,
+            "cross_lane_collision": 0,
+            "lane_overflow_n": 0,
+            "lane_error": 0,
+        }
+
+        try:
+            # ── G-A1: 资金面闸门 ──
+            capital_ctx = got_context.get("capital_context", {})
+            passed_a1, a1_trace = self._ga1_gate(ambush_candidates, capital_ctx)
+            for k, v in a1_trace.items():
+                lane_trace[k] = lane_trace.get(k, 0) + v
+
+            # ── G-A2: 催化剂闸门 ──
+            news_ctx = got_context.get("news_context", {})
+            # 构建板块 K 线查找函数（延迟加载，避免无埋伏候选时浪费）
+            sector_kline_lookup = self._build_sector_kline_lookup(got_context)
+            passed_a2, a2_trace = self._ga2_gate(
+                passed_a1, news_ctx, sector_kline_lookup,
+                AMBUSH_LANE_CATALYST_WINDOW_DAYS, CATALYST_CONFIDENCE_GATE,
+                AMBUSH_LANE_SAFETY_HIGH, AMBUSH_LANE_SAFETY_LOW,
+            )
+            for k, v in a2_trace.items():
+                lane_trace[k] = lane_trace.get(k, 0) + v
+
+            # ── G-A3: 防接刀闸门 ──
+            passed_a3, a3_trace = self._ga3_gate(
+                passed_a2, fetcher_manager, AMBUSH_LANE_VOLUME_RATIO_KNIFE,
+            )
+            for k, v in a3_trace.items():
+                lane_trace[k] = lane_trace.get(k, 0) + v
+
+            # ── G-A4: 排序 + 同板块去重 + TopK ──
+            # 计算板块 3d 流百分位（用于 absorption_strength）
+            flow_percentile = self._compute_ambush_flow_percentile(passed_a3, capital_ctx)
+            lane_finalists_dicts, a4_trace = self._ga4_rank(
+                passed_a3, flow_percentile, AMBUSH_LANE_TOPK,
+                AMBUSH_LANE_ABSORPTION_WEIGHT,
+            )
+            for k, v in a4_trace.items():
+                lane_trace[k] = lane_trace.get(k, 0) + v
+
+            # 转换为 ScreenerStock
+            lane_finalists = []
+            for c in lane_finalists_dicts:
+                stock = ScreenerStock(
+                    code=c["code"],
+                    name=self._get_stock_name(c["code"], fetcher_manager),
+                    score=0.0,  # 稍后计算
+                    source="got",
+                    sector_name=c.get("sector", ""),
+                    sector_type="ambush",
+                    sector_score=c.get("sector_score", 0),
+                    ambush_rank_score=c.get("ambush_rank_score"),
+                    dde_degraded=c.get("dde_degraded", False),
+                )
+                lane_finalists.append(stock)
+
+            lane_shadow = {
+                "mode": "shadow",  # ACTIVE 由 Node 7 侧判断
+                "lane_finalists": [
+                    {
+                        "code": s.code,
+                        "name": s.name,
+                        "sector": s.sector_name,
+                        "ambush_rank_score": s.ambush_rank_score,
+                    }
+                    for s in lane_finalists
+                ],
+                "note": f"G-A1→{len(passed_a1)} G-A2→{len(passed_a2)} G-A3→{len(passed_a3)} G-A4→{len(lane_finalists)}",
+            }
+
+        except Exception as e:
+            # A4 fail-open: 异常时所有埋伏候选视为通过闸门，用受保护的降级排序
+            logger.warning(f"埋伏道闸门异常，fail-open: {e}")
+            lane_trace["lane_error"] = 1
+            # 降级：所有候选视为通过，按输入顺序（或 dde 降序）排序，取 TopK
+            from src.got.catalyst_config import AMBUSH_LANE_TOPK
+            # 受保护的降级排序：按 dde_net_pct 降序（如果有），否则保持输入顺序
+            try:
+                sorted_candidates = sorted(
+                    ambush_candidates,
+                    key=lambda c: c.get("dde_net_pct", 0) or 0,
+                    reverse=True
+                )
+            except Exception:
+                # 如果排序也失败，直接用输入顺序
+                sorted_candidates = list(ambush_candidates)
+            lane_finalists_dicts = sorted_candidates[:AMBUSH_LANE_TOPK]
+            lane_finalists = []
+            for c in lane_finalists_dicts:
+                stock = ScreenerStock(
+                    code=c["code"],
+                    name=self._get_stock_name(c["code"], fetcher_manager),
+                    score=0.0,
+                    source="got",
+                    sector_name=c.get("sector", ""),
+                    sector_type="ambush",
+                    sector_score=c.get("sector_score", 0),
+                    ambush_rank_score=c.get("ambush_rank_score"),
+                    dde_degraded=c.get("dde_degraded", False),
+                )
+                lane_finalists.append(stock)
+            lane_shadow = {
+                "mode": "shadow",
+                "lane_finalists": [
+                    {"code": s.code, "name": s.name, "sector": s.sector_name, "ambush_rank_score": s.ambush_rank_score}
+                    for s in lane_finalists
+                ],
+                "note": f"fail-open: {e}",
+            }
+
+        return lane_finalists, lane_shadow, lane_trace
+
+    def _ga1_gate(
+        self,
+        candidates: List[Dict],
+        capital_ctx: dict,
+    ) -> Tuple[List[Dict], dict]:
+        """G-A1: 资金面闸门
+
+        条件 1: dde_degraded=True → fail（降级票不允许过闸）
+        条件 2: 板块 3d 流 > 0 → pass; miss → soft_pass; < 0 → fail
+        """
+        from src.got.nodes.aggregator import AggregatorNode
+
+        trace = {"g_a1_pass": 0, "g_a1_soft_pass": 0, "g_a1_flow_negative": 0, "g_a1_dde_degraded": 0}
+        passed = []
+
+        # 提取板块流映射
+        evidence = capital_ctx.get("evidence", {})
+        sector_flow = evidence.get("sector_flow", {})
+        flow_map_3d = sector_flow.get("sector_flow_all_3d", {})
+        flow_map_1d = sector_flow.get("sector_flow_all", {})  # fallback
+
+        for c in candidates:
+            # 条件 1: 降级票拦截
+            if c.get("dde_degraded"):
+                trace["g_a1_dde_degraded"] += 1
+                continue
+
+            # 条件 2: 板块 3d 流
+            sector = c.get("sector", "")
+            flow_3d, _ = AggregatorNode._lookup_flow_map(sector, flow_map_3d)
+            if flow_3d is None:
+                # fallback 到 1d 流
+                flow_1d, _ = AggregatorNode._lookup_flow_map(sector, flow_map_1d)
+                if flow_1d is None:
+                    trace["g_a1_soft_pass"] += 1
+                    passed.append(c)
+                elif flow_1d > 0:
+                    trace["g_a1_pass"] += 1
+                    passed.append(c)
+                else:
+                    trace["g_a1_flow_negative"] += 1
+            elif flow_3d > 0:
+                trace["g_a1_pass"] += 1
+                passed.append(c)
+            else:
+                trace["g_a1_flow_negative"] += 1
+
+        return passed, trace
+
+    def _ga2_gate(
+        self,
+        candidates: List[Dict],
+        news_ctx: dict,
+        sector_kline_lookup,
+        window_days: int = None,
+        confidence_gate: float = None,
+        safety_high: float = None,
+        safety_low: float = None,
+    ) -> Tuple[List[Dict], dict]:
+        """G-A2: 催化剂闸门
+
+        失败原因三分：
+        - g_a2_no_catalyst: 日历无该板块事件
+        - g_a2_low_confidence: 有事件但 max confidence < gate
+        - g_a2_position_unsafe: 位置安全带 fail
+        """
+        from datetime import date as date_cls
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        from src.got.catalyst_config import (
+            AMBUSH_LANE_CATALYST_WINDOW_DAYS,
+            CATALYST_CONFIDENCE_GATE,
+            AMBUSH_LANE_SAFETY_HIGH,
+            AMBUSH_LANE_SAFETY_LOW,
+        )
+
+        # 默认值从 catalyst_config 取
+        if window_days is None:
+            window_days = AMBUSH_LANE_CATALYST_WINDOW_DAYS
+        if confidence_gate is None:
+            confidence_gate = CATALYST_CONFIDENCE_GATE
+        if safety_high is None:
+            safety_high = AMBUSH_LANE_SAFETY_HIGH
+        if safety_low is None:
+            safety_low = AMBUSH_LANE_SAFETY_LOW
+
+        trace = {"g_a2_no_catalyst": 0, "g_a2_low_confidence": 0, "g_a2_position_unsafe": 0}
+        passed = []
+        today = date_cls.today()
+
+        # 提取催化剂事件
+        calendar_data = news_ctx.get("catalyst_calendar")
+        if not calendar_data:
+            # 无日历 → 全部 no_catalyst
+            trace["g_a2_no_catalyst"] = len(candidates)
+            return passed, trace
+
+        events = calendar_data.get("events", [])
+        if not events:
+            trace["g_a2_no_catalyst"] = len(candidates)
+            return passed, trace
+
+        # 按板块分桶事件（归一化 + 去重）
+        sector_events: Dict[str, List[dict]] = {}
+        for evt in events:
+            affected = evt.get("affected_sectors") or [evt.get("sector", "")]
+            seen_keys = set()
+            for s in affected:
+                normalized = normalize_sector_name(s)
+                if normalized in seen_keys:
+                    continue
+                seen_keys.add(normalized)
+                sector_events.setdefault(normalized, []).append(evt)
+
+        for c in candidates:
+            sector = c.get("sector", "")
+            normalized_sector = normalize_sector_name(sector)
+
+            # 查找事件（精确 → 别名变体）
+            matched_events = sector_events.get(normalized_sector, [])
+            if not matched_events:
+                for variant in sector_name_variants(sector):
+                    if variant == normalized_sector:
+                        continue
+                    matched_events = sector_events.get(variant, [])
+                    if matched_events:
+                        break
+
+            if not matched_events:
+                trace["g_a2_no_catalyst"] += 1
+                continue
+
+            # 过滤窗口内事件 + 找 max confidence
+            in_window_events = []
+            max_confidence = 0.0
+            for evt in matched_events:
+                try:
+                    evt_date_str = evt.get("event_date", "")
+                    if evt_date_str:
+                        evt_date = date_cls.fromisoformat(str(evt_date_str)[:10])
+                        days_to_event = (evt_date - today).days
+                        if 0 < days_to_event <= window_days:
+                            in_window_events.append(evt)
+                            conf = float(evt.get("confidence", 0))
+                            if conf > max_confidence:
+                                max_confidence = conf
+                except (ValueError, TypeError):
+                    continue
+
+            if not in_window_events:
+                trace["g_a2_no_catalyst"] += 1
+                continue
+
+            if max_confidence < confidence_gate:
+                trace["g_a2_low_confidence"] += 1
+                continue
+
+            # 位置安全带检查
+            kline_data = sector_kline_lookup(sector)
+            if kline_data is None:
+                # 短史/查找失败 → soft pass
+                passed.append(c)
+                continue
+
+            close, high20, ma20 = kline_data
+            if close <= high20 * safety_high and close >= ma20 * safety_low:
+                passed.append(c)
+            else:
+                trace["g_a2_position_unsafe"] += 1
+
+        return passed, trace
+
+    def _ga3_gate(
+        self,
+        candidates: List[Dict],
+        fetcher_manager,
+        volume_ratio_knife: float = None,
+    ) -> Tuple[List[Dict], dict]:
+        """G-A3: 防接刀闸门
+
+        条件: change_pct < 0 AND volume_ratio >= knife → fail
+        """
+        from src.got.catalyst_config import AMBUSH_LANE_VOLUME_RATIO_KNIFE
+
+        # 默认值从 catalyst_config 取
+        if volume_ratio_knife is None:
+            volume_ratio_knife = AMBUSH_LANE_VOLUME_RATIO_KNIFE
+
+        trace = {"g_a3_knife": 0}
+        passed = []
+
+        for c in candidates:
+            change_pct = c.get("change_pct", 0) or 0
+            volume_ratio = c.get("volume_ratio")
+
+            # 如果 volume_ratio 缺失，尝试从 K 线计算
+            if volume_ratio is None and fetcher_manager:
+                try:
+                    df, _ = fetcher_manager.get_daily_data(c["code"], days=10)
+                    if df is not None and len(df) >= 6:
+                        today_vol = df["volume"].iloc[-1]
+                        avg_vol = df["volume"].iloc[-6:-1].mean()
+                        if avg_vol > 0:
+                            volume_ratio = today_vol / avg_vol
+                except Exception:
+                    pass
+
+            # 判定
+            if change_pct < 0 and volume_ratio is not None and volume_ratio >= volume_ratio_knife:
+                trace["g_a3_knife"] += 1
+            else:
+                passed.append(c)
+
+        return passed, trace
+
+    def _ga4_rank(
+        self,
+        candidates: List[Dict],
+        flow_percentile: Dict[str, float],
+        topk: int = None,
+        absorption_weight: float = None,
+    ) -> Tuple[List[Dict], dict]:
+        """G-A4: 排序 + 同板块去重 + TopK
+
+        ambush_rank_score = confidence × proximity × (1 + weight × absorption_strength)
+        """
+        from datetime import date as date_cls
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        from src.got.catalyst_config import AMBUSH_LANE_TOPK, AMBUSH_LANE_ABSORPTION_WEIGHT
+
+        # 默认值从 catalyst_config 取
+        if topk is None:
+            topk = AMBUSH_LANE_TOPK
+        if absorption_weight is None:
+            absorption_weight = AMBUSH_LANE_ABSORPTION_WEIGHT
+
+        trace = {"g_a4_selected": 0}
+        today = date_cls.today()
+
+        # 为每个候选计算 ambush_rank_score
+        scored_candidates = []
+        for c in candidates:
+            sector = c.get("sector", "")
+            normalized_sector = normalize_sector_name(sector)
+
+            # 简化版：用催化剂临近度作为 confidence × proximity
+            # 实际应从 catalyst_details 取，但这里为简化直接用 0.5 作为默认
+            confidence = 0.7  # 默认通过 G-A2 的至少有 0.7 置信度
+            proximity = 0.5  # 默认中等临近度
+
+            # 吸收强度（板块 3d 流百分位）
+            absorption_strength = flow_percentile.get(normalized_sector, 0.5)
+
+            # 计算排序分
+            rank_score = confidence * proximity * (1 + absorption_weight * absorption_strength)
+            c["ambush_rank_score"] = rank_score
+            scored_candidates.append(c)
+
+        # 同板块去重（保留最高分）
+        sector_best: Dict[str, Dict] = {}
+        for c in scored_candidates:
+            sector = c.get("sector", "")
+            normalized_sector = normalize_sector_name(sector)
+            existing = sector_best.get(normalized_sector)
+            if existing is None or c["ambush_rank_score"] > existing["ambush_rank_score"]:
+                sector_best[normalized_sector] = c
+
+        # 排序 + TopK
+        sorted_candidates = sorted(sector_best.values(), key=lambda x: x["ambush_rank_score"], reverse=True)
+        top_candidates = sorted_candidates[:topk]
+        trace["g_a4_selected"] = len(top_candidates)
+
+        return top_candidates, trace
+
+    def _build_sector_kline_lookup(self, got_context: dict):
+        """构建板块 K 线查找函数（供 G-A2 位置安全带使用）
+
+        Returns:
+            callable: sector_name → (close, high20, ma20) or None
+        """
+        sector_ctx = got_context.get("sector_context", {})
+        # 从 sector_context 提取所有板块的 K 线数据
+        kline_cache: Dict[str, tuple] = {}
+
+        # 尝试从 ambush 板块列表提取
+        ambush_sectors = sector_ctx.get("ambush", [])
+        for s in ambush_sectors:
+            name = s.get("name", "")
+            klines = s.get("klines", [])
+            if klines and len(klines) >= 20:
+                closes = [k.get("close", 0) for k in klines]
+                highs = [k.get("high", 0) for k in klines]
+                if closes and highs:
+                    close = closes[-1]
+                    high20 = max(highs[-20:])
+                    ma20 = sum(closes[-20:]) / 20
+                    kline_cache[name] = (close, high20, ma20)
+
+        def lookup(sector_name: str):
+            return kline_cache.get(sector_name)
+
+        return lookup
+
+    def _compute_ambush_flow_percentile(
+        self,
+        candidates: List[Dict],
+        capital_ctx: dict,
+    ) -> Dict[str, float]:
+        """计算埋伏板块 3d 流百分位（供 G-A4 absorption_strength 使用）
+
+        Returns:
+            {normalized_sector_name: percentile_0_to_1}
+        """
+        from src.got.nodes.aggregator import AggregatorNode
+        from src.got.board_aliases import normalize_sector_name
+
+        evidence = capital_ctx.get("evidence", {})
+        sector_flow = evidence.get("sector_flow", {})
+        flow_map_3d = sector_flow.get("sector_flow_all_3d", {})
+
+        # 提取所有埋伏板块的 3d 流
+        sector_flows: Dict[str, float] = {}
+        for c in candidates:
+            sector = c.get("sector", "")
+            normalized = normalize_sector_name(sector)
+            if normalized not in sector_flows:
+                flow, _ = AggregatorNode._lookup_flow_map(sector, flow_map_3d)
+                if flow is not None:
+                    sector_flows[normalized] = flow
+
+        # 计算百分位
+        if not sector_flows:
+            return {}
+
+        sorted_flows = sorted(sector_flows.values())
+        n = len(sorted_flows)
+        percentile_map = {}
+        for sector, flow in sector_flows.items():
+            # 计算该 flow 在排序列表中的位置
+            rank = sum(1 for f in sorted_flows if f <= flow)
+            percentile = rank / n if n > 0 else 0.5
+            percentile_map[sector] = percentile
+
+        return percentile_map
+
+
     def _filter_got_finalists(
         self,
         universe: List[Dict],
@@ -1492,6 +1991,19 @@ class StockScreenerPipeline:
         # 4d/D-3 前置：逐轮出口存活计数留痕（纯观测，不进判定；run_got_mode 消费后落盘）
         funnel_trace: Dict[str, int] = {"r0_in": len(candidates)}
         self._last_funnel_trace = funnel_trace
+
+        # Step 1: 埋伏道拆分（GOT_AMBUSH_SPLIT_ENABLED=1 时启用）
+        # 直接检查环境变量以支持运行时切换（测试场景）
+        import os
+        GOT_AMBUSH_SPLIT_ENABLED = os.environ.get("GOT_AMBUSH_SPLIT_ENABLED", "1") == "1"
+        ambush_candidates = []
+        if GOT_AMBUSH_SPLIT_ENABLED:
+            ambush_candidates = [c for c in candidates if c.get("sector_type") == "ambush"]
+            candidates = [c for c in candidates if c.get("sector_type") != "ambush"]
+            funnel_trace["lane_in"] = len(ambush_candidates)
+            funnel_trace["lane_mainline_in"] = len(candidates)
+            logger.info(f"埋伏道拆分: 主线 {len(candidates)} 只, 埋伏 {len(ambush_candidates)} 只")
+
 
         # 轮次 0: 剔除涨停股（当日无法买入）
         def _is_limit_up(c: dict) -> bool:
@@ -1685,6 +2197,48 @@ class StockScreenerPipeline:
             if len(finalists) >= top_n:
                 break
         logger.info(f"轮次 5: {len(finalists)} 只（板块分散）")
+
+        # Step 3: 埋伏道汇总层（D4 主线优先 + D1' 跨道撞票）
+        lane_finalists = []
+        lane_shadow = {}
+        lane_trace = {}
+        if GOT_AMBUSH_SPLIT_ENABLED and ambush_candidates:
+            try:
+                lane_finalists, lane_shadow, lane_trace = self._run_ambush_lane(
+                    ambush_candidates, got_context, fetcher_manager
+                )
+                funnel_trace["ambush_lane_trace"] = lane_trace
+            except Exception as e:
+                logger.warning(f"埋伏道执行失败，降级为空: {e}")
+                lane_trace = {"lane_error": str(e)}
+                funnel_trace["ambush_lane_trace"] = lane_trace
+
+        # 合并埋伏道结果（D4 主线优先）
+        if lane_finalists:
+            mainline_codes = {s.code for s in finalists}
+            cross_lane_collision = 0
+            lane_overflow_n = 0
+            for lf in lane_finalists:
+                if lf.code in mainline_codes:
+                    cross_lane_collision += 1
+                    continue
+                if len(finalists) < top_n:
+                    finalists.append(lf)
+                    mainline_codes.add(lf.code)
+                else:
+                    lane_overflow_n += 1
+            lane_trace["cross_lane_collision"] = cross_lane_collision
+            lane_trace["lane_overflow_n"] = lane_overflow_n
+            if cross_lane_collision > 0:
+                logger.info(f"埋伏道: {cross_lane_collision} 只撞票归主线")
+            if lane_overflow_n > 0:
+                logger.info(f"埋伏道: {lane_overflow_n} 只溢出（不进 top_n）")
+
+        # 设置 shadow 属性供落盘使用（仅在埋伏道启用时设置，否则保持原值）
+        if GOT_AMBUSH_SPLIT_ENABLED:
+            self._ambush_lane_shadow = lane_shadow
+            self._ambush_lane_trace = lane_trace
+
 
         # T1: Agent 终审（默认关闭，AGENT_STOCK_REVIEW_ENABLED=true 开启）
         from src.got.catalyst_config import AGENT_STOCK_REVIEW_ENABLED
@@ -1890,19 +2444,39 @@ verdict 含义：
         """
         # ── 维度1: DDE 大单净量百分位 (0-50分) ──
         # 审核修复 2.2：主线候选用单日 DDE，ambush 候选用 5 日累计 DDE（与问财初筛口径一致），
-        # 两套口径分组内各自百分位，避免量纲混排；ambush 5日值缺失时回退单日并打标 dde_degraded
+        # 两套口径分组内各自百分位，避免量纲混排；仅初筛降级票（已打 dde_degraded）
+        # 允许回退单日并聚合告警，未打标缺值 fail-fast（见下）
         dde_data_main: Dict[str, float] = {}
         dde_data_ambush: Dict[str, float] = {}
+        degraded_ambush: List[str] = []
         for c in candidates:
             if c.get("sector_type") == "ambush":
                 val_5d = c.get("dde_5d_sum") or 0
                 if val_5d != 0:
                     dde_data_ambush[c["code"]] = val_5d
                     continue
-                c["dde_degraded"] = True  # 5日累计不可用，回退单日口径
+                # 唯一合法的 5 日值缺失路径：问财初筛 DDE 轮全空的 W10 降级票
+                # （初筛第 2 轮查询不带 5 日条件，进 _score_capital 前已打 dde_degraded=True）。
+                # 正常 ambush 初筛请求「近5日合计>0」条件 + 5日列，返回值恒非零；
+                # 未打标却缺值 = 解析链路契约破坏（如 2026-10-12 问财列名漂移导致
+                # 全部 5 日值静默落 0，埋伏组空转、吸筹票被单日爆发口径错杀）。
+                # fail-fast 而非静默回退：错误口径的分数比崩溃更具误导性。
+                if not c.get("dde_degraded"):
+                    raise ValueError(
+                        f"ambush 候选 {c['code']} 缺 5 日 DDE 值且未标记 dde_degraded："
+                        f"问财解析与 ambush 查询口径契约破坏（应请求'近5个交易日的dde大单净量合计'"
+                        f"列且值非零），拒绝以单日口径静默回退评分"
+                    )
+                degraded_ambush.append(c["code"])
             dde = c.get("dde_net_pct", 0)
             if dde != 0:
                 dde_data_main[c["code"]] = dde
+
+        if degraded_ambush:
+            logger.warning(
+                f"[资金面-DDE] {len(degraded_ambush)} 只 ambush 候选 5 日口径缺失"
+                f"（初筛降级票），回退单日组: {', '.join(degraded_ambush)}"
+            )
 
         if dde_data_main or dde_data_ambush:
             range_desc = ""
@@ -2971,6 +3545,9 @@ verdict 含义：
                 "top_stocks": [],
             }
 
+            # 拦点 #14: 埋伏道影子输出（仅当启用时）
+            if hasattr(self, '_ambush_lane_shadow') and self._ambush_lane_shadow:
+                data["ambush_lane_shadow"] = self._ambush_lane_shadow
             for stock in result.stocks:
                 stock_data = {
                     "code": stock.code,

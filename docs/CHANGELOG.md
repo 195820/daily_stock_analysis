@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 本地工作（GOT 及仓库自维护，非上游发布内容）
 
+- [feat(got/screener)] **埋伏道拆分 v2 — 抽道/四闸门/汇总层/开关落码 + Node 7 拦点接线（2026-10-13）**：
+  **Step 0 胜率测试 PASS**（`.review_tmp/ambush_lane_winrate/`）：J1 lane Top3 T+5 超额 vs ambush 等权 +0.716%（bootstrap CI95 [0.121, 1.361], block_len=5）；J2 PASS（T+1 +0.498% > T+5−2pp）；J3 FAIL-informational（TopK 填充 17.6%，`no_catalyst` 176/218=80.7%——供给面量化读数，Layer 2 判据②校准基）；J4 PASS（sh000852 同窗读数在案）。Arm2 hard-pass-only 更强：T+5 +1.304% vs ambush_eq / +3.576% vs sh000852。`censored_days=9`, `walk_forward_skipped=sample_lt_train`。
+  **落码清单**：① 抽道 `_filter_got_finalists` 入口 + 四闸门 `_ga1/_ga2/_ga3/_ga4` + 汇总层 D4 主线优先 + D1' `cross_lane_collision` + `lane_overflow_n`；② Node 7 拦点 #1 action 豁免（ACTIVE 抬 priority≥55 + `action_gate_watch`）/ #2 bear gate 扩展（`_bypass_ambush_sectors` ∪ lane 过闸板块 + `bear_gate_watch`）/ #3 `capital_gate_watch` / #4 `sector_verify_miss` / #8 composite tech 折算 `ambush_rank_score×100`（ACTIVE）/ #9 `meg_fts_overheat_triggers` / #13 `funnel_stats["ambush_lane_trace"]` / #14 顶层 `ambush_lane_shadow`；③ Schema：`UnifiedScoringResult.sector_type` default `"mainline"` + `PortfolioDecision.ambush_lane_shadow/ambush_lane_trace` Optional[dict]=None（DEVIATION：plan §3.1 #5 写 `default_factory=dict`，实装从 6 个既有 shadow 字段先例取 `Optional[dict]=None`——declaration  survives dump→load 硬要求满足）；④ 开关 `GOT_AMBUSH_SPLIT_ENABLED`（default "1"，false=A4 唯一回滚分支）+ `GOT_AMBUSH_SPLIT_ACTIVE`（default "0"，影子语义：ENABLED=1 抽道+四闸门+trace 全开但 Node 7 豁免不生效；ACTIVE=0 时 Node 7 行为与拆分前逐字节一致）。
+  **拦点处置 14 项抄录表**（plan §3.1 → 实装对照）：
+
+  | # | 处置 | trace 字段 |
+  |---|---|---|
+  | 1 | 分道豁免（ACTIVE 抬 priority≥55） | `action_gate_watch` |
+  | 2 | 分道豁免扩展（ACTIVE 扩 `_bypass_ambush_sectors`） | `bear_gate_watch` |
+  | 3 | 保持共用 | `capital_gate_watch` |
+  | 4 | 保持共用 + miss 留痕 | `sector_verify_miss` |
+  | 5 | Schema 声明（Optional[dict]=None，从先例） | （字段即产物） |
+  | 6 | Schema 声明加 `sector_type` default `"mainline"`（兜底缺省；生产 passthrough 携带 screener 词表 `active_mainline`/`ambush` 原样不 remap，所有闸门判 `=="ambush"` 兜底值永不等价 → 语义安全；生产实测 `unified_scoring[0].sector_type="active_mainline"`） | （字段即产物） |
+  | 7 | 原计划 D2/D4 已覆盖（埋伏道绕过 R1–R4） | `funnel_trace["ambush_lane"]` |
+  | 8 | Step 3 折算（ACTIVE 时 `ambush_rank_score×100`） | `ambush_lane_shadow` |
+  | 9 | 保持共用 + trace | `meg_fts_overheat_triggers` |
+  | 10 | 不动（持仓层，与入场拆分正交） | — |
+  | 11 | 写明现状 + trace | `g_a1_dde_degraded` |
+  | 12 | T1 默认 OFF 保持；若开 T1 须补喂 ambush 上下文，reject 只降级 | — |
+  | 13 | `funnel_stats["ambush_lane_trace"]` 直接加键（仅 `--screener` 独立模式经 `run_got_mode`→`_save_got_result` 落 `got_screener/*.json`；生产 `--got` Phase 2 绕过 `run_got_mode` 直调 `_extract_got_universe`+`_filter_got_finalists`，trace 经实例属性 `_ambush_lane_trace` 进 `portfolio_decision.json`） | （字段即产物） |
+  | 14 | 顶层 `ambush_lane_shadow`（无 Pydantic 约束；同 #13，仅 `--screener` 独立模式写文件） | （字段即产物） |
+
+  **pre-T1 caveat**：生产 15:11 终选含 T1 reject 降级（000736/怡亚通/捷成股份 → *ST中地/怡亚通/捷成股份），归档重放断言只对 pre-T1 名义终选成立（重放无 LLM 不跑 T1）。Step 0 胜率测试的 J1-J4 判据同样只对 pre-T1 名义终选口径成立。T1 开启后的 ambush 上下文补喂与 reject 语义（只降级不移除）为条件性文档项（拦点 #12），未开 T1 时不涉及。
+  **trace null 语义注记（2026-10-13）**：`meta.funnel_stats.round_survival_counts.ambush_lane_trace=null` = ENABLED 但当日埋伏供给 0 未跑（非关闭、非异常）。
+- [修复] **问财 5 日 DDE 列名漂移 + ambush 资金面静默回退改 fail-fast（2026-10-12）**：① **根因**——问财把「近5个交易日的dde大单净量合计」在响应里物化为新键名「区间dde大单净量总和[YYYYMMDD-YYYYMMDD]」，`ths_screener.py` 的 contains 匹配找旧措辞「dde大单净量合计」永不命中 → `dde_5d_sum` 全部静默落 0.0 → `_score_capital` 的 ambush 回退分支把全埋伏板块静默踢进单日组，与当日爆发票（单日 DDE≥0.5%）同场百分位，吸筹票结构性垫底（当日实证：黄金概念 15 只全灭于轮次 2，10:01/10:04/13:58/14:01 四次运行 ambush 5 日桶均为 0；原始响应复放确认新列名为 float，单日列才带 str）。② **修复**——`ths_screener.py` 列匹配改为新旧两种措辞都认（`'dde大单净量合计' in k or '区间dde大单净量总和' in k`），实测复放 30/30 只 `dde_5d_sum` 非零；③ **契约收紧**——`stock_screener.py` `_score_capital` 静默回退（`c["dde_degraded"]=True` 无任何告警）改为 fail-fast：未打标 `dde_degraded` 的 ambush 候选缺 5 日值 = 解析与初筛口径契约破坏，直接 `raise ValueError`（对齐 A6 `GOT_A6_ENABLED=false` 的 fail-fast 先例），仅 W10 初筛降级票（第 2 轮查询天然不带 5 日条件、进评分前已打标）保留单日回退路径并新增聚合 WARNING（"N 只 ambush 候选 5 日口径缺失（初筛降级票），回退单日组: …"）。④ **测试**——`tests/test_ths_dde_5d_parse.py` 新增 5 例锁定新旧列名措辞/缺列默认 0/单日相近列名不误配（`dde大单净流入量`/`最新dde大单净额`）；`tests/test_phase2_audit_fixes.py` 2.2 节回退测试改判新契约（未打标缺值 assertRaises(ValueError) + 已打标回退 assertLogs 聚合告警），25 passed。
+
 - [文档] **A1 #4：影子五线转正门槛分两侧定稿（2026-10-12，零代码改动）**——“影子线必登判据”四要素中的最后一项（转正门槛）自 10-11 补登以来一直空着，而影子样本每天都在积，属“先跑后写判据”。负责人裁决分两侧：**① 3b `risk_override_shadow` 定门槛（不属持仓侧，继续爬坡，到期即可测）**——有效样本日=`risk_override_shadow` 非 null 且当日 `agent_glue.status=ok`，需 ≥10 个；测法为按 **11 类冲突分类分层**抽查（每类 ≥2 条，全量归档只出现过 2 类 ⇒ 不足类用合成上下文补测并如实标注）、负责人逐条判“分类 + `decision_path_hint`”一致率 ≥80%；硬红线：零条“应买入/应减仓被判成 `veto_buy`”（enabled 后该判定会把 `buy_budget` 归零）。并明写**不得拿“与 `contradictions[]` 差异 0”当判据**（两套口径互比只说明没打架）。**② 其余四条全部冻结**（`sell_source` / `exposure_enforce` / `signal_size` / `mature_reduce`）——均为持仓/卖出侧观测，样本前提卡在 W3 多账户口径 / conf_w 未校准 / 空仓日无买入分配 / T-2 生命期标签断供，继续积天数只会得出成堆 `null` 并制造“已在观察”的假安心；去留统一归持仓文档新增的 **WI-P-7**（大改时逐条判“留/改/删”，裁决前不得开对应 enabled 开关）。取证：`risk_override_shadow` 自 0928 上线以来仅 **6 个有效样本日**（0928/0929/0930/1008/1009/1012，glue 均 ok），且 `conflict_type` 只有 2 种取值——该实情写进判据以免拿 2/11 类的样本当全量达标。同步更新 verification.md 影子五线表（逐行标冻结/已定门槛）与 10-12 实跑节、backlog §5 Phase 3b、§1.I、§8 #13（本项四要素至此齐）、`got/README.md` 第 4d/5 行。
 
 - [代码+数据] **A1 #3：`mature_reduce_shadow` 由裸 list 改为三态自描述 dict（2026-10-12，纯观测零决策改动）**：C-B2 盘点字段原语义不可归因——`[]` 同时表示「无账户」「有账户无持仓」「有持仓但无标的落入 `14<day≤30` 窗口」，10-09/10-10 两天的零命中读数因此无法定性（与同日发现的 antibias 零产物零告警同谱系）。现改为 `{hits, holdings_seen, skipped_reason}`：`null`=本次未调 `_score_holdings`；`skipped_reason=no_accounts/no_holdings`=跑了但无可观测对象（不得读作“没有到期持仓”）；`holdings_seen>0 且 hits 空`=真读数。先 grep 确认该字段无渲染/无决策消费者（仅 `schemas.py:1325` 声明 + `portfolio_decision.py:306` 落盘）⇒ 就地改形不需双写兼容；旧归档（1008/1009 的 `[]`）与新 dict 不得对拍，已在 verification.md 五线表与 schemas 描述里声明形状变更。**接线到持仓大改文档**（负责人要求）：`plans/持仓模块重构_待分析与待实施清单_20261010.md` 新增 **WI-P-6** 与 **§六「大改返工钩子」表**——明列该三态依赖 `accounts[0].positions` 形状与成熟窗口定义，§二.1 真相源 / §二.3 退出分层 / §二.4 T-2 归属任一落地都必须同步重做观测与 verification 语义（同表还列入 WI-P-2/3 四字段与 T-1 no-op 规则的返工条件）；§二.3 加反向指针，§五 复现锚点行号随本批代码行移修正。新增 `tests/test_mature_reduce_shadow_probe.py`（5 例：三态、写入时机、schema 形状）；回归 mature_reduce + trailing_stop + phase2_audit_fixes = **41 passed**。

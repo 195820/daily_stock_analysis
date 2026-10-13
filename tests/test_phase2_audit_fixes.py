@@ -5,7 +5,7 @@
 - 1.1 archive_phase2 原子写：回读自检失败 → .corrupt 保留 + 好文件不被覆盖；NaN 清洗
 - 1.2 partial 落盘：Step2.5/Step3/LLM 精炼失败 → status="partial"、unified_scoring 保留
 - 2.1 轮次 2 Tier A 主线保底：补回 1 只且打标；上限 5 只；已有代表不补
-- 2.2 ambush 5 日 DDE 口径：分组百分位 + 缺失回退单日打标 dde_degraded
+- 2.2 ambush 5 日 DDE 口径：分组百分位 + 降级票回退打标；未打标缺值 fail-fast（ValueError）
 - 2.3 _score_capital：并列 tie 一致、孤样本 0 分、排序键无数据后置
 - 3.3 仲裁降级：见 test_verify_candidate_sectors.py（保守分支断言已更新）
 - 回放（轻量）：0924 归档上复算未命中板块 + 保底规则让红黄酒至少 1 只进轮次 3
@@ -309,15 +309,25 @@ class TestScoreCapital(unittest.TestCase):
         self.assertEqual(scores["A2"], 0.0)
         self.assertFalse(cands[2].get("dde_degraded"))
 
-    def test_ambush_5d_missing_falls_back_single_day_flagged(self):
-        """5 日累计不可用 → 回退单日口径并打标 dde_degraded（W10）"""
+    def test_ambush_5d_missing_unflagged_raises(self):
+        """未打标的 ambush 缺 5 日值 = 解析契约破坏 → fail-fast，拒绝静默回退"""
         cands = [
             {"code": "A1", "sector": "", "sector_type": "ambush", "dde_net_pct": 2.0},
+        ]
+        with self.assertRaises(ValueError):
+            self.s._score_capital(cands, {})
+
+    def test_ambush_5d_missing_pre_flagged_falls_back_with_warning(self):
+        """初筛降级票（已打 dde_degraded）→ 回退单日组并聚合告警"""
+        cands = [
+            {"code": "A1", "sector": "", "sector_type": "ambush",
+             "dde_net_pct": 2.0, "dde_degraded": True},
             {"code": "M1", "sector": "", "sector_type": "active_mainline", "dde_net_pct": 1.0},
         ]
-        scores, _ = self.s._score_capital(cands, {})
-        self.assertTrue(cands[0].get("dde_degraded"))
+        with self.assertLogs("src.services.stock_screener", level="WARNING") as cm:
+            scores, _ = self.s._score_capital(cands, {})
         self.assertEqual(scores["A1"], 50.0)  # 回退后进入主线组排名
+        self.assertTrue(any("5 日口径缺失" in m and "A1" in m for m in cm.output))
 
     def test_sector_flow_normalization_fallback(self):
         """3.1：精确键未命中 → variants/归一化命中（'白酒概念'→'白酒'），不再静默 0 分"""
