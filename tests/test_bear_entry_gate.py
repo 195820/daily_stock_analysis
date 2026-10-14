@@ -31,7 +31,7 @@ from src.got.schemas import (
 
 def _make_capital():
     return CapitalContext(status="normal", institutional_attitude="neutral",
-                          institutional_score=0.0, confidence_multiplier=1.0,
+                          institutional_score=0.0,
                           evidence=CapitalEvidence(), reasoning=None, data_quality=DataQuality())
 
 

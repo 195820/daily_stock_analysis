@@ -46,7 +46,7 @@ def _prev(name, days_suppressed=0, days_healthy=0, aggravated=False, band="toppi
 # ──────────────── WI-B 共用夹具（与 test_meg_momentum_exhaustion_gate 同构）────────────────
 def _make_capital():
     return CapitalContext(status="normal", institutional_attitude="neutral",
-                          institutional_score=0.0, confidence_multiplier=1.0,
+                          institutional_score=0.0,
                           evidence=CapitalEvidence(), reasoning=None, data_quality=DataQuality())
 
 

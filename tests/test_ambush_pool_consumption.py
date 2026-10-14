@@ -28,7 +28,6 @@ def _make_capital():
         status="normal",
         institutional_attitude="neutral",
         institutional_score=0.0,
-        confidence_multiplier=1.0,
         evidence=CapitalEvidence(),
         reasoning=None,
         data_quality=DataQuality(),

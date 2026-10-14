@@ -480,7 +480,10 @@ class CapitalContext(BaseModel):
     status: str = Field(..., description="normal / degraded / failed")
     institutional_attitude: str = Field(..., description="bullish / bearish / neutral")
     institutional_score: float = Field(..., ge=-1.0, le=1.0)
-    confidence_multiplier: float = Field(..., ge=0.0, le=1.0)
+    # 2026-10-14 裁决（backlog §1.J 二）删除 `confidence_multiplier`：DDE 摘除 + 北向永久豁免后
+    # 有效维度总数=1，该字段退化为 1.0/0.0 二值常量（0.0 只伴随 status=failed 整块降级），
+    # 零决策消费者且接进公式只做无谓缩放。降级语义由 `status` + `single_dimension` 承载。
+    # 历史 capital.json 多出的该键经 Pydantic v2 缺省 extra='ignore' 静默忽略，读侧不炸。
     single_dimension: bool = Field(
         default=False,
         description="机构态度仅由单一可用资金维度支撑（证据维度单薄，报告需诚实标注单维口径）",

@@ -59,7 +59,6 @@ def _capital_ctx() -> CapitalContext:
         status="normal",
         institutional_attitude="neutral",
         institutional_score=0.1,
-        confidence_multiplier=1.0,
     )
 
 

@@ -331,6 +331,10 @@ S≥5, A≥3, B<3
 - 缺失北向→不降低 confidence_multiplier，不标记 fetch_failed
 - 有效维度=2（板块流+DDE），confidence=available/2
 
+> ⚠️ **2026-10-14 订正（本段为 0831 快照口径，已在两处失效，原文保留供追溯）**：
+> ① **DDE 维度已摘除**（东财 push2 整域封锁），`DIMENSION_WEIGHTS` 现为 `sector_flow 0.85 + northbound_realtime 0.15`，计入分母的有效维度=**1**；
+> ② **`confidence_multiplier` 字段已删除**（backlog §1.J 二 分侧裁决）——分母被推到 1 后取值恒为 1.0/0.0（`0.0` 只伴随 `status=failed` 整块降级），零决策消费者。降级语义现由 **`status` + `single_dimension`** 承载；旧 `capital.json` 里多出的该键经 Pydantic 缺省 `extra='ignore'` 静默忽略，读取历史归档不受影响。
+
 **降级**: 缺失维度权重归一化；全 3 维失败→status="failed"，score=0
 
 ### 4.2 v2.1 多日扩展

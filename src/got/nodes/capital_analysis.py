@@ -42,15 +42,12 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # 维度权重（缺陷③A：DDE 随东财 push2 整域封锁长期失效，已摘除死维度）
-# northbound_realtime 自 2024-08 起官方停披，永久豁免、不进置信度分母。
-# 实际参与评分的非豁免维度当前仅 sector_flow 一维（单维资金口径）。
+# northbound_realtime 自 2024-08 起官方停披，永久豁免、不计入缺失维度。
+# 实际参与评分的维度当前仅 sector_flow 一维（单维资金口径）。
 DIMENSION_WEIGHTS: dict[str, float] = {
     "sector_flow": 0.85,
     "northbound_realtime": 0.15,
 }
-
-# 永久豁免维度（官方停披/结构性不可用，不参与置信度分母计算）
-EXEMPT_DIMENSIONS: set[str] = {"northbound_realtime"}
 
 # 维度中文名称
 DIMENSION_LABELS: dict[str, str] = {
@@ -131,7 +128,6 @@ class CapitalAnalysisNode:
                 f"[Node 3] 完成 — "
                 f"态度: {result.institutional_attitude} "
                 f"评分: {result.institutional_score:.3f} "
-                f"置信度: {result.confidence_multiplier:.1f} "
                 f"缺失: {result.missing_dimensions}"
             )
             return result
@@ -250,7 +246,7 @@ class CapitalAnalysisNode:
             available_weights.append(DIMENSION_WEIGHTS["northbound_realtime"])
             quality.available_fields.append("northbound_realtime")
         # 北向资金 2024-08 起官方停披，缺失时不标记 fetch_failed / missing
-        # 避免每天恒定 degraded 拖累置信度
+        # （避免每天恒定 degraded）
 
         # === 降级处理 ===
         if not available_scores:
@@ -258,7 +254,6 @@ class CapitalAnalysisNode:
                 status="failed",
                 institutional_attitude="neutral",
                 institutional_score=0.0,
-                confidence_multiplier=0.0,
                 evidence=evidence,
                 missing_dimensions=missing_dimensions,
                 reasoning="所有资金流维度数据均不可用",
@@ -272,14 +267,11 @@ class CapitalAnalysisNode:
         )
         institutional_score = clip(institutional_score, -1.0, 1.0)
 
-        # 置信度 = 可用维度数 / 有效维度总数（排除永久豁免维度，上限 1.0）
-        # 摘除 DDE 后 effective_total=1；北向豁免维度若偶发可用属加分，
-        # 故对 confidence_multiplier 做 min(1.0, ·) 夹逼，避免越出 schema le=1.0。
-        effective_total = len(DIMENSION_WEIGHTS) - len(EXEMPT_DIMENSIONS & set(DIMENSION_WEIGHTS.keys()))
-        confidence_multiplier = min(1.0, len(available_scores) / max(1, effective_total))
-
         # 缺陷③A 诚实标注：机构态度仅由单一可用维度支撑时置位
-        # （摘除 DDE 后 effective_total=1，sector_flow 可用即单维口径）
+        # （摘除 DDE + 北向豁免后，sector_flow 可用即单维口径）
+        # 原 `confidence_multiplier = 可用维度数 / 有效维度总数` 已于 2026-10-14 删除
+        # （backlog §1.J 二）：分母已被推到 1，取值恒为 1.0/0.0，不携带信息量；
+        # 降级程度统一由 status + single_dimension 承载。
         single_dimension = len(available_scores) == 1
 
         # 态度判定
@@ -296,7 +288,6 @@ class CapitalAnalysisNode:
             status=status,
             institutional_attitude=attitude,
             institutional_score=round(institutional_score, 4),
-            confidence_multiplier=round(confidence_multiplier, 2),
             single_dimension=single_dimension,
             evidence=evidence,
             missing_dimensions=missing_dimensions,
@@ -597,12 +588,14 @@ class CapitalAnalysisNode:
             timing_note = "请基于当日全天数据分析，不要使用午后等盘中时态。"
 
         # 有效维度说明（盘中单维模式 / 数据降级时注入，限制 LLM 过度自信）
+        # 2026-10-14：原「置信度 {confidence_multiplier:.0%}。若置信度≤50%…」随字段删除移除——
+        # 走到此处时该值恒为 100%（sector_flow 不可用已在 status=failed 分支提前返回），
+        # 「若置信度≤50%」结构性不可达，留着等于给 LLM 一条永不触发的假约束。
         dim_note = ""
         if ctx.missing_dimensions:
             dim_note = (
                 f"有效维度缺失：{'、'.join(ctx.missing_dimensions)}，"
-                f"置信度 {ctx.confidence_multiplier:.0%}。"
-                "若置信度≤50%，请在结论中明确提示“结论基于单一资金维度、证据强度有限”，"
+                "证据维度有限，请在结论中明确提示“结论基于单一资金维度、证据强度有限”，"
                 "严禁使用“强烈看多”“坚决做多”等强绝对化措辞，改用“资金维度强流入”等限定表述。"
             )
         else:
@@ -664,7 +657,6 @@ class CapitalAnalysisNode:
             status="normal",  # 北向豁免后，仅 sector_flow 单维即为正常
             institutional_attitude="neutral",
             institutional_score=0.05,
-            confidence_multiplier=1.0,  # 1/1 有效维度（北向已豁免、DDE 已摘除）
             single_dimension=True,  # 缺陷③A：仅剩 sector_flow 单维口径
             evidence=CapitalEvidence(
                 sector_flow={

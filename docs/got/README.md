@@ -32,7 +32,7 @@
 | 7 | [`plans/architecture_optimization_implementation_20260929.md`](plans/architecture_optimization_implementation_20260929.md) — GOT 架构优化明细实施报告（2 GATE + 26 WI） | **逐条推进中**（§11.1 已落地：GATE-1/GATE-2/P0-3/P0-4/P0-5/P1-7(a)(b)/P1-9/P1-11/P2-9(a)，均为 off/shadow 态；§11.2 延后：P0-1/P0-2/P1-1…P1-6/P1-8/P1-10/P2 余项——其中 P1-10 原催化剂日历改动面已随 2026-10-08 裁决退役，残余 scope＝bundle→RiskAgent 侧消费 `earnings.forecast_type`，开工前须先改写 WI（见该计划 §200 状态头）） | 各 WI shadow 读数达标后逐个 enabled；候选池归零红线用例必备 |
 | 8 | [`plans/竞品经验补强计划_20261006.md`](plans/竞品经验补强计划_20261006.md) — 9 个竞品比对后的 7 批次补强 A–G（证据链/反偏见/双源校验/异动归因/lite档/回测纪律/运行时自查） | ✅ **一期已实施（2026-10-11，commit `5a4f29f`）**——经外网对标计划 §7 拍板批准全量按序，已落 D0→D→G→A→B→C1/C2→E1→E3→F（均影子/观测先行、零决策面变化，`news_pulse.py`/`output_review.py`/`data_consistency.py`/`backtest_standard.py`/`antibias.py` 均在产）；**E2 回放与 lite 自动降级按前置阻塞未开工**。判据已登 [`verification.md`](verification.md) 2026-10-11 补登节（本行原记「规划稿、批次 A–G 零落地、四文件均不存在」已过期）。⚠️ 批次 B 于 10-12 实跑发现**结构性无样本**（无买入/持有标的时零产物），判据需补前提，见 backlog §9 #7 | 逐批读数达标后转正；A 二期 rumor 折扣需历史重放 + 人工确认 |
 
-**需裁决事项**入口：[`backlog.md` §7](backlog.md)——§7 现共 12 条，**其中 #11（bundle 预算与逐源延迟）已拍「挂起观察」、#12（家族兜底阈值重标定）已拍「另开 WI」待排期，其余均已拍板并实施**；另有 backlog §3.3 **OPEN-C3** 待拍板（简报在顶层）。
+**需裁决事项**入口：[`backlog.md` §7](backlog.md)——§7 现共 **16 条**：**#14**（regime 钉死新形态的豁免键）待裁决——已有文献对照四方案；**#15 / #16**（`industry_top` / `cross_node_signals`，2026-10-14 由 §1.J 断路四条裁出）**待分析**——先出分析稿、不得直接接线；**#11**（bundle 预算与逐源延迟）已拍「挂起观察」、**#12**（家族兜底阈值重标定）已拍「另开 WI」待排期；其余（含 **#13** F-1 修法口径，2026-10-14 拍定并实施）均已拍板。§1.J 四条已**分侧处置**（二删除 / 三并入 §3.1 **OPEN-2** / 一四转待分析），不再整体结项；另有 §3.3 **OPEN-C3** 待拍板（简报在顶层）。
 
 ## 验收工器（红线复算入口）
 

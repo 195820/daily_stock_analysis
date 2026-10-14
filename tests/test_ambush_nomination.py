@@ -42,7 +42,6 @@ def _make_capital(flow_map, flow_3d_map=None):
         status="normal",
         institutional_attitude="neutral",
         institutional_score=0.0,
-        confidence_multiplier=1.0,
         evidence=ev,
     )
 

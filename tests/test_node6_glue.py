@@ -78,7 +78,7 @@ def _make_news(events=None):
 def _make_capital():
     return CapitalContext(
         status="normal", institutional_attitude="neutral",
-        institutional_score=0.0, confidence_multiplier=1.0,
+        institutional_score=0.0,
         evidence=CapitalEvidence(
             sector_flow={"sector_flow_all_3d": {"旅游概念": 1.5, "半导体": -0.3}},
         ),

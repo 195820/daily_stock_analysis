@@ -132,7 +132,6 @@ class TestAccumulationGateTiers(unittest.TestCase):
             status="normal",
             institutional_attitude="neutral",
             institutional_score=0.0,
-            confidence_multiplier=1.0,
             evidence=ev,
         )
 
@@ -188,7 +187,6 @@ class TestAccumulationGateTiers(unittest.TestCase):
             status="failed",
             institutional_attitude="neutral",
             institutional_score=0.0,
-            confidence_multiplier=0.0,
             evidence=CapitalEvidence(),
         )
         passed, detail, strength, _evidence = self.node._check_accumulation_gate("半导体", capital)
