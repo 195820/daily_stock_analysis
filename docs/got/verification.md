@@ -14,7 +14,7 @@
 | **重放读数（归档上下文+真实闸门函数）** | 50 票 → A1 50 过（`g_a1_pass=40 soft_pass=10 flow_negative=0`）→ A2 30 过（`no_catalyst=20`）→ A3 30 过 → A4 Top3=黄金/有色/小金属。逐板块：影视音像 **no_catalyst**（唯一事件 event_date=2026-10-13=运行日，`0 < days_to_event` 排除同日）；黄金概念 **no_catalyst**（事件只挂「黄金」「有色金属」，无别名变体）；黄金/有色/小金属 pass（conf 0.8/0.8/0.7）→ 三板块本应各出 TopK 候选 |
 | 重放局限 | ① 逐票 change_pct/volume_ratio 归档无 → G-A3 用中性值（knife 判定不敏感）；② **G-A2 位置安全带是生产级 schema 缺口，非重放产物**：`SectorDetail`（`schemas.py:267+`）无 `klines` 字段且 `archive.py` 全量 model_dump ⇒ 归档 `sector.json` ambush 条目永不带 K 线，而 `_load_got_context` 消费的正是这些归档 JSON ⇒ `_build_sector_kline_lookup` 生产恒空缓存 → `position_unsafe` 分支**生产也恒 soft-pass**（已登 backlog 待接线，见 backlog「埋伏道 G-A2 位置安全带 K 线接线」） |
 | 新可观测性 | 下一实跑起：日志 `埋伏道闸门: in=… G-A1→… G-A2→… G-A3→… G-A4→… (soft= flow_neg= dde_deg= no_cat= low_conf= pos_unsafe= knife= err=)`（合并块后单时点扁平汇入 `funnel_trace`，含合并块写入的 `cross_lane_collision`/`lane_overflow_n`）；`meta.json.funnel_stats.round_survival_counts` 直接含 `lane_in/g_a1_pass/…/cross_lane_collision/lane_overflow_n` 扁平键（嵌套 `ambush_lane_trace` 键不再出现；trace 全量仍独立落 `portfolio_decision.json.ambush_lane_trace`） |
-| 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`；② `candidate_pool.json` 写入器 `_save_candidate_pool_snapshot` 键错位，落盘全空壳 |
+| 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`。〔② candidate_pool.json 写入器键错位已不属于本节：2026-10-14 修复拍板（dict 直修·窄契约），迁 backlog §7 #13〕 |
 
 ---
 

@@ -3534,20 +3534,25 @@ class PortfolioDecisionNode:
         """F-1：落 candidate_pool.json —— 持久化 universe（含被 Top-10 截断的 rank 11+ 候选）
         与 finalists membership，使未来交易日可离线复算 FXG 剔除后的补位来源。
         纯观测，随 FTS ENABLED=1 产出；异常由调用方吞掉，不阻塞 Phase 2。
+
+        输入契约（F-1 修复后钉死，勿放宽为双口径）：
+        - universe: List[Dict]，来自 ScreenerPipeline._extract_got_universe，
+          板块键为 ``sector``（非 sector_name），个股键 code/name/sector_score。
+        - finalists: List[ScreenerStock]（dataclass 对象，经漏斗已带 agent_verdict）。
         """
         finalist_codes = {getattr(s, "code", "") for s in (finalists or [])}
 
-        def _row(s: Any) -> Dict[str, Any]:
-            sector = getattr(s, "sector_name", "") or getattr(s, "sector", "") or ""
+        def _row(s: Dict[str, Any]) -> Dict[str, Any]:
+            sector = s.get("sector", "")
             intel = (sector_intel_map or {}).get(sector, {})
             return {
-                "symbol": getattr(s, "code", ""),
-                "name": getattr(s, "name", ""),
+                "symbol": s.get("code", ""),
+                "name": s.get("name", ""),
                 "sector_name": sector,
                 "family": intel.get("frame_group"),
-                "sector_score": getattr(s, "sector_score", None),
-                "is_finalist": getattr(s, "code", "") in finalist_codes,
-                "agent_verdict": getattr(s, "agent_verdict", "") or "",
+                "sector_score": s.get("sector_score"),
+                "is_finalist": s.get("code", "") in finalist_codes,
+                "agent_verdict": "",
             }
 
         record = {

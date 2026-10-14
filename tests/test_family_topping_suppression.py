@@ -711,23 +711,44 @@ class TestFxgShadowArtifact(unittest.TestCase):
         self.assertNotIn("fxg", rec)
 
     def test_candidate_pool_snapshot(self):
-        """F-1：candidate_pool.json 落 universe（含 family/is_finalist）。"""
+        """F-1：candidate_pool.json 落 universe（含 family/is_finalist）。
+
+        输入必须复刻生产契约（F-1 教训：传错形态的测试=防线空转）：
+        universe = List[Dict]（_extract_got_universe 返回，板块键 sector），
+        finalists = List[ScreenerStock]（_filter_got_finalists 返回）。
+        """
         from src.got.nodes.portfolio_decision import PortfolioDecisionNode
         node = PortfolioDecisionNode(use_mock=True)
-        s = _make_stock(code="600513", name="联环药业", sector_name="创新药")
+        finalist = _make_stock(code="600513", name="联环药业", sector_name="创新药")
+        universe_dict = {"code": "600513", "name": "联环药业", "sector": "创新药",
+                         "sector_type": "active_mainline", "sector_score": 90}
+        other_dict = {"code": "000001", "name": "平安银行", "sector": "银行",
+                      "sector_type": "ambush", "sector_score": 60}
         old = os.getcwd()
         with tempfile.TemporaryDirectory() as d:
             os.chdir(d)
             try:
-                node._save_candidate_pool_snapshot([s], [s], {"创新药": _intel_fxg()})
+                node._save_candidate_pool_snapshot(
+                    [universe_dict, other_dict], [finalist],
+                    {"创新药": _intel_fxg(), "银行": _intel_fxg(family="金融")})
                 p = Path("data/got_daily") / date.today().strftime("%Y%m%d") / "candidate_pool.json"
                 rec = json.loads(p.read_text(encoding="utf-8"))
             finally:
                 os.chdir(old)
         self.assertEqual(rec["line"], "candidate_pool")
-        self.assertEqual(rec["universe"][0]["symbol"], "600513")
-        self.assertEqual(rec["universe"][0]["family"], "医药")
-        self.assertTrue(rec["universe"][0]["is_finalist"])
+        self.assertEqual(rec["universe_size"], 2)
+        self.assertEqual(rec["finalist_size"], 1)
+        row0, row1 = rec["universe"]
+        self.assertEqual(row0["symbol"], "600513")
+        self.assertEqual(row0["name"], "联环药业")
+        self.assertEqual(row0["sector_name"], "创新药")
+        self.assertEqual(row0["family"], "医药")
+        self.assertEqual(row0["sector_score"], 90)
+        self.assertTrue(row0["is_finalist"])
+        # 非 finalist 行：真实 code 不在 finalist 集合（F-1 缺陷时恒 False）
+        self.assertEqual(row1["symbol"], "000001")
+        self.assertEqual(row1["sector_name"], "银行")
+        self.assertFalse(row1["is_finalist"])
 
     def test_render_fxg_section(self):
         """archive：fts 带 fxg 子块 → reasoning 出 FXG 段（剔/豁免板块）。"""
