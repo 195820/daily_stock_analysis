@@ -49,6 +49,7 @@
 ### 两条零产物：定性完全不同，别混为一谈
 
 1. **`shadow_bear_gate.json` 缺失＝留痕被抹，不是「当日无拦单」**。日志铁证：10:02:11「Node1=bear 收手闸门**命中 1 单**（dip_mode=veto，埋伏来源已豁免）」、10:06:10 第二轮「命中 0 单」，而 `shadow_bear_gate.json` 未落盘、`reasoning.md` 渲染成「本次无产物…多为当日无拦单」（该解释在此案下**是错的**）。机制：`portfolio_decision.py:4027` 每轮 `_score_candidates` 重置 `self._bear_gate_shadow = []`，`:4306` 只在命中时组装 dict，`:3492` 落盘处 `or None` ⇒ **最后一轮的 `[]` 覆盖前一轮命中**。Phase 2 一天跑两轮是常态（今日实测），所以 backlog §1.H 记的「拦单留痕已实施闭环」在生产上不成立，**B 的误伤率照样算不出来**。修法（跨轮按 `date+symbol` 累积去重 / 落盘时合并当日各轮）与判据对齐已回写 backlog §1.H 改判为真·待实施。
+   **〔2026-10-14 复核订正 + 修复落地（backlog §1.H 收口）〕**：当日 09:49 run 为**单次** `_score_candidates` 调用——10:02 命中 1 单出自 **FXG veto 双跑的基线实例**（独立 `PortfolioDecisionNode`，不走 `run()/_save_shadow_records`，永不落盘），10:06 真实轮 0 命中 ⇒ 无产物；「每实例内多轮重置互相覆盖」在生产拓扑（每实例单次调用）下不存在，上文机制链与「修法①跨轮累积」**作废**。真实盲区两条：①基线实例只进日志零归档（已修：拦单观测随 `fxg_baseline_scoring.json` 以 `bear_gate` 子块落盘）；②0 命中日无 tombstone、缺文件三义混写（已修：`_score_candidates` 末尾无条件组装 `{hits:0, executed:false}`，dict 必落、0 命中日覆盖 stale 旧文件）。**现行判据**：`shadow_bear_gate.json` **缺文件＝当日未跑 Phase 2**；文件在＝「跑过就有产物」，0 命中日读 `hits:0`（tombstone），命中日读 `flagged_stocks`。详见下文「bear gate 拦单留痕产物」节 2026-10-14 段。
 2. **`shadow_antibias.json` 缺失＝结构性无输入，不是缺陷**。批次 B 缺省开，但 `antibias._collect_actionable_sectors` 只取 `is_holding` 或 action ∈ (`buy_trend`, `buy_dip`, `hold`)；今日 `unified_scoring` 3 行**全 `watch` 且空仓** ⇒ 返回空、函数 `return None` 不落盘（无任何日志/告警）。⇒ B 的转正判据「影子 ≥10 交易日 + `counter_thesis` 非空率 >80%」在空仓 / 全 watch 的行情日**一天样本都攒不到**，判据必须补「仅在有买入/持有标的的交易日计样本」，否则又是一个不动的计时器（同 FXG「暂无读数 ≠ 证伪」谱系）。已登 backlog §9 #7。
 
 > ⚠️ **本节不改动下面各节的历史记载**，只作起算日订正：下文「三闸门读数起算」中「MEG 1 天 / FTS 0 天 / FXG 0 天」「至今一份都没有」与「≥1013 首验后才起算」均自 2026-10-12 起过期。
@@ -341,7 +342,15 @@ T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A
 - **`shadow_bear_gate.json`**：命中闸门的候选逐单 dict `{symbol, name, sector, pool_source, composite, action_before, action_after, mode}`，汇总 `{line: "bear_gate", executed, regime, dip_mode, hits, flagged_stocks}`。**〔2026-10-12 更正：原写「无命中日落 `{"executed": false}`」与实现不符——`_save_shadow_records` 走 `self._bear_gate_shadow or None`，「仅命中时落盘」，无命中日不产文件且同日多轮 `_score_candidates` 只保留最后一轮，命中会被后一轮的重置抹掉（10-12 实测：10:02 命中 1 单 → 归档无产物）。判据随 backlog §1.H 的修复一并重定〕**
 - 由 `_save_shadow_records()` 第 5 项落盘到 `data/got_daily/{date}/`，同走 `_render_shadow_section()` 渲染链。
 - **性质与 T1/T1-H 影子不同**：闸门本身是生效的（硬拦/veto/soft 三档真实改写候选动作），留痕只是**观测旁挂**（闸门缺省 on、留痕非影子开关），不存在"攒读数后转正"的开关翻转。
-- 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。**⚠️ 该降级文案会误导向**：10-12 实测「有拦单但留痕被后一轮抹去」也会渲染成同一句「多为当日无拦单」⇒ 不得拿这句当作「当日无拦单」的证据，需回查日志 `Node1=bear 收手闸门命中 N 单`。
+- 归档渲染：`_render_shadow_section` 新增 `_render_shadow_bear_gate` 线（同批接线，`shadow_bear_gate.json` 缺失时降级为"当日无拦单"）。**⚠️ 该降级文案会误导向**：10-12 实测「有拦单但留痕被后一轮抹去」也会渲染成同一句「多为当日无拦单」⇒ 不得拿这句当作「当日无拦单」的证据，需回查日志 `Node1=bear 收手闸门命中 N 单`。**〔2026-10-14 渲染同步更新〕**：缺文件文案改为「缺失 = 当日未跑 Phase 2（或旧归档）」；tombstone 两态分句渲染——`executed:false` →「非 bear 日，闸门未激活」，`executed:true`+`hits:0` →「bear 日闸门开启、当日 0 拦单」，命中行并列 Node1/Node6 双 regime 口径。
+
+**〔2026-10-14 修复（backlog §1.H 收口），口径重定如下〕**
+
+- **tombstone**：`_score_candidates` 末尾**无条件**组装汇总 dict——0 命中轮写 `{"executed": false, "hits": 0, "flagged_stocks": []}`，`_save_shadow_records` 对 bear_gate 行改判「dict 必落」⇒ **0 命中日有 tombstone、不再盲日**；旧命中文件在 0 命中日被覆盖，stale 归因歧义消除。`executed` 语义改为「闸门条件是否激活」（Node1 raw=bear 日 true / 其余 false），0 命中日 `executed:false` ≠ 闸门关闭，勿混淆。
+- **regime 双字段**：新增 `node1_regime`（触发口径，闸门只认 Node1 raw regime）；原 `regime` 保留为 Node6 unified 展示口径（10-14 实测 Node1=bear / Node6=transition 并存属正常，非误标）。
+- **基线侧盲区收口**：FXG veto 双跑的基线实例（`orchestrator._maybe_capture_fxg_baseline` 独立实例）不走 `run()/_save_shadow_records`，其 bear gate 拦单观测**随 `fxg_baseline_scoring.json` 以 `bear_gate` 子块落盘**（tombstone 契约下真跑必为 dict；桩测未组装为 null）。10-14 之前该实例拦单只进日志、归档零痕迹（1014 `fxg_baseline_scoring.json` 4 行全 watch 是其唯一间接痕迹）。
+- **历史归因更正（2026-10-14 复核）**：10-12「上午命中被下午轮抹掉」系误诊——当日 09:49 run 为单次调用，10:02 命中 1 单出自**基线实例**（独立实例、永不落盘），10:06 真实轮 0 命中 ⇒ 无产物；「每实例内多轮覆盖」在生产拓扑（每实例单次调用）下不存在，同日重跑覆盖仅在「后轮也有命中」时发生。
+- 单测：`tests/test_bear_entry_gate.py` 新增 5 例（tombstone 组装/命中携带/双 regime 口径/stale 覆盖落盘 + 基线子块 2 例）；`tests/test_fxg_veto_baseline_pair.py` 集成冒烟补 `bear_gate` 子块端到端断言。conda 与 .venv 双 101 passed（四套：bear_entry_gate/fxg_veto_baseline_pair/family_topping_suppression/shadow_reasoning）。
 
 详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
 

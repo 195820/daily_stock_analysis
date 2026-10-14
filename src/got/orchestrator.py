@@ -97,8 +97,13 @@ class GOTOrchestrator:
                 "action_recommendation": s.action_recommendation,
                 "composite_score": s.composite_score,
             } for s in (baseline_scoring or [])]
+            # FXG 基线实例不走 run()/_save_shadow_records（独立实例，内存态随实例丢弃），
+            # 其 bear gate 拦单观测随基线产物留痕（backlog §1.H 基线侧盲区，2026-10-14）：
+            # _score_candidates 末尾无条件组装 dict（0 命中=hits:0 tombstone）；桩测未组装时为 None。
+            _bg = baseline_node._bear_gate_shadow
             record = {"line": "fxg_baseline", "mode": "baseline_off",
-                      "date": target_date.strftime("%Y%m%d"), "rows": rows}
+                      "date": target_date.strftime("%Y%m%d"), "rows": rows,
+                      "bear_gate": dict(_bg) if isinstance(_bg, dict) else None}
             day_dir = Path("data/got_daily") / target_date.strftime("%Y%m%d")
             day_dir.mkdir(parents=True, exist_ok=True)
             PortfolioDecisionNode._atomic_write_json(day_dir / "fxg_baseline_scoring.json", record)

@@ -3501,7 +3501,8 @@ class PortfolioDecisionNode:
             # S-2：仅 EXCLUDE_ENABLED=1（_fxg_shadow 非空）才并入 fxg 子块，off 态不产（逐字节不变）
             if self._fxg_shadow:
                 fts["fxg"] = dict(self._fxg_shadow)
-        if not (self._shadow_t1 or self._shadow_t1h or meg or fts or self._bear_gate_shadow):
+        if not (self._shadow_t1 or self._shadow_t1h or meg or fts
+                or isinstance(self._bear_gate_shadow, dict)):
             return
         day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
         try:
@@ -3511,7 +3512,10 @@ class PortfolioDecisionNode:
                 ("shadow_t1h.json", self._shadow_t1h),
                 ("shadow_meg.json", meg),
                 ("shadow_fts.json", fts),
-                ("shadow_bear_gate.json", self._bear_gate_shadow or None),
+                # bear_gate：tombstone（backlog §1.H 修法②）——dict 每轮必落（0 命中=hits:0），
+                # 未组装（list）不落；旧命中文件在 0 命中日被 tombstone 覆盖，不再 stale。
+                ("shadow_bear_gate.json", self._bear_gate_shadow
+                    if isinstance(self._bear_gate_shadow, dict) else None),
             ):
                 if record:
                     self._atomic_write_json(day_dir / filename, record)
@@ -4431,19 +4435,21 @@ verdict 含义：
 
         # 工作流 B：闸门命中计数（可观测，供上线后 A/B 复盘；reasoning 已逐单落盘）
         self._bear_gate_hits = _bear_gate_hits
-        # 工作流 B 拦单留痕汇总：命中时落 self._bear_gate_shadow dict，供 _save_shadow_records 写盘
-        # （闸门缺省 on，留痕随命中自动产出，无独立影子开关）
-        if _bear_gate_hits:
-            # 先取逐单 list 再组装 dict：self._bear_gate_shadow 正被覆盖，原写法自引用恒取 []
-            flagged = self._bear_gate_shadow if isinstance(self._bear_gate_shadow, list) else []
-            self._bear_gate_shadow = {
-                "line": "bear_gate", "executed": True,
-                "regime": getattr(unified_context, "market_regime", None).regime
-                    if getattr(unified_context, "market_regime", None) is not None else None,
-                "dip_mode": _bear_dip_mode,
-                "hits": _bear_gate_hits,
-                "flagged_stocks": flagged,
-            }
+        # 工作流 B 拦单留痕汇总：每轮无条件组装 dict（backlog §1.H 修法② tombstone，2026-10-14）。
+        # 0 命中同样落盘 {"hits": 0}：原先「缺文件」是 无拦单/基线轮未落盘/同日重跑覆盖 三义混写，
+        # 盲日断档使误伤率样本不可靠；executed 反映闸门条件是否激活（Node1=bear 日 True / 其余 False），
+        # node1_regime 记录触发口径（闸门只认 Node1 raw，regime 字段保留为 Node6 unified 展示口径）。
+        # 先取逐单 list 再组装 dict：self._bear_gate_shadow 正被覆盖，原写法自引用恒取 []
+        flagged = self._bear_gate_shadow if isinstance(self._bear_gate_shadow, list) else []
+        self._bear_gate_shadow = {
+            "line": "bear_gate", "executed": bool(_bear_day_gate),
+            "node1_regime": _node1_regime,
+            "regime": getattr(unified_context, "market_regime", None).regime
+                if getattr(unified_context, "market_regime", None) is not None else None,
+            "dip_mode": _bear_dip_mode,
+            "hits": _bear_gate_hits,
+            "flagged_stocks": flagged,
+        }
         if _bear_day_gate:
             logger.info(
                 f"[Phase 2] Node1=bear 收手闸门命中 {_bear_gate_hits} 单"

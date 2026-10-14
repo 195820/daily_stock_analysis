@@ -829,17 +829,21 @@ def _render_glue_degraded_note(glue: "dict | None") -> list[str]:
 def _render_shadow_bear_gate(bg: "dict | None") -> list[str]:
     """工作流 B bear gate 拦单留痕：闸门生效（非影子开关），留痕为观测旁挂。
 
-    产物形态：{line, executed, regime, dip_mode, hits, flagged_stocks[]}；
-    无命中日 _save_shadow_records 不写该文件（读取侧按缺失降级）。
+    产物形态：{line, executed, node1_regime, regime, dip_mode, hits, flagged_stocks[]}；
+    tombstone（2026-10-14，backlog §1.H 修法②）后跑过 Phase 2 必有文件——
+    缺失=当日未跑 Phase 2（或闸门上线前的旧归档）；executed=False=非 bear 日未激活，
+    executed=True+hits=0=bear 日闸门开、0 拦单，两态分别渲染不混写。
     """
     if not bg:
-        return ["**工作流 B bear gate**（闸门生效）：本次无产物（`shadow_bear_gate.json` 缺失，多为当日无拦单）。", ""]
+        return ["**工作流 B bear gate**（闸门生效）：本次无产物（`shadow_bear_gate.json` 缺失 = 当日未跑 Phase 2，或旧归档）。", ""]
     flagged = bg.get("flagged_stocks") or []
-    if not bg.get("executed") or not flagged:
-        return ["**工作流 B bear gate**（闸门生效）：当日无拦单。", ""]
+    if not bg.get("executed"):
+        return [f"**工作流 B bear gate**（闸门生效）：非 bear 日，闸门未激活（Node1 regime=`{bg.get('node1_regime')}`，0 拦单）。", ""]
+    if not flagged:
+        return [f"**工作流 B bear gate**（闸门生效）：bear 日闸门开启、当日 0 拦单（Node1 regime=`{bg.get('node1_regime')}`，dip_mode=`{bg.get('dip_mode')}`）。", ""]
     lines = [
         f"**工作流 B bear gate**（闸门生效）：拦单 {bg.get('hits', len(flagged))} 单"
-        f"（regime=`{bg.get('regime')}`，dip_mode=`{bg.get('dip_mode')}`）。",
+        f"（Node1 regime=`{bg.get('node1_regime')}`，Node6 regime=`{bg.get('regime')}`，dip_mode=`{bg.get('dip_mode')}`）。",
         "",
     ]
     lines += [
@@ -1194,7 +1198,7 @@ SHADOW_PROGRESS_RULES = {
     "fxg": {"label": "FXG 家族级上游排除(veto)", "tag": "FXG", "status": "active",
             "needs": ["fts", "fxg"], "required": 5, "clock_start": "2026-10-12"},
     "bear_gate": {"label": "工作流 B bear gate", "tag": "bear gate", "status": "gate",
-                  "note": "闸门生效非影子转正线；拦单留痕在生产多轮场景丢失（backlog §1.H 真·待实施），样本不可靠累计"},
+                  "note": "闸门生效非影子转正线；拦单留痕已修复（2026-10-14 tombstone：0 命中日落 hits:0，基线观测随 fxg_baseline_scoring.json 子块，backlog §1.H 已收口），缺文件=当日未跑 Phase 2"},
     "tradability": {"label": "GATE-1 卖出可成交性投影", "tag": "GATE-1", "status": "active",
                     "needs": ["tradability"], "required": 10, "clock_start": "2026-10-12"},
     "t1": {"label": "T1 候选股终审", "tag": "T1", "status": "qualitative",

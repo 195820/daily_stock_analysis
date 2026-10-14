@@ -202,6 +202,9 @@ class TestFxgBaselineIntegrationSmoke(unittest.IsolatedAsyncioTestCase):
                 rec = json.loads(p.read_text(encoding="utf-8"))
                 self.assertEqual(rec["mode"], "baseline_off")
                 self.assertGreaterEqual(len(rec["rows"]), 1)
+                # 基线实例 bear gate 拦单观测随产物留痕（tombstone 契约：真跑必为 dict）
+                self.assertIsInstance(rec["bear_gate"], dict)
+                self.assertEqual(rec["bear_gate"]["hits"], 0)
                 # 基线不产/不 clobber 正式 candidate_pool.json
                 self.assertFalse((p.parent / "candidate_pool.json").exists())
                 # 基线跑后 EXCLUDE_ENABLED 已复原为 1（不泄漏给真实 run）

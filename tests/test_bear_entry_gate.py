@@ -13,11 +13,16 @@
 驱动 _score_candidates 循环体，夹具与 test_winrate_optimization 同构。
 """
 import asyncio
+import json
 import os
+import tempfile
 import types
 import unittest
+from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from tests.test_fxg_veto_baseline_pair import _FULL, _usr
 from src.got.schemas import (
     CapitalContext, CapitalEvidence, DataQuality, NewsContext, SentimentContext,
     SectorContext, UnifiedContext, AmbushCandidate,
@@ -207,6 +212,133 @@ class TestBearEntryGate(_BearGateHarness):
         self.assertIn("软降权", soft.reasoning)
         self.assertLess(soft.composite_score, clean.composite_score)
         self.assertAlmostEqual(soft.composite_score, round(clean.composite_score * 0.8, 4), places=3)
+
+    # ── backlog §1.H 修法② tombstone（2026-10-14）：每轮无条件组装留痕 dict ──
+
+    async def test_tombstone_assembled_on_zero_hits(self):
+        """非 bear 日 0 命中 → 仍组装 dict（hits:0、executed:False），盲日可辨识。"""
+        stock = _make_stock()
+        node, _ = await self._run(stock, _intel("launch", 1), "transition",
+                                  {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1"})
+        rec = node._bear_gate_shadow
+        self.assertIsInstance(rec, dict)
+        self.assertEqual(rec["hits"], 0)
+        self.assertFalse(rec["executed"])
+        self.assertEqual(rec["flagged_stocks"], [])
+        self.assertEqual(rec["node1_regime"], "transition")
+
+    async def test_tombstone_carries_flagged_on_hits(self):
+        """bear 日命中 → dict 含逐单 flagged_stocks 与双 regime 口径字段。"""
+        stock = _make_stock()
+        node, res = await self._run(stock, _intel("launch", 1), "bear",
+                                    {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1"})
+        self.assertEqual(res.action_recommendation, "watch")
+        rec = node._bear_gate_shadow
+        self.assertIsInstance(rec, dict)
+        self.assertEqual(rec["hits"], 1)
+        self.assertTrue(rec["executed"])
+        self.assertEqual(rec["node1_regime"], "bear")
+        self.assertEqual(rec["flagged_stocks"][0]["symbol"], stock.code)
+        self.assertEqual(rec["flagged_stocks"][0]["action_after"], "watch")
+
+    async def test_tombstone_regime_fields_distinct(self):
+        """node1_regime 记触发口径（raw），regime 记 Node6 unified 展示口径——两字段并存不混用。"""
+        stock = _make_stock()
+        node, _ = await self._run(stock, _intel("launch", 1), "bear",
+                                  {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1"})
+        rec = node._bear_gate_shadow
+        self.assertEqual(rec["node1_regime"], "bear")       # 触发口径
+        self.assertIsNone(rec["regime"])                     # 夹具 UnifiedContext 无 market_regime
+
+    async def test_tombstone_overwrites_stale_on_save(self):
+        """0 命中日落盘 tombstone 覆盖旧命中文件，消除 stale 归因歧义。"""
+        import json
+        import tempfile
+        from pathlib import Path
+        from datetime import date
+
+        stock = _make_stock()
+        node, _ = await self._run(stock, _intel("launch", 1), "transition",
+                                  {"GOT_BEAR_ENTRY_GATE": "1", "GOT_WINRATE_STEP3_ENABLED": "1"})
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+                day_dir.mkdir(parents=True, exist_ok=True)
+                stale = {"line": "bear_gate", "executed": True, "hits": 9, "flagged_stocks": []}
+                (day_dir / "shadow_bear_gate.json").write_text(
+                    json.dumps(stale, ensure_ascii=False), encoding="utf-8")
+                node._save_shadow_records()
+                rec = json.loads(
+                    (day_dir / "shadow_bear_gate.json").read_text(encoding="utf-8"))
+                self.assertEqual(rec["hits"], 0)
+                self.assertFalse(rec["executed"])
+            finally:
+                os.chdir(old)
+
+
+class TestFxgBaselineBearGateSubblock(unittest.IsolatedAsyncioTestCase):
+    """基线实例不走 run()/_save_shadow_records，其 bear gate 拦单观测随 fxg_baseline_scoring.json
+    以 bear_gate 子块留痕（backlog §1.H 基线侧盲区，2026-10-14）。"""
+
+    async def _call(self, score_ret):
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+        async def _fake_score(self_node, sector_ctx, capital_ctx, news_ctx, market_ctx,
+                              unified, sentiment_context=None):
+            # 真 _score_candidates 末尾无条件组装 tombstone（见 test_tombstone_*）；桩直接落同形 dict
+            self_node._bear_gate_shadow = {"line": "bear_gate", "executed": False,
+                                           "node1_regime": None, "regime": None,
+                                           "dip_mode": "veto", "hits": 0, "flagged_stocks": []}
+            return score_ret
+
+        with patch.object(PortfolioDecisionNode, "_score_candidates", _fake_score), \
+             patch.dict(os.environ, dict(_FULL)):
+            old = os.getcwd()
+            with tempfile.TemporaryDirectory() as d:
+                os.chdir(d)
+                try:
+                    from src.got.orchestrator import GOTOrchestrator
+                    await GOTOrchestrator.__new__(GOTOrchestrator)._maybe_capture_fxg_baseline(
+                        MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                        MagicMock(), MagicMock(), date(2026, 10, 10))
+                    p = Path("data/got_daily/20261010") / "fxg_baseline_scoring.json"
+                    rec = json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+                finally:
+                    os.chdir(old)
+        return rec
+
+    async def test_bear_gate_subblock_present(self):
+        """基线跑后 _bear_gate_shadow 为 dict（tombstone 组装）→ 子块随产物落盘。"""
+        rec = await self._call([_usr()])
+        self.assertIsNotNone(rec["bear_gate"])
+        self.assertEqual(rec["bear_gate"]["line"], "bear_gate")
+        self.assertIn("hits", rec["bear_gate"])
+
+    async def test_bear_gate_subblock_none_when_stubbed(self):
+        """桩测未组装（_bear_gate_shadow 保持 list）→ 子块为 None，不炸不造数据。"""
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+        async def _fake_score_poke(self_node, *a, **k):
+            return [_usr()]
+
+        with patch.object(PortfolioDecisionNode, "_score_candidates", _fake_score_poke), \
+             patch.dict(os.environ, dict(_FULL)):
+            old = os.getcwd()
+            with tempfile.TemporaryDirectory() as d:
+                os.chdir(d)
+                try:
+                    from src.got.orchestrator import GOTOrchestrator
+                    await GOTOrchestrator.__new__(GOTOrchestrator)._maybe_capture_fxg_baseline(
+                        MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                        MagicMock(), MagicMock(), date(2026, 10, 10))
+                    p = Path("data/got_daily/20261010") / "fxg_baseline_scoring.json"
+                    rec = json.loads(p.read_text(encoding="utf-8"))
+                finally:
+                    os.chdir(old)
+        # _fake_score_poke 未动 _bear_gate_shadow → __init__ 缺省 [] → 子块 None
+        self.assertIsNone(rec["bear_gate"])
 
 
 if __name__ == "__main__":
