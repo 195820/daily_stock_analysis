@@ -86,34 +86,37 @@
 
 ## 二区 · GOT 现行（`got/`）
 
-> 2026-10-10 文档整理：顶层只留**清单类 + 一份待拍板简报**，已完结的过程稿（0922 审计 / 0926 决策简报 / cp12 系列 / cp13 系列共 8 份）全部移入 [`got/archive/`](got/archive/)。
+> 2026-10-10 文档整理：顶层只留**清单类 + 一份待拍板简报**，已完结的过程稿（0922 审计 / 0926 决策简报 / cp12 系列 / cp13 系列共 8 份）全部移入 [`got/archive/`](got/archive/)。**2026-10-14 治理轮再收 1 份**（`架构审查计划_20261011.md`，原仓库根 untracked）；同时把根目录仅剩的 2 份现行文档（`外网对标实施_PLAN.md` / `GOT_问题分析_PLAN.md`）按「计划单一落点」条款改名移入 `got/plans/`——**仓库根目录自此无 GOT 文档**。
 
 | 文档 | 性质 |
 | --- | --- |
 | [got/README.md](got/README.md) | GOT 文档导航 + 待实施计划排序总览 |
 | [got/backlog.md](got/backlog.md) | **待实施**清单（六类处置、0902 15 项处置表、A6 转正与退役、需裁决事项） |
-| [got/verification.md](got/verification.md) | **待验证 / 影子期**清单（判据、实测值与出处，不落达标判定；**2026-10-10 起含 MEG/FTS/FXG 三道买入侧新闸门判据**，其「读数起算」已按实测更正为 MEG 1 天 / FTS 0 / FXG 0） |
+| [got/verification.md](got/verification.md) | **待验证 / 影子期**清单（判据、实测值与出处，不落达标判定；**2026-10-10 起含 MEG/FTS/FXG 三道买入侧新闸门判据**；「读数起算」已经 10-12 全流程实跑订正：三闸门时钟自 2026-10-12 起算，另含 GATE-1 / D-3 基线 / bear 拦单留痕等新起算节） |
 | [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；⚠️ 正文基线为 0831 快照，**文首时效注记已于 2026-10-10 刷新**并列出四个已知脱节区） |
 | [got/decision_brief_openc3_20260928.md](got/decision_brief_openc3_20260928.md) | **当前唯一待拍板简报**（OPEN-C3 `persistence_regime` 死分支：接线/删分支/保留三选一），故不入归档 |
 
-### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，八份）
+### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，十一份）
 
 | 计划 | 状态 | 开工前置 |
 | --- | --- | --- |
-| [plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | **合稿两份计划**（v3 埋伏分支 + v3.5 波次化生命周期），**两块主体均已实施**（v3：09-28 核实｜v3.5 S2–S5：10-10 核实；S5 校准脚本在库，首跑待埋点满 40 交易日） | 实施前先对账，勿重复；残留仅「存量 NUL 幽灵行清理」与「`wave_days` 回填脚本」两项未落地 |
+| [plans/ambush_split_plan.md](got/plans/ambush_split_plan.md) | **合稿两份计划**（v3 埋伏分支 + v3.5 波次化生命周期），**两块主体均已实施**（v3：09-28 核实｜v3.5 S2–S5：10-10 核实；S5 校准脚本在库，首跑待埋点满 40 交易日） | 实施前先对账，勿重复；原残留两项均已收口（NUL 幽灵行清理 ✅ 10-10 实施；`wave_days` 回填 ✅ 10-12 裁决作废）⇒ **无待实施尾巴** |
 | [plans/win_rate_optimization_plan.md](got/plans/win_rate_optimization_plan.md) | **已实施**（2026-09-17，4 步 + `GOT_WINRATE_*` 开关） | 待回测复验胜率改善 |
-| [plans/入场分道与持仓延续性_总计划_20260930.md](got/plans/%E5%85%A5%E5%9C%BA%E5%88%86%E9%81%93%E4%B8%8E%E6%8C%81%E4%BB%93%E5%BB%B6%E7%BB%AD%E6%80%A7_%E6%80%BB%E8%AE%A1%E5%88%92_20260930.md) | 工作流 A/B/C **已合入**（`4be371b`）｜ **A 已判完成**（10-10 裁决：冻结机制实测生效，`final_pool>0` 不属 A 的责任边界，已移出）｜ B 行为面正常（**验收只剩一个真缺口＝拦单留痕未落盘**；非 bear 日对照＝等条件，「埋伏被放行」已移出 B 归 A-2）｜ C **已终结**（2026-10-10 裁，转持仓模块文档）｜ 下游两条已登 [backlog §1.H](got/backlog.md)；详见下行分析稿 |
+| [plans/入场分道与持仓延续性_总计划_20260930.md](got/plans/%E5%85%A5%E5%9C%BA%E5%88%86%E9%81%93%E4%B8%8E%E6%8C%81%E4%BB%93%E5%BB%B6%E7%BB%AD%E6%80%A7_%E6%80%BB%E8%AE%A1%E5%88%92_20260930.md) | 工作流 A/B/C **已合入**（`4be371b`）｜ **A 已判完成**（10-10 裁决：冻结机制实测生效，`final_pool>0` 不属 A 的责任边界，已移出）｜ B 行为面正常（拦单留痕真缺口已于 **2026-10-14 修法②收口**（tombstone + FXG 基线子块，backlog §1.H）；非 bear 日对照＝等条件，「埋伏被放行」归 A-2 线；非 bear 日两路合并排序缓析待分析）｜ C **已终结**（2026-10-10 裁，转持仓模块文档）｜ 下游两条已登 [backlog §1.H](got/backlog.md)；详见下行分析稿 |
 | [plans/持仓模块重构_待分析与待实施清单_20261010.md](got/plans/%E6%8C%81%E4%BB%93%E6%A8%A1%E5%9D%97%E9%87%8D%E6%9E%84_%E5%BE%85%E5%88%86%E6%9E%90%E4%B8%8E%E5%BE%85%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95_20261010.md) | **待分析 + 待实施清单，未批准实施**；持仓侧问题的唯一归集点（以已终结的工作流 C 为开头） | 最硬一条：近似 HWM 下「曾盈利≥10%」形同恒真（实测 P&L −17.6% 却反推高点收益 +176%）⇒ **WI-P-1 修完前不得开 `GOT_TRAILING_STOP_ENABLED`**；快照地基近乎空（1 行 / 0 行）；挂号于 backlog §1.I |
 | [plans/埋伏池归零下游拦点分析_20261010.md](got/plans/%E5%9F%8B%E4%BC%8F%E6%B1%A0%E5%BD%92%E9%9B%B6%E4%B8%8B%E6%B8%B8%E6%8B%A6%E7%82%B9%E5%88%86%E6%9E%90_20261010.md) | **分析稿，未批准实施**（与旧计划不混排） | 结论：不是 0.7 门槛拦的（全库 43/50 事件 ≥0.7，全天仅 1 例被拦），而是**事件→板块映射覆盖盲区**（16 候选 11 个整链零事件；两个板块宇宙不相交）；三条候选修法均未拍板 |
 | [plans/architecture_optimization_implementation_20260929.md](got/plans/architecture_optimization_implementation_20260929.md) | 2 GATE + 26 WI 明细实施报告（§11 逐条登记已落地/延后裁决） | GATE-1/GATE-2/P0-3/P0-4/P0-5/P1-7/P1-9/P1-11/P2-9(a) 已落；余见 §11.2 |
-| [plans/加速末期识别缺陷分析_20261008.md](got/plans/%E5%8A%A0%E9%80%9F%E6%9C%AB%E6%9C%9F%E8%AF%86%E5%88%AB%E7%BC%BA%E9%99%B7%E5%88%86%E6%9E%90_20261008.md) | 分析稿 + **MEG 已影子接线**（回测证真）；派生出 FTS / FXG 两道闸门 | 影子读数 ≥1 周后切 veto；⚠️ **10-10 实测可读数仅 MEG 1 天 / FTS 0 / FXG 0，“≥1 周”计时尚未开始**（盘中跑为生产常态，判读按 `bar_complete` 分组）；三闸门判据见 [verification.md](got/verification.md) 顶部 |
-| [plans/竞品经验补强计划_20261006.md](got/plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md) | ⚠️ **规划稿，未批准实施**（批次 A–G 零落地：`news_pulse.py`/`output_review.py`/`data_consistency.py`/`backtest_standard.py` 均不存在） | 负责人批准 + 建议序 D0→D→G→A→B→C→E→F |
+| [plans/加速末期识别缺陷分析_20261008.md](got/plans/%E5%8A%A0%E9%80%9F%E6%9C%AB%E6%9C%9F%E8%AF%86%E5%88%AB%E7%BC%BA%E9%99%B7%E5%88%86%E6%9E%90_20261008.md) | 分析稿 + **MEG 已影子接线**（回测证真）；派生出 FTS / FXG 两道闸门 | 影子读数 ≥1 周后切 veto；〔10-10 曾测读数 MEG 1 / FTS 0 / FXG 0，**〔10-12 实跑订正：三闸门时钟自 2026-10-12 起算，首份 FTS/FXG 产物已落盘〕**判读按 `bar_complete` 分组〕；三闸门判据见 [verification.md](got/verification.md) 顶部 |
+| [plans/竞品经验补强计划_20261006.md](got/plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md) | ✅ **一期已实施（2026-10-11，commit `5a4f29f`）**——经外网对标计划 §7 拍板批准全量按序，已落 D0→D→G→A→B→C1/C2→E1→E3→F（均影子/观测先行）；E2 回放与 lite 自动降级按前置阻塞未开工 | 逐批读数达标后转正（判据见 verification.md 10-11 补登节）；A 二期 rumor 折扣需历史重放 + 人工确认 |
+| [plans/埋伏分支拆分_PLAN_v2.md](got/plans/埋伏分支拆分_PLAN_v2.md) | **已实施（2026-10-13，Step 0 门 PASS，影子期 ACTIVE=0）**——埋伏道拆分 v2（抽道/四闸门/Node 7 接线；后经 10-13 P5 变量遮蔽修复 + 10-14 G-A2 三标量接线补强） | 转正判据见该计划 §5.2；生效验证（新归档含 pos_* 三键）登 [verification.md](got/verification.md) 顶部 10-14 节 |
+| [plans/外网对标实施计划_20261011.md](got/plans/%E5%A4%96%E7%BD%91%E5%AF%B9%E6%A0%87%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261011.md)（原根目录 `外网对标实施_PLAN.md`，10-14 治理轮移入） | **部分实施**——项二（direction 净化）✅ / 项一（宏观扇出②+②b）代码在位但双开关缺省关 / 项三 3a ✅（D-3 基线 10-12 起算）/ 项四另列竞品计划 | 3b 双前置＝D-3 基线满 ≥10 交易日 + AlphaSift 接口三点设计拍板；项一翻 `GOT_MACRO_FANOUT_ENABLED`/`GOT_MACRO_SECTOR_ALIGN_ENABLED` 后待全流程读数（判据见 verification.md 项一节） |
+| [plans/regime与数据流断路_文献对照分析_20261011.md](got/plans/regime%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%B5%81%E6%96%AD%E8%B7%AF_%E6%96%87%E7%8C%AE%E5%AF%B9%E7%85%A7%E5%88%86%E6%9E%90_20261011.md)（原根目录 untracked `GOT_问题分析_PLAN.md`，10-14 治理轮移入） | **分析稿（现行，零生产代码）**——分析一（regime 钉死豁免键四方案）供 §7 #14 拍板；分析二（数据流断路接线）中 `confidence_multiplier` 接线建议已被 10-14 §1.J 裁决覆盖为「删除（已实施）」 | backlog §7 **#14** 待拍板；**#16**（cross_node_signals）与 #14 串联出稿；**#15**（industry_top）可独立出分析稿 |
 
 > ℹ️ **MEG / FTS / FXG 三道买入侧闸门无独立计划文档**（判据在 [verification.md](got/verification.md)，设计与回测在 `plans/加速末期识别缺陷分析_20261008.md` §七）。新计划一律写入 `docs/got/plans/`，**仓库根目录不留 PLAN 稿**（见 [AGENTS.md](AGENTS.md) 文档治理条款）。
 
 ### GOT 过程稿（已移入 [`got/archive/`](got/archive/)，不再更新）
 
-[audit_20260922.md](got/archive/audit_20260922.md) / [decision_brief_20260926.md](got/archive/decision_brief_20260926.md) / cp12_×3（[文案草案](got/archive/cp12_prompt_variants_draft_20260926.md)、[M3 预审表](got/archive/cp12_m3_audit_20260926.md)、[事件级对照](got/archive/cp12_event_level_ab_20260926.md)）/ cp13_×3（[设计笔记](got/archive/cp13_grounding_pipeline_research_20260926.md)、[阶段1 矩阵](got/archive/cp13_stage1_matrix_20260927.md)、[阶段2 收口](got/archive/cp13_phase2_closeout_20260928.md)）——原位置与取代关系见 [got/archive/README.md](got/archive/README.md) §一之补。
+[audit_20260922.md](got/archive/audit_20260922.md) / [decision_brief_20260926.md](got/archive/decision_brief_20260926.md) / cp12_×3（[文案草案](got/archive/cp12_prompt_variants_draft_20260926.md)、[M3 预审表](got/archive/cp12_m3_audit_20260926.md)、[事件级对照](got/archive/cp12_event_level_ab_20260926.md)）/ cp13_×3（[设计笔记](got/archive/cp13_grounding_pipeline_research_20260926.md)、[阶段1 矩阵](got/archive/cp13_stage1_matrix_20260927.md)、[阶段2 收口](got/archive/cp13_phase2_closeout_20260928.md)）/ **10-14 新收**：[架构审查计划_20261011.md](got/archive/%E6%9E%B6%E6%9E%84%E5%AE%A1%E6%9F%A5%E8%AE%A1%E5%88%92_20261011.md)——原位置与取代关系见 [got/archive/README.md](got/archive/README.md) §一之补。
 
 ### 专项报告（[`reports/`](reports/)，诊断与预演类）
 
@@ -145,3 +148,5 @@
 *修订：2026-10-10 口径收口第二批（除状态头外另清四处「文档与实测不符」）——Ⅰ verification.md 顶部三闸门「读数起算」原写自 10-09 起算，实测为 MEG 1 天 / FTS 0 / FXG 0（1009 那次跑的 commit `d391345` 早于 FTS/FXG 合入，10-10 无完整归档）；Ⅱ backlog §5 的 5c「样本 6<10 DEFER」已过期——`glue_consumed=true` 现 11 个归档日 ≥ 10 ⇒ 4.2 P1-1 分位重标解锁；Ⅲ backlog §8 #8（R-D2 附录 A）重标可脚本化的两项（divergent 11 日/154 条且全在 0917 后；蓄水池顶格 20 日/最长连续 8），③④ 两项属人工清点不给值；Ⅳ architecture.md 时效注记刷新至 10-10。未动任何代码行为与开关值；页内同行与本文件页脚同步。*
 *修订：2026-10-10 口径不一致收口——`ambush_split_plan.md` 内嵌的 v3.5 节原挂「设计收口，待实施」，与同文件文首「主体已实施」与本索引互相矛盾；逐条代码实测后改为「S2–S5 已实施 + 两处从未落地」（见该文件 v3.5 状态头），本页与 `got/README.md` 同行同步；`sector_analysis.py` 对未创建脚本 `scripts/backfill_wave_days.py` 的死引用注释已订正（注释文案，零行为变更）。*
 *修订：2026-10-10 文档整理——docs/got 顶层 8 份完结过程稿移入 `got/archive/`（代码/测试/CHANGELOG 中的路径引用已同步改指）；仓库根目录 6 份 PLAN/审核/报告/审查稿移入 `got/archive/` 并加状态头（`FIX_SUMMARY.md` 同步改名，`.gitignore` 逐条忽略规则作废）；二区拆为「清单类 / plans 计划 / 已归档过程稿」三段并补齐六份计划状态。*
+
+*修订：2026-10-14 文档治理轮（零代码行为变更）——仓库根目录 GOT 文档清零：`GOT_项目架构审查_PLAN.md`（untracked，审查已执行）完结归档为 [`got/archive/架构审查计划_20261011.md`](got/archive/%E6%9E%B6%E6%9E%84%E5%AE%A1%E6%9F%A5%E8%AE%A1%E5%88%92_20261011.md)（登记见 archive README 一之补②）；`GOT_问题分析_PLAN.md`（untracked，现行分析）改名入库 [`got/plans/regime与数据流断路_文献对照分析_20261011.md`](got/plans/regime%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%B5%81%E6%96%AD%E8%B7%AF_%E6%96%87%E7%8C%AE%E5%AF%B9%E7%85%A7%E5%88%86%E6%9E%90_20261011.md)；`外网对标实施_PLAN.md` 改名移入 [`got/plans/外网对标实施计划_20261011.md`](got/plans/%E5%A4%96%E7%BD%91%E5%AF%B9%E6%A0%87%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261011.md)——backlog/verification/CHANGELOG 内带路径引用全部同步改指。二区 plans 行数八→十一（补外网对标/regime 分析/埋伏分支拆分_PLAN_v2 三行），ambush_split 残留尾巴、竞品一期已实施、入场分道 B 拦单留痕 10-14 收口、加速末期三闸门时钟 10-12 起算四处过期状态描述同步更新；`scripts/calibrate_sector_thresholds.py`（10-11 取证脚本）入库，`update_portfolio.py` 经核为硬编码一次性记账脚本移 `.review_tmp/` 不入库；持仓重构文档 §一 加 10-14 覆写注记。*
