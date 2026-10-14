@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -1114,6 +1114,189 @@ def _render_shadow_fts(fts: "dict | None") -> list[str]:
     return lines
 
 
+def _render_shadow_risk_override(shadow: "dict | None") -> list[str]:
+    """3b 风控覆盖计划（RiskOverridePlan，影子）：冲突分类 + veto_buy + 调整计划。
+
+    与同源的「3b 分歧摘要」（读 unified.conflict_summary_shadow）正交：本块读
+    portfolio_decision.risk_override_shadow，是 verification.md ≥10 有效样本日转正判据的
+    唯一对应体（shadow 不改 buy_budget；enabled+veto_buy 才与 over_limit_forced 并列归零）。
+    """
+    if not shadow:
+        return ["**3b 风控覆盖（RiskOverridePlan）**（影子，不进 T3 仲裁）：本次无产物"
+                "（`portfolio_decision.json` 未落 `risk_override_shadow`，多为 3b 开关关闭或当日无矛盾）。", ""]
+    mode = shadow.get("mode", "shadow")
+    plan = shadow.get("plan") or {}
+    veto = plan.get("veto_buy")
+    if mode == "enabled" and veto:
+        tag = "enabled，veto 生效（预算归零）"
+    elif mode == "enabled":
+        tag = "enabled（未否决）"
+    else:
+        tag = "影子，不进仲裁"
+    lines = [f"**3b 风控覆盖（RiskOverridePlan）**（{tag}，mode=`{mode}`）："
+             f"分类 `{shadow.get('conflict_type') or 'unknown'}`。"]
+    if shadow.get("decision_path_hint"):
+        lines.append(f"- **决策路径提示:** {shadow.get('decision_path_hint')}")
+    reason = plan.get("reason") or ""
+    lines.append(f"- **风控覆盖:** veto_buy={veto}" + (f"（{reason}）" if veto and reason else ""))
+    if plan.get("adjustment"):
+        lines.append(f"- **调整计划:** {plan.get('adjustment')} → 目标信号 "
+                     f"`{plan.get('target_signal') or ''}`（{reason}）")
+    lines.append("")
+    return lines
+
+
+def _render_shadow_tradability(shadow: "dict | None") -> list[str]:
+    """GATE-1 卖出可成交性投影（影子）：mode + 被拦截/待顺延卖单清单。
+
+    降级红线（verification.md GATE-1 节）：行情缺失/超时/异常一律放行不拦截，仅留
+    `quote_unavailable` 告警。空仓/无卖单日 pending_exits 为空属正常（非无样本≠被证伪）。
+    """
+    if not shadow:
+        return ["**GATE-1 卖出可成交性投影**（影子，只打标）：本次无产物"
+                "（`portfolio_decision.json` 未落 `tradability_shadow`，多为 `GOT_TRADABILITY_GATE=off`）。", ""]
+    mode = shadow.get("mode", "shadow")
+    pend = shadow.get("pending_exits") or []
+    tag = "enabled，已顺延" if mode == "enabled" else ("影子，只打标" if mode == "shadow" else "off")
+    lines = [f"**GATE-1 卖出可成交性投影**（{tag}，mode=`{mode}`）："
+             f"被拦截/待顺延卖单 {len(pend)} 笔。"]
+    for e in pend:
+        lines.append(
+            f"- **{_shadow_display_name(e.get('name'), e.get('symbol'))}**："
+            f"`{e.get('intent', '')}` 拦截原因 `{e.get('reason', '')}`（{e.get('quantity', 0)} 股）"
+        )
+    if not pend:
+        lines.append("- 本次无可成交性拦截（账户空仓/无卖单时为 0，属正常，≠被证伪）。")
+    lines.append("")
+    return lines
+
+
+# ── 影子线转正进度 / 到期提示（仅计数，达标判定归负责人）─────────────
+# 逐线口径与 docs/got/verification.md 判据对齐：
+#   needs: 一日算「有效样本日」需同时为真的 flag（见 _build_shadow_day_index）
+#   status: active(≥N 数值天数) / frozen(已冻结不积算) / qualitative(无固定天数门槛，定性转正) / gate(闸门生效非影子线)
+#   required: ≥N 有效影子日（active 用）；clock_start: 起算日（该线首个可用产物的登记口径）
+SHADOW_PROGRESS_RULES = {
+    "market_theme": {"label": "4b 市场结构", "tag": "4b", "status": "qualitative",
+                     "needs": ["market_theme"],
+                     "note": "转正前置为相关性验收脚本（无固定天数门槛）"},
+    "disagreement": {"label": "3b 分歧摘要", "tag": "3b", "status": "qualitative",
+                     "needs": ["conflict_summary"],
+                     "note": "分类摘要为观测（转正门槛见下方风控覆盖计划线）"},
+    "risk_override": {"label": "3b 风控覆盖(RiskOverridePlan)", "tag": "3b风控", "status": "active",
+                      "needs": ["risk_override", "glue_ok"], "required": 10},
+    "sell_source": {"label": "4.1 超限减仓", "tag": "4.1", "status": "frozen",
+                    "note": "去留归持仓大改 WI-P-7，裁决前不积算转正天数"},
+    "meg": {"label": "MEG 动能衰竭门", "tag": "MEG", "status": "active",
+            "needs": ["meg"], "required": 5, "clock_start": "2026-10-09"},
+    "fts": {"label": "FTS 家族见顶压制门", "tag": "FTS", "status": "active",
+            "needs": ["fts"], "required": 5, "clock_start": "2026-10-12"},
+    "fxg": {"label": "FXG 家族级上游排除(veto)", "tag": "FXG", "status": "active",
+            "needs": ["fts", "fxg"], "required": 5, "clock_start": "2026-10-12"},
+    "bear_gate": {"label": "工作流 B bear gate", "tag": "bear gate", "status": "gate",
+                  "note": "闸门生效非影子转正线；拦单留痕在生产多轮场景丢失（backlog §1.H 真·待实施），样本不可靠累计"},
+    "tradability": {"label": "GATE-1 卖出可成交性投影", "tag": "GATE-1", "status": "active",
+                    "needs": ["tradability"], "required": 10, "clock_start": "2026-10-12"},
+    "t1": {"label": "T1 候选股终审", "tag": "T1", "status": "qualitative",
+           "needs": ["t1"], "note": "转正为定性判读（无固定天数门槛），归负责人"},
+    "t1h": {"label": "T1-H 持仓审查", "tag": "T1-H", "status": "qualitative",
+            "needs": ["t1h"], "note": "转正为定性判读（无固定天数门槛），归负责人"},
+}
+
+
+def _project_trading_date(start: date, n: int) -> date:
+    """从 start 起再过 n 个「工作日」（启发式，仅跳周末、不含法定节假日）。"""
+    d = start
+    left = n
+    while left > 0:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:
+            left -= 1
+    return d
+
+
+def _build_shadow_day_index(base_dir: Path, run_date: date) -> list[dict]:
+    """一次性扫历史归档，逐日返回各影子线「有效样本 flag」（每个 JSON 只读一次）。
+
+    纯观测、全包 try/except：任一归档损坏都不应中断渲染（_read_json_quiet 已降级为 None）。
+    """
+    index: list[dict] = []
+    for day_dir in list_archive_dirs(reverse=False, base_dir=base_dir):
+        try:
+            ddate = datetime.strptime(day_dir.name, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if ddate > run_date:
+            continue
+        pdj = _read_json_quiet(day_dir / "portfolio_decision.json") or {}
+        uj = _read_json_quiet(day_dir / "unified.json") or {}
+        gj = _read_json_quiet(day_dir / GLUE_ARTIFACT) or {}
+        ftsj = _read_json_quiet(day_dir / SHADOW_FTS_ARTIFACT)
+        flags = {
+            "risk_override": pdj.get("risk_override_shadow") is not None,
+            "glue_ok": gj.get("status") == "ok",
+            "sell": pdj.get("sell_source_shadow") is not None,
+            "tradability": pdj.get("tradability_shadow") is not None,
+            "market_theme": uj.get("market_theme_shadow") is not None,
+            "conflict_summary": uj.get("conflict_summary_shadow") is not None,
+            "meg": (day_dir / SHADOW_MEG_ARTIFACT).exists(),
+            "fts": ftsj is not None,
+            "fxg": bool((ftsj or {}).get("fxg")),
+            "t1": (day_dir / SHADOW_T1_ARTIFACT).exists(),
+            "t1h": (day_dir / SHADOW_T1H_ARTIFACT).exists(),
+        }
+        index.append({"date": ddate, "flags": flags})
+    return index
+
+
+def _count_valid_shadow_days(index: list[dict], needs: list[str], clock_start: "str | None") -> int:
+    clock = datetime.strptime(clock_start, "%Y-%m-%d").date() if clock_start else None
+    return sum(
+        1 for row in index
+        if (clock is None or row["date"] >= clock)
+        and all(row["flags"].get(k) for k in needs)
+    )
+
+
+def _shadow_progress_note(spec: dict, index: "list[dict] | None") -> list[str]:
+    """生成单条影子线的「转正进度 + 到期提示」行（只报事实，不作达标判定）。
+
+    不重复各线的全名标题（只带短标签如 MEG/FTS/FXG），避免推理档按全名
+    计数时出现重复，同时保证同块内的 FTS 与 FXG 进度行可区分。
+    """
+    status = spec.get("status")
+    tag = spec.get("tag", "")
+    head = f"转正进度·{tag}" if tag else "转正进度"
+    if status == "frozen":
+        return [f"> ⏸️ {head}：已冻结——{spec.get('note', '不积算转正天数')}。", ""]
+    if status == "gate":
+        return [f"> ℹ️ {head}：{spec.get('note', '闸门生效，非影子转正线')}。", ""]
+    if index is None:
+        return []
+    count = _count_valid_shadow_days(index, spec.get("needs", []), spec.get("clock_start"))
+    if status == "qualitative":
+        extra = spec.get("note", "")
+        tail = f"（{extra}）" if extra else ""
+        return [f"> 📊 {head}：影子在产 **{count}** 个交易日{tail}。", ""]
+    # active：有 ≥N 数值门槛
+    required = spec.get("required") or 0
+    clock_txt = f"，起算 {spec['clock_start']}" if spec.get("clock_start") else ""
+    if count >= required:
+        return [
+            f"> 🟢 {head}：有效影子日 **{count} / 需 ≥{required}{clock_txt}**"
+            f"——已达最少样本天数，是否转正归负责人判读。",
+            "",
+        ]
+    gap = required - count
+    anchor = index[-1]["date"] if index else date.today()
+    proj = _project_trading_date(anchor, gap)
+    return [
+        f"> 📊 {head}：有效影子日 **{count} / 需 ≥{required}{clock_txt}**，还差 **{gap}** 个；"
+        f"按每日跑节奏自 {anchor.isoformat()} 启发式估算约 **{proj.isoformat()}** 满窗（仅跳周末、不含法定节假日，仅供参考）。",
+        "",
+    ]
+
+
 def _render_shadow_section(
     *,
     glue: "dict | None",
@@ -1125,23 +1308,56 @@ def _render_shadow_section(
     meg_shadow: "dict | None" = None,
     fts_shadow: "dict | None" = None,
     bear_gate_shadow: "dict | None" = None,
+    risk_override_shadow: "dict | None" = None,
+    tradability_shadow: "dict | None" = None,
+    base_dir: "Path | None" = None,
+    run_date: "date | None" = None,
 ) -> list[str]:
     """渲染「影子模式观测」段（reasoning.md 末尾，各影子线各一段）。
 
-    各线：4b 市场结构 / 3b 分歧摘要 / 4.1 超限减仓 / T1 候选股终审 / T1-H 持仓审查 / MEG / FTS（含 FXG）/ 工作流 B bear gate 留痕。
+    各线：4b 市场结构 / 3b 分歧摘要 / 3b 风控覆盖(RiskOverridePlan) / 4.1 超限减仓 / MEG / FTS（含 FXG）/ 工作流 B bear gate 留痕 / GATE-1 卖出可成交性 / T1 候选股终审 / T1-H 持仓审查。
     A5 语义粘合层已转正（A6），改由 Node 6 正文子块 `_render_a6_glue_formal` 承载；
     仅当 glue 降级时才在本段留一条降级观测行。code_to_name 保留签名位（已转正线不再用）。
+
+    base_dir + run_date 同时提供时，逐线追加「转正进度 + 到期提示」行（扫历史归档计数，
+    仅报事实不作达标判定）；缺省 None（如单测）则不产出进度行，输出与旧版逐字节一致。
     """
+    index = _build_shadow_day_index(base_dir, run_date) \
+        if (base_dir is not None and run_date is not None) else None
+
+    def _prog(key: str) -> list[str]:
+        if index is None:
+            return []
+        return _shadow_progress_note(SHADOW_PROGRESS_RULES[key], index)
+
     lines = [SHADOW_SECTION_TITLE, "", SHADOW_READING_BASELINE_NOTE, ""]
     lines += _render_shadow_market_theme(unified)
+    lines += _prog("market_theme")
     lines += _render_shadow_disagreement(unified)
+    lines += _prog("disagreement")
+    lines += _render_shadow_risk_override(risk_override_shadow)
+    lines += _prog("risk_override")
     lines += _render_shadow_sell_source(sell_source_shadow)
-    lines += _render_shadow_meg(meg_shadow)
-    lines += _render_shadow_fts(fts_shadow)
+    lines += _prog("sell_source")
+    _meg = _render_shadow_meg(meg_shadow)
+    lines += _meg
+    if _meg:
+        lines += _prog("meg")
+    _fts = _render_shadow_fts(fts_shadow)
+    lines += _fts
+    if _fts:
+        lines += _prog("fts")
+        if (fts_shadow or {}).get("fxg"):
+            lines += _prog("fxg")
     lines += _render_shadow_bear_gate(bear_gate_shadow)
+    lines += _prog("bear_gate")
+    lines += _render_shadow_tradability(tradability_shadow)
+    lines += _prog("tradability")
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
+    lines += _prog("t1")
     lines += _render_shadow_t1h(t1h)
+    lines += _prog("t1h")
     return lines
 
 
@@ -1222,6 +1438,10 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
     day_dir = reasoning_path.parent
     _unified_json = _read_json_quiet(day_dir / "unified.json") or {}
     _pd_json = _read_json_quiet(day_dir / "portfolio_decision.json") or {}
+    try:
+        _shadow_run_date = datetime.strptime(day_dir.name, "%Y%m%d").date()
+    except ValueError:
+        _shadow_run_date = None
     _code_to_name = {
         s.get("sector_code"): s.get("sector_name")
         for s in (_unified_json.get("confirmed_sectors") or [])
@@ -1237,6 +1457,10 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         meg_shadow=_read_json_quiet(day_dir / SHADOW_MEG_ARTIFACT),
         fts_shadow=_read_json_quiet(day_dir / SHADOW_FTS_ARTIFACT),
         bear_gate_shadow=_read_json_quiet(day_dir / SHADOW_BEAR_GATE_ARTIFACT),
+        risk_override_shadow=_pd_json.get("risk_override_shadow"),
+        tradability_shadow=_pd_json.get("tradability_shadow"),
+        base_dir=day_dir.parent,
+        run_date=_shadow_run_date,
     )
 
     reasoning_path.write_text("\n".join(lines), encoding="utf-8")

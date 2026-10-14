@@ -463,3 +463,83 @@ def test_save_shadow_records_writes_both_files(tmp_path: Path, monkeypatch) -> N
     t1h = json.loads((day_dir / "shadow_t1h.json").read_text(encoding="utf-8"))
     assert t1["executed"] is False and "无候选进入终审" in t1["reason"]
     assert t1h["executed"] is True and t1h["reviewed"] == 1
+
+
+def test_shadow_progress_lines_emitted_and_clock_filtered(tmp_path: Path) -> None:
+    """逐线「转正进度 + 到期」行：仅当传 base_dir+run_date 时产出；起算日前不计入；
+    冻结/闸门/定性线各走自己的措辞（达标判定仍归负责人，本行只报事实）。
+    """
+    import json
+    from datetime import date
+    from src.got.archive import (
+        SHADOW_MEG_ARTIFACT, SHADOW_T1_ARTIFACT, SHADOW_T1H_ARTIFACT, GLUE_ARTIFACT,
+    )
+
+    base = tmp_path / "got_daily"
+
+    def _day(tag: str, *, meg=False, t1=False, glue_ok=False, risk=False, theme=False, trad=False):
+        d = base / tag
+        d.mkdir(parents=True, exist_ok=True)
+        if meg:
+            (d / SHADOW_MEG_ARTIFACT).write_text(
+                json.dumps({"mode": "shadow", "evaluated": 1}), encoding="utf-8")
+        if t1:
+            (d / SHADOW_T1_ARTIFACT).write_text(
+                json.dumps({"line": "t1", "executed": False, "reason": "无候选"}), encoding="utf-8")
+            (d / SHADOW_T1H_ARTIFACT).write_text(
+                json.dumps({"line": "t1h", "executed": False, "reason": "无持仓"}), encoding="utf-8")
+        if glue_ok:
+            (d / GLUE_ARTIFACT).write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+        if theme:
+            (d / "unified.json").write_text(
+                json.dumps({"market_theme_shadow": {"status": "ok", "breadth": {}},
+                            "conflict_summary_shadow": {"conflict_type": "none"}}),
+                encoding="utf-8")
+        (d / "portfolio_decision.json").write_text(
+            json.dumps({"risk_override_shadow": ({"mode": "shadow", "plan": {"veto_buy": False}} if risk else None),
+                        "tradability_shadow": ({"mode": "shadow", "pending_exits": []} if trad else None),
+                        "sell_source_shadow": {"mode": "shadow"}}), encoding="utf-8")
+
+    _day("20261008", meg=True, t1=True)                        # 早于 MEG 起算 10-09 → 不计入 MEG
+    _day("20261009", meg=True, t1=True, glue_ok=True, risk=True, theme=True)
+    _day("20261010", meg=True, t1=True, glue_ok=True, risk=True, theme=True)
+    _day("20261011", meg=True, t1=True, glue_ok=True, risk=True, theme=True)
+    _day("20261012", t1=True, glue_ok=True, risk=True, theme=True, trad=True)  # GATE-1 起算日
+
+    common = dict(
+        glue=None,
+        t1={"line": "t1", "executed": False, "reason": "无候选"},
+        t1h={"line": "t1h", "executed": False, "reason": "无持仓"},
+        code_to_name={},
+        unified={"market_theme_shadow": {"status": "ok", "source": "x",
+                                        "top5_concepts": [], "breadth": {"total_count": 1}},
+                 "conflict_summary_shadow": {"conflict_type": "none", "bullish_agents": [],
+                                             "bearish_agents": [], "neutral_agents": []}},
+        sell_source_shadow={"mode": "shadow", "excess_value": 100.0},
+        meg_shadow={"mode": "shadow", "evaluated": 1},
+        fts_shadow={"mode": "shadow", "evaluated": 1, "fxg": {"mode": "veto"}},
+        bear_gate_shadow=None,
+        risk_override_shadow={"mode": "shadow", "conflict_type": "mixed_with_degraded_inputs",
+                              "decision_path_hint": "优先补数据", "plan": {"veto_buy": False,
+                              "adjustment": "downgrade_one", "target_signal": "hold", "reason": "directional_conflict"}},
+        tradability_shadow={"mode": "shadow", "pending_exits": [
+            {"symbol": "600189", "name": "泉阳泉", "reason": "limit_down", "intent": "sell", "quantity": 500}]},
+    )
+    with_prog = "\n".join(_render_shadow_section(base_dir=base, run_date=date(2026, 10, 12), **common))
+    without = "\n".join(_render_shadow_section(**common))
+
+    # 未传 base_dir/run_date → 不产出进度行（向后兼容，旧输出逐字节不变）
+    assert "转正进度" not in without
+    # 两条新线即使不传 base_dir 也应渲染内容块（标题在）
+    assert "3b 风控覆盖（RiskOverridePlan）" in without and "GATE-1 卖出可成交性投影" in without
+    assert "veto_buy=False" in without and "limit_down" in without
+    # MEG 起算 10-09，1008 那日被过滤 → 有 meg 文件的 4 天只数 3（证明 clock 过滤生效）
+    assert "转正进度·MEG" in with_prog
+    assert "有效影子日 **3 / 需 ≥5" in with_prog
+    # 3b 风控覆盖 ≥10（需 risk_override+glue_ok）/ GATE-1 起算 10-12
+    assert "转正进度·3b风控" in with_prog and "有效影子日 **4 / 需 ≥10" in with_prog
+    assert "转正进度·GATE-1" in with_prog and "起算 2026-10-12" in with_prog
+    # 4.1 冻结 / bear gate 非影子转正线 / 定性线走各自措辞
+    assert "转正进度·4.1" in with_prog and "已冻结" in with_prog
+    assert "转正进度·bear gate" in with_prog
+    assert "转正进度·T1：" in with_prog and "影子在产" in with_prog
