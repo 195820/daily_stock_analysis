@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 本地工作（GOT 及仓库自维护，非上游发布内容）
 
+- [feat(got/archive)] **影子段逐线「转正进度 + 到期提示」+ 补渲染 3b 风控覆盖 / GATE-1（2026-10-14）**：
+  **动机**：`reasoning.md`「🧪 影子模式观测」段此前只报当日读数、无累计进度；且 `verification.md` 在册且有转正判据的 `risk_override_shadow`（≥10 有效样本日）、`tradability_shadow`（GATE-1）两条线从未进正文（§8 #10/#13「影子线必登判据但无人渲染」同谱系）。**改动**：① 逐线追加进度行（`SHADOW_PROGRESS_RULES` + `_build_shadow_day_index` 一次扫归档得各线「有效样本日」计数），按判据分 active(≥N 数值天数) / qualitative(无固定门槛) / frozen(已冻结不积算) / gate(闸门生效非影子线) 四种措辞，到期用工作日启发式估算并显式标「仅供参考」，只报事实不作达标判定（归负责人）；进度行用短标签（MEG/FTS/FXG/3b风控/GATE-1…）不带全名，避免推理档按线名计数重复。② 新增 `_render_shadow_risk_override`（RiskOverridePlan：mode/冲突分类/decision_path_hint/veto_buy/调整计划）与 `_render_shadow_tradability`（GATE-1：mode + 被拦截/待顺延卖单，空仓无卖单如实标 0 属正常≠被证伪）；≥10 判据从「3b 分歧摘要」归位到其真正对应的「3b 风控覆盖」，分歧摘要改定性观测。**向后兼容**：不传 `base_dir/run_date`（如单测）不产出进度行、旧输出逐字节不变；纯观测、不触决策路径，`_read_json_quiet` 已对半截损坏归档降级不中断。**测试**：`test_shadow_progress_lines_emitted_and_clock_filtered`（新块内容/进度/无产物回退 + MEG 起算日过滤），`test_shadow_reasoning` 18 绿。commit `2c5052f`。
+
 - [docs(got/verification)] **M1–M6 解散整体捆绑 + M2/M4-a 随 C-P13 休眠（2026-10-14，负责人裁决）**：
   **背景**：glue 已于 2026-09-17 A6 转正在线，六条转正红线当初「影子期能否转正」的捆绑前提已消失；且 C-P13 接地管线 2026-09-28 阶段2 收口已因 realized 收益率证伪转入休眠、无既定解冻。**裁决（分流，非一刀切休眠）**：① **M3** 已结案（10-06）→ 转日常预警；② **M1 / M5 / M6** → 降为「已上线层水位观测」继续（`verify_glue_metrics.py` 每日零成本读数、不产 PASS/FAIL、不门禁），红线重标与收口时机归负责人；③ **M2 + M4-a** → 随 C-P13 一并休眠——两者修正/重标定的结构解都挂在接地管线（M2 的 variant_b 只是把「覆盖不足」转嫁成 M3「低置信编造」，不算独立杠杆；M4-a 红线 0.6 的 τ 已被收益率口径证伪关闭），解冻绑定 `archive/cp13_phase2_closeout_20260928.md` §6，休眠期读数留存但不推进达标、不作转正依据。**纯文档登记，零代码/零开关改动**：`docs/got/verification.md` §3 加「10-14 裁决」块并改 M1/M2/M4-a 三行状态列；`docs/got/backlog.md` OPEN-C6 追加裁决尾注。**未动**：R-C3 锚点复算口径、`verify_glue_metrics.py` 计算逻辑（本就对 M1/M6 不判 PASS/FAIL）。
 
