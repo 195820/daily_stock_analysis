@@ -352,6 +352,8 @@ T1 与 T1-H 在 2026-09-15 开始各自产出独立的影子产物文件，与 A
 - **历史归因更正（2026-10-14 复核）**：10-12「上午命中被下午轮抹掉」系误诊——当日 09:49 run 为单次调用，10:02 命中 1 单出自**基线实例**（独立实例、永不落盘），10:06 真实轮 0 命中 ⇒ 无产物；「每实例内多轮覆盖」在生产拓扑（每实例单次调用）下不存在，同日重跑覆盖仅在「后轮也有命中」时发生。
 - 单测：`tests/test_bear_entry_gate.py` 新增 5 例（tombstone 组装/命中携带/双 regime 口径/stale 覆盖落盘 + 基线子块 2 例）；`tests/test_fxg_veto_baseline_pair.py` 集成冒烟补 `bear_gate` 子块端到端断言。conda 与 .venv 双 101 passed（四套：bear_entry_gate/fxg_veto_baseline_pair/family_topping_suppression/shadow_reasoning）。
 
+**〔2026-10-14 归档目录日期口径贯通（backlog §7 #12 修法①·实例态变体）〕**：`_save_shadow_records` / `_save_candidate_pool_snapshot` 两写入点的 `day_dir` 改读 `run(as_of=...)` 贯通的 `self._as_of`（兜底 `date.today()`），`candidate_pool.json` 的 `record["date"]` 同步——归档目录跟业务日走，带外跑历史日/重放 harness 不再错落墙钟日目录（20261010 孤儿归档根因闭环）；生产当日 `as_of==today()` 零行为变化，缺省兜底保未跑 `run()` 的直调（基线实例）逐字节不变。测试：`test_fxg_veto_baseline_pair.py` 新增 `TestSaveSnapshotAsOf` 三例；双环境 104 passed。
+
 详见 `tests/test_shadow_reasoning.py` 的 11 个测试用例。
 
 ### GATE-1 tradability 影子留痕（2026-10-11 起）

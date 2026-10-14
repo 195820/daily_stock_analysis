@@ -213,5 +213,71 @@ class TestFxgBaselineIntegrationSmoke(unittest.IsolatedAsyncioTestCase):
                 os.chdir(old)
 
 
+class TestSaveSnapshotAsOf(unittest.TestCase):
+    """backlog §7 #12 修法①：候选池快照 + 影子落盘的归档业务日贯通。
+
+    run(as_of=...) 写 self._as_of；两个 _save_* 直读（_score_candidates 内部调用，
+    不加参波及桩签名），None 兜底 date.today()＝旧行为逐字节不变。
+    复现 20261010 孤儿归档根因的修复面：带外跑历史日不再错落墙钟日目录。
+    """
+
+    def test_default_none_falls_back_to_today(self):
+        """_as_of=None（未跑 run，如基线实例直调）→ 兜底 date.today()，不炸。"""
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode(use_mock=True)
+        self.assertIsNone(node._as_of)
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                node._save_candidate_pool_snapshot([], [], {})
+                p = Path("data/got_daily") / date.today().strftime("%Y%m%d") / "candidate_pool.json"
+                self.assertTrue(p.exists())
+                self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["date"],
+                                 date.today().strftime("%Y%m%d"))
+            finally:
+                os.chdir(old)
+
+    def test_explicit_as_of_writes_business_day(self):
+        """显式 _as_of=历史日 → 快照落历史日目录、record.date=业务日、墙钟日目录不产。"""
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode(use_mock=True)
+        node._as_of = date(2026, 10, 10)
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                node._save_candidate_pool_snapshot([], [], {})
+                hist = Path("data/got_daily/20261010/candidate_pool.json")
+                self.assertTrue(hist.exists())
+                rec = json.loads(hist.read_text(encoding="utf-8"))
+                self.assertEqual(rec["date"], "20261010")
+                self.assertFalse((Path("data/got_daily") /
+                                  date.today().strftime("%Y%m%d") / "candidate_pool.json").exists())
+            finally:
+                os.chdir(old)
+
+    def test_shadow_records_follow_as_of(self):
+        """影子五件套同面：_as_of=历史日 → shadow_bear_gate tombstone 落历史日目录。"""
+        from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+        node = PortfolioDecisionNode(use_mock=True)
+        node._as_of = date(2026, 10, 10)
+        node._bear_gate_shadow = {"line": "bear_gate", "executed": False,
+                                  "node1_regime": "transition", "regime": "transition",
+                                  "dip_mode": "veto", "hits": 0, "flagged_stocks": []}
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                node._save_shadow_records()
+                hist = Path("data/got_daily/20261010/shadow_bear_gate.json")
+                self.assertTrue(hist.exists())
+                self.assertEqual(json.loads(hist.read_text(encoding="utf-8"))["hits"], 0)
+                self.assertFalse((Path("data/got_daily") /
+                                  date.today().strftime("%Y%m%d") / "shadow_bear_gate.json").exists())
+            finally:
+                os.chdir(old)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -75,6 +75,9 @@ class PortfolioDecisionNode:
         # 工作流 B：bear 日收手闸门拦单逐单留痕（回放档 shadow_bear_gate.json，仅命中时非空；
         # 缺省空 list → 不产文件，逐字节不变）。闸门本身缺省 on（GOT_BEAR_ENTRY_GATE），留痕非影子开关。
         self._bear_gate_shadow: list = []
+        # backlog §7 #12 修法①：归档业务日。run(as_of=...) 写入；两个 _save_* 写入点直读
+        # （_score_candidates 内部调用，不加参波及桩签名），None 兜底 date.today()＝旧行为。
+        self._as_of: Optional[date] = None
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
@@ -110,6 +113,9 @@ class PortfolioDecisionNode:
         """
         logger.info("[Phase 2] 开始统一决策")
         _as_of = as_of or date.today()
+        # backlog §7 #12 修法①：影子五件套 + 候选池快照两个 _save_* 写入点统一读此值，
+        # 归档目录跟业务日走（重放/带外跑历史日不再错落墙钟日目录）。
+        self._as_of = _as_of
 
         # 获取当前持仓
         portfolio = self._get_portfolio_snapshot()
@@ -3485,8 +3491,9 @@ class PortfolioDecisionNode:
     def _save_shadow_records(self) -> None:
         """把 T1 / T1-H 的影子观测记录落到当日归档目录，供 archive.py 渲染进 reasoning.md。
 
-        目录基准取「运行日期」，与 aggregator._save_glue_result 一致；
-        Phase 2 只在生产运行（--got-replay 不经过 Phase 2），故 today() 可靠。
+        目录基准取 run(as_of=...) 的业务日（backlog §7 #12 修法①），与 Phase 1 归档
+        （orchestrator target_date）同源；缺省（未跑 run 的直调）兜底 date.today()，
+        生产当日两者相等，零行为变化。
         """
         meg = dict(self._meg_shadow) if self._meg_shadow else None
         if meg:
@@ -3504,7 +3511,7 @@ class PortfolioDecisionNode:
         if not (self._shadow_t1 or self._shadow_t1h or meg or fts
                 or isinstance(self._bear_gate_shadow, dict)):
             return
-        day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+        day_dir = Path("data/got_daily") / (self._as_of or date.today()).strftime("%Y%m%d")
         try:
             day_dir.mkdir(parents=True, exist_ok=True)
             for filename, record in (
@@ -3561,12 +3568,12 @@ class PortfolioDecisionNode:
 
         record = {
             "line": "candidate_pool",
-            "date": date.today().strftime("%Y%m%d"),
+            "date": (self._as_of or date.today()).strftime("%Y%m%d"),
             "universe_size": len(universe or []),
             "finalist_size": len(finalists or []),
             "universe": [_row(s) for s in (universe or [])],
         }
-        day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+        day_dir = Path("data/got_daily") / (self._as_of or date.today()).strftime("%Y%m%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         self._atomic_write_json(day_dir / "candidate_pool.json", record)
 
