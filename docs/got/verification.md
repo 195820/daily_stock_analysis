@@ -1,6 +1,23 @@
 # GOT 待验证 / 影子期清单
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
+---
+
+## ‼️ 2026-10-13 补登（埋伏道静默失效 Bug 修复 — 重放读数与可观测性接线）
+
+**背景**：当日全流程实跑确认 5 个埋伏板块（影视音像 83 / 黄金概念 55 / 黄金 55 / 有色 45 / 小金属 40）却 0 只埋伏票进终选。定性为**决策 Bug 而非闸门过滤**：P5 块变量遮蔽（`ambush_candidates` 被主线池重过滤覆盖为 `[]`）致埋伏道四闸门整段未执行——修复前埋伏道从未被调用，故**本条不设影子判据**（修复即转正对象），登记修复后可观测性与重放读数供复核。
+
+| 项 | 内容 |
+|---|---|
+| 根因与修复 | P5 块遮蔽修复（局部 `p5_ambush`）+ 误导日志双分支 + 闸门存活链 INFO 行 + `funnel_trace` 扁平合并；详见 [`CHANGELOG.md`](../CHANGELOG.md) [Unreleased] 2026-10-13 fix 条目 |
+| 回归锚点 | `tests/test_ambush_lane_split.py` 14 绿（含 2 新例：全链路断言 `_run_ambush_lane` 恰调 1 次；失败注入验证 failing-before/passing-after 闭环） |
+| **重放读数（归档上下文+真实闸门函数）** | 50 票 → A1 50 过（`g_a1_pass=40 soft_pass=10 flow_negative=0`）→ A2 30 过（`no_catalyst=20`）→ A3 30 过 → A4 Top3=黄金/有色/小金属。逐板块：影视音像 **no_catalyst**（唯一事件 event_date=2026-10-13=运行日，`0 < days_to_event` 排除同日）；黄金概念 **no_catalyst**（事件只挂「黄金」「有色金属」，无别名变体）；黄金/有色/小金属 pass（conf 0.8/0.8/0.7）→ 三板块本应各出 TopK 候选 |
+| 重放局限 | ① 逐票 change_pct/volume_ratio 归档无 → G-A3 用中性值（knife 判定不敏感）；② **G-A2 位置安全带是生产级 schema 缺口，非重放产物**：`SectorDetail`（`schemas.py:267+`）无 `klines` 字段且 `archive.py` 全量 model_dump ⇒ 归档 `sector.json` ambush 条目永不带 K 线，而 `_load_got_context` 消费的正是这些归档 JSON ⇒ `_build_sector_kline_lookup` 生产恒空缓存 → `position_unsafe` 分支**生产也恒 soft-pass**（已登 backlog 待接线，见 backlog「埋伏道 G-A2 位置安全带 K 线接线」） |
+| 新可观测性 | 下一实跑起：日志 `埋伏道闸门: in=… G-A1→… G-A2→… G-A3→… G-A4→… (soft= flow_neg= dde_deg= no_cat= low_conf= pos_unsafe= knife= err=)`（合并块后单时点扁平汇入 `funnel_trace`，含合并块写入的 `cross_lane_collision`/`lane_overflow_n`）；`meta.json.funnel_stats.round_survival_counts` 直接含 `lane_in/g_a1_pass/…/cross_lane_collision/lane_overflow_n` 扁平键（嵌套 `ambush_lane_trace` 键不再出现；trace 全量仍独立落 `portfolio_decision.json.ambush_lane_trace`） |
+| 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`；② `candidate_pool.json` 写入器 `_save_candidate_pool_snapshot` 键错位，落盘全空壳 |
+
+---
+
 > **性质**：本清单只登记**待验证项、其判据、实测值与出处**，**不落达标判定**。
 > 影子期 M1–M6 等转正红线的**合格与否由项目负责人判定**；本清单的作用是让判定所需的事实可查、可复算。
 >

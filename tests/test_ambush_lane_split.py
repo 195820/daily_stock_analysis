@@ -139,6 +139,67 @@ class TestAmbushLaneSplit(unittest.TestCase):
             # 断言 lane_shadow 含模式信息
             self.assertIn("mode", lane_shadow)
 
+    def test_p5_shadowing_repro_full_funnel(self):
+        """回归：P5 块变量遮蔽致埋伏道永不执行（2026-10-13 生产事故）。
+
+        修复前：P5 块 `ambush_candidates = [c for c in candidates if ...]`（candidates
+        已是纯主线池）→ 覆盖拆分出的 50 只埋伏票 → 埋伏道 if 恒假 → 闸门/shadow/trace
+        全空且零日志。修复后：_filter_got_finalists 全链路必须调用 _run_ambush_lane。
+        """
+        s = _screener()
+        universe = [
+            _ticket("600001", "主线A", sector_type="mainline"),
+            _ticket("600002", "主线B", sector_type="mainline"),
+            _ticket("600003", "主线C", sector_type="mainline"),
+            _ticket("600004", "埋伏D", sector_type="ambush"),
+            _ticket("600005", "埋伏E", sector_type="ambush"),
+        ]
+        got_context = {
+            "sector_context": {"exhausted_mainline": [], "ambush": []},
+            "capital_context": _capital_ctx(),
+            "news_context": _news_ctx(),
+        }
+
+        with patch.dict(os.environ, {"GOT_AMBUSH_SPLIT_ENABLED": "1"}):
+            with patch("data_provider.base.DataFetcherManager") as mock_fm, \
+                 patch.object(s, "_run_ambush_lane", wraps=s._run_ambush_lane) as m_lane, \
+                 patch.object(s, "_get_stock_name", return_value="票"), \
+                 patch.object(s, "_build_backtest_snapshot", return_value={}):
+                try:
+                    s._filter_got_finalists(universe, got_context, top_n=3)
+                except Exception:
+                    pass  # 评分/风控 helper 对 mock 环境的兼容由埋伏道断言兜底
+
+                # 埋伏道必须被真实调用（bug 下恒为 0 次）
+                self.assertEqual(m_lane.call_count, 1)
+                args = m_lane.call_args[0]
+                self.assertEqual(len(args[0]), 2)  # 2 只埋伏票进闸门
+                self.assertTrue(all(c["sector_type"] == "ambush" for c in args[0]))
+                # trace/shadow 必须非空壳
+                self.assertTrue(s._ambush_lane_trace.get("lane_in") == 2)
+                self.assertTrue(s._ambush_lane_shadow)
+
+    def test_p5_skip_log_reason_ambush_empty(self):
+        """P5 跳过日志必须区分「置信度不足」与「主线池无 ambush 票」。"""
+        s = _screener()
+        universe = [_ticket("600001", "主线A", sector_type="mainline")]
+        got_context = {
+            "sector_context": {"exhausted_mainline": [], "ambush": []},
+            "capital_context": _capital_ctx(),
+            "news_context": _news_ctx(),
+        }
+        with patch.dict(os.environ, {"GOT_AMBUSH_SPLIT_ENABLED": "1"}):
+            with patch("data_provider.base.DataFetcherManager") as mock_fm, \
+                 patch.object(s, "_run_ambush_lane", wraps=s._run_ambush_lane) as m_lane, \
+                 patch.object(s, "_get_stock_name", return_value="票"), \
+                 patch.object(s, "_build_backtest_snapshot", return_value={}):
+                try:
+                    s._filter_got_finalists(universe, got_context, top_n=3)
+                except Exception:
+                    pass
+                # 单道路径 ENABLED 拆分后无 ambush 票 → 埋伏道不调用（不回归遮蔽 bug）
+                self.assertEqual(m_lane.call_count, 0)
+
     def test_g_a1_gate_mapping(self):
         """G-A1：flow>0 → pass; sector miss → soft_pass; flow<0 → fail"""
         s = _screener()
@@ -202,7 +263,7 @@ class TestAmbushLaneSplit(unittest.TestCase):
             _ticket("600004", "未知板块"),  # 无事件 → no_catalyst
         ]
         
-        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline)
+        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
         
         # 断言三分桶
         self.assertIn("g_a2_no_catalyst", trace)
@@ -228,7 +289,7 @@ class TestAmbushLaneSplit(unittest.TestCase):
         sector_kline = _sector_kline_lookup({"黄金概念": (10.0, 10.3, 10.0)})
         candidates = [_ticket("600001", "黄金概念")]
         
-        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline)
+        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
         
         # 断言：两个事件都不在窗口内 → no_catalyst
         self.assertIn("g_a2_no_catalyst", trace)

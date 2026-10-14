@@ -1683,6 +1683,7 @@ class StockScreenerPipeline:
         confidence_gate: float = None,
         safety_high: float = None,
         safety_low: float = None,
+        today=None,
     ) -> Tuple[List[Dict], dict]:
         """G-A2: 催化剂闸门
 
@@ -1712,7 +1713,7 @@ class StockScreenerPipeline:
 
         trace = {"g_a2_no_catalyst": 0, "g_a2_low_confidence": 0, "g_a2_position_unsafe": 0}
         passed = []
-        today = date_cls.today()
+        today = today or date_cls.today()
 
         # 提取催化剂事件
         calendar_data = news_ctx.get("catalyst_calendar")
@@ -2130,26 +2131,34 @@ class StockScreenerPipeline:
             (d.get("confidence", 0) for d in catalyst_details.values()),
             default=0.0,
         )
-        ambush_candidates = [c for c in candidates if c.get("sector_type") == "ambush"]
-        if catalyst_scores and max_catalyst_confidence >= CATALYST_CONFIDENCE_GATE and ambush_candidates:
+        # 注意：此处不得复用外层 ambush_candidates（拆分后的埋伏票，供 L2205 埋伏道消费）；
+        # 2026-10-13 生产事故：同名变量遮蔽导致埋伏道永不执行（拆分后主线池无 ambush 票 → 恒空）。
+        p5_ambush = [c for c in candidates if c.get("sector_type") == "ambush"]
+        if catalyst_scores and max_catalyst_confidence >= CATALYST_CONFIDENCE_GATE and p5_ambush:
             # 对 ambush 候选按催化剂关联度重排
             for c in candidates:
                 c["catalyst_relevance_score"] = catalyst_scores.get(c["code"], 0)
             # 仅重排 ambush 候选（主线候选保持技术排序）
-            ambush_candidates.sort(
+            p5_ambush.sort(
                 key=lambda x: x.get("catalyst_relevance_score", 0), reverse=True
             )
             # 重建候选列表：主线保持原序 + ambush 按催化剂重排
             mainline_reordered = [c for c in candidates if c.get("sector_type") != "ambush"]
-            candidates = mainline_reordered + ambush_candidates
+            candidates = mainline_reordered + p5_ambush
             logger.info(
-                f"P5催化剂重排: {len(ambush_candidates)} 只 ambush 候选重排 "
+                f"P5催化剂重排: {len(p5_ambush)} 只 ambush 候选重排 "
                 f"(max_confidence={max_catalyst_confidence:.2f})"
             )
         elif catalyst_scores:
-            logger.info(
-                f"P5催化剂重排跳过: max_confidence={max_catalyst_confidence:.2f} < {CATALYST_CONFIDENCE_GATE}"
-            )
+            if p5_ambush:
+                logger.info(
+                    f"P5催化剂重排跳过: max_confidence={max_catalyst_confidence:.2f} "
+                    f"< {CATALYST_CONFIDENCE_GATE}"
+                )
+            else:
+                logger.info(
+                    "P5催化剂重排跳过: 主线池无 ambush 候选（埋伏道拆分已隔离，归埋伏道四闸门）"
+                )
 
         # 轮次 5: 板块分散 Top N（每个板块最多 1 只）
         sector_count = {}
@@ -2207,11 +2216,34 @@ class StockScreenerPipeline:
                 lane_finalists, lane_shadow, lane_trace = self._run_ambush_lane(
                     ambush_candidates, got_context, fetcher_manager
                 )
-                funnel_trace["ambush_lane_trace"] = lane_trace
+                # 闸门存活链 INFO 行（2026-10-13 可观测性修复：拆分→闸门→合并断链补齐）
+                # 存活数 = 上一闸门出口 − 本闸门损失；fail-open 时 lane_error=1（见 shadow note）
+                _a1_out = lane_trace.get("g_a1_pass", 0) + lane_trace.get("g_a1_soft_pass", 0)
+                _a2_out = _a1_out - lane_trace.get("g_a2_no_catalyst", 0) \
+                    - lane_trace.get("g_a2_low_confidence", 0) - lane_trace.get("g_a2_position_unsafe", 0)
+                _a3_out = _a2_out - lane_trace.get("g_a3_knife", 0)
+                logger.info(
+                    "埋伏道闸门: in={lane_in} G-A1→{a1} G-A2→{a2} G-A3→{a3} G-A4→{a4} "
+                    "(soft={sp} flow_neg={fn} dde_deg={dd} no_cat={nc} low_conf={lc} "
+                    "pos_unsafe={pu} knife={kn} err={err})".format(
+                        lane_in=lane_trace.get("lane_in", 0),
+                        a1=_a1_out,
+                        a2=_a2_out,
+                        a3=_a3_out,
+                        a4=lane_trace.get("g_a4_selected", 0),
+                        sp=lane_trace.get("g_a1_soft_pass", 0),
+                        fn=lane_trace.get("g_a1_flow_negative", 0),
+                        dd=lane_trace.get("g_a1_dde_degraded", 0),
+                        nc=lane_trace.get("g_a2_no_catalyst", 0),
+                        lc=lane_trace.get("g_a2_low_confidence", 0),
+                        pu=lane_trace.get("g_a2_position_unsafe", 0),
+                        kn=lane_trace.get("g_a3_knife", 0),
+                        err=lane_trace.get("lane_error", 0),
+                    )
+                )
             except Exception as e:
                 logger.warning(f"埋伏道执行失败，降级为空: {e}")
                 lane_trace = {"lane_error": str(e)}
-                funnel_trace["ambush_lane_trace"] = lane_trace
 
         # 合并埋伏道结果（D4 主线优先）
         if lane_finalists:
@@ -2233,6 +2265,13 @@ class StockScreenerPipeline:
                 logger.info(f"埋伏道: {cross_lane_collision} 只撞票归主线")
             if lane_overflow_n > 0:
                 logger.info(f"埋伏道: {lane_overflow_n} 只溢出（不进 top_n）")
+
+        # funnel_trace 扁平汇入（单时点：合并块写入 cross_lane_collision/lane_overflow_n 之后，
+        # 否则 int 按值拷贝看不到后写）。嵌套 `ambush_lane_trace` 键不再出现；
+        # `g_a*` 等扁平键经 `_last_funnel_trace` → `_compute_funnel_stats` 整拷贝
+        # → `meta.json.funnel_stats.round_survival_counts`。lane_error(str) 在异常分支：
+        # funnel_stats 为 Optional[dict] 无内层类型校验，保留可观测；成功分支恒 int。
+        funnel_trace.update(lane_trace)
 
         # 设置 shadow 属性供落盘使用（仅在埋伏道启用时设置，否则保持原值）
         if GOT_AMBUSH_SPLIT_ENABLED:
