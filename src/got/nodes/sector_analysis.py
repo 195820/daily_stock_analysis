@@ -1364,6 +1364,11 @@ class SectorAnalysisNode:
         # MEG 层1信号：动能衰竭三态（§7.3，零新增数据——复用 prev_trend.momentum_trajectory）
         momentum_state, rs_mom_decay_2d = self._compute_momentum_state(rrg, prev_trend)
 
+        # G-A2 位置安全带预计算（backlog §1 row 52 修法③）：close/high20/ma20 三标量
+        # 注入 indicators，随 SectorDetail 落归档——选股侧 _build_sector_kline_lookup
+        # 改读此处，不再依赖 SectorDetail.klines（schema 无该字段，归档永缺）。
+        indicators.update(self._compute_position_scalars(df))
+
         return SectorDetail(
             code=sector_info["code"],
             name=sector_info["name"],
@@ -1389,6 +1394,38 @@ class SectorAnalysisNode:
     # =================================================================
     # 5 维强度评分
     # =================================================================
+
+    @staticmethod
+    def _compute_position_scalars(df: pd.DataFrame) -> dict[str, float]:
+        """G-A2 位置安全带三标量（backlog §1 row 52 修法③）。
+
+        从板块 K 线预计算 close/high20/ma20，注入 indicators 随 SectorDetail
+        落归档；选股侧 `_build_sector_kline_lookup` 读此三键重建安全带判定。
+        口径对齐 PLAN_v2 §166 重放校准：20 日高取 **high 列**（旧 lookup 同口径），
+        无 high 列或全非正 → 回退 close 列；MA20 用收盘算（§166 同文）。
+        短史（<20 根）或 high20 非正 → 空 dict，下游保持 soft-pass 语义。
+
+        Returns:
+            {"pos_close": f, "pos_high20": f, "pos_ma20": f}（round 4 位）
+        """
+        close = df["close"]
+        if len(close) < 20:
+            return {}
+        high20 = 0.0
+        if "high" in df.columns:
+            high20 = float(df["high"].iloc[-20:].max())
+        if pd.isna(high20) or high20 <= 0:
+            high20 = float(close.iloc[-20:].max())
+        if pd.isna(high20) or high20 <= 0:
+            return {}
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        if pd.isna(ma20):
+            return {}
+        return {
+            "pos_close": round(float(close.iloc[-1]), 4),
+            "pos_high20": round(high20, 4),
+            "pos_ma20": round(ma20, 4),
+        }
 
     @staticmethod
     def _klines_to_df(klines: list[dict]) -> Optional[pd.DataFrame]:

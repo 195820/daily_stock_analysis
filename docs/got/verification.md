@@ -3,6 +3,19 @@
 
 ---
 
+## ‼️ 2026-10-14 补登（G-A2 位置安全带接线 — backlog §1 row 52 修法③）
+
+| 项 | 内容 |
+|---|---|
+| 根因 | `_build_sector_kline_lookup`（`stock_screener.py:1902`）只从 `sector_context.ambush[].klines` 建缓存；`SectorDetail`（`schemas.py:267`）无 `klines` 字段 → Node 2 `_analyze_single_sector` 组装时 raw dict 里的 klines 被 Pydantic 静默丢弃 → 归档 ambush 条目永不携带（1009/1012/1013 各 16 条、1014 10 条实测 `any klines = False`）→ 生产 lookup 恒 `None` → `g_a2_position_unsafe` 永不可能非零，安全带因子 soft-pass（闸门退化双因子） |
+| 修法裁决 | 三选一：①选股侧按 `code` 实时拉（选股路径加 I/O）②`SectorDetail` 加 `klines` 字段（归档体积大增、与另一会话 schemas.py 未提交改动冲突）**③Node 2 预计算三标量（拍板采纳）**——close/high20/ma20 注入 `indicators`（自由 dict，schema 零改动），判据留在闸门（trace/转正判据口径不破），数据归源头（不重复拉、不整包搬运）。口径：high20 取 **high 列**（对齐 PLAN_v2 §166 重放校准「收盘 ≤ 20 日高×1.03」与仓库惯例 `_detect_launch_signal` 突破判据，J1-J4 胜率结论直接迁移；high 缺失/非正回退 close 列），MA20 用收盘算（§166 同文） |
+| 改动 | Node 2：新增静态助手 `_compute_position_scalars(df)`（`sector_analysis.py:1399`，≥20 根才产出 `{pos_close, pos_high20, pos_ma20}`，round 4 位；短史/ma20 NaN/high20 非正 → 空 dict 保 soft-pass），`_analyze_single_sector` 在 `SectorDetail` 组装前 `indicators.update(...)`（:1370）。选股侧：`_build_sector_kline_lookup` 改读 `indicators` 三键建缓存（:1919-1924），klines 旧路径废弃删除 |
+| 生效边界 | 修复落码后**首个生产实跑归档**起 ambush 条目才携带三标量——新归档前生产仍是 soft-pass；旧归档条目（无三键）lookup 返回 None 走 soft-pass，回放兼容。生效判据：新归档 `sector.json` ambush 条目 `indicators` 含 `pos_close/pos_high20/pos_ma20` 三键，且实跑日志 `pos_unsafe=` 出现非零值 |
+| 测试 | `tests/test_ambush_lane_split.py` 新增 `TestGA2PositionScalars` 6 例（助手满史 high 列口径/无 high 列回退 close/短史空 dict、lookup 读 indicators、端到端 position_unsafe=1 真拦截〔failing-before 场景：生产归档形态恒 soft-pass〕、缺三标量 soft-pass 保留）；`test_sector_state_machine`/`test_wave_days`/`test_meg_momentum_exhaustion_gate`/`test_family_topping_suppression` 回归。.venv 与 conda 双 152 passed（五套：ambush_lane_split 20 / sector_state_machine / wave_days / meg_momentum_exhaustion_gate / family_topping_suppression） |
+| 归因说明 | 抓取层无故障——`_fetch_sector_data` 90d K 线拉取/重试/`data_quality.sector_klines` 记账全正常，K 线在 Node 2 内部已充分消费（indicators/RRG/生命周期全源于它）；断点仅是 `SectorDetail` 映射出口缺失 |
+
+---
+
 ## ‼️ 2026-10-13 补登（埋伏道静默失效 Bug 修复 — 重放读数与可观测性接线）
 
 **背景**：当日全流程实跑确认 5 个埋伏板块（影视音像 83 / 黄金概念 55 / 黄金 55 / 有色 45 / 小金属 40）却 0 只埋伏票进终选。定性为**决策 Bug 而非闸门过滤**：P5 块变量遮蔽（`ambush_candidates` 被主线池重过滤覆盖为 `[]`）致埋伏道四闸门整段未执行——修复前埋伏道从未被调用，故**本条不设影子判据**（修复即转正对象），登记修复后可观测性与重放读数供复核。
@@ -12,7 +25,7 @@
 | 根因与修复 | P5 块遮蔽修复（局部 `p5_ambush`）+ 误导日志双分支 + 闸门存活链 INFO 行 + `funnel_trace` 扁平合并；详见 [`CHANGELOG.md`](../CHANGELOG.md) [Unreleased] 2026-10-13 fix 条目 |
 | 回归锚点 | `tests/test_ambush_lane_split.py` 14 绿（含 2 新例：全链路断言 `_run_ambush_lane` 恰调 1 次；失败注入验证 failing-before/passing-after 闭环） |
 | **重放读数（归档上下文+真实闸门函数）** | 50 票 → A1 50 过（`g_a1_pass=40 soft_pass=10 flow_negative=0`）→ A2 30 过（`no_catalyst=20`）→ A3 30 过 → A4 Top3=黄金/有色/小金属。逐板块：影视音像 **no_catalyst**（唯一事件 event_date=2026-10-13=运行日，`0 < days_to_event` 排除同日）；黄金概念 **no_catalyst**（事件只挂「黄金」「有色金属」，无别名变体）；黄金/有色/小金属 pass（conf 0.8/0.8/0.7）→ 三板块本应各出 TopK 候选 |
-| 重放局限 | ① 逐票 change_pct/volume_ratio 归档无 → G-A3 用中性值（knife 判定不敏感）；② **G-A2 位置安全带是生产级 schema 缺口，非重放产物**：`SectorDetail`（`schemas.py:267+`）无 `klines` 字段且 `archive.py` 全量 model_dump ⇒ 归档 `sector.json` ambush 条目永不带 K 线，而 `_load_got_context` 消费的正是这些归档 JSON ⇒ `_build_sector_kline_lookup` 生产恒空缓存 → `position_unsafe` 分支**生产也恒 soft-pass**（已登 backlog 待接线，见 backlog「埋伏道 G-A2 位置安全带 K 线接线」） |
+| 重放局限 | ① 逐票 change_pct/volume_ratio 归档无 → G-A3 用中性值（knife 判定不敏感）；② **G-A2 位置安全带是生产级 schema 缺口，非重放产物**：`SectorDetail`（`schemas.py:267+`）无 `klines` 字段且 `archive.py` 全量 model_dump ⇒ 归档 `sector.json` ambush 条目永不带 K 线，而 `_load_got_context` 消费的正是这些归档 JSON ⇒ `_build_sector_kline_lookup` 生产恒空缓存 → `position_unsafe` 分支**生产也恒 soft-pass**（~~已登 backlog 待接线~~ → **2026-10-14 修法③接线完成，见「2026-10-14 补登」节**） |
 | 新可观测性 | 下一实跑起：日志 `埋伏道闸门: in=… G-A1→… G-A2→… G-A3→… G-A4→… (soft= flow_neg= dde_deg= no_cat= low_conf= pos_unsafe= knife= err=)`（合并块后单时点扁平汇入 `funnel_trace`，含合并块写入的 `cross_lane_collision`/`lane_overflow_n`）；`meta.json.funnel_stats.round_survival_counts` 直接含 `lane_in/g_a1_pass/…/cross_lane_collision/lane_overflow_n` 扁平键（嵌套 `ambush_lane_trace` 键不再出现；trace 全量仍独立落 `portfolio_decision.json.ambush_lane_trace`） |
 | 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`。〔② candidate_pool.json 写入器键错位已不属于本节：2026-10-14 修复拍板（dict 直修·窄契约），迁 backlog §7 #13〕 |
 

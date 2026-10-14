@@ -1900,28 +1900,28 @@ class StockScreenerPipeline:
         return top_candidates, trace
 
     def _build_sector_kline_lookup(self, got_context: dict):
-        """构建板块 K 线查找函数（供 G-A2 位置安全带使用）
+        """构建板块位置查找函数（供 G-A2 位置安全带使用）
+
+        数据源：Node 2 `_analyze_single_sector` 预计算的 indicators 三标量
+        （pos_close/pos_high20/pos_ma20，backlog §1 row 52 修法③）。
+        旧实现读 ambush[].klines——SectorDetail 无 klines 字段，归档永不携带，
+        生产恒 soft-pass（闸门退化双因子），已废弃。
 
         Returns:
             callable: sector_name → (close, high20, ma20) or None
         """
         sector_ctx = got_context.get("sector_context", {})
-        # 从 sector_context 提取所有板块的 K 线数据
         kline_cache: Dict[str, tuple] = {}
 
-        # 尝试从 ambush 板块列表提取
         ambush_sectors = sector_ctx.get("ambush", [])
         for s in ambush_sectors:
             name = s.get("name", "")
-            klines = s.get("klines", [])
-            if klines and len(klines) >= 20:
-                closes = [k.get("close", 0) for k in klines]
-                highs = [k.get("high", 0) for k in klines]
-                if closes and highs:
-                    close = closes[-1]
-                    high20 = max(highs[-20:])
-                    ma20 = sum(closes[-20:]) / 20
-                    kline_cache[name] = (close, high20, ma20)
+            ind = s.get("indicators", {})
+            close = ind.get("pos_close")
+            high20 = ind.get("pos_high20")
+            ma20 = ind.get("pos_ma20")
+            if close is not None and high20 is not None and ma20 is not None:
+                kline_cache[name] = (float(close), float(high20), float(ma20))
 
         def lookup(sector_name: str):
             return kline_cache.get(sector_name)

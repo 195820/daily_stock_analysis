@@ -434,5 +434,109 @@ class TestAmbushLaneSplit(unittest.TestCase):
         self.assertEqual(restored.unified_scoring[0].sector_type, "ambush")
 
 
+# ─────────────────────── 修法③：G-A2 位置安全带接线（backlog §1 row 52） ───────────────────────
+
+class TestGA2PositionScalars(unittest.TestCase):
+    """G-A2 位置安全带修法③：Node 2 预计算三标量 → lookup 读 indicators。
+
+    旧链路断点：lookup 只读 ambush[].klines，但 SectorDetail 无 klines 字段，
+    归档永不携带 → 生产恒 None → soft-pass（闸门退化双因子）。
+    修法③：三标量 pos_close/pos_high20/pos_ma20 注入 indicators（schema 零改动）。
+    """
+
+    def test_compute_position_scalars_full_history(self):
+        """Node 2 助手：≥20 根 → 三标量齐全且数值正确（high 列口径）。"""
+        import pandas as pd
+        from src.got.nodes.sector_analysis import SectorAnalysisNode
+
+        closes = [10.0] * 19 + [11.0]
+        df = pd.DataFrame({
+            "close": closes, "high": [c + 0.2 for c in closes],
+            "volume": [1000] * 20,
+        })
+        out = SectorAnalysisNode._compute_position_scalars(df)
+        self.assertEqual(set(out), {"pos_close", "pos_high20", "pos_ma20"})
+        self.assertEqual(out["pos_close"], 11.0)
+        self.assertEqual(out["pos_high20"], 11.2)  # high 列（对齐 PLAN_v2 §166）
+        self.assertAlmostEqual(out["pos_ma20"], 10.05, places=4)
+
+    def test_compute_position_scalars_close_fallback(self):
+        """Node 2 助手：无 high 列 → 回退 close 列（旧 lookup 消费形态兼容）。"""
+        import pandas as pd
+        from src.got.nodes.sector_analysis import SectorAnalysisNode
+
+        df = pd.DataFrame({"close": [10.0] * 19 + [11.0], "volume": [1000] * 20})
+        out = SectorAnalysisNode._compute_position_scalars(df)
+        self.assertEqual(out["pos_high20"], 11.0)
+
+    def test_compute_position_scalars_short_history_empty(self):
+        """Node 2 助手：短史 <20 根 → 空 dict（下游 soft-pass 语义保留）。"""
+        import pandas as pd
+        from src.got.nodes.sector_analysis import SectorAnalysisNode
+
+        df = pd.DataFrame({"close": [10.0] * 19, "volume": [1000] * 19})
+        self.assertEqual(SectorAnalysisNode._compute_position_scalars(df), {})
+
+    def test_build_sector_kline_lookup_reads_indicators(self):
+        """选股侧 lookup：读 indicators 三标量建缓存。"""
+        s = _screener()
+        ctx = {"sector_context": {"ambush": [
+            {"name": "黄金概念", "indicators": {
+                "pos_close": 10.0, "pos_high20": 10.3, "pos_ma20": 10.0}},
+            {"name": "白银概念", "indicators": {}},  # 无三标量 → 不进缓存
+        ]}}
+        lookup = s._build_sector_kline_lookup(ctx)
+        self.assertEqual(lookup("黄金概念"), (10.0, 10.3, 10.0))
+        self.assertIsNone(lookup("白银概念"))
+        self.assertIsNone(lookup("不存在"))
+
+    def test_ga2_gate_end_to_end_position_unsafe_nonzero(self):
+        """端到端：indicators 三标量 → lookup → position_unsafe 真实拦截。
+
+        修复前该场景（生产归档形态，无 klines）恒 soft-pass。"""
+        s = _screener()
+        today = date(2026, 10, 13)
+        news_ctx = _news_ctx({
+            "黄金概念": [{"event_date": (today + timedelta(days=5)).isoformat(),
+                          "confidence": 0.8}],
+            "铜概念": [{"event_date": (today + timedelta(days=5)).isoformat(),
+                       "confidence": 0.8}],
+        })
+        sector_ctx = {"sector_context": {"ambush": [
+            {"name": "黄金概念", "indicators": {
+                "pos_close": 10.0, "pos_high20": 10.3, "pos_ma20": 10.0}},  # safe
+            {"name": "铜概念", "indicators": {
+                "pos_close": 11.0, "pos_high20": 10.3, "pos_ma20": 10.0}},  # 11 > 10.3×1.03
+        ]}}
+        sector_kline = s._build_sector_kline_lookup(sector_ctx)
+        candidates = [_ticket("600001", "黄金概念"), _ticket("600003", "铜概念")]
+
+        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
+
+        passed_codes = {c["code"] for c in passed}
+        self.assertIn("600001", passed_codes)
+        self.assertNotIn("600003", passed_codes)
+        self.assertEqual(trace["g_a2_position_unsafe"], 1)
+
+    def test_ga2_gate_soft_pass_preserved_on_missing(self):
+        """soft-pass 语义保留：三标量缺失（短史板块）→ 放行且不计数。"""
+        s = _screener()
+        today = date(2026, 10, 13)
+        news_ctx = _news_ctx({
+            "新板块": [{"event_date": (today + timedelta(days=5)).isoformat(),
+                       "confidence": 0.8}],
+        })
+        sector_ctx = {"sector_context": {"ambush": [
+            {"name": "新板块", "indicators": {}},  # 无三标量
+        ]}}
+        sector_kline = s._build_sector_kline_lookup(sector_ctx)
+        candidates = [_ticket("600009", "新板块")]
+
+        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
+
+        self.assertEqual([c["code"] for c in passed], ["600009"])
+        self.assertEqual(trace["g_a2_position_unsafe"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
