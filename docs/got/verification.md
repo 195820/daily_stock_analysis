@@ -2,6 +2,41 @@
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
 ---
+## ‼️ 2026-10-15 补登（三问裁决 Wave 1/2 影子接线——C4/E1/E2/F1 判据登记）
+
+四条新影子线 + 三组支撑改动（C1/C2/C3 基础设施 + D2 参数登记），全部缺省开、零决策改动。判据如下：
+
+| 线 | 开关 | 产物字段 | 转正门槛（≥10 交易日观测） | 红线 |
+|---|---|---|---|---|
+| **C4** 分道预算 trace | `GOT_LANE_BUDGET_SHADOW` | `PortfolioDecision.lane_budget_split_shadow`（lane/allocated_value/allocated_weight/role_budget_m/n_positions/formula_version） | 积累 10 日后对照 `scripts/backtest_lane_budget.py` 的 regime×lane 前向超额分箱：**分箱区分度不显著（无 lane 主胜出或差距 <2pp）→ f() 维持现状等权 ROLE_MULTIPLIER，LANE_BUDGET_PARAMS 不引入新数值**（O3 纪律） | trace 数值与实际 allocation 分道统计逐日可复算一致；≠0 日 `_allocate` 决策输出与 =0 日完全一致（只读性质） |
+| **E1** T3 verdict 路由 | `GOT_T3_ROUTING_SHADOW` | `PortfolioDecision.t3_routing_shadow`（contradiction_id/rule_verdict/t3_verdict/routed_signal=None/action_taken=shadow_none） | 10 日内 `rule_verdict` 与 `t3_verdict` 不一致条目的占比稳定 ≤30%（T3 仲裁是修正不是翻案）；若 >30% 说明规则层与 LLM 层系统性分歧，先查 prompt/词表再谈转正 | 零数值调制：任何日 `unified_scoring`/`allocation` 输出与 =0 日一致 |
+| **E2** cross_node 路由 | `GOT_XNODE_ROUTING_SHADOW` | `PortfolioDecision.cross_node_signals_shadow`（signal_type/routing_mode/blocked_by/action_taken） | `bull_confirmation` 条目在 **#14 regime 钉死拍板前恒 blocked_by=regime_pin_#14_pending，不得解除**；其余三模式积累 10 日后人工抽 10 条判 routing_mode 语义是否成立（≥80% 一致） | 同上零决策改动 |
+| **F1** 埋伏道校验 | `GOT_AMBUSH_VALIDATION_SHADOW` | `UnifiedContext.ambush_lane_validation`（rule=stagnation_ambush/catalyst_expiry_watch/family_divergence + sector/detail/proposal/severity） | 10 日内 `catalyst_expiry_watch`（阈值 days_in_reservoir≥7，0.7×RESERVOIR_EXPIRY_DAYS=10）触发条目与实际除名/升格事件的命中率 ≥60% 才有资格进入提案转正讨论；`stagnation_ambush`/`family_divergence` 先积累分布 | **埋伏池本体 set 相等**：任一日 `ambush_pool`/`ambush_reservoir` 内容与开关关闭日完全一致（校验只产提案，不删不加不移） |
+
+支撑改动（无判据，仅记录）：C1 `trade_plans` 表 + `TradePlanRecord`（storage.py，UniqueConstraint(plan_date,symbol,action) UPSERT）；C2 `src/got/decision_plan.py` assemble/reconcile（W3-pending：reconcile 单账户口径；卖出计划对账语义=票消失才 executed，票仍在=cancelled，缺昨日基线不判 partial）；C3 `--got` 通知 hook（`GOT_NOTIFY_ENABLED` 缺省 1，正文=终端块精简版 ≤25 行，try/except 不阻断）；D2 `LANE_BUDGET_PARAMS` 登记 + `SCORING_FORMULA_VERSION` bump '2026-10-11.1'→'2026-10-15.1'；E3 3b 先验权重接线（见上节 3b 判据注记）。
+
+**读数起点 = 2026-10-15**（14:03 修复 F1 后的重跑为首个有效观测日归档；13:36 首跑崩于 F1 bug 未归档）。F1 规则3 已修 `ThemeFamily.family_name` 字段名 bug（agent 产物 `f.name` 会 AttributeError 静默失效，已验证三规则正例路径全通）；首跑另抓规则1 `SectorDetail.name` 字段名 bug（同日修复，见下读数表）。
+
+### 2026-10-15 首个观测日读数（14:03 实跑，六项清单 + 四线 presence）
+
+| 项 | 读数 |
+|---|---|
+| **首跑即抓 bug** | 13:36 首跑崩于 Node 6 末尾：F1 规则1 对 `cooling_down`/`industry_top`（`SectorDetail`，字段 `name`）误用 `sector_name` → AttributeError，**归档全未落**。已修（aggregator.py:2629-2630）+ 合成 smoke，14:03 重跑成功。首日 lessons：影子代码崩在生产主链路上（虽然函数本身在门控内，但接线点 :461 无 try/except），与 C2b/C3 的双层防不同——**F1 后续若再改，接线处同样不加防（读数保真优先），靠门禁测试拦截** |
+| 退日历 | catalyst events=29，`akshare_*`=0 ✅ |
+| 4b | `market_theme_shadow` present，status=ok（mootdx_quick_change 覆盖~1.0，top1 出版业）✅ |
+| 3b | `conflict_summary_shadow` present（bullish_agents: family_rank/catalyst_gate）✅ |
+| **C4** | `lane_budget_split_shadow` = **[]（空数组，非 None）**——今日 0 交易（空仓观望，allocation=0），buy 道无分道可记。presence ✅，有效样本待首个非空仓日 |
+| **E1** | `t3_routing_shadow` = 4 条 ✅ 首个有料样本；`t3_verdict` 全 None（dwell_days=1<2 新切换，T3 仲裁 skip——与 aggregator.py:4799 日志一致）；rule_verdict 有长文本裁决。**注意**：`contradiction_id` 格式 `pair:timeframe`、`rule_verdict` 是中文裁决文本而非枚举——转正统计口径（不一致率）需先定义 verdict 归一化规则，否则无法对齐比对 |
+| **E2** | `cross_node_signals_shadow` = []（今日 `cross_node_signals` 本身空，路由无输入）presence ✅ |
+| **F1** | `ambush_lane_validation` = []（今日正式池=0、蓄水池 15 条全部 days<5，三规则无触发）presence ✅ |
+| funnel_stats | r0_in=49 → r4=7，zero_pick_rate=0.0 ✅（非 D-3 归零形态） |
+| MEG/FTS/FXG | shadow_meg evaluated=5 flagged=0；shadow_fts 医药 aggravated days=2；fxg_baseline mode=baseline_off ✅ |
+| GATE-1 / C1/C2 | `trade_plans` 表已建、今日 0 行（空仓无买卖计划，正常）；通知 hook：`GOT_NOTIFY_ENABLED=1` 走到 send但因未配置渠道跳过（log :249 证实，hook 本身工作正常） |
+| regime | transition → **bear**（dwell=1, transition_events=5），risk_budget=0.39 |
+
+**首日结论**：四线全部 present（两条空数组属输入为零的正常形态，非字段缺失）；E1 产出首个非空样本但暴露 verdict 归一化口径缺口（登记待办：定义 rule_verdict/t3_verdict 对齐规则后再统计不一致率）。读数起点自此日计。
+
+---
 
 ## ‼️ 2026-10-14 补登（G-A2 位置安全带接线 — backlog §1 row 52 修法③）
 
@@ -86,7 +121,7 @@
 **转正门槛（2026-10-12 负责人裁决，取代本行原写的“未定——五线均无登记”）——拆成两侧**：
 
 **① 3b `risk_override_shadow`：已定门槛，影子期到期即可测**（本线不属持仓侧，继续爬坡）：
-- **有效样本日**：`risk_override_shadow` 非 null 且当日 `agent_glue.status=ok`（降级/回放日不计）；**需累计 ≥10 个**（现 6 个，差 4）。
+- **有效样本日**：`risk_override_shadow` 非 null 且当日 `agent_glue.status=ok`（降级/回放日不计）；**需累计 ≥10 个**（现 6 个，差 4）。**〔2026-10-15 E3 接线注记〕** `_build_conflict_summary_shadow` 的 `memory=None` 已改 `AgentMemory.from_config()`（aggregator.py E3），3b 权重从等权切换为 `_SOURCE_PRIOR_WEIGHTS` 先验加权（regime 1.5 / capital 1.3 / family_rank 1.2 / catalyst_gate 1.0 / sell_source 1.0 / sentiment 0.8）——此前 6 个有效样本日读数**作废重计，读数起点 2026-10-15 起**；分层抽查一致率须用新口径。
 - **测法（先写后跑）**：按 **11 类冲突分类分层**抽查，每类 ≥2 条（全量归档只出现过 2 类 ⇒ 不足类用合成上下文补测，并如实标“未见于生产样本”，不得只测已出现的两类就算过）；负责人逐条判“分类 + `decision_path_hint` 是否成立”，**一致率 ≥80%**。
 - **硬红线**：零条“实际应买入/应减仓被判成 `veto_buy`”的严重误判（enabled 后该判定会把 `buy_budget` 归零，错一次就是直接资金影响）。
 - ❌ **不得拿“与现行 `contradictions[]` 差异 0”当判据**：那是两套口径互比，一致只说明没打架，不说明分类对（参 M3 结案：分层人工终审才是尺子）。
