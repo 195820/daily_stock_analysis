@@ -1017,6 +1017,12 @@ class UnifiedContext(BaseModel):
         default_factory=list,
         description="矛盾否决记录（★★★利空 / 拥挤黑名单等否决理由）",
     )
+    # ── F1 埋伏道一致性校验（2026-10-15，影子观测）──
+    ambush_lane_validation: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description="埋伏道交叉校验提案（三规则：stagnation_ambush/catalyst_expiry_watch/family_divergence），"
+                    "只产提案不改 ambush_pool/ambush_reservoir 本体（GOT_AMBUSH_VALIDATION_SHADOW 开关控制）",
+    )
     # ── 过热降权（Part 1: 家族拥挤信号透传）──
     crowded_families: list[str] = Field(
         default_factory=list,
@@ -1363,6 +1369,30 @@ class PortfolioDecision(BaseModel):
                     "纯观测，不参与判定。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
+    # ── C4 分道预算影子 trace（三问裁决 WI-P-7，2026-10-15）──
+    lane_budget_split_shadow: Optional[list[dict]] = Field(
+        default=None,
+        description="分道预算观测留痕: [{lane, allocated_value, allocated_weight, role_budget_m, "
+                    "n_positions, formula_version}]。只读现状，零决策改动；GOT_LANE_BUDGET_SHADOW=0 时 None。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── E1 T3 verdict 路由影子（三问裁决 WI-P-7，2026-10-15）──
+    t3_routing_shadow: Optional[list[dict]] = Field(
+        default=None,
+        description="T3 仲裁路由留痕: [{contradiction_id, rule_verdict, t3_verdict, routed_signal, action_taken}]。"
+                    "action_taken 恒 'shadow_none'（零数值调制，O3 纪律）；GOT_T3_ROUTING_SHADOW=0 时 None。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── E2 cross_node_signals 路由影子（三问裁决 WI-P-7，2026-10-15）──
+    cross_node_signals_shadow: Optional[list[dict]] = Field(
+        default=None,
+        description="跨节点信号路由留痕: [{signal_type, source_signal, strength, routing_mode, blocked_by, action_taken}]。"
+                    "routing_mode ∈ {strong_alignment_pass, divergence_escalate, weak_signal_hold, bull_confirmation}；"
+                    "bull_confirmation 行带 blocked_by='regime_pin_#14_pending'（#14 未拍板前零样本休眠）；"
+                    "GOT_XNODE_ROUTING_SHADOW=0 时 None。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+
 
 
 

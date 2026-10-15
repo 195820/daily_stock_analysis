@@ -1290,6 +1290,43 @@ class HoldingThesisRecord(Base):
     )
 
 
+class TradePlanRecord(Base):
+    """决策编排层 v0：每日可执行交易计划（C1，2026-10-15）。
+
+    Phase 2 run() 末尾由 DecisionPlanAssembler.assemble 写入：allocation → 计划行。
+    次日 run() 开头由 reconcile 回填执行状态（executed/partial/expired/cancelled）。
+
+    去重策略：(plan_date, symbol, action) 唯一——当日同票同动作一条，重跑 UPSERT 覆盖
+    （与 HoldingThesisRecord 同日更新分支语义一致，portfolio_decision.py:2937-2952 先例）。
+    Base.metadata.create_all 自动建表，无迁移脚本。
+    """
+
+    __tablename__ = 'trade_plans'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_date = Column(Date, nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    name = Column(String(64))
+    lane = Column(String(16))                                  # mainline / ambush / holding_reduce
+    action = Column(String(16))
+    target_quantity = Column(Float)
+    target_value = Column(Float)
+    target_weight = Column(Float, nullable=True)
+    trigger_price = Column(Float, nullable=True)
+    valid_until = Column(Date, nullable=True)
+    tranches = Column(Text, nullable=True)                     # JSON 序列化
+    execution_status = Column(String(20), default='pending', index=True)  # pending / partial / executed / expired / cancelled
+    source_composite = Column(Float, nullable=True)
+    blocked_reason = Column(String(255), default='')
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('plan_date', 'symbol', 'action', name='uix_trade_plans_date_symbol_action'),
+        Index('ix_trade_plans_status', 'plan_date', 'execution_status'),
+    )
+
+
 class CatalystRealizationRecord(Base):
     """催化剂事件兑现归档（P6）。
 
