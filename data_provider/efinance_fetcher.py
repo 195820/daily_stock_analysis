@@ -705,7 +705,16 @@ class EfinanceFetcher(BaseFetcher):
             pe_col = '市盈率' if '市盈率' in df.columns else 'pe_ratio'
             total_mv_col = '总市值' if '总市值' in df.columns else 'total_mv'
             circ_mv_col = '流通市值' if '流通市值' in df.columns else 'circ_mv'
-            
+
+            # 五档盘口（Phase 6-1 盘中闸门）：efinance 实时快照含 买一价~买五价/量、卖一价~卖五价/量 列，
+            # 缺列时置 None（该源不支持，闸门走覆盖率降级）
+            def _ob_list(name_variants: List[str]) -> Optional[List[float]]:
+                col = next((c for v in name_variants for c in (v,) if c in df.columns), None)
+                if col is None:
+                    return None
+                vals = [safe_float(row.get(f'{col}{i}')) for i in range(1, 6)]
+                return vals if any(v is not None for v in vals) else None
+
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=str(row.get(name_col, '')),
@@ -724,6 +733,10 @@ class EfinanceFetcher(BaseFetcher):
                 pe_ratio=safe_float(row.get(pe_col)),  # 市盈率
                 total_mv=safe_float(row.get(total_mv_col)),  # 总市值
                 circ_mv=safe_float(row.get(circ_mv_col)),  # 流通市值
+                bid_prices=_ob_list(['买一价', 'bid_price']),
+                ask_prices=_ob_list(['卖一价', 'ask_price']),
+                bid_volumes=_ob_list(['买一量', 'bid_volume']),
+                ask_volumes=_ob_list(['卖一量', 'ask_volume']),
             )
             
             logger.info(f"[实时行情-efinance] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "

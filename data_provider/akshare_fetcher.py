@@ -1452,6 +1452,16 @@ class AkshareFetcher(BaseFetcher):
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
             # 使用 realtime_types.py 中的统一转换函数
             amount = _parse_tencent_amount(fields)
+            # 五档盘口（Phase 6-1 盘中闸门）：9-18 买一价/量…买五价/量，19-28 卖一价/量…卖五价/量
+            def _tx_pair(idx: int) -> Optional[float]:
+                v = safe_float(fields[idx]) if len(fields) > idx else None
+                return v
+
+            bid_prices = [p for p in (_tx_pair(9 + 2 * k) for k in range(5)) if p is not None]
+            bid_volumes = [v for v in (_tx_pair(10 + 2 * k) for k in range(5)) if v is not None]
+            ask_prices = [p for p in (_tx_pair(19 + 2 * k) for k in range(5)) if p is not None]
+            ask_volumes = [v for v in (_tx_pair(20 + 2 * k) for k in range(5)) if v is not None]
+
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
@@ -1472,6 +1482,10 @@ class AkshareFetcher(BaseFetcher):
                 pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,  # 市净率
                 circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
                 total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
+                bid_prices=bid_prices or None,
+                ask_prices=ask_prices or None,
+                bid_volumes=bid_volumes or None,
+                ask_volumes=ask_volumes or None,
             )
             
             logger.info(

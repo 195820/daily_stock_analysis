@@ -193,6 +193,19 @@ AGENT_STOCK_REVIEW_SHADOW = os.environ.get("AGENT_STOCK_REVIEW_SHADOW", "true").
 AGENT_STOCK_REVIEW_MAX = 2           # T1: Agent 终审最大调用数（R7 成本预算）
 
 # =============================================================================
+# Phase 6-1: 盘中 0→1 确认闸门（docs/got/plans/Phase6-1_盘中闸门影子期实施稿_20261015.md）
+# =============================================================================
+# 旁挂节点（Node 8）：三时点（0926/1125/1445）纯规则判定当日 GOT 候选，
+# 产物落 data/got_daily/YYYYMMDD/intraday/，零决策影响、零 LLM 调用。
+# INTRADAY_GATE_ENABLED=false：不跑（缺省，6-2 影子运营才翻 true）；
+# INTRADAY_GATE_ENABLED=true + SHADOW=true：照跑只归档；
+# ⚠️ INTRADAY_GATE_SHADOW=false 属 Phase 6-4 转正动作——影子期 I1-I6 双达标
+# （0907 §6.2）+ 负责人批准前**禁止置 false**（写侧有防御性拦载兜底）。
+INTRADAY_GATE_ENABLED = os.environ.get("INTRADAY_GATE_ENABLED", "false").lower() == "true"
+INTRADAY_GATE_SHADOW = os.environ.get("INTRADAY_GATE_SHADOW", "true").lower() == "true"
+INTRADAY_GATE_TOPN = int(os.environ.get("INTRADAY_GATE_TOPN", "8"))
+
+# =============================================================================
 # LLM 精炼视野扩围（0831 短剧案例修复，决策 20）
 # =============================================================================
 

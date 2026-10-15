@@ -1,6 +1,38 @@
 # GOT 待验证 / 影子期清单
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
+---
+## ‼️ 2026-10-15 补登 #4（Phase 6-1 盘中 0→1 确认闸门落码 — 三开关 + I1-I6 判据 + 一票否决线）
+
+**实施稿**：[`plans/Phase6-1_盘中闸门影子期实施稿_20261015.md`](plans/Phase6-1_%E7%9B%98%E4%B8%AD%E9%97%B8%E9%97%A8%E5%BD%B1%E5%AD%90%E6%9C%9F%E5%AE%9E%E6%96%BD%E7%A8%BF_20261015.md)（§4 十项已全落码，落码清单见 backlog 2026-10-15 Phase 6-1 落码轮修订行）。
+
+**开关**（`src/got/catalyst_config.py`，`.env.example` 同步登记）：
+
+| 开关 | 缺省 | 说明 |
+|---|---|---|
+| `INTRADAY_GATE_ENABLED` | `false` | 总开关；`true` 才跑 `--got-intraday` |
+| `INTRADAY_GATE_SHADOW` | `true` | **影子期一票否决线：Phase 6-4 转正前禁止置 false**（配置注记为第一道闸，`run_session` 写侧防御性拦载为第二道） |
+| `INTRADAY_GATE_TOPN` | `8` | 每时点轮询候选数上限（`portfolio_decision.unified_scoring` 按 composite_score 降序截断） |
+| `INTRADAY_GAP_THRESHOLD_PCT` | `3.0` | θ_gap 竞价高开幅（影子期校准） |
+| `INTRADAY_PULLBACK_THRESHOLD_PCT` | `2.0` | θ_pull 冲高回落幅度 |
+| `INTRADAY_IMBALANCE_THRESHOLD` | `0.15` | 五档委比 |
+| `INTRADAY_SEAL_DECAY_THRESHOLD` | `0.5` | 封单衰减（观测用） |
+
+**产物**：`data/got_daily/YYYYMMDD/intraday/{0926,1125,1445}/verdicts.json` + 当日 `intraday/summary.json`；`archive_daily_run` 已加 `intraday/` 搬运分支（原子替换不抹当日盘中产物）；读取 `archive.load_intraday_shadow_record`。
+
+**影子期判据（转正 = Phase 6-4，双达标 + 负责人批准）**：
+
+- **I1 证据覆盖率**：`verdict.evidence` 非空占比。目标 ≥80%；竞价明细缺失日（F5 段补测前）分层标注 `missing_auction_detail=true` 单独统计，不混入总池。
+- **I2 confirm 占比**：confirm/(confirm+reject+wait)。目标区间 10%–50%（过低=判据过严无信号，过高=闸门失效）。
+- **I3 判据分辨率**：confirm 股 T+1 相对收益 vs wait/reject 股应显著为正（影子期逐日积累，样本 ≥10 交易日后回看）。
+- **I4 reject 命中率**：reject 股 T+1 收益中位数 ≤ 0（尾盘转弱/诱多判定有杀伤力）。
+- **I5 数据新鲜度**：三时点必须盘中实时跑（0926/09:26、1125/11:25、1445/14:45 ±5min）；收盘补跑样本作废（schtasks 注册后由 summary.sessions_run 核对时点齐全）。
+- **I6 样本纪律**：影子期样本**仅计跑满三时点的交易日**（summary.sessions_run 长度=3）；单时点缺勤日不计入分母。
+- **零决策纪律**：影子期产物不进 Node 1-7、不进 screener 漏斗、不进通知；任何消费路径出现即违规（grep 无消费点为静态证据）。
+
+**排期步骤（待负责人启动影子期）**：① schtasks 三时点注册（0926/1125/1445 各 `python main.py --got-intraday --intraday-time <t>`，`INTRADAY_GATE_ENABLED=true` 入 .env）；② F5 竞价段 9:15-9:25 `transactions()` 交易日补测（补齐 I1 竞价分层）。
+
+---
 ## ‼️ 2026-10-15 补登 #3（§8 #1 meta 运行记次实施 + §7 #12 家族兜底 WI 代码侧 + Phase 6-0 探测）
 
 三件并行实施，两件零决策、一件含缺省关的 V2 开关：
@@ -9,7 +41,6 @@
 2. **§7 #12 WI 代码侧（三小项，V2 缺省关）**：`src/got/family_embed.py` 两-term 打分 `cos×0.6+keyword_overlap×0.4`（`GOT_FAMILY_SCORING_V2` 缺省 0=旧逻辑逐字节不变）+ 语义兜底 bypass（覆盖率≥0.8 直接归家族，trace `fallback_reason='keyword_exact'`）+ 网格脚本 `scripts/calibrate_family_threshold.py`（761 个真实「其他」板块 S×M 网格跑通）。**S=0.48/M=0.03 为伪 cosine（hash 模拟）占位数非标定结论**——归档无历史 cosine 分数，真实标定须 shadow（V2=1+fallback=shadow）≥5 交易日后复跑。盲区候选集对齐报告 [`plans/家族兜底盲区候选集对齐_20261015.md`](plans/%E5%AE%B6%E6%97%8F%E5%85%9C%E5%BA%95%E7%9B%B2%E5%8C%BA%E5%80%99%E9%80%89%E9%9B%86%E5%AF%B9%E9%BD%90_20261015.md)（差集={华为生态,前沿科技}，推荐 FALLBACK 收缩到 PROMPT 12 个，待拍板）。3 个新 env 键属超范围新增待负责人确认。
 3. **Phase 6-0 四接口只读探测（已实施，零生产改动）**：`scripts/probe_intraday_capabilities.py` 真实跑通——F3 五档买量**可用**（`quotes()` 46 列含 bid_vol1~5/ask_vol1~5，OPEN-I2 解决）；F4 分时/分钟K **可用**（`minute()` 240 行 + `bars(frequency=8)` 1 分钟 K，OPEN-I3 解决）；F5 集合竞价**部分可用**（`transactions()` 历史逐笔可得，9:15-9:25 段待交易日补测）；W1 调度**可行**（schtasks 零依赖或 schedule 库）。结论 [`plans/Phase6-0_盘中数据地基探测_20261015.md`](plans/Phase6-0_%E7%9B%98%E4%B8%AD%E6%95%B0%E6%8D%AE%E5%9C%B0%E5%9F%BA%E6%8E%A2%E6%B5%8B_20261015.md)；开 Phase 6-1 影子期归负责人。
 
----
 ---
 ## ‼️ 2026-10-15 补登 #2（#14 ④ regime jump penalty 模型 — 两级开关 + λ 标定 + 影子判据）
 

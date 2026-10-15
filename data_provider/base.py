@@ -518,6 +518,13 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_minute_data(self, stock_code: str) -> Optional[pd.DataFrame]:
+        """获取当日分时序列 (time, price, vol)。
+
+        仅部分数据源实现（Phase 6-1 盘中闸门）；缺省 None = 不支持，触发降级。
+        """
+        return None
+
     def get_all_concept_boards(self) -> Optional[list[dict]]:
         """获取全量概念板块列表。
 
@@ -3661,6 +3668,10 @@ class DataFetcherManager:
     ) -> Optional[pd.DataFrame]:
         """获取板块K线（自动切换数据源）。"""
         return self._try_fetchers_for_method("get_board_kline", "板块K线", board_code, board_type, days)
+
+    def get_minute_data(self, stock_code: str) -> Optional[pd.DataFrame]:
+        """获取当日分时序列（Phase 6-1 盘中闸门，自动切换数据源）。"""
+        return self._try_fetchers_for_method("get_minute_data", "分时数据", stock_code)
 
     def get_all_concept_boards(self) -> Optional[list[dict]]:
         """获取全量概念板块列表（自动切换数据源）。"""

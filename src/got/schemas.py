@@ -1470,3 +1470,43 @@ class SemanticGlueResult(BaseModel):
     # 仅 replay_mode + GLUE_PIPELINE_ENABLED 下非空；trace 详情落 glue_pipeline_trace.json。
     pipeline_status: str = Field(default="", description="C-P13 管线留痕：空=未走管线，ok/embedding_unavailable/day_void/l2_failed/l2_partial/pipeline_error（仅回放生效）")
     raw_response: str = Field(default="", exclude=True)
+
+
+# =====================================================================
+# Phase 6-1: 盘中 0→1 确认闸门（docs/got/plans/Phase6-1_盘中闸门影子期实施稿_20261015.md）
+# 旁挂节点产物，不进 Node 1-7 决策面（影子期）。
+# =====================================================================
+
+class IntradayVerdict(BaseModel):
+    """单只候选股的三时点规则判定结果（纯规则，影子期仅归档）。"""
+    code: str = Field(..., description="股票代码（6 位）")
+    trigger_time: str = Field(..., description="时点标记：0926 / 1125 / 1445")
+    verdict: str = Field(..., description="判定：confirm / reject / wait")
+    confidence: float = Field(default=0.0, description="多判据几何平均置信度 [0,1]")
+    reason: str = Field(default="", description="一句话判定依据（中文，供人工查档）")
+    shadow: bool = Field(default=True, description="恒 true（Phase 6-4 转正前禁止置 false）")
+    evidence: dict = Field(
+        default_factory=dict,
+        description=(
+            "判据证据快照：gap_pct(高开幅)/volume_ratio(量比)/order_book_imbalance(委比)/"
+            "above_vwap(站上分时均线)/intraday_rise(冲高幅度)/pullback_pct(回落幅度)/"
+            "seal_volume(封单量)/provider_timestamp(数据新鲜度)。"
+            "I1 覆盖率 = evidence 非空占比"
+        ),
+    )
+    provider_timestamp: Optional[str] = Field(default=None, description="行情数据源时间戳（I6 新鲜度）")
+
+
+class IntradayShadowRecord(BaseModel):
+    """单个交易日的盘中闸门影子观测汇总（落 got_daily/YYYYMMDD/intraday/summary.json）。"""
+    date: str = Field(..., description="交易日 YYYYMMDD")
+    sessions_run: list[str] = Field(
+        default_factory=list,
+        description="实际跑过的时点（0926/1125/1445 子集）；不足三个 = 缺勤日，不计入影子期样本",
+    )
+    candidates_polled: int = Field(default=0, description="当日轮询候选数（INTRADAY_GATE_TOPN 截断后）")
+    verdicts: list[IntradayVerdict] = Field(default_factory=list)
+    i1_coverage: Optional[float] = Field(default=None, description="evidence 非空率 [0,1]（竞价明细缺失日分层标注）")
+    i2_confirm_ratio: Optional[float] = Field(default=None, description="confirm 占比 [0,1]")
+    missing_auction_detail: bool = Field(default=False, description="F5 竞价段 9:15-9:25 明细缺失（I1 分层）")
+    notes: list[str] = Field(default_factory=list, description="异常注记（数据缺失/降级/全量同判等）")

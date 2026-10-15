@@ -18,7 +18,7 @@ import logging
 import time
 from threading import RLock
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -155,6 +155,12 @@ class UnifiedRealtimeQuote:
     change_60d: Optional[float] = None      # 60日涨跌幅(%)
     high_52w: Optional[float] = None        # 52周最高
     low_52w: Optional[float] = None         # 52周最低
+
+    # === 五档盘口（Phase 6-1 盘中闸门，仅部分源支持，None=该源未提供）===
+    bid_prices: Optional[List[float]] = None     # 五档买价 [bid1..bid5]
+    ask_prices: Optional[List[float]] = None     # 五档卖价 [ask1..ask5]
+    bid_volumes: Optional[List[float]] = None    # 五档买量（股）
+    ask_volumes: Optional[List[float]] = None    # 五档卖量（股）
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（过滤 None 值）"""
@@ -171,7 +177,8 @@ class UnifiedRealtimeQuote:
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-            'change_60d', 'high_52w', 'low_52w'
+            'change_60d', 'high_52w', 'low_52w',
+            'bid_prices', 'ask_prices', 'bid_volumes', 'ask_volumes'
         ]
         for f in optional_fields:
             val = getattr(self, f, None)

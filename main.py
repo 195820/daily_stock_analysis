@@ -365,6 +365,19 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--got-intraday',
+        action='store_true',
+        help='运行盘中 0→1 确认闸门单时点（Phase 6-1，影子模式；须与 --intraday-time 同用）'
+    )
+
+    parser.add_argument(
+        '--intraday-time',
+        choices=['0926', '1125', '1445'],
+        default=None,
+        help='盘中闸门时点（0926 竞价后 / 1125 午前 / 1445 尾盘），仅与 --got-intraday 同用'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -1313,6 +1326,46 @@ def main() -> int:
 
             except Exception as e:
                 logger.exception(f"[选股] 执行失败: {e}")
+                return 1
+
+        # 模式1.5a: 盘中 0→1 确认闸门（Phase 6-1，影子模式旁挂节点）
+        if args.got_intraday:
+            if not args.intraday_time:
+                logger.error("--got-intraday 须与 --intraday-time {0926,1125,1445} 同用")
+                return 1
+            logger.info("模式: 盘中确认闸门 — 时点: %s", args.intraday_time)
+            try:
+                from datetime import datetime as _idt
+                from src.core.trading_calendar import is_market_open
+                from src.got.nodes.intraday_confirm import IntradayConfirmNode
+                from data_provider.base import DataFetcherManager
+
+                _now = _idt.now()
+                today = _now.strftime("%Y%m%d")
+                if not is_market_open("cn", _now.date()):
+                    logger.warning("今日 A 股非交易日，盘中闸门跳过（可临时改代码强制，不建议）")
+                    return 0
+
+                manager = DataFetcherManager()
+                node = IntradayConfirmNode(manager)
+                record = node.run_session(today, args.intraday_time)
+                if record is None:
+                    logger.info("[盘中闸门] 本次无判定（开关关闭或当日无候选）")
+                    return 0
+
+                confirms = [v for v in record.verdicts if v.verdict == "confirm"]
+                rejects = [v for v in record.verdicts if v.verdict == "reject"]
+                print("\n" + "=" * 60)
+                print(f"盘中闸门（影子） {today} {args.intraday_time} — "
+                      f"candidates={record.candidates_polled} "
+                      f"confirm={len(confirms)} reject={len(rejects)} "
+                      f"evidence覆盖率={record.i1_coverage}")
+                print("=" * 60)
+                for v in record.verdicts:
+                    print(f"  [{v.verdict.upper():7s}] {v.code} conf={v.confidence:.2f} — {v.reason}")
+                return 0
+            except Exception as e:
+                logger.exception("[盘中闸门] 执行失败: %s", e)
                 return 1
 
         # 模式1.5b: GOT 回放（只跑 Node 6，从归档加载数据）

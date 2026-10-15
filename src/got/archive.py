@@ -142,6 +142,12 @@ def archive_daily_run(
         if replay_src.exists():
             replay_dst = tmp_dir / "_replay"
             shutil.move(str(replay_src), str(replay_dst))
+        # Phase 6-1 盘中闸门：intraday/ 是盘中实时旁挂产物（0926/1125/1445 三时点
+        # verdicts + summary），GOT 主链路通常晚于尾盘时点归档，必须随本轮搬运，
+        # 否则被原子替换删除（同 glue/regime-jump 影子产物语义：当日结论末版为准）。
+        intraday_src = archive_dir / "intraday"
+        if intraday_src.exists():
+            shutil.move(str(intraday_src), str(tmp_dir / "intraday"))
 
     contexts = {
         "market": market_ctx,
@@ -1947,6 +1953,34 @@ def load_phase2_decision(run_date: date) -> Optional["PortfolioDecision"]:
         return decision
     except Exception as e:
         logger.error(f"[Archive] Phase 2 决策加载失败: {e}")
+        return None
+
+
+def load_intraday_shadow_record(
+    run_date: date,
+    base_dir: Optional[Path] = None,
+) -> Optional["IntradayShadowRecord"]:
+    """加载当日盘中闸门影子观测汇总（data/got_daily/YYYYMMDD/intraday/summary.json）。
+
+    Phase 6-1 影子期：供回放/复盘读取，生产决策面零消费。
+    """
+    from src.got.schemas import IntradayShadowRecord
+
+    base_dir = base_dir or _default_base_dir()
+    date_str = run_date.strftime("%Y%m%d")
+    summary_path = base_dir / date_str / "intraday" / "summary.json"
+
+    if not summary_path.exists():
+        logger.debug(f"[Archive] 盘中闸门影子汇总不存在: {summary_path}")
+        return None
+
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        record = IntradayShadowRecord.model_validate(data["record"])
+        logger.info(f"[Archive] 盘中闸门影子汇总已加载: {summary_path}")
+        return record
+    except Exception as e:
+        logger.error(f"[Archive] 盘中闸门影子汇总加载失败: {e}")
         return None
 
 

@@ -467,11 +467,53 @@ class MootdxFetcher(BaseFetcher):
                         'amount': float(q.get('amount', 0)),
                         'bid_prices': [float(q.get(f'bid{i}', 0)) for i in range(1, 6)],
                         'ask_prices': [float(q.get(f'ask{i}', 0)) for i in range(1, 6)],
+                        # Phase 6-1 盘中闸门：五档挂单量（OPEN-I2 实证 quotes() 46 列含 *_vol 列）
+                        'bid_volumes': [float(q.get(f'bid_vol{i}', 0) or 0) for i in range(1, 6)],
+                        'ask_volumes': [float(q.get(f'ask_vol{i}', 0) or 0) for i in range(1, 6)],
                     }
         except DataFetchError:
             raise
         except Exception as e:
             logger.warning(f"mootdx 获取实时行情失败 {stock_code}: {e}")
+
+        return None
+
+    def get_minute_data(
+        self,
+        stock_code: str,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取当日分时序列（Phase 6-1 盘中闸门，OPEN-I3 实证 minute() 240 行可用）。
+
+        Returns:
+            DataFrame(time, price, vol)：240 个分钟点（当日 4 小时），
+            盘前/非交易时段返回当日已有部分或 None；失败返回 None（触发 Manager 降级）。
+        """
+        if is_bse_code(stock_code):
+            raise DataFetchError(f"MootdxFetcher 不支持北交所 {stock_code}")
+        if _is_us_code(stock_code) or _is_hk_market(stock_code):
+            raise DataFetchError(f"MootdxFetcher 不支持非A股 {stock_code}")
+
+        try:
+            symbol = self._get_market_prefix(stock_code)
+            code_only = self._strip_market_prefix(symbol)
+            with self._mootdx_session() as client:
+                logger.info(f"[API调用] mootdx minute 分时: {stock_code}")
+                df = client.minute(symbol=code_only)
+                if df is None or df.empty:
+                    return None
+                # 统一列名：mootdx minute 返回 day/time/price/vol
+                cols = {c.lower(): c for c in df.columns}
+                out = pd.DataFrame({
+                    'time': df[cols['time']] if 'time' in cols else df.index,
+                    'price': pd.to_numeric(df[cols['price']], errors='coerce'),
+                    'vol': pd.to_numeric(df[cols.get('vol', cols.get('volume'))], errors='coerce'),
+                })
+                return out.dropna(subset=['price'])
+        except DataFetchError:
+            raise
+        except Exception as e:
+            logger.warning(f"mootdx 获取分时数据失败 {stock_code}: {e}")
 
         return None
 
