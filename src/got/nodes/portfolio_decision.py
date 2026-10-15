@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import pandas as pd
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -118,6 +119,27 @@ class PortfolioDecisionNode:
         self._as_of = _as_of
 
         # 获取当前持仓
+        # ── C2b reconcile 接线（三问裁决 WI-P-7，2026-10-15）──
+        # run() 开头：对昨日 pending 计划回填执行状态。try/except 双层防（decision_plan 内部已有，
+        # 接线层再加一层防 import 错误）。零决策改动，不改变 run() 返回值语义。
+        try:
+            from src.got.decision_plan import reconcile
+            import exchange_calendars as xcals
+            _cal = xcals.get_calendar("XSHG")
+            _session = _cal.date_to_session(pd.Timestamp(_as_of), direction="previous")
+            _prev_date = _cal.previous_session(_session).date()
+            _holdings_snapshot = self._get_portfolio_snapshot()
+            _holdings_dict = {}
+            for _acct in (_holdings_snapshot.get("accounts") or []):
+                for _pos in (_acct.get("positions") or []):
+                    _sym = _pos.get("symbol")
+                    if _sym:
+                        _holdings_dict[_sym] = _pos.get("quantity", 0)
+            reconcile(_prev_date, _holdings_dict)
+        except Exception as _recon_exc:
+            logger.warning("[Phase 2] C2b reconcile 失败（不阻断）: %s", _recon_exc)
+
+
         portfolio = self._get_portfolio_snapshot()
 
         # 提取情绪动量（用于轮动时机检测）
@@ -318,11 +340,28 @@ class PortfolioDecisionNode:
             # 由 _score_candidates 落 self；ACTIVE=false 时仍记录 trace（纯观测）
             ambush_lane_shadow=getattr(self, "_ambush_lane_shadow", None),
             ambush_lane_trace=getattr(self, "_ambush_lane_trace", None),
+            # ── C4/E1/E2 三问裁决影子 trace（WI-P-7，2026-10-15）──
+            # C4 分道预算观测（_allocate 落 self）；E1 T3 路由 / E2 cross_node 路由（_score_candidates 落 self）
+            # 全部只读现状，零决策改动；开关=0 时字段为 None（与既有 #5a 先例一致）
+            lane_budget_split_shadow=getattr(self, "_lane_budget_split_shadow", None),
+            t3_routing_shadow=getattr(self, "_t3_routing_shadow", None),
+            cross_node_signals_shadow=getattr(self, "_cross_node_signals_shadow", None),
             data_quality=data_quality,
         )
 
         # 影子观测落盘（A5 的 agent_glue.json 由 Node 6 自行落盘，此处补 T1 / T1-H 两条线）
         self._save_shadow_records()
+
+        # ── C2b assemble 接线（三问裁决 WI-P-7，2026-10-15）──
+        # run() 末尾：将 allocation 映射为 TradePlanRecord 写入 trade_plans 表。
+        # try/except 双层防（decision_plan 内部已有，接线层再加一层防 import 错误）。
+        # 零决策改动，不改变 run() 返回值语义。
+        try:
+            from src.got.decision_plan import assemble
+            assemble(decision, unified_context, _as_of)
+        except Exception as _asm_exc:
+            logger.warning("[Phase 2] C2b assemble 失败（不阻断）: %s", _asm_exc)
+
 
         logger.info(
             f"[Phase 2] 完成 — 交易建议: {len(allocation)} 条, "
@@ -4495,6 +4534,60 @@ verdict 含义：
         self._ambush_lane_shadow = _lane_shadow
         self._ambush_lane_trace = _pd_lane_trace
 
+        # ── E1 T3 verdict 路由影子（三问裁决 WI-P-7，2026-10-15）──
+        # 只读 unified.contradictions，零数值调制（O3 纪律）。开关关时字段保持 None。
+        from src.got.catalyst_config import GOT_T3_ROUTING_SHADOW
+        if GOT_T3_ROUTING_SHADOW:
+            _t3_trace = []
+            for _ctr in (unified_context.contradictions or []):
+                _av = getattr(_ctr, "arbitration_verdict", None)
+                _t3_trace.append({
+                    "contradiction_id": f"{getattr(_ctr, 'pair', '')}:{getattr(_ctr, 'timeframe', '')}",
+                    "rule_verdict": getattr(_ctr, "resolution", None),
+                    "t3_verdict": _av,
+                    "routed_signal": None,  # 零数值调制，不落假想方向
+                    "action_taken": "shadow_none",
+                })
+            self._t3_routing_shadow = _t3_trace
+        else:
+            self._t3_routing_shadow = None
+
+        # ── E2 cross_node_signals 路由影子（三问裁决 WI-P-7，2026-10-15）──
+        # 四模式路由：strong_alignment→pass / divergence→escalate / weak→hold / bull_confirmation→blocked
+        from src.got.catalyst_config import GOT_XNODE_ROUTING_SHADOW
+        if GOT_XNODE_ROUTING_SHADOW:
+            _xnode_trace = []
+            for _sig in (unified_context.cross_node_signals or []):
+                _st = getattr(_sig, "signal_type", "")
+                _conf = getattr(_sig, "confidence", 0.0)
+                if _st == "bull_confirmation":
+                    _mode = "bull_confirmation"
+                    _blocked = "regime_pin_#14_pending"
+                elif _st == "sentiment_top" and _conf >= 0.7:
+                    _mode = "divergence_escalate"
+                    _blocked = None
+                elif _st == "catalyst_confirmation" and _conf >= 0.7:
+                    _mode = "strong_alignment_pass"
+                    _blocked = None
+                elif _st == "range_reversal":
+                    _mode = "weak_signal_hold"
+                    _blocked = None
+                else:
+                    _mode = "weak_signal_hold"
+                    _blocked = None
+                _xnode_trace.append({
+                    "signal_type": _st,
+                    "source_signal": getattr(_sig, "suggested_action", ""),
+                    "strength": _conf,
+                    "routing_mode": _mode,
+                    "blocked_by": _blocked,
+                    "action_taken": "shadow_none",
+                })
+            self._cross_node_signals_shadow = _xnode_trace
+        else:
+            self._cross_node_signals_shadow = None
+
+
         return results
 
 
@@ -5139,6 +5232,31 @@ verdict 含义：
                         blocked_reason=_tg_buy_reason,
                     )
                 )
+        # ── C4 分道预算影子 trace（三问裁决 WI-P-7，2026-10-15）──
+        # 只读现状，零决策改动。开关关时字段保持 None。
+        from src.got.catalyst_config import GOT_LANE_BUDGET_SHADOW, LANE_BUDGET_PARAMS, SCORING_FORMULA_VERSION
+        if GOT_LANE_BUDGET_SHADOW:
+            _lane_trace: Dict[str, Dict[str, Any]] = {}
+            for _a in allocations:
+                if _a.action != "buy":
+                    continue
+                _sld = _a.sector_limit_detail or {}
+                _lane = _sld.get("sector_role", "unknown")
+                if _lane not in _lane_trace:
+                    _lane_trace[_lane] = {
+                        "lane": _lane,
+                        "allocated_value": 0.0,
+                        "allocated_weight": LANE_BUDGET_PARAMS.get(_lane, 0.55),
+                        "role_budget_m": ROLE_MULTIPLIER.get(_lane, ROLE_MULTIPLIER.get(DEFAULT_SECTOR_ROLE, 1.0)),
+                        "n_positions": 0,
+                        "formula_version": SCORING_FORMULA_VERSION,
+                    }
+                _lane_trace[_lane]["allocated_value"] += _a.target_value
+                _lane_trace[_lane]["n_positions"] += 1
+            self._lane_budget_split_shadow = list(_lane_trace.values()) if _lane_trace else []
+        else:
+            self._lane_budget_split_shadow = None
+
 
         # 预算不足时，全部 BUY 候选被约束否决 → 显式透出（消除"高分候选 vs 0 交易"静默矛盾）
         vetoed_candidates = buy_candidates if buy_budget <= 0 else []

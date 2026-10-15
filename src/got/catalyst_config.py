@@ -352,6 +352,31 @@ LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
 GOT_AMBUSH_SPLIT_ENABLED = os.environ.get("GOT_AMBUSH_SPLIT_ENABLED", "1") == "1"
 GOT_AMBUSH_SPLIT_ACTIVE = os.environ.get("GOT_AMBUSH_SPLIT_ACTIVE", "0") == "1"
 
+# =============================================================================
+# Step 0 裁决资料包——四组影子观测开关（C4 / E1 / E2 / F1）
+# 全部缺省 1（影子开），零决策改动；=0 时对应观测逻辑跳过、零额外计算。
+# =============================================================================
+# C4 分道预算影子 trace（只读现状，零决策改动；=0 时 _allocate 内零额外计算）
+GOT_LANE_BUDGET_SHADOW = os.environ.get("GOT_LANE_BUDGET_SHADOW", "1") == "1"
+# E1 T3 verdict 路由影子（零数值调制，O3 纪律）
+GOT_T3_ROUTING_SHADOW = os.environ.get("GOT_T3_ROUTING_SHADOW", "1") == "1"
+# E2 cross_node_signals 四模式路由影子（bull_confirmation 带 blocked_by_regime_pin，#14 未拍板前只留痕）
+GOT_XNODE_ROUTING_SHADOW = os.environ.get("GOT_XNODE_ROUTING_SHADOW", "1") == "1"
+# F1 埋伏道一致性校验影子（三规则只产提案，埋伏池本体零改动）
+GOT_AMBUSH_VALIDATION_SHADOW = os.environ.get("GOT_AMBUSH_VALIDATION_SHADOW", "1") == "1"
+
+# =============================================================================
+# D2 分道预算参数登记（现状 ROLE_MULTIPLIER 数值登记化，非新参数）
+# f() 真正形态参数（regime 交互项 / 催化供给项）须 D1 前向超额标定报告出区分度后
+# 才允许写入此 dict（O3 纪律：未绑校准源的 f() 不接受落码）。
+# =============================================================================
+LANE_BUDGET_PARAMS: dict[str, float] = {
+    "mainline": 1.0,
+    "ambush": 0.55,
+    "cooling": 0.3,
+    "unknown": 0.55,
+}
+
 # G-A4: 埋伏道 TopK（同板块去重后取前 N）
 AMBUSH_LANE_TOPK = 3
 # G-A2: 催化剂窗口（日历日，约 10 交易日）
@@ -369,8 +394,9 @@ IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 
 # F3（批次 F）：评分/阈值公式版本戳（UZI consensus_formula.version 模式）。权重/阈值表
 # 任何调参必须 bump 本值并写入归档 meta.json，供回测按版本分组（与 git commit 互补：
-# commit 定位代码，version 定位参数谱系；防“多版本逻辑混池统计导致结论失真”事故复发）。
-SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-11.1")
+# commit 定位代码，version 定位参数谱系；防"多版本逻辑混池统计导致结论失真"事故复发）。
+# 2026-10-15.1 bump：分道预算 trace(C4) / T3 路由(E1) / cross_node 路由(E2) / 埋伏校验(F1) 四组影子观测字段加入。
+SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-15.1")
 
 # =============================================================================
 # 批次 A（竞品补强）：证据链与出处（一期只降不升，防换池）

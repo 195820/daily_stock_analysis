@@ -74,6 +74,7 @@ from src.got.catalyst_config import (
     GLUE_MAX_TOKENS,
     GLUE_PIPELINE_ENABLED,
     GOT_A6_ENABLED,
+    GOT_AMBUSH_VALIDATION_SHADOW,
     LLM_CALL_TIMEOUT_S,
 )
 from src.got import glue_pipeline as _glue_pipeline_mod
@@ -456,6 +457,10 @@ class AggregatorNode:
                     logger.info(
                         "[Node 6] 4b enabled：题材阶段与主线状态不一致 → confidence ×%.1f", _factor
                     )
+        # F1 埋伏道一致性校验（2026-10-15，影子观测）
+        ambush_lane_validation = self._build_ambush_lane_validation(
+            ambush_pool, ambush_reservoir, sector
+        )
 
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
@@ -478,6 +483,7 @@ class AggregatorNode:
             ambush_pool=ambush_pool,
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
+            ambush_lane_validation=ambush_lane_validation,
             crowded_families=getattr(sector, "crowded_families", []) or [],
             mainline_endurance=mainline_endurance,
             family_suppression=family_suppression,
@@ -2596,6 +2602,111 @@ class AggregatorNode:
             logger.info(f"[Node 6] 升格支路 relations 补挂快照: {_DISCARD_STATS}")
 
         return promoted_pool, remaining
+    @staticmethod
+    def _build_ambush_lane_validation(
+        ambush_pool: list[AmbushCandidate],
+        ambush_reservoir: list[AmbushReservoirEntry],
+        sector: SectorContext,
+    ) -> Optional[list[dict]]:
+        """F1 埋伏道一致性校验（2026-10-15，影子观测）
+
+        三规则交叉验证，只产提案不改 ambush_pool/ambush_reservoir 本体：
+        1. stagnation_ambush: ambush_pool 候选板块同时出现在 cooling_down 或 industry_top
+        2. catalyst_expiry_watch: ambush_reservoir 条目 days_in_reservoir >= 7 (0.7×10)
+        3. family_divergence: reservoir 条目家族与主线 strength 榜前 3 家族分歧
+
+        Returns:
+            list[dict] 或 None（开关关闭时）
+        """
+        if not GOT_AMBUSH_VALIDATION_SHADOW:
+            return None
+
+        proposals = []
+
+        # 规则 1: stagnation_ambush — ambush_pool 候选板块同时出现在 cooling_down 或 industry_top
+        # 注意：cooling_down/industry_top 元素是 SectorDetail，字段名是 name（不是 sector_name）；
+        # ambush_pool（AmbushCandidate）/ambush_reservoir（AmbushReservoirEntry）才有 sector_name
+        cooling_names = {s.name for s in getattr(sector, "cooling_down", [])}
+        industry_names = {s.name for s in getattr(sector, "industry_top", [])}
+        stagnant_names = cooling_names | industry_names
+
+        for candidate in ambush_pool:
+            if candidate.sector_name in stagnant_names:
+                proposals.append({
+                    "rule": "stagnation_ambush",
+                    "sector": candidate.sector_name,
+                    "detail": {
+                        "in_cooling": candidate.sector_name in cooling_names,
+                        "in_industry_top": candidate.sector_name in industry_names,
+                    },
+                    "proposal": "建议移出埋伏池进观察道",
+                    "severity": "medium",
+                })
+
+        # 规则 2: catalyst_expiry_watch — ambush_reservoir 条目驻留天数接近过期
+        for entry in ambush_reservoir:
+            days = getattr(entry, "days_in_reservoir", 0)
+            if days >= 7:  # 0.7 × RESERVOIR_EXPIRY_DAYS (10)
+                proposals.append({
+                    "rule": "catalyst_expiry_watch",
+                    "sector": entry.sector_name,
+                    "detail": {
+                        "days_in_reservoir": days,
+                        "expiry_days": RESERVOIR_EXPIRY_DAYS,
+                    },
+                    "proposal": "蓄水池驻留接近过期，建议升格或除名",
+                    "severity": "high",
+                })
+            elif days >= 5:  # 早期预警
+                proposals.append({
+                    "rule": "catalyst_expiry_watch",
+                    "sector": entry.sector_name,
+                    "detail": {
+                        "days_in_reservoir": days,
+                        "expiry_days": RESERVOIR_EXPIRY_DAYS,
+                    },
+                    "proposal": "蓄水池驻留进入预警区间",
+                    "severity": "low",
+                })
+
+        # 规则 3: family_divergence — reservoir 条目家族与主线 strength 榜前 3 家族分歧
+        # 从 sector.theme_families 取主线家族榜（按 family_score 排序）
+        theme_families = getattr(sector, "theme_families", [])
+        if theme_families and ambush_reservoir:
+            # 主线 strength 榜前 3 家族名称
+            sorted_families = sorted(theme_families, key=lambda f: getattr(f, "family_score", 0), reverse=True)
+            top3_family_names = {getattr(f, "family_name", "") for f in sorted_families[:3]}
+
+            # reservoir 条目强度中位数（用 entered_strength 或 strength_lookup）
+            strength_lookup = getattr(sector, "strength_lookup", {})
+            reservoir_strengths = [
+                strength_lookup.get(e.sector_name, getattr(e, "entered_strength", 0))
+                for e in ambush_reservoir
+            ]
+            median_strength = sorted(reservoir_strengths)[len(reservoir_strengths) // 2] if reservoir_strengths else 0
+
+            # 检查每个 reservoir 条目的家族归属
+            for entry in ambush_reservoir:
+                entry_strength = strength_lookup.get(entry.sector_name, getattr(entry, "entered_strength", 0))
+                # 简单启发式：板块名包含家族关键词（实际应查 member stocks 的家族归属）
+                # 此处简化为检查板块名是否与 top3 家族名有子串关系
+                for family_name in top3_family_names:
+                    if family_name in entry.sector_name or entry.sector_name in family_name:
+                        if entry_strength < median_strength:
+                            proposals.append({
+                                "rule": "family_divergence",
+                                "sector": entry.sector_name,
+                                "detail": {
+                                    "family": family_name,
+                                    "entry_strength": entry_strength,
+                                    "median_strength": median_strength,
+                                },
+                                "proposal": "家族在主线强势但该板块强度低于中位数",
+                                "severity": "medium",
+                            })
+                        break  # 匹配到一个家族即可
+
+        return proposals
 
     async def _build_ambush_channel(
         self,
@@ -2615,6 +2726,10 @@ class AggregatorNode:
            Agent 催化剂先行提名（单次批量调用，满足 G2/G3 才进视野）
         3. 跨日合并：今日蓄水池 + 前日留存 → 合并列表（天数递增，过期除名）
         4. 升格检测：蓄水池中满足条件的板块 → 重新走闸门 → 正式池
+
+        F1 影子校验（2026-10-15）：
+            产出 ambush_lane_validation 提案列表（三规则：stagnation_ambush / catalyst_expiry_watch / family_divergence），
+            零本体改动——ambush_pool / ambush_reservoir 内容不变。
 
         Returns:
             (ambush_pool, ambush_reservoir, veto_log)
@@ -3865,15 +3980,23 @@ class AggregatorNode:
         """Phase 3b 影子留痕：把节点信号→AgentOpinion[]→11 类冲突分类，产观测 dict（不进判定）。
 
         aggregator 侧无组合层 sell_source（那是 Phase 2 产物），故 risk_override_present
-        在此恒 False（真风控否决在 PD 侧派生）；memory=None → 退化等权。
+        在此恒 False（真风控否决在 PD 侧派生）。
+        E3 接线（2026-10-15）：memory 由 None 改为 AgentMemory.from_config()——
+        compute_signal_weights 走先验常量表 _SOURCE_PRIOR_WEIGHTS 路径（from_config 内部
+        try/except 回退 enabled=False → compute_skill_weights 返回全 1.0 校准因子，
+        先验权重直接生效）。仅改 shadow JSON 内容，零决策影响（3b 缺省 0 不触发 veto_buy）。
+        2026-10-15 前的等权读数作废重计（verification.md 3b 判据节注记读数起点）。
         """
+        from src.agent.memory import AgentMemory
         from src.got.disagreement import build_disagreement_summary, build_opinions
 
         opinions = build_opinions(
             regime=regime, sector=sector, sector_intels=sector_intels,
             capital=capital, sentiment=sentiment, sell_source=None,
         )
-        return build_disagreement_summary(opinions, risk_override_present=False, memory=None)
+        return build_disagreement_summary(
+            opinions, risk_override_present=False, memory=AgentMemory.from_config()
+        )
 
     # =========================================================================
     # 辅助方法
@@ -4831,7 +4954,6 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         3. 技术分排名 vs 综合分排名落差（口径分裂的可读化信号，2026-08-18）
         4. 资金强流入 vs 情绪中性/恐惧（跨维背离，2026-08-18）
         5. Regime 刚切换低置信（dwell < 2）
-        6. glue 口径 vs Node 3 规则口径矛盾（Q8-A2，audit_20260922，只标记不排除）
         """
         contradictions = []
 

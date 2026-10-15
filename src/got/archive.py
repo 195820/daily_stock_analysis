@@ -1117,6 +1117,81 @@ def _render_shadow_fts(fts: "dict | None") -> list[str]:
     lines.append("")
     return lines
 
+def _render_shadow_lane_budget(lane_shadow: "list[dict] | None") -> list[str]:
+    """📊 分道预算影子（C4，三问裁决 WI-P-7）。
+
+    None → 未开启；[] → 开启但无买入分配；非空 → 逐 lane 列出。
+    """
+    if lane_shadow is None:
+        return ["**📊 分道预算影子**（未开启）", ""]
+    if not lane_shadow:
+        return ["**📊 分道预算影子**：本次无买入分配（预算不足或无候选）。", ""]
+    lines = [f"**📊 分道预算影子**（只读现状，零决策改动）：{len(lane_shadow)} 条分道记录。"]
+    lines.append("")
+    lines.append("| lane | allocated_value | role_budget_m | n_positions | formula_version |")
+    lines.append("|---|---|---|---|---|")
+    for row in lane_shadow:
+        lines.append(
+            f"| {row.get('lane', '?')} "
+            f"| ¥{row.get('allocated_value', 0):,.0f} "
+            f"| {row.get('role_budget_m', '?')} "
+            f"| {row.get('n_positions', 0)} "
+            f"| {row.get('formula_version', '?')} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_shadow_t3_routing(t3_shadow: "list[dict] | None") -> list[str]:
+    """⚖️ T3 verdict 路由影子（E1，三问裁决 WI-P-7）。
+
+    None → 未开启；[] → 开启但无矛盾；非空 → 行数 + 前 5 条 rule→t3 对照。
+    """
+    if t3_shadow is None:
+        return ["**⚖️ T3 verdict 路由影子**（未开启）", ""]
+    if not t3_shadow:
+        return ["**⚖️ T3 verdict 路由影子**：本次无矛盾（unified.contradictions 为空）。", ""]
+    lines = [
+        f"**⚖️ T3 verdict 路由影子**（零数值调制，O3 纪律）：共 {len(t3_shadow)} 条矛盾，"
+        f"action_taken 恒 `shadow_none`。"
+    ]
+    for row in t3_shadow[:5]:
+        lines.append(
+            f"- `{row.get('contradiction_id', '?')}`: "
+            f"rule_verdict=`{row.get('rule_verdict')}` → "
+            f"t3_verdict=`{row.get('t3_verdict')}`"
+        )
+    if len(t3_shadow) > 5:
+        lines.append(f"- …（省略 {len(t3_shadow) - 5} 条）")
+    lines.append("")
+    return lines
+
+
+def _render_shadow_xnode_routing(xnode_shadow: "list[dict] | None") -> list[str]:
+    """🔀 cross_node 路由影子（E2，三问裁决 WI-P-7）。
+
+    四模式计数 + bull_confirmation blocked 条目数。
+    """
+    if xnode_shadow is None:
+        return ["**🔀 cross_node 路由影子**（未开启）", ""]
+    if not xnode_shadow:
+        return ["**🔀 cross_node 路由影子**：本次无跨节点信号。", ""]
+    _counts: dict[str, int] = {}
+    _blocked_n = 0
+    for row in xnode_shadow:
+        _m = row.get("routing_mode", "unknown")
+        _counts[_m] = _counts.get(_m, 0) + 1
+        if row.get("blocked_by"):
+            _blocked_n += 1
+    _mode_txt = " / ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+    lines = [
+        f"**🔀 cross_node 路由影子**（四模式路由）：共 {len(xnode_shadow)} 条信号，"
+        f"{_mode_txt}；bull_confirmation blocked {_blocked_n} 条（#14 regime 钉死未决，冻结）。"
+    ]
+    lines.append("")
+    return lines
+
+
 
 def _render_shadow_risk_override(shadow: "dict | None") -> list[str]:
     """3b 风控覆盖计划（RiskOverridePlan，影子）：冲突分类 + veto_buy + 调整计划。
@@ -1171,6 +1246,46 @@ def _render_shadow_tradability(shadow: "dict | None") -> list[str]:
         )
     if not pend:
         lines.append("- 本次无可成交性拦截（账户空仓/无卖单时为 0，属正常，≠被证伪）。")
+    lines.append("")
+    return lines
+
+def _render_shadow_ambush_validation(unified: "dict | None") -> list[str]:
+    """🔍 埋伏道校验影子（F1，三问裁决 WI-P-8）：三规则计数 + high 条目明细。
+
+    规则：stagnation_ambush / catalyst_expiry_watch / family_divergence。
+    只读 unified.ambush_lane_validation，零决策改动。
+    """
+    validation = (unified or {}).get("ambush_lane_validation")
+    if validation is None:
+        return ["**🔍 埋伏道校验影子**（未开启）", ""]
+    if not validation:
+        return ["**🔍 埋伏道校验影子**：（无提案）", ""]
+
+    # 按规则计数
+    rule_counts: dict[str, int] = {}
+    for row in validation:
+        rule = row.get("rule", "unknown")
+        rule_counts[rule] = rule_counts.get(rule, 0) + 1
+
+    # 提取 high severity 条目（最多 5 条）
+    high_entries = [row for row in validation if row.get("severity") == "high"][:5]
+
+    lines = [
+        f"**🔍 埋伏道校验影子**（三规则交叉验证）：共 {len(validation)} 条提案，"
+        f"stagnation_ambush={rule_counts.get('stagnation_ambush', 0)} / "
+        f"catalyst_expiry_watch={rule_counts.get('catalyst_expiry_watch', 0)} / "
+        f"family_divergence={rule_counts.get('family_divergence', 0)}。"
+    ]
+
+    if high_entries:
+        lines.append(f"  high severity 条目（{len(high_entries)} 条）：")
+        for row in high_entries:
+            sector = row.get("sector", "?")
+            detail = row.get("detail", {})
+            days = detail.get("days_in_reservoir", "?")
+            expiry = detail.get("expiry_days", "?")
+            lines.append(f"  - `{sector}`: {row.get('proposal', '')}（驻留 {days}/{expiry} 天）")
+
     lines.append("")
     return lines
 
@@ -1314,12 +1429,15 @@ def _render_shadow_section(
     bear_gate_shadow: "dict | None" = None,
     risk_override_shadow: "dict | None" = None,
     tradability_shadow: "dict | None" = None,
+    lane_budget_split_shadow: "list[dict] | None" = None,
+    t3_routing_shadow: "list[dict] | None" = None,
+    cross_node_signals_shadow: "list[dict] | None" = None,
     base_dir: "Path | None" = None,
     run_date: "date | None" = None,
 ) -> list[str]:
     """渲染「影子模式观测」段（reasoning.md 末尾，各影子线各一段）。
 
-    各线：4b 市场结构 / 3b 分歧摘要 / 3b 风控覆盖(RiskOverridePlan) / 4.1 超限减仓 / MEG / FTS（含 FXG）/ 工作流 B bear gate 留痕 / GATE-1 卖出可成交性 / T1 候选股终审 / T1-H 持仓审查。
+    各线：4b 市场结构 / 3b 分歧摘要 / 3b 风控覆盖(RiskOverridePlan) / 4.1 超限减仓 / MEG / FTS（含 FXG）/ 工作流 B bear gate 留痕 / GATE-1 卖出可成交性 / C4 分道预算 / E1 T3 路由 / E2 cross_node 路由 / T1 候选股终审 / T1-H 持仓审查。
     A5 语义粘合层已转正（A6），改由 Node 6 正文子块 `_render_a6_glue_formal` 承载；
     仅当 glue 降级时才在本段留一条降级观测行。code_to_name 保留签名位（已转正线不再用）。
 
@@ -1357,6 +1475,12 @@ def _render_shadow_section(
     lines += _prog("bear_gate")
     lines += _render_shadow_tradability(tradability_shadow)
     lines += _prog("tradability")
+    # ── C4/E1/E2 三问裁决影子 trace（WI-P-7，2026-10-15）──
+    lines += _render_shadow_lane_budget(lane_budget_split_shadow)
+    lines += _render_shadow_t3_routing(t3_routing_shadow)
+    lines += _render_shadow_xnode_routing(cross_node_signals_shadow)
+    # ── F1 埋伏道校验影子 trace（WI-P-8，2026-10-15）──
+    lines += _render_shadow_ambush_validation(unified)
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _prog("t1")
@@ -1463,6 +1587,9 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         bear_gate_shadow=_read_json_quiet(day_dir / SHADOW_BEAR_GATE_ARTIFACT),
         risk_override_shadow=_pd_json.get("risk_override_shadow"),
         tradability_shadow=_pd_json.get("tradability_shadow"),
+        lane_budget_split_shadow=_pd_json.get("lane_budget_split_shadow"),
+        t3_routing_shadow=_pd_json.get("t3_routing_shadow"),
+        cross_node_signals_shadow=_pd_json.get("cross_node_signals_shadow"),
         base_dir=day_dir.parent,
         run_date=_shadow_run_date,
     )
