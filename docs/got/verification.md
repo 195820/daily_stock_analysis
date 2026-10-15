@@ -55,7 +55,7 @@
 | **FXG** | veto `evaluated 25`、剔池 0、豁免 0；**`fxg_baseline_scoring.json` 首份**（`mode=baseline_off` 对照 3 行） | 0 → **1 天** | 自建对照机制首次真实跑通；「≥1 周」时钟自 10-12 起算 |
 | **GATE-1 tradability** | `tradability_shadow.mode="shadow"`、`pending_exits=[]` | 0 → **1 天** | WI-P-4 的「下一交易日确认 mode==shadow」今日闭环；**账户空仓无卖单 ⇒ 今日无 `quote_unavailable` 样本** |
 | **项三 3a / D-3 基线** | `meta.json.funnel_stats` **首次非空**：actionable 7 / 有入选 3 / **零入选率 0.571**（创新药、有色、生物疫苗、银行），逐轮存活 61→55→55→36→20→15→6→3 | 0 → **1 天** | **D-3 归零率基线起算日 = 2026-10-12**（取代原「≥1013 首验后才起算」的表述） |
-| **个股级事件退日历** | 42 事件按源 `macro_rule 10 / global_map 21 / llm_narrative 11`，**`akshare_*` 计数 = 0** | 验收首次可读 | 10-08 裁决的判据今日首次通过；再现即旁路复活 |
+| **个股级事件退日历** | 42 事件按源 `macro_rule 10 / global_map 21 / llm_narrative 11`，**`akshare_*` 计数 = 0** | 验收首次可读 | 10-08 裁决的判据今日首次通过；再现即旁路复活。**后续：10-13 = 0/62、10-14 = 0/13 连续通过（登记见 10-08 节）** |
 | **批次 G / C1 / E1 / F** | `review.json` 在产；`consistency.json`（抽样 3 / 告警 0 / 缺源 0）；`net_preflight` 4/4 ok；`scoring_formula_version=2026-10-11.1` | 首日 | 一期批次首次有生产读数 |
 | **影子五线** | `risk_override`/`sell_source`（缺口 ¥3,541、削 0 只）/`exposure_enforce`（`mode=n/a`）present；**`signal_size_shadow=null`**；**`mature_reduce_shadow=[]`**（旧形状）| 逐日累计 | 当日把五线判据里待确认的 **`[]`（跑了没命中）vs `null`（未产样本）** 语义实例化了一遍；**其中 `mature_reduce_shadow` 已于同日定稿为三态 dict（A1 #3 / WI-P-6），其余四线门槛仍待填（A1 #4）** |
 
@@ -97,6 +97,21 @@
 
 ---
 
+## ‼️ 2026-10-15 补登（4b 市场结构上下文影子判据——「影子线必登判据」条款补漏）
+
+**背景**：4b（批次 5 §2.2，2026-09-28 上线）此前只有读数更正（§7 TickFlow 探测节「4b 排名源确定 mootdx 自算」）与 10-11 复核注，**判据四要素从未入本清单**——同 §8 #10 谱系「影子线必登判据」漏登，本节补齐。只登记事实与判据面，达标与否归负责人（遵 §0）。
+
+| 要素 | 登记 |
+|---|---|
+| **开关与缺省** | `GOT_MARKET_THEME_SHADOW=1`（缺省开，每日真跑零决策改动）/ `GOT_MARKET_THEME_ENABLED=0`（缺省关，开了才对 `overall_confidence` 施一致性因子并填 `market_theme` 真值）。⚠️ 两者为**消费点内联 `os.getenv`**（`aggregator.py` 4b 消费块 + `orchestrator.py` Step 2.5 构造块），**不在 `catalyst_config.py`**（Phase A 勘误表已勘） |
+| **产物** | `unified.json` → `market_theme_shadow`（影子留痕 dict：`{status, source, top5_concepts[], breadth, note}`，`schemas.py:1062`）；`market_theme`（真值 `MarketThemeContext`，仅 ENABLED=1 时填，影子期恒 `None`，`schemas.py:1069`）。Step 2.5 构造块（orchestrator）与 Node 6 消费块（aggregator）读同一对开关，无独立构造开关 |
+| **判据面** | ① 影子日 `market_theme_shadow` present 且 `status` 非 None（取数失败回退 `unknown` 属正常读数，不得记缺陷）；② `market_theme` 恒 `null`（ENABLED=0 下非 null 即违约——把未生效数据伪装成已接入）；③ `source` 字段可追溯排名源（探测结论：mootdx 自算，见 §7） |
+| **转正门槛** | **未定，归负责人**（本线零决策改动，转正语义 = 开 `GOT_MARKET_THEME_ENABLED` 使 `overall_confidence` 吃一致性因子，属决策面变更，须先有影子期一致性观测材料；**非空可数日 8 天（0928–1014），不足 10**，语义一致性判定亦未做） |
+
+**既有读数锚点**（2026-10-15 只读抽验 11 归档日实测）：**非空可数日 = 8 天（0928→1014：0928/0929/0930/1008/1009/1012/1013/1014），全部 `status="ok"`**，`market_theme` 真值全 `null`（判据② 无违约）；0922–0924 上线前无产物（`None`）属预期，判据①「影子日 present」以 0928 起算（10-11 复核注口径）。另有 10-11 复核注已订正「0928 产物不可用」旧记载；TickFlow 探测节（§7）确认排名源 = mootdx 自算而非 TickFlow API。
+
+---
+
 ## ‼️ 2026-10-08 状态变更（个股级结构化事件退出催化剂日历）
 
 **背景**：1008 全流程实测中财报披露通道「死而复生」（0825–0930 因 `stock_yjyg_em` 取数失真恒为零，六周下游无一处报缺）；当日 7 条 `akshare_earnings`（direction=drift）挤占 22 格日历，飞龙股份一只扇出 4 板块——与 WI-P2-4 移除解禁的三条理由（层次错配/稀释密度/无规模信息）逐字同案。
@@ -108,6 +123,7 @@
 **待验证判据**（本条只登记事实，达标与否由负责人判定）：
 - 存量 7 条 earnings（`expires_at=2026-10-13`）已经负责人指令**当日直接删除**（1008，连带 `catalyst_realizations` 7 条注册行，脚本 `.review_tmp/del_earnings_rows_1008.py`）；删后 DB 仅剩 macro_rule/global_map/llm_narrative 三源。**次一交易日（1009）即增量日，DB 已无个股存量，明日起日历不应再出现任何 akshare_\* 条目**（无需等到 ~10-14 下次全量重建）。
 - 验收：每日 `news.json → catalyst_calendar.events` 中 `source.startswith('akshare_')` 计数 = 0；若再现即为旁路复活。
+- **连续通过登记（2026-10-15 补记）**：1009 起算的验收读数实测 **10-13 = 0/62、10-14 = 0/13**（62/13 为当日日历事件总数，`akshare_*` 均为 0）——个股级退日历判据连续两交易日通过，无旁路复活迹象；判据继续按日生效。
 - 单测锚点：`tests/test_catalyst_calendar_stock_events.py`（5 例，含「增量日仍带存量」的反向登记——该例测的是桩内 DB 存量语义，与本次直接删库不矛盾）；消费侧回归 `test_node6_glue / test_node6_ambush_funnel / test_ambush_relations_wiring / test_lockup_risk_events` 共 67 例绿。
 
 ---
@@ -181,7 +197,7 @@
 | **D** news_pulse 持仓异动归因 | `GOT_NEWS_PULSE_ENABLED=0`（缺省**关**）/ `GOT_NEWS_PULSE_THRESHOLD=7.0` / `GOT_NEWS_PULSE_MAX_STOCKS=3` | `data/got_daily/{date}/news_pulse.json` | 先手动跑一周验输出质量（归因表含排除项/性质四选一/盘中收盘两口径）；推送接线另立子项 | 代码+测试就位（6 例），默认关未跑 |
 | **G** output_review 产出自查 | `GOT_OUTPUT_REVIEW=1`（缺省**开**，warn 态零行为） | `data/got_daily/{date}/review.json` | 一期只 warn；critical 项升为**阻断**需两周零误报人工确认（且阻断只拦推送/终端，归档照常） | 已落（一期 warn），10 例 |
 | **A** 证据链与出处 | 无独立总开关；一期 `EVIDENCE_TIER_MULTIPLIER` confirmed==reported==1.0（**零行为变化**）；Node4 抽取 prompt 的 url/时间接地受 `GOT_NEWS_EVIDENCE_GATING=false` 门控（审查 W2：开启会改 LLM 输入，缺省关=prompt 逐字同改造前） | `catalyst_events.evidence_tier/source_url` + `node4_raw_news.url/published_at` 列（已实 DB 迁移） | 二期启用 rumor<1.0 折扣前，先历史归档重放 pool 成员对比 + 人工确认（防换池）；开接地前先同输入 golden 抽取对照 | 已落（催化剂侧 tier+乘数零变化 + 新闻侧回连机制，默认关），13 例；rumor 未标→零变化 |
-| **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80%。**〔10-12 实测补条件：`_collect_actionable_sectors` 只取 `is_holding` 或 action∈(buy_trend,buy_dip,hold)；10-12 三个候选全 `watch` 且空仓 ⇒ 函数 `return None`、零产物零告警 ⇒ 「≥10 交易日」必须只计「有买入/持有标的」的日，否则计时器不动（backlog §9 #7）〕** | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
+| **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80%。**〔10-12 实测补条件：`_collect_actionable_sectors` 只取 `is_holding` 或 action∈(buy_trend,buy_dip,hold)；10-12 三个候选全 `watch` 且空仓 ⇒ 函数 `return None`、零产物零告警 ⇒ 「≥10 交易日」必须只计「有买入/持有标的」的日，否则计时器不动（backlog §9 #7）〕**〔10-15 采样口径注记：产物侧 `{skipped_reason: no_actionable_target}` 落行仍未实施（全仓零命中），在补码前，空仓/全 watch 日「文件缺失 = 无样本日不计」的读法成立；样本侧不足类冲突按 3b 门槛先例用合成上下文补测，不得拿单一行情态样本当全量〕 | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
 | **C1** 双源交叉验证 | `GOT_CONSISTENCY_SAMPLE=10`（缺省 10，**0=关**）/ `GOT_CONSISTENCY_TOL=1.0` | `data/got_daily/{date}/consistency.json` | 不改任何决策输入；二期可接推送/告警 | 已落（源A=manager 实时 / 源B=腾讯批量 D0，比当日 change_pct；资金无二源→诚实标注），10 例 |
 | **C2** 全局 is_stale | 无开关（`src/got/data_freshness.py`） | —（工具） | — | 已抽为唯一权威实现，capital_analysis 改为引用（禁二口径）+ 扩识别英文 `date` 列；**Node 1/2/5 行情消费点接入为待办子项** |
 | **E1** 网络预检 | `GOT_NET_PREFLIGHT=true`（缺省开，纯观测） | `meta.json.net_preflight`（回读-改-写） | 不据此降级；lite 自动降级延后到 lite/full 历史差异读数后 | 已落（GET 探活4域），4 例；**lite 手动/自动降级为独立子项（未实现）** |

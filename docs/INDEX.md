@@ -96,7 +96,7 @@
 | [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；⚠️ 正文基线为 0831 快照，**文首时效注记已于 2026-10-10 刷新**并列出四个已知脱节区） |
 | [got/decision_brief_openc3_20260928.md](got/decision_brief_openc3_20260928.md) | **当前唯一待拍板简报**（OPEN-C3 `persistence_regime` 死分支：接线/删分支/保留三选一），故不入归档 |
 
-### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，十一份）
+### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，十二份）
 
 | 计划 | 状态 | 开工前置 |
 | --- | --- | --- |
@@ -109,6 +109,7 @@
 | [plans/加速末期识别缺陷分析_20261008.md](got/plans/%E5%8A%A0%E9%80%9F%E6%9C%AB%E6%9C%9F%E8%AF%86%E5%88%AB%E7%BC%BA%E9%99%B7%E5%88%86%E6%9E%90_20261008.md) | 分析稿 + **MEG 已影子接线**（回测证真）；派生出 FTS / FXG 两道闸门 | 影子读数 ≥1 周后切 veto；〔10-10 曾测读数 MEG 1 / FTS 0 / FXG 0，**〔10-12 实跑订正：三闸门时钟自 2026-10-12 起算，首份 FTS/FXG 产物已落盘〕**判读按 `bar_complete` 分组〕；三闸门判据见 [verification.md](got/verification.md) 顶部 |
 | [plans/竞品经验补强计划_20261006.md](got/plans/%E7%AB%9E%E5%93%81%E7%BB%8F%E9%AA%8C%E8%A1%A5%E5%BC%BA%E8%AE%A1%E5%88%92_20261006.md) | ✅ **一期已实施（2026-10-11，commit `5a4f29f`）**——经外网对标计划 §7 拍板批准全量按序，已落 D0→D→G→A→B→C1/C2→E1→E3→F（均影子/观测先行）；E2 回放与 lite 自动降级按前置阻塞未开工 | 逐批读数达标后转正（判据见 verification.md 10-11 补登节）；A 二期 rumor 折扣需历史重放 + 人工确认 |
 | [plans/埋伏分支拆分_PLAN_v2.md](got/plans/埋伏分支拆分_PLAN_v2.md) | **已实施（2026-10-13，Step 0 门 PASS，影子期 ACTIVE=0）**——埋伏道拆分 v2（抽道/四闸门/Node 7 接线；后经 10-13 P5 变量遮蔽修复 + 10-14 G-A2 三标量接线补强） | 转正判据见该计划 §5.2；生效验证（新归档含 pos_* 三键）登 [verification.md](got/verification.md) 顶部 10-14 节 |
+| [plans/GOT三问架构裁决_实施计划_20261015.md](got/plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261015.md)（原仓库根 `GOT三问架构裁决_PLAN.md`，10-15 治理轮移入） | **现行实施计划（Phase A–F）**：A 文档落账 ✅（10-15，backlog 三处挂号 + 持仓文档 §七 + 归档稿 [GOT三问架构裁决_20261014.md](got/plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_20261014.md)）；C 决策编排层 v0（C1 trade_plans 表 / C2 `decision_plan.py` / C3 通知接线 / C4 thesis 状态机挂 B 门 / C5 归档渲染）、D 分道预算标定（`SCORING_FORMULA_VERSION` → 2026-10-15.1）、E 三路路由影子、F 埋伏 per-lane validation 待实施 | **Phase B step 0 裁决资料包＝用户裁决门**（W3 五处口径枚举 + 入场锚选项 + thesis 状态机定稿），C4/Phase D ACTIVE 接线挂其后；C1/C2/C3/C5、E、F 不受 B 门阻塞可先行 |
 | [plans/外网对标实施计划_20261011.md](got/plans/%E5%A4%96%E7%BD%91%E5%AF%B9%E6%A0%87%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261011.md)（原根目录 `外网对标实施_PLAN.md`，10-14 治理轮移入） | **部分实施**——项二（direction 净化）✅ / 项一（宏观扇出②+②b）代码在位但双开关缺省关 / 项三 3a ✅（D-3 基线 10-12 起算）/ 项四另列竞品计划 | 3b 双前置＝D-3 基线满 ≥10 交易日 + AlphaSift 接口三点设计拍板；项一翻 `GOT_MACRO_FANOUT_ENABLED`/`GOT_MACRO_SECTOR_ALIGN_ENABLED` 后待全流程读数（判据见 verification.md 项一节） |
 | [plans/regime与数据流断路_文献对照分析_20261011.md](got/plans/regime%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%B5%81%E6%96%AD%E8%B7%AF_%E6%96%87%E7%8C%AE%E5%AF%B9%E7%85%A7%E5%88%86%E6%9E%90_20261011.md)（原根目录 untracked `GOT_问题分析_PLAN.md`，10-14 治理轮移入） | **分析稿（现行，零生产代码）**——分析一（regime 钉死豁免键四方案）供 §7 #14 拍板；分析二（数据流断路接线）中 `confidence_multiplier` 接线建议已被 10-14 §1.J 裁决覆盖为「删除（已实施）」 | backlog §7 **#14** 待拍板；**#16**（cross_node_signals）与 #14 串联出稿；**#15**（industry_top）可独立出分析稿 |
 
