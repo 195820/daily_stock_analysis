@@ -1513,8 +1513,48 @@ def main() -> int:
                             print(f"  [!] {warning}")
 
                     print(f"\n推理总结:\n{decision.reasoning}")
+                    # ── GOT 通知 hook（C3）──
+                    if os.environ.get("GOT_NOTIFY_ENABLED", "1") == "1":
+                        try:
+                            from src.notification import get_notification_service
+                            _notify_lines = [f"📊 GOT 每日决策 — {date.today().isoformat()}", f"操作总结: {decision.summary}"]
+                            _ra = decision.risk_assessment
+                            _notify_lines.append(
+                                f"风险: 仓位上限 {_ra.position_limit:.0%} / 当前 {_ra.current_position_ratio:.0%} / 止损 {_ra.stop_loss_threshold:.0%}"
+                            )
+                            _top_alloc = decision.allocation[:3]
+                            if _top_alloc:
+                                _notify_lines.append(f"\n交易建议 Top {len(_top_alloc)}:")
+                                for _al in _top_alloc:
+                                    _at = {"buy": "BUY", "sell": "SELL", "hold": "HOLD"}.get(_al.action, "?")
+                                    _notify_lines.append(
+                                        f"  [{_at}] {_al.name}({_al.symbol}) "
+                                        f"区间 {_al.price_range[0]:.2f}~{_al.price_range[1]:.2f}"
+                                    )
+                            if decision.rotation_signals:
+                                _notify_lines.append(f"\n轮动信号 ({len(decision.rotation_signals)}):")
+                                for _rs in decision.rotation_signals[:3]:
+                                    _notify_lines.append(f"  [{_rs['type']}] {_rs['reason']}")
+                            if decision.crowding_warnings:
+                                _notify_lines.append(f"\n拥挤警告 ({len(decision.crowding_warnings)}):")
+                                for _cw in decision.crowding_warnings[:3]:
+                                    _sv = "⚠️高" if _cw['severity'] == 'high' else "⚡中"
+                                    _notify_lines.append(f"  {_sv} {_cw['suggestion']}")
+                            if decision.warnings:
+                                _notify_lines.append(f"\n风险提示 ({len(decision.warnings)}):")
+                                for _w in decision.warnings[:5]:
+                                    _notify_lines.append(f"  [!] {_w}")
+                            _notify_svc = get_notification_service()
+                            _notify_svc.send(
+                                content="\n".join(_notify_lines),
+                                severity="info",
+                                dedup_key=f"got_daily_{date.today().isoformat()}",
+                            )
+                        except Exception as e:
+                            logger.warning(f"[GOT] 通知发送失败（不阻断）: {e}")
                 else:
                     logger.info("[GOT] Phase 2 决策不存在（可能 Phase 2 未启用或失败）")
+
 
                 return 0
 
