@@ -559,11 +559,8 @@ class PortfolioDecisionNode:
 
             # 简化版：使用持仓盈亏比例估计回撤
             # 实际应该从历史净值序列中计算，这里用持仓的平均盈亏代替
-            accounts = portfolio.get("accounts", [])
-            if not accounts:
-                return 0.0
-
-            positions = accounts[0].get("positions", [])
+            # B1-b：全账户 positions 合并视图（与全账户 total_equity 同口径）
+            positions = self._all_positions(portfolio)
             if not positions:
                 return 0.0
 
@@ -671,16 +668,15 @@ class PortfolioDecisionNode:
             "skipped_reason": None,
         }
 
-        accounts = portfolio.get("accounts", [])
-        if not accounts:
-            self._mature_reduce_shadow_hits["skipped_reason"] = "no_accounts"
-            return results
-
-        positions = accounts[0].get("positions", [])
+        # B1-b：全账户 positions 合并视图（与全账户 total_* 同口径）
+        # 空账户（含兜底快照 accounts=[]）→ 无可评估对象
+        positions = self._all_positions(portfolio)
         self._mature_reduce_shadow_hits["holdings_seen"] = len(positions)
         if not positions:
             # 无持仓：本轮成熟期盘点无可评估对象（与「有持仓但都不在窗口」不同义）
-            self._mature_reduce_shadow_hits["skipped_reason"] = "no_holdings"
+            self._mature_reduce_shadow_hits["skipped_reason"] = (
+                "no_accounts" if not portfolio.get("accounts") else "no_holdings"
+            )
 
         # 构建板块 → 强度映射（从 sector_context）
         sector_strength_map = self._build_sector_strength_map(sector_context)
@@ -902,6 +898,9 @@ class PortfolioDecisionNode:
                 )
                 if grace_applied:
                     reasoning += f", [家族宽限]"
+                else:
+                    # B3 状态机：无宽限卖出 = 论点已破（家族走弱/深度破位/无家族）
+                    self._mark_thesis_broken(symbol)
             elif thesis_drift:
                 # Fix 2: 板块漂移检测 — 论点板块与当日匹配不一致
                 thesis = thesis_map.get(symbol)
@@ -918,6 +917,8 @@ class PortfolioDecisionNode:
                 else:
                     action = "sell"
                     reasoning += f", [论点漂移卖出: {thesis_family}→{sector_name}]"
+                    # B3 状态机：论点漂移无宽限卖出 = 论点已破
+                    self._mark_thesis_broken(symbol)
             elif lifecycle_phase is None:
                 # 板块不在 confirmed_sectors 中（可能被踢出）
                 # Invesco 2024 非对称门槛：持仓者降温期保护
@@ -949,6 +950,9 @@ class PortfolioDecisionNode:
                 )
                 if grace_applied:
                     reasoning += f", [家族宽限]"
+                else:
+                    # B3 状态机：非主线/埋伏角色 + 无宽限卖出 = 论点已破
+                    self._mark_thesis_broken(symbol)
             elif sector_role == "ambush" and symbol in ambush_snapshot_map:
                 # P4 埋伏退出分支：催化剂驱动，替代生命周期逻辑
                 snapshot = ambush_snapshot_map[symbol]
@@ -2941,6 +2945,17 @@ class PortfolioDecisionNode:
         for sn, fg in fgl.items():
             sector_to_family.setdefault(sn, fg)
 
+        # B2-c（2026-10-15 拍板）：thesis 为所有 GOT 买入的唯一入场锚源。
+        # 埋伏买入已被 buy_allocations 覆盖（不过滤 is_ambush_entry）；
+        # 此处额外把催化剂事件 ID 回写 thesis 行，埋伏元数据仍以 ambush 表为准。
+        ambush_catalyst_by_symbol: dict[str, str] = {}
+        ambush_pool_map = {c.sector_name: c for c in unified_context.ambush_pool}
+        for s in unified_scoring:
+            sector = s.sector_name or ""
+            if sector in ambush_pool_map:
+                events = ambush_pool_map[sector].events or [""]
+                ambush_catalyst_by_symbol[s.symbol] = events[0]
+
 
         written = []
         failed_symbols = []
@@ -2976,6 +2991,14 @@ class PortfolioDecisionNode:
                         existing.entry_price = entry_price
                         existing.source = "got_buy"
                         existing.is_open = True
+                        # B3 状态机：买入/重写 → 论点成立（幂等重跑重置为 intact）
+                        # 不变式：intact ⟹ drift_watch_since 为 NULL（迁移回填谓词依赖），
+                        # 重置 intact 必须同步清 since，否则下次重启回填翻回 drift_watch
+                        existing.lifecycle_state = "intact"
+                        existing.drift_watch_since = None
+                        existing.drift_family = None
+                        # B2-c：埋伏买入补催化剂关联（非埋伏票置空，避免同日改道残留）
+                        existing.catalyst_event_id = ambush_catalyst_by_symbol.get(alloc.symbol) or None
                         logger.info(f"[Fix 2] 持仓论点快照已更新（同日重跑）: {alloc.symbol} @ {today}")
                     else:
                         record = HoldingThesisRecord(
@@ -2986,6 +3009,8 @@ class PortfolioDecisionNode:
                             entry_price=entry_price,
                             composite_at_entry=scoring.composite_score,
                             source="got_buy",
+                            lifecycle_state="intact",
+                            catalyst_event_id=ambush_catalyst_by_symbol.get(alloc.symbol) or None,
                             is_open=True,
                         )
                         session.add(record)
@@ -2995,6 +3020,8 @@ class PortfolioDecisionNode:
                         "sector": sector_name,
                         "family": family_name,
                         "entry_price": entry_price,
+                        # B2-c：埋伏催化剂关联留痕（归档排查用，非埋伏票为 None）
+                        "catalyst_event_id": ambush_catalyst_by_symbol.get(alloc.symbol) or None,
                     })
 
                 session.commit()
@@ -3067,8 +3094,9 @@ class PortfolioDecisionNode:
             with db.get_session() as session:
                 for alloc in sell_allocations:
                     # 查当前持仓数量，判断是否清仓
+                    # B1-b：全账户 positions 合并视图（多账户等价单账户现状）
                     current_qty = 0.0
-                    for pos in portfolio.get("accounts", [{}])[0].get("positions", []):
+                    for pos in self._all_positions(portfolio):
                         if pos.get("symbol") == alloc.symbol:
                             current_qty = pos.get("quantity", 0.0)
                             break
@@ -3079,7 +3107,7 @@ class PortfolioDecisionNode:
                         session.query(HoldingThesisRecord).filter(
                             HoldingThesisRecord.symbol == alloc.symbol,
                             HoldingThesisRecord.is_open == True,  # noqa: E712
-                        ).update({"is_open": False})
+                        ).update({"is_open": False, "lifecycle_state": "closed"})
                         logger.info(f"[Fix 2] 论点快照关闭（清仓）: {alloc.symbol}")
                     else:
                         logger.info(f"[Fix 2] 论点快照保持（部分减仓）: {alloc.symbol} 剩余{remaining:.0f}股")
@@ -3248,6 +3276,8 @@ class PortfolioDecisionNode:
                     # 存在则 UPDATE
                     record.drift_watch_since = today
                     record.drift_family = family
+                    # B3 状态机：漂移观察 → drift_watch
+                    record.lifecycle_state = "drift_watch"
                     logger.info(f"[Fix 3] 漂移观察更新：{symbol} 家族{family} 锚点{anchor_composite:.0f}")
                 else:
                     # 不存在则懒建（source="drift_watch"）
@@ -3262,6 +3292,7 @@ class PortfolioDecisionNode:
                         entry_price=last_price,
                         composite_at_entry=anchor_composite,
                         source="drift_watch",
+                        lifecycle_state="drift_watch",
                         drift_watch_since=today,
                         drift_family=family,
                         is_open=True,
@@ -3272,6 +3303,32 @@ class PortfolioDecisionNode:
                 session.commit()
         except Exception as e:
             logger.warning(f"[Fix 3] 漂移观察写库失败（降级）: {e}")
+
+    def _mark_thesis_broken(self, symbol: str) -> None:
+        """B3 状态机（2026-10-15 拍板）：漂移无宽限卖出 → thesis_broken。
+
+        调用点在 _score_holdings 的漂移 sell 分支（_drift_action_with_grace 返回
+        ("sell", False) 之后），保持判定函数纯净（可单测直调、不触库）。
+        仅改 open 记录的 lifecycle_state；清仓路径由 _close_thesis_snapshots 置 closed。
+        写库 try/except 降级（状态标注失败不影响卖出决策）。
+        """
+        try:
+            from src.storage import HoldingThesisRecord, DatabaseManager
+            db = DatabaseManager()
+            with db.get_session() as session:
+                updated = (
+                    session.query(HoldingThesisRecord)
+                    .filter(
+                        HoldingThesisRecord.symbol == symbol,
+                        HoldingThesisRecord.is_open == True,  # noqa: E712
+                    )
+                    .update({"lifecycle_state": "thesis_broken"})
+                )
+                session.commit()
+                if updated:
+                    logger.info(f"[B3] 论点状态 thesis_broken：{symbol}")
+        except Exception as e:
+            logger.warning(f"[B3] thesis_broken 状态写库失败（降级）: {e}")
 
     def _close_ambush_snapshots(
         self,
@@ -3290,11 +3347,10 @@ class PortfolioDecisionNode:
             return
 
         # 构建 symbol → last_price 映射
-        accounts = portfolio.get("accounts", [])
+        # B1-b：全账户 positions 合并视图
         price_map: Dict[str, float] = {}
-        if accounts:
-            for pos in accounts[0].get("positions", []):
-                price_map[pos.get("symbol", "")] = pos.get("last_price", 0.0)
+        for pos in self._all_positions(portfolio):
+            price_map[pos.get("symbol", "")] = pos.get("last_price", 0.0)
 
         try:
             from src.storage import AmbushPositionSnapshotRecord, DatabaseManager
@@ -4087,6 +4143,36 @@ verdict 含义：
             self._last_funnel_stats = None
             logger.warning("[Phase 2] funnel_stats 观测计算失败（已忽略）: %s", fe)
 
+        # ── D4 催化剂供给观测（三问裁决 Phase D，2026-10-15）──
+        # 为 _allocate 的 C4 trace 提供 catalyst_supply_by_lane 供数：按 P5 同门槛
+        # （CATALYST_CONFIDENCE_GATE=0.7）过滤后，归一化板块名 → 事件数。
+        # 纯观测旁路：失败置 None 不阻塞（与 funnel_stats 同防御）。
+        self._last_catalyst_supply = None
+        try:
+            _cal = getattr(news_context, "catalyst_calendar", None)
+            _cal_events = list(getattr(_cal, "events", None) or [])
+            if _cal_events:
+                from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE
+                from src.got.board_aliases import normalize_sector_name
+                _supply: Dict[str, int] = {}
+                for _evt in _cal_events:
+                    if float(getattr(_evt, "confidence", 0) or 0) < CATALYST_CONFIDENCE_GATE:
+                        continue
+                    _affected = getattr(_evt, "affected_sectors", None) or []
+                    _sectors = _affected if _affected else (
+                        [getattr(_evt, "sector", "")] if getattr(_evt, "sector", "") else [])
+                    _seen: set = set()
+                    for _s in _sectors:
+                        _norm = normalize_sector_name(_s)
+                        if not _norm or _norm in _seen:
+                            continue
+                        _seen.add(_norm)
+                        _supply[_norm] = _supply.get(_norm, 0) + 1
+                self._last_catalyst_supply = _supply
+        except Exception as cs_exc:  # noqa: BLE001 - 观测失败不进决策主流程
+            self._last_catalyst_supply = None
+            logger.warning("[Phase 2] catalyst_supply 观测计算失败（已忽略）: %s", cs_exc)
+
         # 影子观测：T1 终审结果随 finalists 返回（ScreenerStock.agent_verdict），此前无人消费
         self._collect_shadow_t1(finalists)
 
@@ -4611,11 +4697,10 @@ verdict 含义：
         allocations = []
 
         # 当前持仓映射
-        accounts = portfolio.get("accounts", [])
-        holdings_map = {}
-        if accounts:
-            positions = accounts[0].get("positions", [])
-            holdings_map = {p.get("symbol", ""): p for p in positions}
+        # B1-b：全账户 positions 合并视图（与全账户 total_* 同口径）
+        holdings_map = {
+            p.get("symbol", ""): p for p in self._all_positions(portfolio)
+        }
 
         # 目标仓位
         total_equity = portfolio.get("total_equity", 1.0)
@@ -5168,6 +5253,15 @@ verdict 含义：
                 # 仓位生效（sector_exposure_limits 全仓无执行消费者，仅用于落盘记录）。
                 role_budget_m = ROLE_MULTIPLIER.get(sector_role, ROLE_MULTIPLIER[DEFAULT_SECTOR_ROLE])
                 stop_loss_pct = ROLE_STOP_LOSS.get(sector_role, ROLE_STOP_LOSS[DEFAULT_SECTOR_ROLE])
+                # ── D3 分道预算生产门控骨架（三问裁决 Phase D，2026-10-15）──
+                # 缺省 0：走现状 ROLE_MULTIPLIER 路径，逐字节不变。
+                # =1：接线判据（D1 区分度报告 + Layer 2 积样）未满足 → fail-fast；
+                #     判据满足后接线时删除 raise、改读 LANE_BUDGET_PARAMS 并 bump formula version。
+                from src.got.catalyst_config import GOT_LANE_BUDGET_ENABLED
+                if GOT_LANE_BUDGET_ENABLED:
+                    raise NotImplementedError(
+                        "GOT_LANE_BUDGET_ENABLED=1：分道预算接线待 D1 标定报告出区分度"
+                        "（docs/got/verification.md C4 判据）+ Layer 2 积样后实施")
                 per_stock_budget = base_budget * role_budget_m
                 branch = sector_role
 
@@ -5234,8 +5328,21 @@ verdict 含义：
                 )
         # ── C4 分道预算影子 trace（三问裁决 WI-P-7，2026-10-15）──
         # 只读现状，零决策改动。开关关时字段保持 None。
-        from src.got.catalyst_config import GOT_LANE_BUDGET_SHADOW, LANE_BUDGET_PARAMS, SCORING_FORMULA_VERSION
+        # ── D4 增强（Phase D，2026-10-15）──
+        #   would_be_split: 若 D3 生效（LANE_BUDGET_PARAMS 分道预算），各道假想预算比（纯计算不落决策）
+        #   catalyst_supply_by_lane: 该道板块当日 confidence≥0.7 催化剂事件数（与 P5 同门槛，_score_candidates 供数）
+        from src.got.catalyst_config import (
+            GOT_LANE_BUDGET_SHADOW,
+            GOT_LANE_BUDGET_ENABLED,
+            LANE_BUDGET_PARAMS,
+            SCORING_FORMULA_VERSION,
+        )
         if GOT_LANE_BUDGET_SHADOW:
+            # lane 词表 = sector_role（mainline/ambush/cooling/unknown）；
+            # buy_candidates.sector_type 是 screener 词表（active_mainline/ambush），须映射后归道。
+            def _stype_to_role(_t: str) -> str:
+                return {"active_mainline": "mainline", "ambush": "ambush"}.get(_t, "unknown")
+
             _lane_trace: Dict[str, Dict[str, Any]] = {}
             for _a in allocations:
                 if _a.action != "buy":
@@ -5249,10 +5356,53 @@ verdict 含义：
                         "allocated_weight": LANE_BUDGET_PARAMS.get(_lane, 0.55),
                         "role_budget_m": ROLE_MULTIPLIER.get(_lane, ROLE_MULTIPLIER.get(DEFAULT_SECTOR_ROLE, 1.0)),
                         "n_positions": 0,
+                        "lane_budget_applied": GOT_LANE_BUDGET_ENABLED,
                         "formula_version": SCORING_FORMULA_VERSION,
                     }
                 _lane_trace[_lane]["allocated_value"] += _a.target_value
                 _lane_trace[_lane]["n_positions"] += 1
+
+            # D4-a would_be_split：按 buy_candidates 的 sector_type 映射分道，假想预算比 = w×n / Σ。
+            # 零决策改动：不重排 buy_candidates、不触碰 allocation，纯观测字段。
+            _wb_candidates: Dict[str, int] = {}
+            for _sc in buy_candidates[:3]:
+                _sc_role = _stype_to_role(getattr(_sc, "sector_type", "") or "")
+                _wb_candidates[_sc_role] = _wb_candidates.get(_sc_role, 0) + 1
+            if _wb_candidates:
+                _wb_total = sum(
+                    LANE_BUDGET_PARAMS.get(_l, LANE_BUDGET_PARAMS["unknown"]) * _n
+                    for _l, _n in _wb_candidates.items()
+                )
+                if _wb_total > 0:
+                    for _l in _wb_candidates:
+                        if _l not in _lane_trace:
+                            _lane_trace[_l] = {
+                                "lane": _l,
+                                "allocated_value": 0.0,
+                                "allocated_weight": LANE_BUDGET_PARAMS.get(_l, 0.55),
+                                "role_budget_m": ROLE_MULTIPLIER.get(_l, ROLE_MULTIPLIER.get(DEFAULT_SECTOR_ROLE, 1.0)),
+                                "n_positions": 0,
+                                "lane_budget_applied": GOT_LANE_BUDGET_ENABLED,
+                                "formula_version": SCORING_FORMULA_VERSION,
+                            }
+                        _lane_trace[_l]["would_be_split"] = round(
+                            LANE_BUDGET_PARAMS.get(_l, LANE_BUDGET_PARAMS["unknown"])
+                            * _wb_candidates[_l] / _wb_total, 4)
+            # D4-b catalyst_supply_by_lane：该道板块（confirmed_sectors 按 sector_role 归道）
+            # 当日 confidence≥0.7 事件数（_last_catalyst_supply 键为归一化板块名，
+            # 查表侧同样归一化，别名变体不落空）。
+            _catalyst_supply = getattr(self, "_last_catalyst_supply", None)
+            if _catalyst_supply:
+                from src.got.board_aliases import normalize_sector_name as _nsn
+                for _si in (unified_context.confirmed_sectors or []):
+                    _si_lane = getattr(_si, "sector_role", "") or "unknown"
+                    if _si_lane not in _lane_trace:
+                        continue
+                    _si_name = getattr(_si, "sector_name", "") or ""
+                    _si_events = _catalyst_supply.get(_nsn(_si_name), 0)
+                    _agg = _lane_trace[_si_lane].setdefault("catalyst_supply_by_lane", {})
+                    _agg[_si_name] = _si_events
+
             self._lane_budget_split_shadow = list(_lane_trace.values()) if _lane_trace else []
         else:
             self._lane_budget_split_shadow = None
@@ -5458,6 +5608,30 @@ verdict 含义：
         except Exception as e:
             logger.debug(f"[Phase 2] 获取 {symbol} 价格失败: {e}")
         return 0.0
+
+    @staticmethod
+    def _all_positions(portfolio: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """B1-b：全账户 positions 合并视图（真相源裁决 2026-10-15，选项 b）
+
+        GOT 消费侧聚合 helper：遍历 `PortfolioService.get_portfolio_snapshot()`
+        返回的 `accounts` 列表累加 positions，消除「total_* 全账户加总 vs
+        positions=accounts[0] 单账户」的口径错配（OPEN-1 W3 五处实测点）。
+
+        symbol 重复时取先出现者（账户顺序即 service 返回顺序）；单账户现状下
+        与 `accounts[0].positions` 逐字节等价。
+        空账户兜底（10 万虚拟资金）不在此处理——由 _get_portfolio_snapshot 保持。
+        """
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        for account in portfolio.get("accounts", []) or []:
+            for pos in account.get("positions", []) or []:
+                symbol = pos.get("symbol", "")
+                if symbol and symbol in seen:
+                    continue
+                if symbol:
+                    seen.add(symbol)
+                merged.append(pos)
+        return merged
 
     def _get_portfolio_snapshot(self) -> Dict[str, Any]:
         """获取当前持仓快照"""

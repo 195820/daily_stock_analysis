@@ -1387,7 +1387,10 @@ class PortfolioDecision(BaseModel):
     lane_budget_split_shadow: Optional[list[dict]] = Field(
         default=None,
         description="分道预算观测留痕: [{lane, allocated_value, allocated_weight, role_budget_m, "
-                    "n_positions, formula_version}]。只读现状，零决策改动；GOT_LANE_BUDGET_SHADOW=0 时 None。"
+                    "n_positions, formula_version, would_be_split, "
+                    "catalyst_supply_by_lane}]。只读现状，零决策改动；GOT_LANE_BUDGET_SHADOW=0 时 None。"
+                    "D4 增强（2026-10-15）：would_be_split=若 D3 生效各道假想预算比（纯计算）；"
+                    "catalyst_supply_by_lane=该道板块当日 confidence≥0.7 催化剂事件数（与 P5 同门槛）。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
     # ── E1 T3 verdict 路由影子（三问裁决 WI-P-7，2026-10-15）──

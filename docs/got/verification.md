@@ -2,6 +2,35 @@
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
 ---
+## ‼️ 2026-10-15 补登 #5（决策编排层 B 门五项拍板落地第一版 — thesis 四态状态机 + 全账户聚合）
+
+**资料包**：[`plans/决策编排层_step0_裁决资料包_20261015.md`](plans/%E5%86%B3%E7%AD%96%E7%BC%96%E6%8E%92%E5%B1%82_step0_%E8%A3%81%E5%86%B3%E8%B5%84%E6%96%99%E5%8C%85_20261015.md)；**实施计划**：[`plans/GOT三问架构裁决_实施计划_20261015.md`](plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261015.md)。五项裁决按资料包推荐倾向落第一版。
+
+**五项裁决与落码**：
+
+| 裁决 | 选择 | 落码 |
+|---|---|---|
+| **B1** positions 口径 | **b**：GOT 侧自建聚合 `_all_positions`，不动 PortfolioService（webui 共享真相源） | `portfolio_decision.py` 新增 static helper（合并 accounts positions、symbol 重复取先现者、单账户等价）；四处 `accounts[0]` 错配改写（`_estimate_current_drawdown` / `_score_holdings` no_accounts 三态保留 / `_close_thesis_snapshots` / `_close_ambush_snapshots` / `_allocate`）；`total_*` 全账户读法本就正确不动；空账户 10 万虚拟兜底保留 |
+| **B2** 埋伏入场锚 | **c**：双表并存，thesis 唯一入场锚源，埋伏行补 catalyst_event_id 关联 | 实测 `_write_thesis_snapshots` buy_allocations 不过滤 is_ambush_entry ⇒ 埋伏买入已被覆盖，收窄为 `catalyst_event_id` 关联回写（ambush_pool_map 按 sector_name 命中，UPDATE/INSERT 两分支；非埋伏票置空防同日改道残留） |
+| **B3** 论点生命周期 | **四态状态机** intact/drift_watch/thesis_broken/closed，`is_open` 降级派生（closed↔False）保留兼容 | 列 `lifecycle_state` + `catalyst_event_id`（storage.py）；迁移 `_migrate_thesis_lifecycle_state`（模式同 catalyst_realizations，接线 init 链）；转换点：买入/重写=intact、`_apply_drift_watch`=drift_watch、`_mark_thesis_broken`（新 helper，`_score_holdings` 三处漂移 sell 且无宽限分支调用，判定函数 `_drift_action_with_grace` 保持纯净零写库）、清仓=closed。**评审轮补丁**：同日重写分支重置 intact 时同步清 `drift_watch_since/drift_family`（不变式 intact⟹since NULL——回填谓词随每次 init 重跑，若保留 since 下次重启会把行翻回 drift_watch）；**宽限期内回归→intact 转换延后**：drift_watch 行宽限期内不回写 intact、保持观察态，实施挂 B4/持仓大改轮 |
+| **B4** 退出分层 | **C**：按角色分道，本版只登记判据不接线 | 见下方登记；实施挂 WI-P-7 解冻 |
+| **B5** 家族中继 | **b**：`_family_relay_match` 现状核对结案（Fix 1 已实现：一级半层中继、0.85 打折、weight 1.2、同族单名额） | 零改动 |
+
+**迁移踩坑登记（回填谓词）**：SQLite `ALTER TABLE ADD COLUMN ... DEFAULT 'intact'` 给存量行**直接回填 DEFAULT 值非 NULL** ⇒ `WHERE lifecycle_state IS NULL` 永不命中。修正为**证据冲突驱动**谓词：`WHERE lifecycle_state='intact' AND (is_open=0 OR drift_watch_since IS NOT NULL)` → CASE 置 closed/drift_watch；回填后不再冲突 ⇒ 天然幂等（重跑零写入）。生产库 `data/stock_analysis.db` 已迁移 + 存量行 688598（open + drift_watch_since=2026-10-15）已修正回填 drift_watch。
+
+**验证**：新增 `tests/test_thesis_lifecycle_state.py` **15 用例**（迁移回填三行证据 + 幂等重跑 + 新库建列 + 四转换路径含 `_apply_drift_watch`/`_close_thesis_snapshots` 真实方法直调（部分减仓保持/清仓关闭）+ intact 重写清 since 不变式 + thesis_broken 不触 closed 行 + `_all_positions` 三态）；回归 `test_phase2_audit_fixes.py`(20) + `test_portfolio_decision_lot_rejection.py`(8) + 全矩阵 5 文件(113) 全绿，合计 **156 passed**。
+
+**B4-C 退出分层判据登记（本版不接线，实施挂 WI-P-7 解冻）**：
+
+| 持仓角色 | 主锚（第一优先） | 兜底 |
+|---|---|---|
+| 主线仓 | 硬止损 + 生命期（生命期耗尽/板块 exhausted） | FTS 全角色兜底 |
+| 埋伏仓 | P4 催化退出 + HWM 移动止盈 | FTS 全角色兜底 |
+| 全角色 | FTS（恐慌清仓）不受角色分道限制 | — |
+
+> T-1 近似 HWM 退役依赖 B2 已定稿（埋伏行已有 catalyst_event_id 关联 + thesis 唯一锚源）；真 HWM 引入归 B4 实施轮。**约束**：WI-P-7 冻结仍约束持仓侧四条 shadow（sell_source/exposure_enforce/signal_size/mature_reduce）开关与判据不得动；B3 状态机仅标注状态不改任何卖出决策路径。
+
+---
 ## ‼️ 2026-10-15 补登 #4（Phase 6-1 盘中 0→1 确认闸门落码 — 三开关 + I1-I6 判据 + 一票否决线）
 
 **实施稿**：[`plans/Phase6-1_盘中闸门影子期实施稿_20261015.md`](plans/Phase6-1_%E7%9B%98%E4%B8%AD%E9%97%B8%E9%97%A8%E5%BD%B1%E5%AD%90%E6%9C%9F%E5%AE%9E%E6%96%BD%E7%A8%BF_20261015.md)（§4 十项已全落码，落码清单见 backlog 2026-10-15 Phase 6-1 落码轮修订行）。
@@ -82,13 +111,40 @@
 
 ---
 
-## ‼️ 2026-10-15 补登（三问裁决 Wave 1/2 影子接线——C4/E1/E2/F1 判据登记）
+## ‼️ 2026-10-15 晚间补登（D3 门控骨架 + D4 trace 增强 + candidate_pool 测试污染事故）
+
+### D3 分道预算门控骨架（零决策，fail-fast）
+
+`GOT_LANE_BUDGET_ENABLED`（catalyst_config.py:387，缺省 `0`）→ `_allocate` 预算行前插入门控块（portfolio_decision.py:5205-5209）：`=1` 时 `raise NotImplementedError`——**接线被 D1 标定判据阻塞，按 O3 纪律不允许静默等权旁路**。转正判据：`scripts/backtest_lane_budget.py` 前向超额分箱出显著区分度（lane 主胜出且差距 ≥2pp）+ Layer 2 积样 ≥20 交易日/≥30 票 + `SCORING_FORMULA_VERSION` bump + 基线 diff 归零，四条同时满足才允许把门控块替换为真实预算接线。
+
+### D4 trace 增强（`GOT_LANE_BUDGET_SHADOW=1` 时 lane_budget_split_shadow 道条目内新增两键）
+
+| 字段 | 语义 | 供数 |
+|---|---|---|
+| `lane_budget_applied` | 该道当日 D3 是否生效（bool，恒 false 直至 D3 转正） | `GOT_LANE_BUDGET_ENABLED` 直读 |
+| `would_be_split` | 若 D3 生效，该道假想预算比 = `LANE_BUDGET_PARAMS[lane]×n / Σ`（`buy_candidates[:3]`，screener `sector_type` 词表经 `_stype_to_role` 映射到 sector_role 词表，miss→unknown；纯计算，不重排不触碰 allocation） | `:5310-5335` |
+| `catalyst_supply_by_lane` | 该道板块当日 confidence≥0.7 催化剂事件数（与 P5 同门槛 `CATALYST_CONFIDENCE_GATE`） | `_score_candidates` 末尾 `_last_catalyst_supply`（catalyst_calendar.events → normalize_sector_name 归一化键，`:4090-4118`）；查询侧同归一化（`:5339-5349`） |
+
+**词表锚点（D4-a 映射依据）**：`buy_candidates.sector_type` = screener 词表 `active_mainline/ambush`（stock_screener.py:89/1070，埋伏道 finalist 硬编码 `ambush` :1564）；`_lane_trace` 键 = `SectorIntel.sector_role` 词表 `mainline/ambush/cooling/unknown`（schemas.py:783 + ROLE_MULTIPLIER :45）。映射 `{"active_mainline": "mainline", "ambush": "ambush"}`，miss→`unknown`。**冒烟实证**（2026-10-15）：2 主线+1 埋伏 → `would_be_split={mainline: 0.7843, ambush: 0.2157}`（和=1），`lane_budget_applied=false`，`catalyst_supply_by_lane={半导体: 2}` 归一化查表命中，无幽灵 `active_mainline` 条目。
+
+### 🧨 测试污染事故与修复（F-1 candidate_pool.json）
+
+| 项 | 内容 |
+|---|---|
+| 根因 | `test_bear_entry_gate.py` / `test_meg_momentum_exhaustion_gate.py` / `test_winrate_optimization.py` / `test_family_topping_suppression.py`（FtsGate harness）的 `_run()` 不 chdir，stub universe 为 `[{"code": stock.code}]` 残缺形态；`GOT_FAMILY_TOPPING_GATE_ENABLED=1`（.env:909）时 `_score_candidates` F-1 分支（:4124-4129）把 stub 写进 **repo cwd** `data/got_daily/<今日>/candidate_pool.json`，覆盖生产归档 |
+| 实锤 | 1015 mtime 18:58→22:38（pytest 17 passed 触发）；1013/1014 同机制；1012 全空 symbol 行是 `0175423`（10-14 14:21 F-1 修复）之前的旧 getattr bug，另一成因。污染行形如 `{"symbol": "300001"/"600513", "name": "", ...}`（测试 fixture 默认 code） |
+| 修复 | 四个 harness 实例级打桩 `node._save_candidate_pool_snapshot = lambda *a, **k: None`（与 test_family_topping_suppression FxgPhase2 harness :594 / orchestrator.py:79 先例同款；不 chdir——chdir 会让 `_save_shadow_records` 等其它写盘失真）。test_ambush_pool_consumption 无需打桩（fake_extract 返回 `[]` → universe 空提前 return，快照分支不可达）；test_fxg_veto_baseline_pair 原有 stub+chdir 双保险 |
+| 处置 | `20261013/14/15` 三个污染 candidate_pool.json 已删除（md5 留痕 `.review_tmp/*.bak`，内容本身即污染 stub 非生产数据）。**生产快照已不可恢复**（pytest 覆写发生在备份前的多个时点） |
+| 防回归 | 全矩阵 6 文件 134 passed × 2 轮，mtime 恒定不刷新（23:00:50 桩前写入后冻结）；语义断言由 test_family_topping_suppression `test_candidate_pool_snapshot`（chdir 隔离 + 生产契约形态输入）继续承保 |
+| **D1 数据地基结论** | candidate_pool 6 日快照**全部无效**（1012 旧 bug 全空行；1013-1015 测试 stub 单行）→ D1 回测样本源归零。修好后新样本只能等新交易日自然积累；D1 报告（`.review_tmp/lane_budget_d1_report_20261015.md`，n=2）作废，待样本重新积累后按 C4 判据重跑 |
+
+---
 
 四条新影子线 + 三组支撑改动（C1/C2/C3 基础设施 + D2 参数登记），全部缺省开、零决策改动。判据如下：
 
 | 线 | 开关 | 产物字段 | 转正门槛（≥10 交易日观测） | 红线 |
 |---|---|---|---|---|
-| **C4** 分道预算 trace | `GOT_LANE_BUDGET_SHADOW` | `PortfolioDecision.lane_budget_split_shadow`（lane/allocated_value/allocated_weight/role_budget_m/n_positions/formula_version） | 积累 10 日后对照 `scripts/backtest_lane_budget.py` 的 regime×lane 前向超额分箱：**分箱区分度不显著（无 lane 主胜出或差距 <2pp）→ f() 维持现状等权 ROLE_MULTIPLIER，LANE_BUDGET_PARAMS 不引入新数值**（O3 纪律） | trace 数值与实际 allocation 分道统计逐日可复算一致；≠0 日 `_allocate` 决策输出与 =0 日完全一致（只读性质） |
+| **C4** 分道预算 trace | `GOT_LANE_BUDGET_SHADOW` | `PortfolioDecision.lane_budget_split_shadow`（lane/allocated_value/allocated_weight/role_budget_m/n_positions/formula_version；**D4 增强 2026-10-15 晚**：+`lane_budget_applied`/`would_be_split`/`catalyst_supply_by_lane`，见上「晚间补登」节） | 积累 10 日后对照 `scripts/backtest_lane_budget.py` 的 regime×lane 前向超额分箱：**分箱区分度不显著（无 lane 主胜出或差距 <2pp）→ f() 维持现状等权 ROLE_MULTIPLIER，LANE_BUDGET_PARAMS 不引入新数值**（O3 纪律）；**D1 样本源 2026-10-15 晚归零**（测试污染事故，见上节），样本自修复后重新积累 | trace 数值与实际 allocation 分道统计逐日可复算一致；≠0 日 `_allocate` 决策输出与 =0 日完全一致（只读性质） |
 | **E1** T3 verdict 路由 | `GOT_T3_ROUTING_SHADOW` | `PortfolioDecision.t3_routing_shadow`（contradiction_id/rule_verdict/t3_verdict/routed_signal=None/action_taken=shadow_none） | 10 日内 `rule_verdict` 与 `t3_verdict` 不一致条目的占比稳定 ≤30%（T3 仲裁是修正不是翻案）；若 >30% 说明规则层与 LLM 层系统性分歧，先查 prompt/词表再谈转正 | 零数值调制：任何日 `unified_scoring`/`allocation` 输出与 =0 日一致 |
 | **E2** cross_node 路由 | `GOT_XNODE_ROUTING_SHADOW` | `PortfolioDecision.cross_node_signals_shadow`（signal_type/routing_mode/blocked_by/action_taken） | `bull_confirmation` 条目在 **#14 regime 钉死拍板前恒 blocked_by=regime_pin_#14_pending，不得解除**；其余三模式积累 10 日后人工抽 10 条判 routing_mode 语义是否成立（≥80% 一致） | 同上零决策改动 |
 | **F1** 埋伏道校验 | `GOT_AMBUSH_VALIDATION_SHADOW` | `UnifiedContext.ambush_lane_validation`（rule=stagnation_ambush/catalyst_expiry_watch/family_divergence + sector/detail/proposal/severity） | 10 日内 `catalyst_expiry_watch`（阈值 days_in_reservoir≥7，0.7×RESERVOIR_EXPIRY_DAYS=10）触发条目与实际除名/升格事件的命中率 ≥60% 才有资格进入提案转正讨论；`stagnation_ambush`/`family_divergence` 先积累分布 | **埋伏池本体 set 相等**：任一日 `ambush_pool`/`ambush_reservoir` 内容与开关关闭日完全一致（校验只产提案，不删不加不移） |

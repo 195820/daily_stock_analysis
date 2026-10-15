@@ -380,6 +380,12 @@ GOT_XNODE_ROUTING_SHADOW = os.environ.get("GOT_XNODE_ROUTING_SHADOW", "1") == "1
 # F1 埋伏道一致性校验影子（三规则只产提案，埋伏池本体零改动）
 GOT_AMBUSH_VALIDATION_SHADOW = os.environ.get("GOT_AMBUSH_VALIDATION_SHADOW", "1") == "1"
 
+# D3 分道预算生产门控（三问裁决 Phase D 骨架，缺省 0 = 逐字节走现状 ROLE_MULTIPLIER 路径）。
+# =1 时 _allocate 的 per_stock_budget 改从 LANE_BUDGET_PARAMS 读分道预算——但接线判据
+# （D1 前向超额区分度报告显著 + Layer 2 积样 ≥20 交易日/≥30 票）未满足前该分支 raise，
+# 误开即 fail-fast，不允许静默半接线。接线时须 bump SCORING_FORMULA_VERSION 并跑基线 diff。
+GOT_LANE_BUDGET_ENABLED = os.environ.get("GOT_LANE_BUDGET_ENABLED", "0") == "1"
+
 # =============================================================================
 # #14 ④ regime jump penalty（backlog §7 #14 拍板 2026-10-15：结构性删除确认层）
 # 两级开关，影子先行纪律：λ 标定回放 → 影子 5 交易日 → 切默认（归负责人判定）。

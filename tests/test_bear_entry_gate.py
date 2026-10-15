@@ -90,6 +90,10 @@ class _BearGateHarness(unittest.IsolatedAsyncioTestCase):
         node._adjust_score_by_sector_intel = lambda base, name, mm: base
         node._compute_overheat_penalty = lambda name, mm, uc: 1.0
         node._collect_shadow_t1 = lambda finalists: None
+        # F-1 污染防线：stub universe 是 [{"code": ...}] 残缺形态，GOT_FAMILY_TOPPING_GATE_ENABLED=1
+        # （.env 已置 1）时 4098 分支会把 stub 写进 repo cwd data/got_daily/<today>/candidate_pool.json，
+        # 覆盖生产归档（1013/1014/1015 三日实锤）。打桩 = test_family_topping_suppression 同款先例。
+        node._save_candidate_pool_snapshot = lambda *a, **k: None
 
         async def _fake_verify(finalists, sector_intel_map):
             return finalists

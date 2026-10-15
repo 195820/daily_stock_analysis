@@ -1278,6 +1278,11 @@ class HoldingThesisRecord(Base):
     entry_price = Column(Float, nullable=False)
     composite_at_entry = Column(Float, nullable=True)
     source = Column(String(20), nullable=False)  # "got_buy" / "drift_watch"
+    # B3 四态状态机（2026-10-15 拍板）：intact / drift_watch / thesis_broken / closed
+    # is_open 降级为派生字段（closed ↔ False），保留以兼容既有消费点
+    lifecycle_state = Column(String(20), nullable=False, default="intact", server_default="intact")
+    # B2-c 埋伏买入补锚（2026-10-15 拍板）：thesis 为唯一入场锚源，埋伏行关联催化剂事件 ID
+    catalyst_event_id = Column(String(64), nullable=True)
     drift_watch_since = Column(Date, nullable=True)  # Fix 3: 漂移观察起始日
     drift_family = Column(String(64), nullable=True)  # Fix 3: 观察时的家族名
     is_open = Column(Boolean, nullable=False, default=True, index=True)
@@ -1601,6 +1606,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._migrate_deactivate_ambush_frames()
             self._migrate_stock_daily_canonical_id()
             self._migrate_node4_run_based_columns()
+            self._migrate_thesis_lifecycle_state()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1661,6 +1667,72 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 session.commit()
         except Exception as exc:
             logger.warning("[storage] node2_sector_trends 列迁移失败，降级运行: %s", exc)
+
+    def _migrate_thesis_lifecycle_state(self) -> None:
+        """幂等轻量迁移：为 holding_thesis_snapshots 补齐 B3 四态状态机列并回填存量行。
+
+        SQLAlchemy create_all 只建新表、不补旧表列。老库缺 lifecycle_state /
+        catalyst_event_id 会导致 thesis 写入路径 INSERT/UPDATE 抛 OperationalError
+        且被上层 try/except 静默吞掉（违反 R3）。
+        模式同 _migrate_catalyst_realizations：PRAGMA table_info → ALTER TABLE → 回填。
+
+        回填规则（B3 资料包迁移路径第 3 条）：
+        - is_open=False → closed
+        - drift_watch_since 非空 → drift_watch
+        - 其余 → intact
+        """
+        if not self._is_sqlite_engine:
+            return
+        new_columns = {
+            "lifecycle_state": "VARCHAR(20) DEFAULT 'intact'",
+            "catalyst_event_id": "VARCHAR(64)",
+        }
+        try:
+            with self._SessionLocal() as session:
+                table_exists = session.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='holding_thesis_snapshots'"
+                    )
+                ).scalar()
+                if not table_exists:
+                    return
+                existing = {
+                    row[1]
+                    for row in session.execute(
+                        text("PRAGMA table_info(holding_thesis_snapshots)")
+                    ).fetchall()
+                }
+                for col, col_type in new_columns.items():
+                    if col not in existing:
+                        session.execute(
+                            text(
+                                f"ALTER TABLE holding_thesis_snapshots "
+                                f"ADD COLUMN {col} {col_type}"
+                            )
+                        )
+                        logger.info(
+                            "[storage] 迁移 holding_thesis_snapshots: 新增列 %s", col
+                        )
+                # 存量回填：SQLite 的 ALTER TABLE ADD COLUMN ... DEFAULT 会给存量行
+                # 直接回填 DEFAULT 'intact'（非 NULL），无法用 IS NULL 区分旧库行。
+                # 改用证据冲突驱动：仅修正「lifecycle_state='intact' 但 is_open/drift_watch_since
+                # 证据矛盾」的行；回填后不再冲突 → 天然幂等（重跑零写入）。
+                session.execute(
+                    text(
+                        "UPDATE holding_thesis_snapshots "
+                        "SET lifecycle_state = CASE "
+                        "WHEN is_open = 0 THEN 'closed' "
+                        "ELSE 'drift_watch' END "
+                        "WHERE lifecycle_state = 'intact' "
+                        "AND (is_open = 0 OR drift_watch_since IS NOT NULL)"
+                    )
+                )
+                session.commit()
+        except Exception as exc:
+            logger.warning(
+                "[storage] holding_thesis_snapshots 列迁移失败，降级运行: %s", exc
+            )
 
     def _migrate_stock_daily_canonical_id(self) -> None:
         """幂等轻量迁移：为 stock_daily 补齐 §9 canonical_id 列 + 索引，并回填存量行。

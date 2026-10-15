@@ -242,6 +242,8 @@ class _ScoreCandidatesHarness(unittest.IsolatedAsyncioTestCase):
         node._adjust_score_by_sector_intel = lambda base, name, m: base
         node._compute_overheat_penalty = lambda name, m, uc: overheat
         node._collect_shadow_t1 = lambda finalists: None
+        # F-1 污染防线（同 test_bear_entry_gate）：stub universe 残缺形态不落生产归档
+        node._save_candidate_pool_snapshot = lambda *a, **k: None
 
         async def _fake_verify(finalists, sector_intel_map):
             return finalists
