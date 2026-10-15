@@ -87,14 +87,28 @@ def run_antibias(
 ) -> Optional[Dict[str, Any]]:
     """对 actionable 板块做一次反偏见 LLM 调用，落 shadow_antibias.json（纯观测）。
 
-    无 actionable 板块 → None（不落盘）。调用方须 try/except 包裹、不阻断主流程。
+    无 actionable 板块 → 落一行 `{skipped_reason: no_actionable_target}` 观测产物
+    （2026-10-15 拍板 §9 #7：空仓/全 watch 日计时器不累加必须留声息）。
+    调用方须 try/except 包裹、不阻断主流程。
     """
     if not shadow:
         return None
 
     sectors = _collect_actionable_sectors(decision)
     if not sectors:
-        return None
+        record = {
+            "line": "antibias",
+            "mode": "shadow",
+            "date": target_date.strftime("%Y%m%d"),
+            "sectors_evaluated": 0,
+            "counter_thesis_nonempty": 0,
+            "skipped_reason": "no_actionable_target",
+            "note": "空仓/全 watch 日：无持仓且无买入/持有标的，影子计时器本日不累加",
+            "items": [],
+        }
+        _write_artifact(target_date, record)
+        logger.info("[antibias] 无 actionable 板块，落 skipped 观测行")
+        return record
     sectors = sectors[:max_sectors]
 
     sector_lines = "\n".join(f"- {i + 1}. {name}" for i, name in enumerate(sectors))
@@ -146,7 +160,7 @@ def run_antibias(
         "counter_thesis_nonempty": nonempty,
         "red_lines_enum": list(RED_LINES),
         "llm_error": error,
-        "promotion_precondition": "glue_ok 非降级/回放日 + 影子≥10交易日 + counter_thesis 非空率>80%（人工判定）",
+        "promotion_precondition": "glue_ok 非降级/回放日 + 影子≥10交易日（仅计有买入/持有标的的交易日）+ counter_thesis 非空率>80%（人工判定）",
         "items": items,
     }
     _write_artifact(target_date, record)

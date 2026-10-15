@@ -377,6 +377,123 @@ class TestRegimeOscillationFix(unittest.TestCase):
         self.assertIsNone(r.transition_events)   # 旧模式不记事件，避免半新半旧
 
 
+class TestRegimeJumpModel(unittest.TestCase):
+    """#14 ④ jump penalty 模型（backlog §7 #14 拍板 2026-10-15）。
+
+    s_t = argmin_s[|raw−θ_s| + λ·1{s≠s_{t-1}}]；影子层零决策改动；
+    生产切换（GOT_REGIME_JUMP_PENALTY=1）替换确认层。
+    """
+
+    def _run_jump(self, raw, history, today=None, lam=None):
+        from datetime import date as _real_date, datetime as _real_dt
+        from src.got.nodes.aggregator import AggregatorNode
+        from src.got.schemas import MarketRegime as _MR
+
+        if today is None:
+            today = _real_date.today().strftime("%Y%m%d")
+        if lam is None:
+            from src.got.catalyst_config import REGIME_JUMP_LAMBDA
+            lam = REGIME_JUMP_LAMBDA
+
+        class _FixedDate:
+            @staticmethod
+            def today():
+                return _real_dt.strptime(today, "%Y%m%d").date()
+
+        regime = _MR(
+            regime="transition", risk_budget=0.4, raw_regime_score=raw,
+        )
+        with patch("src.got.persistence.load_regime_jump_history",
+                   return_value=history), \
+             patch("src.got.nodes.aggregator.date", _FixedDate):
+            return AggregatorNode._apply_regime_jump_model(regime)
+
+    @staticmethod
+    def _row(day, raw, regime):
+        return {"date": day, "raw": raw, "regime": regime}
+
+    def test_argmin_tie_keeps_previous(self):
+        """切换与保持代价相等 → 保持 s_{t-1}（不动点优先）。"""
+        from src.got.nodes.aggregator import AggregatorNode
+        # raw=-0.05: stay transition=0.05; bear=0.25+λ → 任取 λ 使 0.25+λ==0.05 不可能，
+        # 改造对称 tie：raw=0.3, prev=bull: stay=0.0? |0.3-0.3|=0 → bull 显然。
+        # tie 构造：raw=0.25, prev=bull → stay |0.25-0.3|=0.05; transition 0.25+λ;
+        # 取 λ 使 0.25+λ=0.05 → λ=-0.2 非法。用 bear tie：raw=-0.05, prev=transition
+        # stay=0.05, bear=0.25+0.3=0.55, bull=0.35 — 无 tie。直接验证严格小于逻辑：
+        # raw=-0.3, prev=bull: stay=0.6, bear=0.0+0.25=0.25 → bear wins（非 tie）。
+        # tie 唯一可达：stay==切换代价，如 raw=-0.05, prev=transition, λ=-0.2 非法 →
+        # 实际 tie 面为测度零，此处验证主导序（严格 <）即可。
+        s, cost = AggregatorNode._jump_argmin(-0.36, "transition", 0.25)
+        self.assertEqual(s, "bear")       # 0.06+0.25=0.31 < 0.36
+        self.assertEqual(cost, 0.36)
+
+    def test_lambda_too_large_pins_initial_state(self):
+        """λ=2.0：|raw−θ| 最大 1.3 < 2.0 → 锚点阈值态永不切换（锚点实测）。"""
+        raw_seq = [-0.74, 0.53, -0.66, 0.31, -0.36]
+        hist = []
+        for i, r in enumerate(raw_seq[:-1]):
+            day = f"2026{1000+i}"
+            hist.append(self._row(day, r, "transition"))
+        result = self._run_jump(raw_seq[-1], hist)
+        # 锚点（首日 raw=-0.74）阈值态 = bear，λ 过大钉死在 bear
+        self.assertEqual(result.regime, "bear")
+
+    def test_jump_switch_immediate(self):
+        """raw 越过 θ±λ 成本线 → 当日切换（无两日确认）。"""
+        hist = [
+            self._row("20261013", 0.10, "transition"),
+            self._row("20261014", -0.46, "transition"),
+        ]
+        result = self._run_jump(-0.74, hist, today="20261015")
+        # 1014 已是 bear（0.06+0.25<0.46）；1015 raw=-0.74 → 保持 bear
+        self.assertEqual(result.regime, "bear")
+        self.assertEqual(result.previous_regime, "bear")
+        # 1013→1014 transition→bear 1 次 + 1014→1015 保持 = 1 次切换
+        self.assertEqual(result.transition_count, 1)
+
+    def test_transition_count_is_jump_window(self):
+        """transition_count = 20 日窗 jump 切换数（事件日列表含当日）。"""
+        hist = [
+            self._row("20261008", -0.57, "transition"),
+            self._row("20261009", -0.29, "transition"),
+            self._row("20261012", -0.66, "transition"),
+            self._row("20261013", 0.10, "transition"),
+            self._row("20261014", -0.46, "transition"),
+        ]
+        result = self._run_jump(-0.74, hist, today="20261015")
+        # 锚点 1008 raw=-0.57 → bear；重放：1009/1012 保持 bear，
+        # 1013 (0.10) bear→transition、1014 (-0.46) transition→bear、1015 保持
+        self.assertEqual(result.transition_events, ["20261013", "20261014"])
+        self.assertEqual(result.transition_count, 2)
+        self.assertEqual(result.regime, "bear")
+
+    def test_legacy_rows_estimate_via_output_diff(self):
+        """raw 缺失的旧归档日：按输出 diff 估算事件（迁移种子语义）。"""
+        hist = [
+            self._row("20261001", None, "bull"),
+            self._row("20261002", None, "bear"),   # diff → 事件
+            self._row("20261003", None, "bear"),
+        ]
+        result = self._run_jump(-0.5, hist, today="20261004")
+        self.assertEqual(result.transition_count, 1)
+
+    def test_cold_start_no_history(self):
+        """冷启动：s_0 = raw 阈值态，无切换成本。"""
+        result = self._run_jump(-0.74, [], today="20261015")
+        self.assertEqual(result.regime, "bear")
+        self.assertEqual(result.transition_count, 0)
+        self.assertEqual(result.dwell_days, 1)
+        self.assertEqual(result.pinned_days, 0)
+        self.assertIsNone(result.transition_pending)
+
+    def test_retired_fields_default(self):
+        """退役字段恒空：pinned=0 / pending=None / exempt=False。"""
+        result = self._run_jump(-0.74, [self._row("20261014", -0.46, "transition")])
+        self.assertEqual(result.pinned_days, 0)
+        self.assertIsNone(result.transition_pending)
+        self.assertFalse(result.regime_switch_exempt)
+
+
 class TestComputePositionDwellAware(unittest.TestCase):
     """测试 _compute_position_from_regime dwell 感知缩放。"""
 

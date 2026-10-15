@@ -66,7 +66,6 @@ def _sentiment_ctx() -> SentimentContext:
         overall_sentiment="neutral",
         sentiment_score=0.0,
         sentiment_stage="recovery",
-        trading_signal="hold",
         signal_confidence=0.5,
     )
 

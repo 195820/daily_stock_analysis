@@ -9,6 +9,8 @@
   本模块只借它的 L1 向量检索件，家族判定走本模块 + sector_analysis 独立开关。
 
 三态开关 `GOT_FAMILY_EMBED_FALLBACK`（缺省 **off**）：
+  兜底候选集 = PROMPT_EXPOSED_FAMILIES 12 族（2026-10-15 拍板选项 A，与 glue prompt 白名单
+  对齐；盲区家族「华为生态/前沿科技」不在候选，语义兜底判不出时落「其他」）。
 - off     : 直接返回 skipped_reason="mode_off"，不触网、不算向量、不改判 —— 旧路径逐字节不变
 - shadow  : 计算 + 留痕「若兜底会改判的板块清单」，**不改任何 frame_group**（缺省非 off 态）
 - enabled : 真正改写 SectorDetail.frame_group（调用方负责，见 sector_analysis Step 3.4c）
@@ -20,6 +22,13 @@ score ≥ min_score 且对次名 margin ≥ min_margin，否则维持 "其他"�
 降级纪律（任何一步失败都不得影响 Node 2 主流程）：
 embedding 不可用 / 数量不匹配 / IO 异常 → skipped_reason 留痕 + 返回空 overrides，
 调用方（Step 3.4c）包 try/except 双保险。
+
+§7 #12 WI 打分结构修正（2026-10-15）：
+- ① embedding wire：两-term 打分 = cos_semantic*(1-W) + keyword_overlap*W
+  （keyword_overlap = 板块名对家族关键词表的字符级覆盖率）
+- ② 语义兜底：score<min 但关键词覆盖率 ≥0.8 → 直接归家族（bypass embedding）
+- ④ 网格复跑：scripts/calibrate_family_threshold.py 离线标定 (S,M)
+- 零决策行为变化：GOT_FAMILY_SCORING_V2 默认关，旧逻辑逐字节不变
 """
 from __future__ import annotations
 
@@ -31,7 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.got.catalyst_config import GLUE_EMBEDDING_API_KEY, GLUE_EMBEDDING_MODEL
-from src.got.family_keywords import FAMILY_KEYWORDS
+from src.got.family_keywords import FAMILY_KEYWORDS, PROMPT_EXPOSED_FAMILIES
 from src.got.glue_pipeline import (
     L1_EMBED_CACHE_ROOT,
     _cache_key,
@@ -48,8 +57,26 @@ OTHER_FAMILY = "其他"
 # 保守阈值（可配，缺省值为工程启发式，待 shadow 读数标定后收紧）
 FAMILY_EMBED_MIN_SCORE = float(os.getenv("GOT_FAMILY_EMBED_MIN_SCORE", "0.55"))
 FAMILY_EMBED_MIN_MARGIN = float(os.getenv("GOT_FAMILY_EMBED_MIN_MARGIN", "0.05"))
-# 兜底候选家族（受控词表 = FAMILY_KEYWORDS 声明序，"其他" 本身不参与）
-FALLBACK_FAMILIES: list[str] = [name for name, _ in FAMILY_KEYWORDS if name != OTHER_FAMILY]
+
+# §7 #12 WI：打分结构修正（2026-10-15）
+# V2 开关默认关（零决策行为变化），开时两-term 打分 = cos*(1-W) + keyword*W
+FAMILY_SCORING_V2 = os.getenv("GOT_FAMILY_SCORING_V2", "0").strip() in ("1", "true", "yes")
+FAMILY_KEYWORD_WEIGHT = float(os.getenv("GOT_FAMILY_KEYWORD_WEIGHT", "0.4"))
+# 语义兜底：关键词覆盖率 ≥0.8 → bypass embedding 直接归家族（仅 V2 下生效）
+FAMILY_KEYWORD_EXACT_BYPASS = os.getenv("GOT_FAMILY_KEYWORD_EXACT_BYPASS", "1").strip() in ("1", "true", "yes")
+# 语义兜底覆盖率阈值（字符级）
+_KEYWORD_BYPASS_THRESHOLD = 0.8
+
+# 兜底候选家族（受控词表 = FAMILY_KEYWORDS 声明序，"其他" 本身不参与）。
+# 2026-10-15 拍板（backlog §7 #12 盲区候选集·选项 A）：候选集收缩到 PROMPT_EXPOSED_FAMILIES
+# 12 族——embedding 兜底候选与 glue prompt 白名单同源对齐，消除盲区家族（华为生态/前沿科技）
+# 的错配归属；两族关键词仍在规则侧 FAMILY_KEYWORDS 生效（规则归族不变），仅语义兜底不再
+# 判入盲区族，原可兜底到盲区族的板块落回「其他」。两族转正须走 C-P12 式 replay 后同时改
+# PROMPT 与本清单。
+FALLBACK_FAMILIES: list[str] = [
+    name for name, _ in FAMILY_KEYWORDS
+    if name != OTHER_FAMILY and name in PROMPT_EXPOSED_FAMILIES
+]
 # 家族原型文本注入代表关键词的上限（过多关键词会稀释原型语义）
 _PROTO_KEYWORDS = 8
 
@@ -75,6 +102,33 @@ def build_board_query_text(board_name: str) -> str:
     板块名本身是语义主载体（同 glue_pipeline.build_sector_text 的注释口径）。
     """
     return f"板块名称: {board_name}"
+
+
+def compute_keyword_overlap(board_name: str, family_keywords: list[str]) -> float:
+    """§7 #12 WI：板块名对家族关键词表的字符级覆盖率。
+
+    计算方式：板块名中有多少比例的字符被关键词表命中（字符级，非词级）。
+    例：板块名="混合现实"，关键词=["混合现实", "MR"]，覆盖率=4/4=1.0
+        板块名="英伟达概念"，关键词=["芯片", "GPU"]，覆盖率=0/5=0.0
+    （"英伟达概" 4 字版：{英,伟,达,概} 与 ["芯片","GPU"] 无交集，同为 0.0）
+    """
+    if not board_name or not family_keywords:
+        return 0.0
+    board_chars = set(board_name)
+    matched_chars: set[str] = set()
+    for kw in family_keywords:
+        if not kw:
+            continue
+        matched_chars.update(board_chars & set(kw))
+    return len(matched_chars) / len(board_chars) if board_chars else 0.0
+
+
+def check_keyword_bypass(board_name: str, family_keywords: list[str]) -> bool:
+    """§7 #12 WI：关键词覆盖率 ≥ 阈值 → 语义兜底命中。
+
+    字符级覆盖率 ≥ _KEYWORD_BYPASS_THRESHOLD(0.8) 视为强命中，bypass embedding。
+    """
+    return compute_keyword_overlap(board_name, family_keywords) >= _KEYWORD_BYPASS_THRESHOLD
 
 
 def select_family(
@@ -242,22 +296,91 @@ async def resolve_family_overrides(
         return out
 
     out.update(cache_stats)
+
+    # §7 #12 WI：V2 开关元信息留痕
+    if FAMILY_SCORING_V2:
+        out["scoring_v2"] = True
+        out["keyword_weight"] = FAMILY_KEYWORD_WEIGHT
+        out["keyword_exact_bypass"] = FAMILY_KEYWORD_EXACT_BYPASS
+    else:
+        out["scoring_v2"] = False
+
     for board, vec in zip(unmatched, board_vecs):
-        # 复用 glue_pipeline.retrieve_topk（同一 cosine 口径，不另写第二套相似度）；
-        # k = 候选家族全量（select_family 只取前 3 留痕，k 不参与裁决）
-        ranked = retrieve_topk(vec, proto_vecs, list(FALLBACK_FAMILIES), k=len(FALLBACK_FAMILIES))
-        record = select_family(ranked, min_score=min_score, min_margin=min_margin)
-        record["code"] = board.get("code") or ""
-        out["unmatched_boards"].append({"board": board["name"], **record})
+        board_name = board["name"]
+
+        if FAMILY_SCORING_V2:
+            record = _score_board_v2(board_name, board, vec, proto_vecs, keyword_map,
+                                     min_score, min_margin)
+        else:
+            # V1 旧逻辑：纯 cosine
+            ranked = retrieve_topk(vec, proto_vecs, list(FALLBACK_FAMILIES), k=len(FALLBACK_FAMILIES))
+            record = select_family(ranked, min_score=min_score, min_margin=min_margin)
+            record["code"] = board.get("code") or ""
+
+        out["unmatched_boards"].append({"board": board_name, **record})
         if record["fallback"]:
-            out["overrides"][board["name"]] = record
+            out["overrides"][board_name] = record
 
     out["would_flip_count"] = len(out["overrides"])
     logger.info(
-        "[family_embed] mode=%s 其他板块 %d 个 → 可兜底 %d 个（阈值 score≥%.2f margin≥%.2f）",
-        mode, len(unmatched), out["would_flip_count"], min_score, min_margin,
+        "[family_embed] mode=%s v2=%s 其他板块 %d 个 → 可兜底 %d 个（阈值 score≥%.2f margin≥%.2f）",
+        mode, FAMILY_SCORING_V2, len(unmatched), out["would_flip_count"], min_score, min_margin,
     )
     return out
+
+
+def _score_board_v2(
+    board_name: str,
+    board: dict[str, str],
+    board_vec: list[float],
+    proto_vecs: list[list[float]],
+    keyword_map: dict[str, list[str]],
+    min_score: float,
+    min_margin: float,
+) -> dict[str, Any]:
+    """§7 #12 WI：V2 打分路径（两-term + 语义兜底）。纯函数，便于单测。
+
+    流程：
+    1. 语义兜底：若某家族关键词覆盖率 ≥ 0.8 → bypass embedding 直接归家族
+    2. 否则：cos_semantic*(1-W) + keyword_overlap*W 两-term 打分 → select_family
+    """
+    # Step 1: 语义兜底检查
+    if FAMILY_KEYWORD_EXACT_BYPASS:
+        for fam in FALLBACK_FAMILIES:
+            fam_kws = keyword_map.get(fam, [])
+            if check_keyword_bypass(board_name, fam_kws):
+                return {
+                    "family": fam,
+                    "score": 1.0,
+                    "margin": 1.0,
+                    "candidates": [{"family": fam, "score": 1.0}],
+                    "fallback": True,
+                    "reason": "ok",
+                    "fallback_reason": "keyword_exact",
+                    "code": board.get("code") or "",
+                }
+
+    # Step 2: 两-term 打分
+    cos_ranked = retrieve_topk(board_vec, proto_vecs, list(FALLBACK_FAMILIES), k=len(FALLBACK_FAMILIES))
+    v2_scores: list[tuple[str, float]] = []
+    cos_lookup: dict[str, float] = {}
+    kw_lookup: dict[str, float] = {}
+    for fam, cos_score in cos_ranked:
+        cos_lookup[fam] = cos_score
+        kw_overlap = compute_keyword_overlap(board_name, keyword_map.get(fam, []))
+        kw_lookup[fam] = kw_overlap
+        combined = cos_score * (1.0 - FAMILY_KEYWORD_WEIGHT) + kw_overlap * FAMILY_KEYWORD_WEIGHT
+        v2_scores.append((fam, round(combined, 4)))
+    v2_scores.sort(key=lambda x: x[1], reverse=True)
+
+    record = select_family(v2_scores, min_score=min_score, min_margin=min_margin)
+    record["code"] = board.get("code") or ""
+    # 留痕分项供 shadow 复核
+    if v2_scores:
+        top_fam = v2_scores[0][0]
+        record["cos_score"] = cos_lookup.get(top_fam, 0.0)
+        record["kw_overlap"] = kw_lookup.get(top_fam, 0.0)
+    return record
 
 
 async def load_family_vectors(

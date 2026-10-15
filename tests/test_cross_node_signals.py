@@ -59,8 +59,6 @@ def _make_sentiment(**kwargs):
         "overall_sentiment": "neutral",
         "sentiment_score": 0.0,
         "sentiment_stage": "neutral",
-        "trading_signal": "neutral",
-        "signal_confidence": 0.5,
         "data_quality": DataQuality(),
         "stage_state": None,
         "persistence_regime": None,

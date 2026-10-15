@@ -329,7 +329,7 @@ class CatalystCalendarBuilder:
 
         # 宏观事件直接生成（板块已在规则中指定）
         # 【项一② 2026-10-11】扇出名过 normalize 归一 + concept_set 命中；扩扇出（资源/周期/消费类）
-        # 受 GOT_MACRO_FANOUT_ENABLED 门控（缺省关→仅旧白名单，行为同项一前）；affected_sectors 回填消 NULL。
+        # 受 GOT_MACRO_FANOUT_ENABLED 门控（2026-10-15 拍板缺省 true，扩扇出生效；回滚设 false→仅旧白名单）；affected_sectors 回填消 NULL。
         for raw in macro_raw:
             for sector in resolve_macro_fanout_sectors(
                 raw.get("affected_sectors", []), self.concept_set,

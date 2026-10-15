@@ -88,8 +88,7 @@ def _make_capital():
 def _make_sentiment():
     return SentimentContext(
         overall_sentiment="neutral", sentiment_score=0.0,
-        sentiment_stage="neutral", trading_signal="neutral",
-        signal_confidence=0.5,
+        sentiment_stage="neutral", signal_confidence=0.5,
         hot_stocks=[
             HotStock(stock_code="000001", stock_name="平安银行", mention_count=100, sentiment="positive"),
         ],

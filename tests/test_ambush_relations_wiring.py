@@ -62,7 +62,6 @@ def _make_sentiment():
         overall_sentiment="neutral",
         sentiment_score=0.0,
         sentiment_stage="neutral",
-        trading_signal="neutral",
         signal_confidence=0.5,
     )
 

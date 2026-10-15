@@ -1,7 +1,56 @@
 # GOT 待验证 / 影子期清单
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
+## ‼️ 2026-10-15 补登 #3（§8 #1 meta 运行记次实施 + §7 #12 家族兜底 WI 代码侧 + Phase 6-0 探测）
+
+三件并行实施，两件零决策、一件含缺省关的 V2 开关：
+
+1. **§8 #1 meta 记次（已实施，观测性元数据无开关）**：`src/got/archive.py` 新增 `_read_meta_safe`（meta.json 损坏/缺失/NUL 字节消毒 try/except 当空）+ `_build_allocation_summary`（allocation ≤10 条 `{symbol,name,action,target_value,weight}`）+ `_build_meta(archive_dir)` 读旧 meta merge 后 append `runs` 数组（`run_seq` 当日 1-based 递增 / `run_at` ISO / `phase` phase1→full 双阶段 enrichment / `position_ratio`），tmp+rename 原子写；`archive_phase2` 复用同 entry 补 allocation/position_ratio（phase1→full）。现有字段（funnel_stats/net_preflight/git_commit 等）全保留、下游零感知。同日多次运行归档互相覆盖问题就此有观测解（9/23 案例追溯不可考→此后 meta.json 自带当日全史）。单测 `tests/test_archive_run_counter.py` 10 例。
+2. **§7 #12 WI 代码侧（三小项，V2 缺省关）**：`src/got/family_embed.py` 两-term 打分 `cos×0.6+keyword_overlap×0.4`（`GOT_FAMILY_SCORING_V2` 缺省 0=旧逻辑逐字节不变）+ 语义兜底 bypass（覆盖率≥0.8 直接归家族，trace `fallback_reason='keyword_exact'`）+ 网格脚本 `scripts/calibrate_family_threshold.py`（761 个真实「其他」板块 S×M 网格跑通）。**S=0.48/M=0.03 为伪 cosine（hash 模拟）占位数非标定结论**——归档无历史 cosine 分数，真实标定须 shadow（V2=1+fallback=shadow）≥5 交易日后复跑。盲区候选集对齐报告 [`plans/家族兜底盲区候选集对齐_20261015.md`](plans/%E5%AE%B6%E6%97%8F%E5%85%9C%E5%BA%95%E7%9B%B2%E5%8C%BA%E5%80%99%E9%80%89%E9%9B%86%E5%AF%B9%E9%BD%90_20261015.md)（差集={华为生态,前沿科技}，推荐 FALLBACK 收缩到 PROMPT 12 个，待拍板）。3 个新 env 键属超范围新增待负责人确认。
+3. **Phase 6-0 四接口只读探测（已实施，零生产改动）**：`scripts/probe_intraday_capabilities.py` 真实跑通——F3 五档买量**可用**（`quotes()` 46 列含 bid_vol1~5/ask_vol1~5，OPEN-I2 解决）；F4 分时/分钟K **可用**（`minute()` 240 行 + `bars(frequency=8)` 1 分钟 K，OPEN-I3 解决）；F5 集合竞价**部分可用**（`transactions()` 历史逐笔可得，9:15-9:25 段待交易日补测）；W1 调度**可行**（schtasks 零依赖或 schedule 库）。结论 [`plans/Phase6-0_盘中数据地基探测_20261015.md`](plans/Phase6-0_%E7%9B%98%E4%B8%AD%E6%95%B0%E6%8D%AE%E5%9C%B0%E5%9F%BA%E6%8E%A2%E6%B5%8B_20261015.md)；开 Phase 6-1 影子期归负责人。
+
 ---
+---
+## ‼️ 2026-10-15 补登 #2（#14 ④ regime jump penalty 模型 — 两级开关 + λ 标定 + 影子判据）
+
+**拍板背景**（backlog §7 #14，2026-10-15）：现行 regime 确认状态机在 0910 起的 bull↔bear 震荡中死锁于 `transition`（两日确认 + dwell 要求），直到 1015 才确认 bear——滞后 35 个交易日。裁决采纳 jump penalty 模型 **s_t = argmin_s[|raw−θ_s| + λ·1{s≠s_{t-1}}]**：切换成本 λ 一次性收取，结构性删除两日确认层；θ 固定 ±0.3（与 `_compute_market_regime` 三段阈值一致）；tie 严格小于才切（迟滞语义）。
+
+**两级开关**（`src/got/catalyst_config.py`，缺省与 `.env.example` 同步）：
+
+| 开关 | 缺省 | 语义 |
+|---|---|---|
+| `GOT_REGIME_JUMP_SHADOW` | 1 | 影子层：jump 模型并行重放 raw 序列，落 `data/got_daily/YYYYMMDD/shadow_regime_jump.json`，零决策改动；replay_mode 跳过 |
+| `GOT_REGIME_JUMP_PENALTY` | 0 | 生产切换：=1 时 jump 模型整体替换现行确认状态机（`_apply_regime_jump_model`）；**影子判据达标 + 负责人拍板前禁置 1** |
+| `REGIME_JUMP_LAMBDA` | 0.25 | 切换成本 λ（env 可覆盖）；θ 不设开关（固定 ±0.3，EMA 标定留待影子读数后复核） |
+
+**λ 标定回放**（`scripts/calibrate_regime_jump_penalty.py`，45 日全窗 20260805–20261015，标定窗 0910–1009 共 15 日，σ daily-diff=0.4929）：
+
+| λ | 窗内 switch | 窗内方向一致（vs 无记忆阈值基线） | 全窗 switch | 备注 |
+|---|---|---|---|---|
+| 无记忆（λ=0 极限） | 10 | 15/15 | 31 | 逐日阈值基线，agree 判据对照态 |
+| 0.15 | 7 | 8/15 | 24 | |
+| **0.25（缺省）** | 7 | 8/15 | 23 | 0.5σ；窗内比无记忆少 3 次切换，保留更多信号 |
+| 0.3 | 6 | 7/15 | 17 | |
+| 0.5 | 4 | 7/15 | 9 | 更收敛但抹掉更多真实转向 |
+| 1.0 / 2.0 | 0 | 4/15 | 0 | ⚠ λ 过大钉死锚点态 |
+
+锚点（非真标定）：现行状态机 1015 才切/1 次；λ=0.5 → 0928 切/2 次；λ=2.0 → 0 次永不切换。λ 终选已拍（2026-10-15 负责人）：**维持 0.25 纪律缺省**（0.5σ；λ≥1.0 钉死锚点态作废；影子四判据 clock_start=2026-10-16 触发再复核）。
+
+**影子判据（5 交易日，clock_start=2026-10-16）**——全部满足才有资格提请转正：
+
+1. **方向一致率 ≥80%**：`agree`（jump_state == confirmed_state）天数占比 ≥4/5；
+2. **方向一致不低于无记忆基线**：逐日 jump_state 与当日阈值态（raw>0.3→bull / raw<−0.3→bear / 其余 transition）一致天数 ≥ 无记忆基线同窗读数；
+3. **切换次数低于现行状态机**：`switches_20d_jump` ≤ `switches_20d_confirmed`（同窗对照，滚动窗口逐日记录）；
+4. **零决策红线**：任何日 `unified.json` 的 confirmed regime/dwell_days/transition_count 与 `GOT_REGIME_JUMP_SHADOW=0` 重跑完全一致（影子层只落盘不改决策）。
+
+**回滚**：`GOT_REGIME_JUMP_SHADOW=0`（关影子）；生产态回滚 `GOT_REGIME_JUMP_PENALTY=0`（回到确认状态机）。影子期不动历史归档；raw 序列自 2026-10-15 起新归档携带 `raw_regime_score`（4 位小数），旧归档 raw 缺失日以 regime 输出 diff 参与事件计数（迁移种子语义，随 20 日窗口老化衰减）。
+
+**实现落点**：`aggregator.py` `_jump_argmin`/`_apply_regime_jump_model`/`_compute_regime_jump_shadow`（:858 起）+ call site :238-254 四分支（replay 跳过 / DISABLE_REGIME_STATE_MACHINE 跳过 / PENALTY=1 生产切换 / else 原状态机 + 影子旁路）；`persistence.py` `load_regime_jump_history`（:541）；`MarketRegime.raw_regime_score`（schemas.py:719，不参与决策、不进 R-B8 幂等组）；archive.py `SHADOW_REGIME_JUMP_ARTIFACT` + `_render_shadow_regime_jump` + progress rule（needs=["regime_jump"], required=5, clock_start=2026-10-16）+ archive_daily_run ② 搬运分支（防原子替换删除当日影子产物，同 agent_glue.json 语义）。测试：`tests/test_node6_regime_state.py::TestRegimeJumpModel` 7 例（argmin/tie 严格小于/λ 钉死/立即切换/事件重放/legacy diff/冷启动/退役字段），conda + .venv 双 31 passed。
+
+**首版冒烟事故注记**：首版冒烟直接写真实 `data/got_daily/20261015/shadow_regime_jump.json`（bg_44，跑完 4.3s 自删，`ls` 复核归档干净、unified.json 完好 bear/raw=-0.74）——冒烟纪律已明确：**影子层冒烟一律 tmp chdir 或纯函数级，禁止指向真实日期**（aggregator.py:109 点名事故类）。
+
+---
+
 ## ‼️ 2026-10-15 补登（三问裁决 Wave 1/2 影子接线——C4/E1/E2/F1 判据登记）
 
 四条新影子线 + 三组支撑改动（C1/C2/C3 基础设施 + D2 参数登记），全部缺省开、零决策改动。判据如下：
@@ -35,6 +84,8 @@
 | regime | transition → **bear**（dwell=1, transition_events=5），risk_budget=0.39 |
 
 **首日结论**：四线全部 present（两条空数组属输入为零的正常形态，非字段缺失）；E1 产出首个非空样本但暴露 verdict 归一化口径缺口（登记待办：定义 rule_verdict/t3_verdict 对齐规则后再统计不一致率）。读数起点自此日计。
+
+**E1 归一化口径已拍板（2026-10-15 负责人选 A 案：关键词映射 + 抽样复核，零生产改动）**：起草 rule_verdict（中文裁决文本）→ `{avoid/reduce/hold/buy}` 四档关键词映射表（处理 `contradiction_id` 格式 `pair:timeframe`、映射只对齐统计口径、不改任何字段）；映射表交负责人抽 10 条人工复核后启用不一致率统计。首日 4 样本 `t3_verdict` 全 None（dwell<2 T3 skip）不构成归一化样本，映射表启用后待首个 T3 有值日积累。**✅ 复核通过（2026-10-15 当日）**：映射表草案 v1（[`E1_rule_verdict映射表草案_20261015.md`](plans/E1_rule_verdict%E6%98%A0%E5%B0%84%E8%A1%A8%E8%8D%89%E6%A1%88_20261015.md)）负责人确认映射口径认可，统计启用；读数起点=首个 `t3_verdict` 有值日。**两个口径同日拍板**：① 四档语义 = avoid 拦新买/reduce 既有仓位去风险/hold 口径声明/buy 正向倾向；② avoid→keep 11 条按「非不一致」单列、不进不一致率分母（T3 keep 维持矛盾严重度而非否定勿追涨约束；该模板若被 T3 downgrade 仍属真不一致）。另注：早期归档 20260805–20260814 `unified.json` 内嵌 `\u0000` 转义（TDX 板块名脏字符），凡抽取归档文本二次加工须 `replace('\x00','')` 消毒。
 
 **门禁口径备注**：定向回归最终计数 **83 passed**（storage 19 + aggregator smoke/ambush 49 + PD/GATE-1 34，一次 pytest 调用；bg_42 与 F1 修复后复跑两次一致）。早前「102」为三次独立调用的子集口径相加误计，以 83 为准。归档渲染标签当日为「⚖️ T3 路由影子」，代码同日统一为「T3 verdict 路由影子」（archive.py :1146-1153，cosmetic，JSON 读数不受影响；新旧标签检索口径以此注记为准）。
 
@@ -143,7 +194,7 @@
 | **开关与缺省** | `GOT_MARKET_THEME_SHADOW=1`（缺省开，每日真跑零决策改动）/ `GOT_MARKET_THEME_ENABLED=0`（缺省关，开了才对 `overall_confidence` 施一致性因子并填 `market_theme` 真值）。⚠️ 两者为**消费点内联 `os.getenv`**（`aggregator.py` 4b 消费块 + `orchestrator.py` Step 2.5 构造块），**不在 `catalyst_config.py`**（Phase A 勘误表已勘） |
 | **产物** | `unified.json` → `market_theme_shadow`（影子留痕 dict：`{status, source, top5_concepts[], breadth, note}`，`schemas.py:1062`）；`market_theme`（真值 `MarketThemeContext`，仅 ENABLED=1 时填，影子期恒 `None`，`schemas.py:1069`）。Step 2.5 构造块（orchestrator）与 Node 6 消费块（aggregator）读同一对开关，无独立构造开关 |
 | **判据面** | ① 影子日 `market_theme_shadow` present 且 `status` 非 None（取数失败回退 `unknown` 属正常读数，不得记缺陷）；② `market_theme` 恒 `null`（ENABLED=0 下非 null 即违约——把未生效数据伪装成已接入）；③ `source` 字段可追溯排名源（探测结论：mootdx 自算，见 §7） |
-| **转正门槛** | **未定，归负责人**（本线零决策改动，转正语义 = 开 `GOT_MARKET_THEME_ENABLED` 使 `overall_confidence` 吃一致性因子，属决策面变更，须先有影子期一致性观测材料；**非空可数日 8 天（0928–1014），不足 10**，语义一致性判定亦未做） |
+| **转正门槛** | ✅ **已拍（2026-10-15 负责人选 A 案·简单门槛）**：**非空可数日 ≥10（present）且其中 status=ok 占比 ≥90% 且判据② 真值违约 0 → 达标**，达标后开 `GOT_MARKET_THEME_ENABLED` 试运行（转正语义 = `overall_confidence` 吃一致性因子，属决策面变更）；达标与否归负责人判定。**非空可数日 8 天（0928–1014），不足 10，语义一致性判定亦未做** |
 
 **既有读数锚点**（2026-10-15 只读抽验 11 归档日实测）：**非空可数日 = 8 天（0928→1014：0928/0929/0930/1008/1009/1012/1013/1014），全部 `status="ok"`**，`market_theme` 真值全 `null`（判据② 无违约）；0922–0924 上线前无产物（`None`）属预期，判据①「影子日 present」以 0928 起算（10-11 复核注口径）。另有 10-11 复核注已订正「0928 产物不可用」旧记载；TickFlow 探测节（§7）确认排名源 = mootdx 自算而非 TickFlow API。
 
@@ -216,7 +267,7 @@
 **3b（未开工——受阻，需负责人拍板后另起 WI）**：
 - **前置未满足（§3.2 计划自述）**：3b 前置 = 3a 完成 **+ D-3 基线攒满 ≥10 交易日**。3a 当日才接线，基线 0 天，影子转正窗口尚未起算。
 - **接口缺口（本轮代码核验发现，与计划描述不符）**：`AlphaSiftService.screen(*, strategy, market, max_results)`（`src/services/alphasift_service.py:384`）——① **无 `context`/`sector_filter` 入参**（计划 §3.2 设想的 `screen(strategy=auto, context={sector_filter: actionable_sectors})` 不存在）；② 硬闸 `_ensure_alphasift_enabled`——`ALPHASIFT_ENABLED=false`（生产缺省）时直接抛 403，与「ALPHASIFT_SHADOW=true 跑但不生效」的真影子语义冲突；③ 失败抛 `HTTPException` 而非返回 `{error}`，旁挂需全包裹兜底；④ **P6 ground-truth join** 需给 `catalyst_realizations` 加 `source: primary|alphasift_shadow` 维度且从**板块级**兑现追踪扩到**个股级** PEAD 多窗口收益——属新子系统，非小改。
-- **结论**：3b 非「直接实施」可得，需先就上述 ①②④ 三项做设计拍板（影子如何绕过 enabled 闸、sector_filter 从何注入、个股级兑现追踪是否复用现基建），并待 D-3 基线满 10 日。当前保持未开工，登记备查。
+- **结论**：3b 非「直接实施」可得，需先就上述 ①②④ 三项做设计拍板（影子如何绕过 enabled 闸、sector_filter 从何注入、个股级兑现追踪是否复用现基建），并待 D-3 基线满 10 日。当前保持未开工，登记备查。**✅ 已拍板（2026-10-15 负责人选 D-3 满后连设计一起拍）**：D-3 基线起算 2026-10-12，约 **10-27 满 10 交易日**；届时凭基线读数对 ①②④ 三个设计点（影子绕 `_ensure_alphasift_enabled` 硬闸 / sector_filter 注入点 / 个股级 PEAD 复用与否）一次性拍板再起 WI，此前不先行拍设计。
 
 ### 项四：竞品经验补强计划批次 A–G
 

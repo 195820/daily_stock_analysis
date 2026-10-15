@@ -50,12 +50,18 @@ def test_shadow_off_returns_none(archive_dir):
     assert not (archive_dir / "data").exists()
 
 
-def test_no_actionable_returns_none(archive_dir):
+def test_no_actionable_writes_skipped_row(archive_dir):
+    """2026-10-15 拍板（§9 #7）：空仓/全 watch 日不再静默 None——落 skipped 观测行留声息。"""
     d = SimpleNamespace(unified_scoring=[
         SimpleNamespace(sector_name="煤炭", is_holding=False, action_recommendation="avoid")])
     rec = run_antibias(decision=d, target_date=date(2026, 10, 11),
                        llm=_llm([]), shadow=True, max_sectors=8)
-    assert rec is None
+    assert rec is not None
+    assert rec["skipped_reason"] == "no_actionable_target"
+    assert rec["sectors_evaluated"] == 0 and rec["items"] == []
+    art = archive_dir / "data" / "got_daily" / "20261011" / ANTIBIAS_ARTIFACT
+    assert art.exists()
+    assert json.loads(art.read_text(encoding="utf-8"))["skipped_reason"] == "no_actionable_target"
 
 
 def test_normal_written_and_aligned(archive_dir):

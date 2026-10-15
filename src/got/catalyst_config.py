@@ -175,14 +175,16 @@ AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 �
 import os
 SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "false").lower() == "true"   # T5: 事件→板块对齐层（2026-09-01 转正；影子观察已验证无异常，回滚设 SECTOR_ALIGN_SHADOW=true）
 # 项一②b（外网对标 2026-10-11）：macro_rule 事件是否也走 T5 语义对齐（扇出感知当日埋伏候选/蓄水池）。
-# 默认关=影子先行（不加 macro 进对齐目标，行为同现状）；置 true 开启实验，转正人工改默认。
+# 【2026-10-15 负责人拍板翻 true】与 GOT_MACRO_FANOUT_ENABLED 同日开启开始影子读数；转正判据见
+# verification.md 2026-10-15 节（题材类零事件率<30% + still_missed 降≥50%，连续≥10 交易日）。
 # 回滚：GOT_MACRO_SECTOR_ALIGN_ENABLED=false。
-GOT_MACRO_SECTOR_ALIGN_ENABLED = os.environ.get("GOT_MACRO_SECTOR_ALIGN_ENABLED", "false").lower() == "true"
+GOT_MACRO_SECTOR_ALIGN_ENABLED = os.environ.get("GOT_MACRO_SECTOR_ALIGN_ENABLED", "true").lower() == "true"
 # 项一②（外网对标）：宏观扇出扩到资源/周期/消费类真实板块名（旧伪类目“周期/消费”从不命中 concept_set）。
-# 这会给 PMI/CPI 日多个板块注入宏观催化分——属决策面变更，故缺省**关**（严格影子先行，行为同现状：
-# 只按下列“旧真实板块白名单”扇出）；置 true 启用扩扇出，运维需先比对 PMI/CPI 日板块排序漂移。
+# 这会给 PMI/CPI 日多个板块注入宏观催化分。【2026-10-15 负责人拍板翻 true】开始影子读数（实测增益：
+# PMI 扇出 1→5 板块、CPI 0→6 板块；与 glue L3 relations 互补不重复，分工口径见 backlog §1.H A-2 行）。
+# 运维需比对 PMI/CPI 日板块排序漂移；转正判据见 verification.md 2026-10-15 节。
 # 回滚：GOT_MACRO_FANOUT_ENABLED=false。
-GOT_MACRO_FANOUT_ENABLED = os.environ.get("GOT_MACRO_FANOUT_ENABLED", "false").lower() == "true"
+GOT_MACRO_FANOUT_ENABLED = os.environ.get("GOT_MACRO_FANOUT_ENABLED", "true").lower() == "true"
 # 开关关闭时仅保留的“旧口径真实板块”（历史唯一能命中 concept_set 的三个宏观扇出目标）。
 MACRO_FANOUT_LEGACY_BOARDS = frozenset({"券商", "银行", "房地产"})
 NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
@@ -364,6 +366,24 @@ GOT_T3_ROUTING_SHADOW = os.environ.get("GOT_T3_ROUTING_SHADOW", "1") == "1"
 GOT_XNODE_ROUTING_SHADOW = os.environ.get("GOT_XNODE_ROUTING_SHADOW", "1") == "1"
 # F1 埋伏道一致性校验影子（三规则只产提案，埋伏池本体零改动）
 GOT_AMBUSH_VALIDATION_SHADOW = os.environ.get("GOT_AMBUSH_VALIDATION_SHADOW", "1") == "1"
+
+# =============================================================================
+# #14 ④ regime jump penalty（backlog §7 #14 拍板 2026-10-15：结构性删除确认层）
+# 两级开关，影子先行纪律：λ 标定回放 → 影子 5 交易日 → 切默认（归负责人判定）。
+# =============================================================================
+# 影子层（缺省 1）：每日并行计算 jump 模型 s_t = argmin_s[|raw−θ_s| + λ·1{s≠s_{t-1}}]，
+# 落 shadow_regime_jump.json 观测；现行两日确认状态机零改动。
+GOT_REGIME_JUMP_SHADOW = os.environ.get("GOT_REGIME_JUMP_SHADOW", "1") == "1"
+# 生产切换（缺省 0）：=1 时状态机整体替换为 jump 模型（情形 1/3、pinned、迟滞豁免退役；
+# transition_count 重定义为 20 日窗 jump 切换计数）。影子判据达标前禁止置 1。
+GOT_REGIME_JUMP_PENALTY = os.environ.get("GOT_REGIME_JUMP_PENALTY", "0") == "1"
+# jump 模型 λ（切换惩罚系数，单位=regime_score 量纲）。λ 标定回放（0910–1009 振荡窗）
+# 产出选值后更新此处缺省；λ·1 为切换成本，过大钉死初态（λ=2.0→全程 0 次切换实测）。
+REGIME_JUMP_LAMBDA = float(os.environ.get("GOT_REGIME_JUMP_LAMBDA", "0.25"))
+# 阈值 θ_bull/θ_bear（backlog #14 拍板用固定 ±0.3 起步，与 _compute_market_regime 的
+# raw→regime 三段阈值一致，EMA 基线标定留待影子读数后复核）
+REGIME_JUMP_THETA_BULL = 0.3
+REGIME_JUMP_THETA_BEAR = -0.3
 
 # =============================================================================
 # D2 分道预算参数登记（现状 ROLE_MULTIPLIER 数值登记化，非新参数）

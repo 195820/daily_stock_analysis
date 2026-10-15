@@ -538,6 +538,37 @@ def seed_regime_transition_events(history: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def load_regime_jump_history(days: int = 20) -> list[dict]:
+    """#14 ④ jump 模型跨日记忆：回读近 N 个有效日的 raw 分数 + jump 决策。
+
+    从 unified.json 的 market_regime 读取 `raw_regime_score`（2026-10-15 起新归档
+    才有）与 `regime`（jump 模型生效日的 regime 即 jump 决策 s_t；影子期归档的
+    regime 是旧状态机输出，仅供方向一致性对照，不作为 jump 序列续接点）。
+
+    Returns:
+        [{"date": "YYYYMMDD", "raw": float|None, "regime": str}, ...] 升序。
+    """
+    date_dirs = _list_archive_dirs(reverse=True, before=date.today())
+    entries: list[dict] = []
+    for d in date_dirs:
+        if len(entries) >= days:
+            break
+        data = _load_unified_json(d)
+        if data is None:
+            continue
+        regime_data = data.get("market_regime") or {}
+        if regime_data.get("regime") is None:
+            continue
+        raw = regime_data.get("raw_regime_score")
+        entries.append({
+            "date": d.name,
+            "raw": float(raw) if raw is not None else None,
+            "regime": regime_data["regime"],
+        })
+    entries.reverse()
+    return entries
+
+
 def load_regime_raw_segment_days(days: int = 20) -> int:
     """C-P10: 20 日窗口中落在状态机生效日之前的天数。
 

@@ -125,6 +125,11 @@ def archive_daily_run(
         if glue_src.exists():
             glue_dst = tmp_dir / "agent_glue.json"
             shutil.move(str(glue_src), str(glue_dst))
+        # #14 ④ 影子旁路：aggregator._compute_regime_jump_shadow 在归档前写当日目录，
+        # 同 glue 语义（当日影子结论末版为准），必须随本轮搬运否则被原子替换删除。
+        jump_src = archive_dir / SHADOW_REGIME_JUMP_ARTIFACT
+        if jump_src.exists():
+            shutil.move(str(jump_src), str(tmp_dir / SHADOW_REGIME_JUMP_ARTIFACT))
         # Q1 audit: 搬运 degraded 取证文件（forensics 例外，不受 Q6-A 按日去重约束）
         # 文件名含 HHMMSS 字典序即时间序；同日多次失败仅保留最新 5 份，防止无限堆积
         _degraded_files = sorted(archive_dir.glob("agent_glue_degraded_*.json"), reverse=True)
@@ -164,6 +169,7 @@ def archive_daily_run(
         use_mock=use_mock,
         start_time=start_time,
         contexts=contexts,
+        archive_dir=archive_dir,
     )
     _write_json(tmp_dir / "meta.json", meta)
 
@@ -603,14 +609,57 @@ def _write_reasoning_md(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _read_meta_safe(meta_path: Path) -> dict:
+    """读取 meta.json，损坏/缺失时返回空 dict（不阻断归档）。"""
+    if not meta_path.exists():
+        return {}
+    try:
+        text = meta_path.read_text(encoding="utf-8")
+        # 消毒：早期归档可能含 NUL 字节
+        text = text.replace("\x00", "")
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.warning("[archive] 读取 meta.json 失败（已重置）: %s", e)
+        return {}
+
+
+def _build_allocation_summary(allocation: list) -> list[dict]:
+    """从 TradeAllocation 列表提取简表（≤10 条）。
+
+    每条: {symbol, name, action, weight}
+    weight = target_value 占所有 buy/sell 动作 target_value 总和的比例；
+    无分配或总和为零时 weight 为 0.0。
+    """
+    if not allocation:
+        return []
+    items = []
+    for a in allocation[:10]:
+        items.append({
+            "symbol": getattr(a, "symbol", ""),
+            "name": getattr(a, "name", ""),
+            "action": getattr(a, "action", ""),
+            "target_value": getattr(a, "target_value", 0.0),
+        })
+    total = sum(it["target_value"] for it in items) or 0.0
+    for it in items:
+        it["weight"] = round(it["target_value"] / total, 4) if total > 0 else 0.0
+    return items
+
+
 def _build_meta(
     *,
     run_date: date,
     use_mock: bool,
     start_time: Optional[datetime],
     contexts: dict,
+    archive_dir: Optional[Path] = None,
 ) -> dict:
-    """构建 meta.json 内容。"""
+    """构建 meta.json 内容（Phase 1 侧）。
+
+    §8 #1: 读取旧 meta.json 的 runs 数组，追加一条 phase1 条目后写回。
+    旧 meta.json 的其它字段（funnel_stats 等）保留。
+    """
     now = datetime.now()
     meta: dict = {
         "run_date": run_date.isoformat(),
@@ -673,6 +722,27 @@ def _build_meta(
             meta["regime_choppiness_penalty_applied"] = transition_count >= 5
             meta["transition_count_raw_segment_days"] = load_regime_raw_segment_days(20)
 
+    # §8 #1: 运行记次——读取旧 meta.json，merge 现有字段 + runs 数组追加 phase1 条目
+    if archive_dir is not None:
+        old_meta = _read_meta_safe(archive_dir / "meta.json")
+        # 保留旧 meta 中的非覆盖字段（如 funnel_stats、net_preflight 等）
+        for k, v in old_meta.items():
+            if k not in meta:
+                meta[k] = v
+        # runs 数组：追加 phase1 条目
+        existing_runs = old_meta.get("runs", [])
+        if not isinstance(existing_runs, list):
+            existing_runs = []
+        new_seq = len(existing_runs) + 1
+        existing_runs.append({
+            "run_seq": new_seq,
+            "run_at": now.isoformat(timespec="seconds"),
+            "phase": "phase1",
+            "allocation_summary": [],
+            "position_ratio": None,
+        })
+        meta["runs"] = existing_runs
+
     return meta
 
 
@@ -730,6 +800,7 @@ SHADOW_READING_BASELINE_NOTE = (
 GLUE_ARTIFACT = "agent_glue.json"
 SHADOW_T1_ARTIFACT = "shadow_t1.json"
 SHADOW_T1H_ARTIFACT = "shadow_t1h.json"
+SHADOW_REGIME_JUMP_ARTIFACT = "shadow_regime_jump.json"
 SHADOW_MEG_ARTIFACT = "shadow_meg.json"
 SHADOW_FTS_ARTIFACT = "shadow_fts.json"
 SHADOW_BEAR_GATE_ARTIFACT = "shadow_bear_gate.json"
@@ -1249,6 +1320,33 @@ def _render_shadow_tradability(shadow: "dict | None") -> list[str]:
     lines.append("")
     return lines
 
+def _render_shadow_regime_jump_body(record: "dict") -> list[str]:
+    """jump 影子记录渲染体（record 非空 dict）。"""
+    agree = "一致" if record.get("agree") else "**分歧**"
+    return [
+        f"**🧭 Regime jump penalty 影子**（#14 ④）：jump 模型并行重放 raw 序列，"
+        f"零决策改动（现行状态机不变）。当日 jump={record.get('jump_state', '?')} / "
+        f"confirmed={record.get('confirmed_state', '?')} → {agree}；"
+        f"raw={record.get('raw', '?')}, λ={record.get('lambda', '?')}, "
+        f"cost_stay={record.get('cost_stay', '?')}。",
+        f"  20 日窗切换计数：jump={record.get('switches_20d_jump', '?')} vs "
+        f"现行确认={record.get('switches_20d_confirmed', '?')}。"
+        f"转正判据（影子 5 交易日，clock_start=2026-10-16）见 docs/got/verification.md。",
+        "",
+    ]
+
+
+def _render_shadow_regime_jump(day_dir: "Path") -> list[str]:
+    """🧭 regime jump penalty 影子（#14 ④，拍板 2026-10-15）：jump 模型 vs 现行状态机。
+
+    读 day_dir/shadow_regime_jump.json（缺省开 GOT_REGIME_JUMP_SHADOW），零决策改动。
+    """
+    record = _read_json_quiet(day_dir / SHADOW_REGIME_JUMP_ARTIFACT)
+    if record is None:
+        return []
+    return _render_shadow_regime_jump_body(record)
+
+
 def _render_shadow_ambush_validation(unified: "dict | None") -> list[str]:
     """🔍 埋伏道校验影子（F1，三问裁决 WI-P-8）：三规则计数 + high 条目明细。
 
@@ -1320,6 +1418,8 @@ SHADOW_PROGRESS_RULES = {
            "needs": ["t1"], "note": "转正为定性判读（无固定天数门槛），归负责人"},
     "t1h": {"label": "T1-H 持仓审查", "tag": "T1-H", "status": "qualitative",
             "needs": ["t1h"], "note": "转正为定性判读（无固定天数门槛），归负责人"},
+    "regime_jump": {"label": "#14 ④ regime jump penalty", "tag": "jump", "status": "active",
+                    "needs": ["regime_jump"], "required": 5, "clock_start": "2026-10-16"},
 }
 
 
@@ -1363,6 +1463,7 @@ def _build_shadow_day_index(base_dir: Path, run_date: date) -> list[dict]:
             "fxg": bool((ftsj or {}).get("fxg")),
             "t1": (day_dir / SHADOW_T1_ARTIFACT).exists(),
             "t1h": (day_dir / SHADOW_T1H_ARTIFACT).exists(),
+            "regime_jump": (day_dir / SHADOW_REGIME_JUMP_ARTIFACT).exists(),
         }
         index.append({"date": ddate, "flags": flags})
     return index
@@ -1432,6 +1533,7 @@ def _render_shadow_section(
     lane_budget_split_shadow: "list[dict] | None" = None,
     t3_routing_shadow: "list[dict] | None" = None,
     cross_node_signals_shadow: "list[dict] | None" = None,
+    regime_jump_shadow: "dict | None" = None,
     base_dir: "Path | None" = None,
     run_date: "date | None" = None,
 ) -> list[str]:
@@ -1481,6 +1583,10 @@ def _render_shadow_section(
     lines += _render_shadow_xnode_routing(cross_node_signals_shadow)
     # ── F1 埋伏道校验影子 trace（WI-P-8，2026-10-15）──
     lines += _render_shadow_ambush_validation(unified)
+    # ── #14 ④ regime jump penalty 影子（拍板 2026-10-15）──
+    if regime_jump_shadow is not None:
+        lines += _render_shadow_regime_jump_body(regime_jump_shadow)
+    lines += _prog("regime_jump")
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _prog("t1")
@@ -1590,6 +1696,7 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         lane_budget_split_shadow=_pd_json.get("lane_budget_split_shadow"),
         t3_routing_shadow=_pd_json.get("t3_routing_shadow"),
         cross_node_signals_shadow=_pd_json.get("cross_node_signals_shadow"),
+        regime_jump_shadow=_read_json_quiet(day_dir / SHADOW_REGIME_JUMP_ARTIFACT),
         base_dir=day_dir.parent,
         run_date=_shadow_run_date,
     )
@@ -1645,22 +1752,43 @@ def archive_phase2(
         raise
     os.replace(tmp_path, output_path)
 
-    # 1b. 项三 3a（外网对标 2026-10-11）：将 Phase 2 的 funnel_stats 合并进 meta.json。
-    # archive_daily_run 先于 Phase 2 写 meta.json（当时 Node 尚未选股，无 funnel_stats），
-    # 此处回读-改-写（原子），使生产链路候选池归零率基线可逐日累积（D-3）。仅留痕，失败不阻断。
-    if getattr(decision, "funnel_stats", None):
-        meta_path = output_dir / "meta.json"
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-            if isinstance(meta, dict):
-                meta["funnel_stats"] = decision.funnel_stats
-                _meta_tmp = meta_path.with_name(f"meta.json.{os.getpid()}.tmp")
-                _meta_tmp.write_text(
-                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    # 1b. 合并 Phase 2 数据进 meta.json
+    # - 项三 3a（外网对标 2026-10-11）：funnel_stats 候选池归零率基线
+    # - §8 #1：enrichment（runs 数组最后一条 phase1 → full，附加 allocation_summary + position_ratio）
+    # archive_daily_run 先于 Phase 2 写 meta.json（当时 Node 尚未选股），
+    # 此处回读-改-写（原子），失败不阻断。
+    meta_path = output_dir / "meta.json"
+    try:
+        meta = _read_meta_safe(meta_path)
+        changed = False
+
+        # funnel_stats（有则写）
+        if getattr(decision, "funnel_stats", None):
+            meta["funnel_stats"] = decision.funnel_stats
+            changed = True
+
+        # §8 #1: runs enrichment — 最后一条 run 从 phase1 升级为 full
+        runs = meta.get("runs")
+        if isinstance(runs, list) and runs:
+            last = runs[-1]
+            if isinstance(last, dict) and last.get("phase") == "phase1":
+                last["phase"] = "full"
+                last["allocation_summary"] = _build_allocation_summary(
+                    getattr(decision, "allocation", [])
                 )
-                os.replace(_meta_tmp, meta_path)
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("[archive] funnel_stats 合并进 meta.json 失败（已忽略）: %s", e)
+                ra = getattr(decision, "risk_assessment", None)
+                if ra is not None:
+                    last["position_ratio"] = getattr(ra, "current_position_ratio", None)
+                changed = True
+
+        if changed:
+            _meta_tmp = meta_path.with_name(f"meta.json.{os.getpid()}.tmp")
+            _meta_tmp.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(_meta_tmp, meta_path)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("[archive] meta.json Phase 2 合并失败（已忽略）: %s", e)
 
     # 2. 生成独立的交易建议 MD 文档
     trading_md_path = output_dir / "trading_recommendations.md"

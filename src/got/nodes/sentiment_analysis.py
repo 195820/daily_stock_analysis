@@ -111,11 +111,8 @@ EUPHORIA_ATTENTION_THRESHOLD = 0.75
 OPTIMISM_SCORE_THRESHOLD = 0.2
 PESSIMISM_SCORE_THRESHOLD = -0.2
 CAPITULATION_SCORE_THRESHOLD = -0.5
-
-# 信号置信度
-CONTRARIAN_CONFIDENCE = 0.7
-TREND_CONFIDENCE = 0.5
-NEUTRAL_CONFIDENCE = 0.3
+# 2026-10-15 拍板（OPEN-2）：信号置信度三常量（CONTRARIAN/TREND/NEUTRAL_CONFIDENCE）随
+# trading_signal/signal_confidence 删除而退役——confidence 唯一载体已不存在。
 
 
 class SentimentAnalysisNode:
@@ -151,7 +148,8 @@ class SentimentAnalysisNode:
         sentiment_score = max(-1.0, min(1.0, sentiment_score))
 
         # Step 3: 反身性阶段分类（用东财关注指数替代雪球关注度）
-        stage, signal, confidence = self._classify_reflexivity(
+        # 2026-10-15 拍板（OPEN-2）：trading_signal 删除，_classify_reflexivity 只回 stage
+        stage = self._classify_reflexivity(
             sentiment_score, em_data,
         )
 
@@ -207,8 +205,6 @@ class SentimentAnalysisNode:
             overall_sentiment=overall,
             sentiment_score=sentiment_score,
             sentiment_stage=stage,
-            trading_signal=signal,
-            signal_confidence=confidence,
             forum_mood=forum_mood,
             hot_stocks=hot_stocks,
             hot_topics=hot_topics,
@@ -222,20 +218,23 @@ class SentimentAnalysisNode:
         # 设置新增字段
         result.fear_greed_index = fear_greed
         result.sentiment_dispersion = dispersion_info.get("dispersion", 0.0)
-        result.contrarian_signal = dispersion_info.get("contrarian_signal", False)
+        # 2026-10-15 拍板（OPEN-2）拆态：区分「无数据 0.0」与「真·高一致」
+        result.sentiment_dispersion_state = dispersion_info.get(
+            "dispersion_state", "no_data"
+        )
+        # contrarian_signal 归并 stage_state（唯一来源）；dispersion 触发分支退场
+        result.contrarian_signal = bool(stage_state and stage_state.contrarian_alert)
         result.sentiment_momentum = sentiment_momentum
         # v2.1 阶段状态机 + 持续性
         result.stage_state = stage_state
         result.persistence_regime = persistence_regime
-        # 阶段状态机的反向信号合并到 contrarian_signal（OR 逻辑）
-        if stage_state and stage_state.contrarian_alert:
-            result.contrarian_signal = True
         logger.info(
-            "[Node 5] 完成 — status=%s, score=%.2f, stage=%s, signal=%s, "
-            "dispersion=%.2f, momentum=%+.3f, contrarian=%s, "
+            "[Node 5] 完成 — status=%s, score=%.2f, stage=%s, "
+            "dispersion=%.2f(%s), momentum=%+.3f, contrarian=%s, "
             "stage_state(dwell=%d, dir=%s, alert=%s), persistence=%s",
-            status, sentiment_score, stage, signal,
+            status, sentiment_score, stage,
             dispersion_info.get("dispersion", 0.0),
+            result.sentiment_dispersion_state,
             sentiment_momentum,
             result.contrarian_signal,
             stage_state.dwell_days if stage_state else 0,
@@ -796,8 +795,12 @@ class SentimentAnalysisNode:
     @staticmethod
     def _classify_reflexivity(
         score: float, em_data: Dict,
-    ) -> Tuple[str, str, float]:
-        """反身性阶段分类。用东财关注指数衡量散户狂热程度。"""
+    ) -> str:
+        """反身性阶段分类。用东财关注指数衡量散户狂热程度。
+
+        2026-10-15 拍板（OPEN-2）：不再产出 trading_signal——
+        决策意图由 stage + stage_state 承载，本函数只回 stage。
+        """
         # 散户关注度比率（东财关注指数均值 / 100 归一化）
         attention_ratio = 0.0
         if em_data and "df" in em_data:
@@ -808,21 +811,21 @@ class SentimentAnalysisNode:
 
         # 5 阶段分类
         if score > EUPHORIA_SCORE_THRESHOLD and attention_ratio > EUPHORIA_ATTENTION_THRESHOLD:
-            return "euphoria", "contrarian_sell", CONTRARIAN_CONFIDENCE
+            return "euphoria"
 
         if score > OPTIMISM_SCORE_THRESHOLD:
-            return "optimism", "trend_following", TREND_CONFIDENCE
+            return "optimism"
 
         if abs(score) <= OPTIMISM_SCORE_THRESHOLD:
-            return "neutral", "neutral", NEUTRAL_CONFIDENCE
+            return "neutral"
 
         if score < CAPITULATION_SCORE_THRESHOLD and attention_ratio > 0.5:
-            return "capitulation", "contrarian_buy", CONTRARIAN_CONFIDENCE
+            return "capitulation"
 
         if score < PESSIMISM_SCORE_THRESHOLD:
-            return "pessimism", "trend_following", TREND_CONFIDENCE
+            return "pessimism"
 
-        return "neutral", "neutral", NEUTRAL_CONFIDENCE
+        return "neutral"
 
     # =================================================================
     # 辅助函数
@@ -987,15 +990,18 @@ class SentimentAnalysisNode:
         分歧度低 = 一致看多/看空 → 反向信号。
         """
         if not em_data or "df" not in em_data:
-            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False}
+            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False,
+                    "dispersion_state": "no_data"}
 
         df = em_data["df"]
         if "综合得分" not in df.columns or "涨跌幅" not in df.columns:
-            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False}
+            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False,
+                    "dispersion_state": "no_data"}
 
         scores = df["综合得分"].dropna()
         if len(scores) < 10 or scores.mean() == 0:
-            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False}
+            return {"dispersion": 0.0, "up_down_gap": 0.0, "contrarian_signal": False,
+                    "dispersion_state": "no_data"}
 
         dispersion = scores.std() / abs(scores.mean())
 
@@ -1012,16 +1018,16 @@ class SentimentAnalysisNode:
         # （0902 实盘 Phase 2 因此整体失败：Unable to serialize unknown type:
         # <class 'numpy.bool'>），故在此边界处显式转 bool。
         mean_score = scores.mean()
-        contrarian = bool(
-            dispersion < 0.35
-            and (mean_score > 70 or mean_score < 30)
-        )
+        # 2026-10-15 拍板（OPEN-2）拆态：真·高一致 = 有效读数 + 低分歧 + 极端分位
+        high_consensus = bool(dispersion < 0.35 and (mean_score > 70 or mean_score < 30))
+        contrarian = high_consensus  # 兼容键保留（run() 已不再消费），拆态留观期不删
 
         return {
             "dispersion": round(float(dispersion), 3),
             "up_down_gap": round(float(up_down_gap), 2),
             "contrarian_signal": contrarian,
             "mean_score": round(float(mean_score), 2),
+            "dispersion_state": "high_consensus" if high_consensus else "normal",
         }
 
     @staticmethod
@@ -1319,13 +1325,15 @@ class SentimentAnalysisNode:
         if dispersion_info:
             disp = dispersion_info.get("dispersion", 0)
             gap = dispersion_info.get("up_down_gap", 0)
-            contrarian = dispersion_info.get("contrarian_signal", False)
+            state = dispersion_info.get("dispersion_state", "no_data")
+            state_zh = {"no_data": "无有效读数", "normal": "正常",
+                        "high_consensus": "真·高一致"}.get(state, state)
             dispersion_text = (
-                f"情绪分歧度：{disp:.2f}（低=一致/高=分歧），"
+                f"情绪分歧度：{disp:.2f}（低=一致/高=分歧，读数状态：{state_zh}），"
                 f"涨跌股情绪差：{gap:+.1f}"
             )
-            if contrarian:
-                dispersion_text += "⚠️ 一致看多/看空，反向信号触发"
+            if state == "high_consensus":
+                dispersion_text += "⚠️ 一致看多/看空（真·高一致，观测态不进决策）"
 
         prompt = (
             "你是散户情绪分析师。根据以下数据，撰写一段简洁的散户情绪分析报告。\n\n"
@@ -1427,8 +1435,6 @@ class SentimentAnalysisNode:
             overall_sentiment="bullish",
             sentiment_score=0.42,
             sentiment_stage="optimism",
-            trading_signal="trend_following",
-            signal_confidence=0.5,
             forum_mood="乐观",
             hot_stocks=[
                 HotStock(

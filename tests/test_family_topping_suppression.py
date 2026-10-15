@@ -57,8 +57,7 @@ def _make_news():
 
 def _make_sentiment():
     return SentimentContext(overall_sentiment="neutral", sentiment_score=0.0,
-                            sentiment_stage="neutral", trading_signal="neutral",
-                            signal_confidence=0.5, data_quality=DataQuality(),
+                            sentiment_stage="neutral", signal_confidence=0.5, data_quality=DataQuality(),
                             stage_state=None, persistence_regime=None)
 
 

@@ -75,6 +75,11 @@ from src.got.catalyst_config import (
     GLUE_PIPELINE_ENABLED,
     GOT_A6_ENABLED,
     GOT_AMBUSH_VALIDATION_SHADOW,
+    GOT_REGIME_JUMP_SHADOW,
+    GOT_REGIME_JUMP_PENALTY,
+    REGIME_JUMP_LAMBDA,
+    REGIME_JUMP_THETA_BULL,
+    REGIME_JUMP_THETA_BEAR,
     LLM_CALL_TIMEOUT_S,
 )
 from src.got import glue_pipeline as _glue_pipeline_mod
@@ -234,8 +239,19 @@ class AggregatorNode:
             logger.info("[Node 6] replay_mode=true，跳过状态机（避免污染跨日状态）")
         elif _os.environ.get("DISABLE_REGIME_STATE_MACHINE", "").lower() == "true":
             logger.info("[Node 6] DISABLE_REGIME_STATE_MACHINE=true，跳过状态机")
+        elif GOT_REGIME_JUMP_PENALTY:
+            # #14 ④ 生产切换：jump 模型替换确认层（影子判据达标 + 负责人拍板后才有此分支）
+            regime = self._apply_regime_jump_model(regime)
         else:
             regime = self._apply_regime_state_machine(regime)
+
+        # #14 ④ 影子层（缺省开）：jump 模型只算只落盘，零决策改动。
+        # replay_mode 跳过（不产生持久化副作用，0903 A1 契约）。
+        if GOT_REGIME_JUMP_SHADOW and not replay_mode and not GOT_REGIME_JUMP_PENALTY:
+            try:
+                self._compute_regime_jump_shadow(regime)
+            except Exception as exc:  # noqa: BLE001 — 影子旁路：降级不阻塞主链路
+                logger.warning("[Node 6] jump 影子计算失败（已忽略）: %s", exc)
         logger.info(
             f"[Node 6] Level 0 — regime={regime.regime}, "
             f"risk_budget={regime.risk_budget:.2f}, "
@@ -679,6 +695,8 @@ class AggregatorNode:
             sentiment_stage=sentiment_stage,
             sentiment_momentum=sentiment_momentum,
             macro_overlay=macro_overlay,
+            # #14 ④：阈值前 raw 分数留痕（jump 模型影子输入 + 归档标定源）
+            raw_regime_score=round(regime_score, 4),
         )
 
     @staticmethod
@@ -828,6 +846,224 @@ class AggregatorNode:
             # 旧行为模式不记事件→None；新行为空列表照落（保留「已迁移」标记）
             "transition_events": events,
         })
+
+    # ── #14 ④ jump penalty 模型（backlog §7 #14 拍板 2026-10-15）─────────────
+    # s_t = argmin_s [ |raw − θ_s| + λ·1{s ≠ s_{t-1}} ]
+    # 结构性删除两日确认层：切换成本一次性收取，代替「pending 次日再现才确认」。
+    # transition 作为一个真实状态参与 argmin（0.0 三义拆态归 OPEN-2，本模型暂以
+    # |raw−0|≤θ 处理 transition 邻域）。
+
+    @staticmethod
+    def _jump_argmin(raw: float, prev: str, lam: float) -> tuple[str, float]:
+        """单步 argmin。返回 (s_t, cost_stay)（cost_stay 供影子观测单调性诊断）。
+
+        θ_transition = 0（三状态对称：|raw−0| 即 transition 邻域距离）。
+        tie-break：切换与保持代价相等时保持 s_{t-1}（argmin 取先到者，
+        与「不动点优先」的迟滞语义一致，避免等价抖动）。
+        """
+        costs = {
+            "bull": abs(raw - REGIME_JUMP_THETA_BULL),
+            "transition": abs(raw - 0.0),
+            "bear": abs(raw - REGIME_JUMP_THETA_BEAR),
+        }
+        costs_prev = costs[prev] if prev in costs else costs["transition"]
+        # 保持：无切换成本；切换：+λ
+        best_state, best_cost = prev, costs_prev
+        for state, cost in costs.items():
+            if state == prev:
+                continue
+            total = cost + lam
+            if total < best_cost:  # 严格小于 → tie 保持
+                best_state, best_cost = state, total
+        return best_state, costs_prev
+
+    @staticmethod
+    def _apply_regime_jump_model(regime: MarketRegime) -> MarketRegime:
+        """jump 模型（生产态，GOT_REGIME_JUMP_PENALTY=1 时替换状态机）。
+
+        - raw 来自 regime.raw_regime_score（缺失时回退 macro_overlay 解析，再缺失
+          则按 regime.regime 的阈值中心近似——构造态兜底，不阻塞）。
+        - s_t 序列由 raw 序列整体 argmin 重放（锚点日 = 窗口内首个 raw 有效日，
+          s_0 = 其阈值态；影子期归档的 regime 是旧状态机输出，不作 jump 续接点）。
+        - transition_count 重定义为 20 日窗 jump 切换计数（s_t ≠ s_{t-1} 的事件日列表）。
+        - dwell_days 纯观测（连续保持 s 的天数）；pinned/pending/exempt 整层退役恒空。
+        """
+        from src.got.persistence import load_regime_jump_history
+
+        raw = regime.raw_regime_score
+        if raw is None:
+            m = re.search(r"regime_score=(-?\d+\.?\d*)", regime.macro_overlay or "")
+            raw = float(m.group(1)) if m else {
+                "bull": REGIME_JUMP_THETA_BULL, "transition": 0.0,
+                "bear": REGIME_JUMP_THETA_BEAR,
+            }.get(regime.regime, 0.0)
+        raw = float(raw)
+
+        history = load_regime_jump_history(days=20)
+
+        # 整窗重放：锚点日 = 首个 raw 有效日（s_0 = 阈值态，不收切换成本）；
+        # 旧状态机日（raw=None）只以输出 diff 参与事件计数，不续接 s 序列。
+        seq_prev = None
+        events: list[str] = []
+        for row in history:
+            if row["raw"] is None:
+                if seq_prev is not None and row["regime"] != seq_prev:
+                    events.append(row["date"])
+                seq_prev = row["regime"]
+                continue
+            if seq_prev is None:
+                seq_prev = AggregatorNode._raw_threshold_state(row["raw"])
+                continue
+            s_i, _ = AggregatorNode._jump_argmin(
+                row["raw"], seq_prev, REGIME_JUMP_LAMBDA,
+            )
+            if s_i != seq_prev:
+                events.append(row["date"])
+            seq_prev = s_i
+
+        # 当日：从重放终态续算；无有效历史时冷启动 s_t = raw 阈值态（无切换成本）
+        if seq_prev is None:
+            s_t = AggregatorNode._raw_threshold_state(raw)
+            switch_today = False
+        else:
+            s_t, cost_stay = AggregatorNode._jump_argmin(
+                raw, seq_prev, REGIME_JUMP_LAMBDA,
+            )
+            switch_today = s_t != seq_prev
+        prev = seq_prev if seq_prev is not None else s_t
+        today_str = date.today().strftime("%Y%m%d")
+        if switch_today and today_str not in events:
+            events.append(today_str)
+
+        # dwell：jump 生效段的连续保持天数（从窗口尾部往前数）
+        dwell = AggregatorNode._jump_dwell(history, s_t)
+
+        if switch_today:
+            logger.info(
+                f"[Node 6] Regime jump 切换: {prev} → {s_t}"
+                f"（raw={raw:.2f}, λ={REGIME_JUMP_LAMBDA}, 保持代价={cost_stay:.2f}）"
+            )
+
+        return regime.model_copy(update={
+            "regime": s_t,
+            "dwell_days": dwell,
+            "previous_regime": prev,
+            "transition_count": len(events),
+            "transition_pending": None,
+            "pinned_days": 0,
+            "transition_events": events,
+            "regime_switch_exempt": False,
+        })
+
+    @staticmethod
+    def _raw_threshold_state(raw: float) -> str:
+        """raw 阈值态（无记忆基线，与 _compute_market_regime 三段阈值一致）。"""
+        if raw > REGIME_JUMP_THETA_BULL:
+            return "bull"
+        if raw < REGIME_JUMP_THETA_BEAR:
+            return "bear"
+        return "transition"
+
+    @staticmethod
+    def _jump_dwell(history: list[dict], s_t: str) -> int:
+        """jump 生效段的连续保持天数：从窗口尾部往前数 raw 有效日，argmin 重放。
+
+        简化口径：对 raw 有效日直接比较阈值态与 s_t（影子期过渡段足够；jump
+        生产生效后归档 regime 即 s_t，历史 regime 直接可比，此处保持重放一致性）。
+        """
+        dwell = 1
+        for row in reversed(history):
+            if row["raw"] is None:
+                break
+            if AggregatorNode._raw_threshold_state(row["raw"]) == s_t:
+                dwell += 1
+            else:
+                break
+        return dwell
+
+    def _compute_regime_jump_shadow(self, regime: MarketRegime) -> None:
+        """jump 模型影子（GOT_REGIME_JUMP_SHADOW=1 缺省）：只算只落盘，零决策改动。
+
+        与生产状态机并行跑同一 raw 输入，落 shadow_regime_jump.json：
+        {jump_state, confirmed_state, raw, lambda, agree, switches_20d_jump,
+         switches_20d_confirmed, note}。
+        转正判据见 docs/got/verification.md 2026-10-15 节（影子 5 交易日）。
+        """
+        from src.got.persistence import load_regime_jump_history, load_regime_state_history
+
+        raw = regime.raw_regime_score
+        if raw is None:
+            m = re.search(r"regime_score=(-?\d+\.?\d*)", regime.macro_overlay or "")
+            raw = float(m.group(1)) if m else None
+        if raw is None:
+            logger.info("[Node 6] jump 影子：无 raw 分数（旧归档口径），跳过当日观测")
+            return
+        raw = float(raw)
+
+        jump_hist = load_regime_jump_history(days=20)
+
+        # 整窗重放（与 _apply_regime_jump_model 同构）
+        seq_prev = None
+        jump_switches = 0
+        for row in jump_hist:
+            if row["raw"] is None:
+                if seq_prev is not None and row["regime"] != seq_prev:
+                    jump_switches += 1
+                seq_prev = row["regime"]
+                continue
+            if seq_prev is None:
+                seq_prev = self._raw_threshold_state(row["raw"])
+                continue
+            s_i, _ = self._jump_argmin(row["raw"], seq_prev, REGIME_JUMP_LAMBDA)
+            if s_i != seq_prev:
+                jump_switches += 1
+            seq_prev = s_i
+
+        # 当日 jump 决策
+        if seq_prev is None:
+            s_t = self._raw_threshold_state(raw)
+            cost_stay = abs(raw - {"bull": REGIME_JUMP_THETA_BULL, "transition": 0.0,
+                                   "bear": REGIME_JUMP_THETA_BEAR}[s_t])
+            switched_today = False
+        else:
+            s_t, cost_stay = self._jump_argmin(raw, seq_prev, REGIME_JUMP_LAMBDA)
+            switched_today = s_t != seq_prev
+        if switched_today:
+            jump_switches += 1
+
+        # 对照面：现行状态机 20 日窗确认切换数（transition_events 真相源）
+        confirmed_hist = load_regime_state_history(days=20)
+        confirmed_switches = sum(
+            1 for i in range(1, len(confirmed_hist))
+            if confirmed_hist[i][1] != confirmed_hist[i - 1][1]
+        )
+
+        record = {
+            "date": self._run_date.strftime("%Y%m%d"),
+            "raw": round(raw, 4),
+            "lambda": REGIME_JUMP_LAMBDA,
+            "theta": {"bull": REGIME_JUMP_THETA_BULL, "transition": 0.0,
+                      "bear": REGIME_JUMP_THETA_BEAR},
+            "jump_state": s_t,
+            "jump_prev": seq_prev if seq_prev is not None else s_t,
+            "jump_switched": switched_today,
+            "confirmed_state": regime.regime,
+            "agree": s_t == regime.regime,
+            "switches_20d_jump": jump_switches,
+            "switches_20d_confirmed": confirmed_switches,
+            "cost_stay": round(cost_stay, 4),
+            "note": "影子观测：jump 模型并行计算，零决策改动（#14 ④ 影子 5 交易日判据）",
+        }
+        day_dir = Path("data/got_daily") / self._run_date.strftime("%Y%m%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        out = day_dir / "shadow_regime_jump.json"
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(out)
+        logger.info(
+            "[Node 6] jump 影子: jump=%s confirmed=%s（%s）",
+            s_t, regime.regime, "agree" if record["agree"] else "DIVERGE",
+        )
 
     # =========================================================================
     # Level 1: 板块 mini GOT

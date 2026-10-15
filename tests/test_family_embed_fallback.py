@@ -113,8 +113,17 @@ def test_collect_unmatched_splits_by_keyword_table():
 
 
 def test_fallback_families_exclude_other_bucket():
-    assert fe.FALLBACK_FAMILIES == [n for n, _ in FAMILY_KEYWORDS if n != fe.OTHER_FAMILY]
+    # 2026-10-15 拍板选项 A：兜底候选集与 glue prompt 白名单对齐（12 族），
+    # 盲区家族（华为生态/前沿科技）不在候选，语义兜底判不出时落「其他」。
+    from src.got.family_keywords import PROMPT_EXPOSED_FAMILIES
+    assert fe.FALLBACK_FAMILIES == [
+        n for n, _ in FAMILY_KEYWORDS
+        if n != fe.OTHER_FAMILY and n in PROMPT_EXPOSED_FAMILIES
+    ]
+    assert len(fe.FALLBACK_FAMILIES) == len(PROMPT_EXPOSED_FAMILIES) == 12
     assert fe.OTHER_FAMILY not in fe.FALLBACK_FAMILIES
+    assert "华为生态" not in fe.FALLBACK_FAMILIES
+    assert "前沿科技" not in fe.FALLBACK_FAMILIES
 
 
 # ── 缓存复用（按日 l1_embed_*.json，sha1 键跨日命中）──────────

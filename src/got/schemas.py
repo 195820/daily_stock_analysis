@@ -617,8 +617,8 @@ class SentimentContext(BaseModel):
     overall_sentiment: str = Field(..., description="bullish / bearish / neutral")
     sentiment_score: float = Field(..., ge=-1.0, le=1.0)
     sentiment_stage: str = Field(..., description="euphoria / optimism / neutral / pessimism / capitulation")
-    trading_signal: str = Field(..., description="contrarian_sell / trend_following / neutral / contrarian_buy")
-    signal_confidence: float = Field(..., ge=0.0, le=1.0)
+    # 2026-10-15 拍板（backlog OPEN-2）：`trading_signal` / `signal_confidence` 已删除——
+    # 53 归档日零决策消费（仅归档渲染），决策意图由 sentiment_stage + stage_state 承载。
     forum_mood: str = Field(default="中性")
     hot_stocks: list[HotStock] = Field(default_factory=list)
     hot_topics: list[str] = Field(default_factory=list)
@@ -636,9 +636,16 @@ class SentimentContext(BaseModel):
         default=0.0,
         description="情绪分歧度（低=一致, 高=分歧。一致看多→反向信号）",
     )
+    sentiment_dispersion_state: Optional[str] = Field(
+        default=None,
+        description="分歧度读数状态（2026-10-15 拍板拆态留观）："
+        "no_data=无有效读数（0.0 是缺数据不是真一致）/ normal=有效读数 / "
+        "high_consensus=真·高一致（dispersion<0.35 且极端分位）",
+    )
     contrarian_signal: bool = Field(
         default=False,
-        description="反向信号（情绪极端一致时触发）",
+        description="反向信号（唯一来源=stage_state.contrarian_alert；"
+        "2026-10-15 拍板归并：dispersion 触发分支已退场，仅观测不进决策）",
     )
     sentiment_momentum: float = Field(
         default=0.0,
@@ -716,6 +723,13 @@ class MarketRegime(BaseModel):
     macro_overlay: str = Field(default="", description="一句话宏观判断（LLM 或规则生成）")
     # ── Regime 状态机（v2.1 跨日记忆）──
     dwell_days: int = Field(default=1, description="当前 regime 持续交易日数")
+    raw_regime_score: Optional[float] = Field(
+        default=None,
+        description="【#14 ④ jump penalty 影子接线（2026-10-15）】阈值前的 raw regime_score "
+                    "（_compute_market_regime 局部值，此前未入 schema，新增供 jump 模型与影子标定消费）。"
+                    "**不参与任何决策**，仅留痕/影子输入。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
     previous_regime: Optional[str] = Field(default=None, description="前一交易日的 regime（用于状态转换）")
     transition_count: int = Field(default=0, description="近 20 交易日 regime 确认切换次数（震荡度）")
     transition_pending: Optional[str] = Field(default=None, description="待确认的新 regime（首次出现，待次日确认）")

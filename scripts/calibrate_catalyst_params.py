@@ -106,6 +106,41 @@ def main():
     logger.info(f"✅ 校准报告已生成: {report_path}")
 
 
+def _per_source_direction_accuracy() -> dict:
+    """按 source_type 分组重算方向准确率（净化口径，2026-10-15 OPEN-D10 回填轮）。
+
+    判定与 CatalystRealizationTracker._check_direction 同构：
+    positive→return>0 / negative→return<0 / binary→|return|>2.0。
+    """
+    import sqlite3
+
+    db_path = os.path.join(ROOT_DIR, "data", "stock_analysis.db")
+    if not os.path.exists(db_path):
+        return {}
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT source_type, direction, actual_return FROM catalyst_realizations "
+            "WHERE is_realized = 1 AND actual_return IS NOT NULL"
+        ).fetchall()
+    finally:
+        con.close()
+
+    agg: dict = {}
+    for source, direction, ret in rows:
+        if direction == "positive":
+            ok = ret > 0
+        elif direction == "negative":
+            ok = ret < 0
+        elif direction == "binary":
+            ok = abs(ret) > 2.0
+        else:
+            ok = False
+        hit, total = agg.get(source, (0, 0))
+        agg[source] = (hit + (1 if ok else 0), total + 1)
+    return {s: (h / n if n else 0.0) for s, (h, n) in agg.items()}
+
+
 def _calibrate_confidence_gate(stats: dict, pead: dict) -> list[str]:
     """校准 CATALYST_CONFIDENCE_GATE"""
     lines = ["### 1. CATALYST_CONFIDENCE_GATE（置信度门槛）", ""]
@@ -113,6 +148,11 @@ def _calibrate_confidence_gate(stats: dict, pead: dict) -> list[str]:
     # 按 source 分组的方向准确率
     by_source = stats.get("by_source_type", {})
     direction_acc = stats.get("direction_accuracy", 0)
+
+    # 2026-10-15 修（OPEN-D10 回填轮）：_group_stats 只产 {total, realized, returns[]}，
+    # 从不含 direction_accuracy 键——旧代码 .get(...,0) 恒渲染 0.0%（展示缺陷，非数据缺陷）。
+    # 现按库内 direction 快照 + actual_return 净化口径重算 per-source 方向准确率。
+    per_source_direction_acc = _per_source_direction_accuracy()
 
     lines.append(f"- 整体方向准确率: **{direction_acc:.1%}**")
     lines.append("")
@@ -124,7 +164,7 @@ def _calibrate_confidence_gate(stats: dict, pead: dict) -> list[str]:
             lines.append(
                 f"| {source} | {data.get('total', 0)} | "
                 f"{data.get('rate', 0):.1%} | "
-                f"{data.get('direction_accuracy', 0):.1%} |"
+                f"{per_source_direction_acc.get(source, 0):.1%} |"
             )
     lines.append("")
 
