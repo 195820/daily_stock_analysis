@@ -8,9 +8,9 @@
 
 ### GOT 运行规范
 
-- **影子模式输出总结**：当 GOT 运行包含影子模式内容（如 4.1 超限减仓 `sell_source_shadow`、4b 市场结构、3b 分歧摘要、T1/T1-H 审查层）时，运行完成后必须在终端输出总结，包括：
+- **影子模式输出总结**：当 GOT 运行包含影子模式内容（4.1 超限减仓 `sell_source_shadow`、3b 分歧摘要、T1/T1-H 审查层、GATE-1 tradability、MEG/FTS/FXG 闸门、#14④ jump penalty 等）时，运行完成后必须在终端输出总结，包括：
   - Phase 1 各节点核心结论（大盘/板块/资金/消息/情绪/聚合）
-  - 影子模式输出内容（`reasoning.md` 末尾「🧪 影子模式观测」段承载五条线：4b/3b/4.1/T1/T1-H；A6 glue 已转正，其关系/强度/家族统计改在 Node 6 正文「🧬 A6 语义粘合（已转正）」子块展示）
+  - 影子模式输出内容（`reasoning.md` 末尾「🧪 影子模式观测」段逐线渲染读数+进度+到期提示；A6 glue 已转正，其关系/强度/家族统计改在 Node 6 正文「🧬 A6 语义粘合（已转正）」子块展示）
   - Phase 2 交易建议（持仓分析/候选股/操作建议）
   - 关键风险提示和主线续航评估
 - **长时间运行命令必须加 `timeout: 0`**：执行 `python main.py --got`、`python main.py --screener` 等命令时，必须在 bash 工具调用中设置 `timeout: 0` 参数，禁止使用默认超时。
@@ -51,7 +51,7 @@
 │  数据层                                                          │
 │  DataFetcherManager（11 个数据源策略模式 + 自动故障切换）         │
 │  MootdxFetcher(P0 TCP) + EfinanceFetcher(P0) + AkshareFetcher(P1)│
-│  data_provider/ + src/storage.py（SQLite 30+ 表）               │
+│  data_provider/ + src/storage.py（SQLite 40+ 表）               │
 │  em_rate_limiter.py（东财 HTTP 统一限流）                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -125,7 +125,7 @@ daily_stock_analysis/
 │   │   └── decision_action.py        # 决策动作分类
 │   │
 │   ├── repositories/            # 数据访问层
-│   ├── storage.py               # SQLAlchemy ORM（30+ 表）
+│   ├── storage.py               # SQLAlchemy ORM（40+ 表）
 │   ├── notification_sender/     # 多渠道通知
 │   ├── llm/                     # LLM 配置
 │   └── patches/                 # 反爬补丁
@@ -141,9 +141,9 @@ daily_stock_analysis/
 │   └── ...                           # 另含 baostock/longbridge/yfinance/finnhub 等
 │
 ├── data/                        # 数据文件
-│   ├── stock_analysis.db             # SQLite 数据库（30+ 表）
+│   ├── stock_analysis.db             # SQLite 数据库（40+ 表）
 │   ├── aggregator_contexts/          # GOT 上下文持久化（EMA基线/跨日ctx）
-│   ├── got_daily/YYYYMMDD/           # 每日历史档（6节点JSON+reasoning+meta+agent_glue/shadow_t1/shadow_t1h）
+│   ├── got_daily/YYYYMMDD/           # 每日历史档（6节点JSON+reasoning+meta+agent_glue+各影子/闸门产物 shadow_*.json）
 │   └── got_timeseries/               # 时序数据（monitoring.json）
 │
 ├── strategies/custom/           # 自定义选股策略（YAML）
@@ -263,6 +263,9 @@ daily_stock_analysis/
                         PortfolioDecision                                 │
                     (trades + ambush_exit_signals                         │
                      + reasoning + warnings)                              │
+                                 │                                        │
+                                 ▼  decision_plan.py（C2/C3，2026-10-15） │
+                    trade_plans 装配+昨日对账 / --got 通知                │
                                                                           │
                     ┌──────────────────────────┐                          │
                     │   P6: 催化兑现追踪        │                          │
@@ -334,7 +337,7 @@ run(use_mock=False)
 
 | 路径 | 写入方 | 内容 |
 |------|--------|------|
-| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总；含 Node 6 正文「🧬 A6 语义粘合（已转正）」子块；末尾「🧪 影子模式观测」段承载五条线 4b/3b/4.1/T1/T1-H；🧭 市场结构段仅 4b 转正后升格主正文，影子态收编入 🧪）+ `meta.json`（含 `funnel_stats`） + `portfolio_decision.json` + `trading_recommendations.md` + `agent_glue.json` / `shadow_t1.json` / `shadow_t1h.json`（影子/审查产物） |
+| `data/got_daily/YYYYMMDD/` | `archive.py` | 6 个节点 JSON + `reasoning.md`（全节点 LLM 推理汇总；含 Node 6 正文「🧬 A6 语义粘合（已转正）」子块；末尾「🧪 影子模式观测」段逐线渲染进度与到期提示；🧭 市场结构段仅 4b 转正后升格主正文，影子态收编入 🧪）+ `meta.json`（含 `funnel_stats`） + `portfolio_decision.json` + `unified.json` + `trading_recommendations.md` + `agent_glue.json` + 影子/闸门产物按开关落盘：`shadow_t1.json` / `shadow_t1h.json`（审查层）/ `shadow_antibias.json` / `shadow_bear_gate.json` / `shadow_fts.json`（家族见顶+FXG 子块）/ `shadow_meg.json` / `fxg_baseline_scoring.json` / `shadow_regime_jump.json`（#14④，clock 2026-10-16 起）/ `shadow_intraday.json`（Phase 6-1）等，缺开关=缺文件 |
 | `data/aggregator_contexts/previous_context_YYYYMMDD.json` | `persistence.py` | Node 6 跨日 UnifiedContext（时间一致性校验基准 + 跨日记忆读取） |
 | `data/aggregator_contexts/ema_baseline.json` | `persistence.py` | EMA 基线（α=0.3, regime_score + 滚动标准差, 冷启动 5 日预热） |
 | `data/got_timeseries/monitoring.json` | `persistence.py` | 生产监控指标（运行耗时/数据质量/LLM调用次数/降级事件） |
@@ -410,6 +413,7 @@ run(use_mock=False)
 # 禁止使用 conda run（Windows GBK 编码崩溃）
 source D:/ProgramData/miniconda3/etc/profile.d/conda.sh && conda activate daily_stock_analysis
 python main.py --got               # 全流程 GOT（Phase 1 + Phase 2）
+python main.py --got-intraday --intraday-time {0926,1125,1445}   # 盘中闸门（INTRADAY_GATE_ENABLED=true 才可用）
 python main.py                     # 常规分析
 python main.py --screener          # 选股
 python main.py --got-replay        # GOT 回放（glue/C-P13 管线变体实验入口，生产链路零影响）
