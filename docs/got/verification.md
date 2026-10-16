@@ -11,7 +11,7 @@
 | 裁决 | 选择 | 落码 |
 |---|---|---|
 | **B1** positions 口径 | **b**：GOT 侧自建聚合 `_all_positions`，不动 PortfolioService（webui 共享真相源） | `portfolio_decision.py` 新增 static helper（合并 accounts positions、symbol 重复取先现者、单账户等价）；四处 `accounts[0]` 错配改写（`_estimate_current_drawdown` / `_score_holdings` no_accounts 三态保留 / `_close_thesis_snapshots` / `_close_ambush_snapshots` / `_allocate`）；`total_*` 全账户读法本就正确不动；空账户 10 万虚拟兜底保留 |
-| **B2** 埋伏入场锚 | **c**：双表并存，thesis 唯一入场锚源，埋伏行补 catalyst_event_id 关联 | 实测 `_write_thesis_snapshots` buy_allocations 不过滤 is_ambush_entry ⇒ 埋伏买入已被覆盖，收窄为 `catalyst_event_id` 关联回写（ambush_pool_map 按 sector_name 命中，UPDATE/INSERT 两分支；非埋伏票置空防同日改道残留） |
+| **B2** 埋伏入场锚 | **c**：双表并存，thesis 唯一入场锚源，埋伏行补 catalyst_event_id 关联 | 实测 `_write_thesis_snapshots` buy_allocations 不过滤 is_ambush_entry ⇒ 埋伏买入已被覆盖，收窄为 `catalyst_event_id` 关联回写（ambush_pool_map 按 sector_name 命中，UPDATE/INSERT 两分支；非埋伏票置空防同日改道残留）；`written` dict 同步补 `catalyst_event_id` 字段（归档排查用，非埋伏票为 None） |
 | **B3** 论点生命周期 | **四态状态机** intact/drift_watch/thesis_broken/closed，`is_open` 降级派生（closed↔False）保留兼容 | 列 `lifecycle_state` + `catalyst_event_id`（storage.py）；迁移 `_migrate_thesis_lifecycle_state`（模式同 catalyst_realizations，接线 init 链）；转换点：买入/重写=intact、`_apply_drift_watch`=drift_watch、`_mark_thesis_broken`（新 helper，`_score_holdings` 三处漂移 sell 且无宽限分支调用，判定函数 `_drift_action_with_grace` 保持纯净零写库）、清仓=closed。**评审轮补丁**：同日重写分支重置 intact 时同步清 `drift_watch_since/drift_family`（不变式 intact⟹since NULL——回填谓词随每次 init 重跑，若保留 since 下次重启会把行翻回 drift_watch）；**宽限期内回归→intact 转换延后**：drift_watch 行宽限期内不回写 intact、保持观察态，实施挂 B4/持仓大改轮 |
 | **B4** 退出分层 | **C**：按角色分道，本版只登记判据不接线 | 见下方登记；实施挂 WI-P-7 解冻 |
 | **B5** 家族中继 | **b**：`_family_relay_match` 现状核对结案（Fix 1 已实现：一级半层中继、0.85 打折、weight 1.2、同族单名额） | 零改动 |

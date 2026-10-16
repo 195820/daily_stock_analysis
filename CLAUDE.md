@@ -79,8 +79,8 @@ daily_stock_analysis/
 │   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向永久豁免/降级机制）
 │   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化/原始新闻跨日检测）
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数/时序动量）
-│   │   │   ├── aggregator.py         # Node 6: 聚合（A6 glue 直读·规则评分模式已退役/regime 状态机迟滞豁免/T3仲裁/埋伏通道/跨节点共振/分歧摘要影子）
-│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+Step 1.5超限强制减仓+埋伏退出+T1-H持仓审查）
+│   │   │   ├── aggregator.py         # Node 6: 聚合（A6 glue 直读·规则评分模式已退役/regime 状态机迟滞豁免/T3仲裁/埋伏通道/跨节点共振/分歧摘要影子/埋伏道一致性校验影子 GOT_AMBUSH_VALIDATION_SHADOW）
+│   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+Step 1.5超限强制减仓+埋伏退出+T1-H持仓审查+thesis四态状态机+_all_positions全账户聚合）
 │   │   ├── catalyst_calendar.py   # 催化剂日历（D1回声/D2周末/D3过期/D4置信守卫/T5对齐/T2校验）
 │   │   ├── catalyst_config.py     # 催化剂配置（13组全球→A股映射/影子模式开关/A6与§15审查层开关/可调参数集中管理）
 │   │   ├── catalyst_realization.py # P6: 催化兑现追踪（A1三级解析/PEAD多窗口/故事寿命/resolution三态）
@@ -88,6 +88,7 @@ daily_stock_analysis/
 │   │   ├── intelligence_service.py # 情报服务
 │   │   ├── market_theme.py      # 市场结构主题上下文（Step 2：mootdx 板块排名→MarketThemeContext，影子观测）
 │   │   ├── disagreement.py      # 分歧摘要（Phase 3b：11 类冲突分类学 + RiskOverridePlan，影子观测）
+│   │   ├── decision_plan.py     # 决策编排层（C2：allocation→trade_plans 计划装配 assemble + 昨日对账 reconcile，零新增 LLM）
 │   │   ├── glue_pipeline.py     # C-P13 阶段1 事件→板块接地式召回-验证管线（L1 embedding 检索→L2 受约束生成→L3 CoVe 验证；仅 --got-replay + GLUE_PIPELINE_ENABLED，生产休眠）
 │   │   ├── family_keywords.py     # 主线家族关键词（受控词表 12+1，glue 家族归属）
 │   │   ├── board_aliases.py       # 板块别名表
@@ -286,9 +287,15 @@ run(use_mock=False)
  ├─ Node 6: 聚合（消费全部 5 个 context + 跨日记忆 + 催化剂日历）
  ├─ [仅生产模式] archive_daily_run()（Phase 1 归档 → data/got_daily/YYYYMMDD/）
  ├─ [仅生产模式] Phase 2: PortfolioDecision（消费 6 个 context）
+ │    ├─ run() 开头: reconcile（昨日 pending trade_plans 对账回填，try/except 不阻断）
+ │    └─ allocation 组装后: assemble（当日计划写 trade_plans，try/except 不阻断）
  ├─ [仅生产模式] archive_phase2()（Phase 2 归档）
- └─ [仅生产模式] CatalystRealizationTracker.check_and_record_realization()（P6）
+ ├─ [仅生产模式] CatalystRealizationTracker.check_and_record_realization()（P6）
+ └─ [main.py --got 分支] GOT 通知（GOT_NOTIFY_ENABLED 缺省 1，NotificationService 复用，
+    dedup_key=got_daily_{date}，try/except warn 不阻断）
 ```
+
+**决策编排层（三问裁决落地，2026-10-15）**：Phase B 五项拍板已落第一版——B1-b `_all_positions` 全账户聚合（`portfolio_decision.py` static helper，四处 `accounts[0]` 错配改写，PortfolioService 真相源不动）；B2-c thesis 表补 `catalyst_event_id` 埋伏关联；B3 thesis 四态状态机（intact/drift_watch/thesis_broken/closed，`is_open` 降级派生；迁移证据冲突驱动回填；同日重写重置 intact 同步清 `drift_watch_since`；宽限期内回归→intact 延后挂 B4 轮）；B4-C 退出分层只登记判据（挂 WI-P-7 解冻）；B5-b `_family_relay_match` 零改动结案。Phase D 分道预算只落骨架+观测（D3 `GOT_LANE_BUDGET_ENABLED=1` 即 raise，接线挂 D1 标定门——candidate_pool 样本重积累后重跑 `scripts/backtest_lane_budget.py`）；Phase E 三路路由影子（E3 已接 `AgentMemory.from_config()` 先验权重，3b 读数起点 2026-10-15 重计）；Phase F 埋伏道一致性校验影子（三规则，池不变式零改动）。判据登记 [`docs/got/verification.md`](docs/got/verification.md) 补登 #5。
 
 **催化剂反馈循环**：Node 4 事件 → `CatalystCalendarBuilder`（D1回声守卫+D2周末守卫+T5语义对齐+T2叙事校验）→ `CatalystCalendar` → 嵌入 `NewsContext.catalyst_calendar` → Node 6 埋伏通道 + Phase 2 选股重排（P5）→ P6 兑现追踪（PEAD多窗口验证）
 
@@ -303,8 +310,8 @@ run(use_mock=False)
 | **Node 3** 资金面 | `MarketContext`（trend）, `SectorContext`（主线名称 → 匹配 bonus） | `CapitalContext` | `institutional_score`, `evidence.sector_flow/dde/northbound(永久豁免)`, `status`, `single_dimension`（`confidence_multiplier` 已于 2026-10-14 删除，见 backlog §1.J 二） | — |
 | **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
 | **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
-| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/pinned_days/transition_events/transition_count), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档）, `conflict_summary_shadow`/`decision_path_hint`（Phase 3b 分歧摘要） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
-| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测）, `ambush_lane_shadow`/`ambush_lane_trace`（埋伏道拆分产物）；**埋伏道 Node 7 接线点**：action 判定抬 priority≥55（`GOT_AMBUSH_SPLIT_ACTIVE` 门控，默认影子）+ bear gate 豁免扩展（2026-10-13 转正·无条件，不随 ACTIVE） | `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
+| **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/pinned_days/transition_events/transition_count), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档）, `conflict_summary_shadow`/`decision_path_hint`（Phase 3b 分歧摘要）, `ambush_lane_validation`（埋伏道一致性校验影子，Phase F） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测）, `ambush_lane_shadow`/`ambush_lane_trace`（埋伏道拆分产物）, `lane_budget_split_shadow`（分道预算观测，C4/D4）, `t3_routing_shadow`/`cross_node_signals_shadow`（三路路由影子，Phase E）；**埋伏道 Node 7 接线点**：action 判定抬 priority≥55（`GOT_AMBUSH_SPLIT_ACTIVE` 门控，默认影子）+ bear gate 豁免扩展（2026-10-13 转正·无条件，不随 ACTIVE） | `trade_plans`（计划装配+对账，decision_plan.py）+ `holding_thesis_snapshots`（四态状态机 lifecycle_state，B3）+ `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
 
 ### 持久化层总览
 
@@ -320,6 +327,8 @@ run(use_mock=False)
 | `catalyst_refresh` | CatalystCalendar | 日历刷新节奏（单行表, 全量 5 日 / 增量其余） |
 | `ambush_position_snapshots` | Phase 2 (P4) | 埋伏仓位快照（买入价 + 退出信号 + 退出价 + is_open） |
 | `catalyst_realizations` | P6 | 催化兑现归档（预期 vs 实际收益 + 方向正确性 + 故事寿命 + resolution三态） |
+| `trade_plans` | Phase 2 (`decision_plan.py`) | 可执行计划装配 + 昨日对账（唯一约束 plan_date+symbol+action，execution_status 五态 pending/partial/executed/expired/cancelled） |
+| `holding_thesis_snapshots` | Phase 2 | 持仓论点快照 + 四态生命周期 `lifecycle_state`（intact/drift_watch/thesis_broken/closed，is_open 降级派生；迁移 `_migrate_thesis_lifecycle_state` 证据冲突驱动回填）+ `catalyst_event_id` 埋伏催化剂关联 |
 
 **文件持久化**：
 
