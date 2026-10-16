@@ -366,6 +366,7 @@ run(use_mock=False)
 | 组合层超限减仓 | Step 1.5：个股无卖出但组合仍超 `position_limit` 时按 composite_score 升序削最弱持仓（三态开关 `GOT_SELL_SOURCE_*`，默认影子） | 补 W1「超限无减仓路径/不减反买」；复用板块漂移宽限防 688598 式误卖；影子态落 `sell_source_shadow` 观测、零决策改动 |
 | C-P13 接地管线 | L1 embedding 检索接地（K=8）→ L2 受约束生成（board_code 白名单+证据 span 硬护栏）→ L3 CoVe 验证剪枝；仅 `--got-replay` + `GLUE_PIPELINE_ENABLED` 双与门 | 阶段 1 六条验收全过（2026-09-27 结项，M3=0%）；阶段 2 realized 收益率标定证伪关闭（2026-09-28）→ 管线休眠不解禁不删除；conf≥0.70 全真/牵强全≤0.50，重标定须用 M3 口径 |
 | 北向资金 | 永久豁免维度（`EXEMPT_DIMENSIONS`） | 2024-08 起官方停披，不计入 missing_dimensions 和 confidence 分母 |
+| thesis 生命周期 | 四态状态机 intact/drift_watch/thesis_broken/closed（`is_open` 降级派生保留兼容）；GOT 消费侧 `_all_positions` 全账户聚合 | B3/B1 裁决定稿（2026-10-15）；迁移回填谓词证据冲突驱动（SQLite ADD COLUMN DEFAULT 直回填存量行，`IS NULL` 谓词失效）+ intact 重写同步清 `drift_watch_since` 防重启翻回；宽限期内回归→intact 延后挂 B4 轮 |
 
 ### GOT 驱动选股流水线
 
