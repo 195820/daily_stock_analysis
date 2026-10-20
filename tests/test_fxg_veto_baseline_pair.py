@@ -46,7 +46,7 @@ class TestMaybeCaptureFxgBaseline(unittest.IsolatedAsyncioTestCase):
         from src.got.orchestrator import GOTOrchestrator
         return GOTOrchestrator.__new__(GOTOrchestrator)
 
-    async def _call(self, env, score_ret=None, side_effect=None):
+    async def _call(self, env, score_ret=None, side_effect=None, unset=()):
         """跑 helper，返回 (诊断 dict, 是否产 fxg_baseline_scoring.json, 解析后的 record 或 None)。"""
         from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
@@ -66,6 +66,11 @@ class TestMaybeCaptureFxgBaseline(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(PortfolioDecisionNode, "_score_candidates", _fake_score), \
              patch.dict(os.environ, env):
+            # .env 已把 GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW 等置 1 并载入 os.environ，
+            # patch.dict 不清空环境 ⇒ "缺省不在 env" 的用例会被 .env 值污染。
+            # 显式 pop 才能真实模拟"该键不存在"。
+            for _k in unset:
+                os.environ.pop(_k, None)
             old = os.getcwd()
             with tempfile.TemporaryDirectory() as d:
                 os.chdir(d)
@@ -86,7 +91,9 @@ class TestMaybeCaptureFxgBaseline(unittest.IsolatedAsyncioTestCase):
     async def test_default_off_no_capture(self):
         """BASELINE_SHADOW 缺省（不在 env）→ 不触发、不产文件、不调 _score_candidates。"""
         env = {k: v for k, v in _FULL.items() if k != "GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW"}
-        diag, produced, rec = await self._call(env)
+        diag, produced, rec = await self._call(
+            env, unset=("GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW",)
+        )
         self.assertEqual(diag["calls"], 0)
         self.assertFalse(produced)
         self.assertIsNone(rec)

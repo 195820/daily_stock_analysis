@@ -88,6 +88,13 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "force_run": False,
             "single_notify": False,
             "no_context_snapshot": False,
+            # main() 会访问这些开关；缺键会让 SimpleNamespace 直接 AttributeError，
+            # 把"测试夹具过时"伪装成"模式逻辑失败"（2026-10-20 补：此前 9 例因缺 screener 恒红）
+            "screener": False,
+            "got": False,
+            "got_intraday": False,
+            "got_replay": None,
+            "intraday_time": None,
         }
         defaults.update(overrides)
         return SimpleNamespace(**defaults)

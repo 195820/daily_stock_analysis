@@ -258,7 +258,8 @@ class TestSynthesizeFamilySuppression(unittest.TestCase):
 # ────────────────── WI-B 层B：家族被压制+aggravated → buy 硬降级 ──────────────────
 class _FtsGateHarness(unittest.IsolatedAsyncioTestCase):
 
-    async def _run(self, stock, intel, family_suppression, env, regime="transition"):
+    async def _run(self, stock, intel, family_suppression, env, regime="transition",
+                   snapshot_spy=None):
         from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
         node = PortfolioDecisionNode(use_mock=True)
@@ -267,7 +268,7 @@ class _FtsGateHarness(unittest.IsolatedAsyncioTestCase):
         node._compute_overheat_penalty = lambda name, mm, uc: 1.0
         node._collect_shadow_t1 = lambda finalists: None
         # F-1 污染防线（同 test_bear_entry_gate）：stub universe 残缺形态不落生产归档
-        node._save_candidate_pool_snapshot = lambda *a, **k: None
+        node._save_candidate_pool_snapshot = snapshot_spy or (lambda *a, **k: None)
 
         async def _fake_verify(finalists, sector_intel_map):
             return finalists
@@ -290,6 +291,27 @@ class _FtsGateHarness(unittest.IsolatedAsyncioTestCase):
 
 _STEP3 = {"GOT_WINRATE_STEP3_ENABLED": "1"}
 _ON = {"GOT_FAMILY_TOPPING_GATE_ENABLED": "1"}
+
+
+class TestCandidatePoolSnapshotNotGatedByFts(_FtsGateHarness):
+    """F-1 快照与 FTS 闸门解耦（2026-10-20）。
+
+    快照是 D1 分道预算事后验证 / 板块匹配度评估的唯一带标签样本源（universe 行保留
+    验证前的原始 sector_name、sector_type）。此前它挂在 GOT_FAMILY_TOPPING_GATE_ENABLED
+    下，关掉不相关的 FTS 闸门就会静默断掉样本积累，且归档里看不出断在哪天。
+    """
+
+    async def test_snapshot_written_when_fts_gate_off(self):
+        calls = []
+        await self._run(
+            _make_stock(), _intel_fg(), [],
+            {**_STEP3, "GOT_FAMILY_TOPPING_GATE_ENABLED": "0"},
+            snapshot_spy=lambda *a, **k: calls.append(a),
+        )
+        self.assertEqual(
+            len(calls), 1,
+            "candidate_pool 快照不得再被 GOT_FAMILY_TOPPING_GATE_ENABLED 门控",
+        )
 
 
 class TestFtsActionGate(_FtsGateHarness):
@@ -606,7 +628,8 @@ class _FxgPhase2Harness(unittest.IsolatedAsyncioTestCase):
 
         screener_mock = MagicMock()
         screener_mock._extract_got_universe = _fake_extract
-        screener_mock._filter_got_finalists = lambda uni, ctx, n: [stock]
+        # 2026-10-20：Phase 2 直调多传 lane_merge_mode="union" → stub 须收 *args
+        screener_mock._filter_got_finalists = lambda uni, ctx, n, *a: [stock]
 
         confirmed = [
             SectorIntel(sector_name="创新药", classification="actionable",

@@ -130,6 +130,13 @@ def archive_daily_run(
         jump_src = archive_dir / SHADOW_REGIME_JUMP_ARTIFACT
         if jump_src.exists():
             shutil.move(str(jump_src), str(tmp_dir / SHADOW_REGIME_JUMP_ARTIFACT))
+        # Q1/埋伏宽限影子旁路（2026-10-16）：news_analysis._rescue_low_events 与
+        # aggregator._compute_ambush_exit_grace_shadow 在归档前直写当日目录，同 glue
+        # 语义（当日影子结论末版为准），必须随本轮搬运否则被原子替换删除。
+        for _shadow_name in (SHADOW_LOW_EVENTS_ARTIFACT, SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT):
+            _shadow_src = archive_dir / _shadow_name
+            if _shadow_src.exists():
+                shutil.move(str(_shadow_src), str(tmp_dir / _shadow_name))
         # Q1 audit: 搬运 degraded 取证文件（forensics 例外，不受 Q6-A 按日去重约束）
         # 文件名含 HHMMSS 字典序即时间序；同日多次失败仅保留最新 5 份，防止无限堆积
         _degraded_files = sorted(archive_dir.glob("agent_glue_degraded_*.json"), reverse=True)
@@ -810,6 +817,8 @@ SHADOW_REGIME_JUMP_ARTIFACT = "shadow_regime_jump.json"
 SHADOW_MEG_ARTIFACT = "shadow_meg.json"
 SHADOW_FTS_ARTIFACT = "shadow_fts.json"
 SHADOW_BEAR_GATE_ARTIFACT = "shadow_bear_gate.json"
+SHADOW_LOW_EVENTS_ARTIFACT = "shadow_low_events.json"
+SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT = "shadow_ambush_exit_grace.json"
 
 
 def _shadow_display_name(name: str, symbol: str) -> str:
@@ -1426,6 +1435,10 @@ SHADOW_PROGRESS_RULES = {
             "needs": ["t1h"], "note": "转正为定性判读（无固定天数门槛），归负责人"},
     "regime_jump": {"label": "#14 ④ regime jump penalty", "tag": "jump", "status": "active",
                     "needs": ["regime_jump"], "required": 5, "clock_start": "2026-10-16"},
+    "low_events": {"label": "Q1 low 板块救援", "tag": "low", "status": "active",
+                   "needs": ["low_events", "low_switch"], "required": 10, "clock_start": "2026-10-16"},
+    "ambush_exit_grace": {"label": "埋伏 E14 出场催化宽限", "tag": "grace", "status": "active",
+                          "needs": ["ambush_exit_grace", "grace_switch"], "required": 10, "clock_start": "2026-10-16"},
 }
 
 
@@ -1470,7 +1483,17 @@ def _build_shadow_day_index(base_dir: Path, run_date: date) -> list[dict]:
             "t1": (day_dir / SHADOW_T1_ARTIFACT).exists(),
             "t1h": (day_dir / SHADOW_T1H_ARTIFACT).exists(),
             "regime_jump": (day_dir / SHADOW_REGIME_JUMP_ARTIFACT).exists(),
+            "low_events": (day_dir / SHADOW_LOW_EVENTS_ARTIFACT).exists(),
+            "ambush_exit_grace": (day_dir / SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT).exists(),
         }
+        # 占位日不进有效计数：low 救援 disabled 占位 / grace 空样本带 switch 键三态判定
+        # （enabled 记录恒带 switch:True；缺键 = 老版本产物或手工文件，按启用态计）
+        low_raw = _read_json_quiet(day_dir / SHADOW_LOW_EVENTS_ARTIFACT)
+        grace_raw = _read_json_quiet(day_dir / SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT)
+        flags["low_switch"] = not (
+            isinstance(low_raw, dict) and low_raw.get("switch") is False)
+        flags["grace_switch"] = not (
+            isinstance(grace_raw, dict) and grace_raw.get("switch") is False)
         index.append({"date": ddate, "flags": flags})
     return index
 
@@ -1540,6 +1563,8 @@ def _render_shadow_section(
     t3_routing_shadow: "list[dict] | None" = None,
     cross_node_signals_shadow: "list[dict] | None" = None,
     regime_jump_shadow: "dict | None" = None,
+    low_events_shadow: "dict | None" = None,
+    ambush_exit_grace_shadow: "dict | None" = None,
     base_dir: "Path | None" = None,
     run_date: "date | None" = None,
 ) -> list[str]:
@@ -1593,11 +1618,75 @@ def _render_shadow_section(
     if regime_jump_shadow is not None:
         lines += _render_shadow_regime_jump_body(regime_jump_shadow)
     lines += _prog("regime_jump")
+    # ── Q1 low 板块救援（直连，2026-10-16）+ 埋伏 E14 出场催化宽限影子 ──
+    lines += _render_shadow_low_events(low_events_shadow)
+    lines += _prog("low_events")
+    lines += _render_shadow_ambush_exit_grace(ambush_exit_grace_shadow)
+    lines += _prog("ambush_exit_grace")
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _prog("t1")
     lines += _render_shadow_t1h(t1h)
     lines += _prog("t1h")
+    return lines
+
+
+def _render_shadow_low_events(low_events: "dict | None") -> list[str]:
+    """Q1 low 事件板块级救援（直连）：shadow_low_events.json 渲染体。
+
+    缺省（未跑/缺文件）→ []；disabled 占位 → 单行说明。
+    """
+    if low_events is None:
+        return []
+    if low_events.get("status") == "disabled":
+        return ["**Q1 low 板块救援**：开关关闭（GOT_LOW_SECTOR_RESCUE=0），已回滚原过滤行为。", ""]
+    lines = [
+        f"**Q1 low 板块救援**（直连）：low 事件 {low_events.get('low_count', 0)} 条，"
+        f"送审 {low_events.get('review_candidates', 0)} 条，升级 "
+        f"{low_events.get('upgraded', 0)} 条（sector_impact=high → medium 直进链路）。"
+    ]
+    if low_events.get("failure"):
+        lines.append(f"- 复审失败：{low_events['failure']}（降级=原过滤行为）")
+    dist = low_events.get("sector_impact_dist") or {}
+    if dist:
+        lines.append(
+            f"- sector_impact 分布：high {dist.get('high', 0)} / medium {dist.get('medium', 0)}"
+            f" / low {dist.get('low', 0)}"
+        )
+    upgraded_titles = [
+        (e.get("title") or "") for e in (low_events.get("events") or [])
+        if e.get("upgraded_to")
+    ]
+    for t in upgraded_titles[:3]:
+        lines.append(f"- ↑ 升级：{t}")
+    lines.append("")
+    return lines
+
+
+def _render_shadow_ambush_exit_grace(record: "dict | None") -> list[str]:
+    """埋伏 E14 出场催化宽限影子渲染体（零决策改动观测线）。"""
+    if record is None:
+        return []
+    count = record.get("grace_candidates_count", 0)
+    window = record.get("window_days", 10)
+    lines = [
+        f"**埋伏 E14 出场催化宽限**（影子）：E14 转出候选 {count} 个（宽限窗口 {window} 交易日）。"
+    ]
+    for r in record.get("records") or []:
+        hold = "✓ grace_would_hold" if r.get("grace_would_hold") else "✗"
+        mom = r.get("rrg_momentum_ema")
+        mom_s = f"{mom:.2f}" if isinstance(mom, (int, float)) else "NA"
+        strength = r.get("strength_score")
+        strength_s = f"{strength:.0f}" if isinstance(strength, (int, float)) else "NA"
+        nearest = r.get("nearest_event") or {}
+        td = nearest.get("trade_days_away")
+        td_s = f"最近催化 {td} 交易日" if isinstance(td, int) else "窗口内无催化"
+        lines.append(
+            f"- {r.get('sector_name') or r.get('sector_code')}（{r.get('sector_code')}）："
+            f"mom={mom_s} strength={strength_s} 合格催化 {r.get('qualified_event_count', 0)} 条"
+            f"（{td_s}）{hold}"
+        )
+    lines.append("")
     return lines
 
 
@@ -1674,6 +1763,33 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
             )
         lines.append("")
 
+    # 决策编排层（decision_plan.py 的 reconcile/assemble）输出透传（2026-10-20）：
+    # 逐条列出昨日对账回填与当日计划装配，使 trade_plans 表内容在 reasoning.md 可复盘。
+    # 空列表（缺省/未接线）不渲染任何行——off 态 reasoning.md 逐字节不变。
+    _trade_plan_log = getattr(decision, "trade_plan_log", None)
+    if _trade_plan_log:
+        lines.append("### 决策编排层（trade_plans 装配/对账）")
+        lines.append("")
+        lines.extend(
+            entry if entry.startswith("- ") else f"- {entry}" for entry in _trade_plan_log
+        )
+        lines.append("")
+
+    # 板块身份校验（web 证据）—— 2026-10-20：efinance 跨口径比对退役后，member 票的
+    # 支持原文在此留痕，便于人工抽检"这条判定靠的是哪句话"。
+    # 空列表（缺省/当日全被否）不渲染任何行：off 态 reasoning.md 逐字节不变。
+    _sector_evidence = getattr(decision, "sector_verify_evidence", None)
+    if _sector_evidence:
+        lines.append("### 板块身份校验（web 证据）")
+        lines.append("")
+        for item in _sector_evidence:
+            lines.append(
+                f"- [{item.get('sector', '')}] {item.get('symbol', '')}: "
+                f"「{item.get('quote', '')}」"
+                f"（{item.get('provider', '')} / {item.get('query', '')}）"
+            )
+        lines.append("")
+
     # 影子模式观测（五条影子线）——挂在 Node 7 之后，同日重跑时随 Node 7 段一并被丢弃重建
     day_dir = reasoning_path.parent
     _unified_json = _read_json_quiet(day_dir / "unified.json") or {}
@@ -1703,6 +1819,8 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         t3_routing_shadow=_pd_json.get("t3_routing_shadow"),
         cross_node_signals_shadow=_pd_json.get("cross_node_signals_shadow"),
         regime_jump_shadow=_read_json_quiet(day_dir / SHADOW_REGIME_JUMP_ARTIFACT),
+        low_events_shadow=_read_json_quiet(day_dir / SHADOW_LOW_EVENTS_ARTIFACT),
+        ambush_exit_grace_shadow=_read_json_quiet(day_dir / SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT),
         base_dir=day_dir.parent,
         run_date=_shadow_run_date,
     )

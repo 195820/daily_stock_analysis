@@ -113,6 +113,30 @@ def _warn_if_public_webui_without_auth(host: str) -> None:
     )
 
 
+def _phase2_exit_code(decision) -> int:
+    """Phase 2 产物的退出码（决策系统口径，2026-10-20 用户裁决）：失败即非零退出。
+
+    orchestrator 在 Phase 2 失败时会落 `status="failed"` 占位产物（用于区分"没跑"与
+    "跑崩"），但**占位产物存在 ≠ 运行成功**：exit code 不失败，调度器/终端看到的仍是成功，
+    等于把"静默清空"换成了"静默无决策"。
+
+    - decision 缺失（未产出/未启用）→ 1
+    - `status == "failed"`（占位产物）→ 1
+    - normal / partial → 0（partial 是"部分步骤降级"的既有语义，仍属产出决策）
+    """
+    if decision is None:
+        logger.error("[GOT] Phase 2 决策缺失（未产出或未启用）——按失败退出")
+        return 1
+    if getattr(decision, "status", "") == "failed":
+        logger.error(
+            "[GOT] Phase 2 执行失败（status=failed）——按失败退出: %s",
+            "；".join((getattr(decision, "warnings", None) or [])[:3])
+            or "详见上方异常日志",
+        )
+        return 1
+    return 0
+
+
 def _read_active_env_values() -> Optional[Dict[str, str]]:
     env_path = _get_active_env_path()
     if not env_path.exists():
@@ -1492,7 +1516,11 @@ def main() -> int:
                 from src.got.archive import load_phase2_decision
                 decision = load_phase2_decision(date.today())
 
-                if decision:
+                # 决策系统口径（2026-10-20 用户裁决）：Phase 2 失败 = 当日无决策 = **非零退出**。
+                # orchestrator 已落 status="failed" 占位产物（用于区分"没跑"与"跑崩"），
+                # 但"占位产物存在"≠"运行成功"——出口不失败的话，调度器/终端看到的仍是成功，
+                # 静默清空只是换成了静默无决策。
+                if decision and getattr(decision, "status", "") != "failed":
                     print("\n" + "=" * 60)
                     print("Phase 2: 交易建议")
                     print("=" * 60)
@@ -1605,8 +1633,8 @@ def main() -> int:
                             )
                         except Exception as e:
                             logger.warning(f"[GOT] 通知发送失败（不阻断）: {e}")
-                else:
-                    logger.info("[GOT] Phase 2 决策不存在（可能 Phase 2 未启用或失败）")
+                if _phase2_exit_code(decision):
+                    return 1
 
 
                 return 0

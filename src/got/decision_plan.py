@@ -341,3 +341,58 @@ def reconcile(
                 pass
     
     return updated
+
+
+# =============================================================================
+# 人读日志行（纯函数，2026-10-20）
+# =============================================================================
+# run() 的 reconcile/assemble 接线处把返回值转成人读行，透传进
+# PortfolioDecision.trade_plan_log → reasoning.md Node 7 段的「决策编排层」子块。
+# 纯函数：无 IO、无副作用、可单测；异常路径也产一行（失败要可见，但不阻断主流程）。
+
+def reconcile_log_lines(
+    day: date, updated: list, error: Optional[str] = None
+) -> list[str]:
+    """昨日对账回填结果 → reasoning.md 人读行。
+
+    Args:
+        day: 对账目标日（昨日交易日）
+        updated: reconcile 返回的状态已更新记录列表（空列表=无 pending 计划）
+        error: 接线层捕获的异常字符串（None=未失败）
+    """
+    if error:
+        return [f"昨日对账({day})失败（不阻断）: {error}"]
+    if not updated:
+        return [f"昨日对账({day}): 无 pending 计划待回填"]
+    lines = [f"昨日对账({day}): {len(updated)} 条状态回填"]
+    lines.extend(
+        f"- [{getattr(p, 'lane', '') or '-'}] {getattr(p, 'symbol', '')} "
+        f"{getattr(p, 'action', '')} → {getattr(p, 'execution_status', '')}"
+        for p in updated
+    )
+    return lines
+
+
+def assemble_log_lines(written: list, error: Optional[str] = None) -> list[str]:
+    """当日计划装配结果 → reasoning.md 人读行。
+
+    Args:
+        written: assemble 返回的成功写入记录列表（空列表=allocation 为空或无写入）
+        error: 接线层捕获的异常字符串（None=未失败）
+    """
+    if error:
+        return [f"当日计划装配失败（不阻断）: {error}"]
+    if not written:
+        return ["当日计划装配: allocation 为空，无计划写入"]
+    lines = [f"当日计划装配: {len(written)} 条写入 trade_plans"]
+    for p in written:
+        _qty = float(getattr(p, "target_quantity", 0) or 0)
+        _trigger = getattr(p, "trigger_price", None)
+        _trigger_txt = f"¥{float(_trigger):.2f}" if _trigger is not None else "—"
+        _valid_until = getattr(p, "valid_until", None)
+        lines.append(
+            f"- [{getattr(p, 'lane', '') or '-'}] {getattr(p, 'symbol', '')} "
+            f"{getattr(p, 'action', '')} {_qty:.0f}股 @触发 {_trigger_txt} → "
+            f"{getattr(p, 'execution_status', '')}（有效至 {_valid_until or '—'}）"
+        )
+    return lines

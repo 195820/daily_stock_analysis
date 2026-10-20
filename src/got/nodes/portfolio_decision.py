@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+from collections import Counter
 import pandas as pd
 from datetime import date
 from pathlib import Path
@@ -51,8 +52,48 @@ ROLE_STOP_LOSS: dict[str, float] = {"mainline": 0.07, "ambush": 0.05, "cooling":
 DEFAULT_SECTOR_ROLE = "mainline"
 
 
+class SectorVerifyUnavailable(RuntimeError):
+    """板块身份 LLM 仲裁不可用（API 失败 / 返回空 / 不可解析 / 裁决不完整 / 列表外板名）。
+
+    **决策系统口径（用户 2026-10-20 裁决）**：拿不到判定就报错，不出决策——
+    「断了总比拿错误数据出决策好」。取代旧「审核 3.3 保守清空」路径：那条路把
+    「数据缺失」伪装成「判定为不匹配」，当日仍在无人察觉的降级态下产出
+    watch / 空仓建议，并把降级痕迹埋在 data_quality 里。
+
+    上抛后由 orchestrator 的 Phase 2 失败分支兜底：记 `logger.exception` + 落
+    `status="failed"` 占位产物（allocation=[]）+ warnings 里写明原因，当日无交易建议。
+    """
+
+
+def _stype_to_role(_t: str) -> str:
+    """screener 词表 sector_type → 预算道词表 sector_role（C4 shadow 与 D3 分道预算共用）。
+
+    - ``active_mainline`` → ``mainline``
+    - ``ambush`` → ``ambush``
+    - 其余（缺失 / 未登记词表 / 裸 ``mainline``）→ ``unknown``（保守档，与 D4-a would_be_split 同口径）
+
+    2026-10-20 从 _allocate 内 C4 shadow 块提升为模块级：D3 分道预算与 C4 假想预算比必须
+    用同一映射，否则归档 trace 的分道归属与 allocation 实际金额不可复算。
+    **裸 ``mainline`` 归 unknown（不设别名）**：screener 真实词表只有 ``active_mainline``/
+    ``ambush``，字面 ``mainline`` 只出现在 `UnifiedScoringResult.sector_type` 的 schema
+    缺省值（即 sector_type 未被 passthrough 填充 = 道身份缺失），按 miss 处理拿保守档；
+    否则身份未确认的票会白拿主线 1.0 权重，与「验证失败不享主线预算」的既有口径冲突。
+    """
+    return {"active_mainline": "mainline", "ambush": "ambush"}.get(_t or "", "unknown")
+
+
 class PortfolioDecisionNode:
     """Phase 2 统一决策节点"""
+    # 板块身份校验的 run 级共享态（类级，2026-10-20）：
+    # 1) _sector_verify_dead_offsets —— 死顺位记忆：offset≥1 的 provider 在本次进程内
+    #    一轮检索全无结果后停用（主顺位 0 永不停用）。背景：SearXNG 公共实例模式的
+    #    is_available 只看配置意图（use_public_instances=True），实例池拉不下来仍报可用，
+    #    offset=1 每票白等 ~5s 超时。配好第二家后行为自动恢复。
+    # 2) _sector_verify_decision_cache —— (symbol, sector) → 决策 dict 复用：FXG 基线
+    #    影子（orchestrator._maybe_capture_fxg_baseline）会用独立实例再跑一次
+    #    _score_candidates，同一批候选不得二次检索/二次 LLM 裁决（次数/成本翻倍）。
+    _sector_verify_dead_offsets: set = set()
+    _sector_verify_decision_cache: Dict[tuple, Dict[str, Any]] = {}
 
     def __init__(self, use_mock: bool = False):
         self.use_mock = use_mock
@@ -82,6 +123,11 @@ class PortfolioDecisionNode:
         # 审核修复 3.3/S1/S2：板块验证降级状态 / 名称兜底缓存 / 旁路补选板块
         self._sector_verify_degraded = False
         self._sector_verify_pending_count = 0
+        # 2026-10-20：「未验证即放行」逐票留痕（efinance 板块列表取不到时保留问财标签）。
+        # 归档侧据此区分「真命中」与「没验过」，否则匹配度/精度分母会被污染。
+        self._sector_verify_unverified: Optional[List[Dict[str, Any]]] = None
+        # 2026-10-20 web 证据留痕：[{symbol, sector, quote, provider, query}]
+        self._sector_verify_evidence: Optional[List[Dict[str, Any]]] = None
         self._stock_name_cache: Dict[str, str] = {}
         self._bypass_ambush_sectors: set = set()
 
@@ -117,13 +163,18 @@ class PortfolioDecisionNode:
         # backlog §7 #12 修法①：影子五件套 + 候选池快照两个 _save_* 写入点统一读此值，
         # 归档目录跟业务日走（重放/带外跑历史日不再错落墙钟日目录）。
         self._as_of = _as_of
+        # ── 决策编排层日志透传（2026-10-20）──
+        # reconcile（昨日对账）+ assemble（当日装配）的返回值此前在接线处被丢弃，只进 SQLite。
+        # 这里转成人读行累积，run() 末尾回填 decision.trade_plan_log → reasoning.md Node 7 段。
+        self._trade_plan_log: List[str] = []
+        _prev_date = None
 
         # 获取当前持仓
         # ── C2b reconcile 接线（三问裁决 WI-P-7，2026-10-15）──
         # run() 开头：对昨日 pending 计划回填执行状态。try/except 双层防（decision_plan 内部已有，
         # 接线层再加一层防 import 错误）。零决策改动，不改变 run() 返回值语义。
         try:
-            from src.got.decision_plan import reconcile
+            from src.got.decision_plan import reconcile, reconcile_log_lines
             import exchange_calendars as xcals
             _cal = xcals.get_calendar("XSHG")
             _session = _cal.date_to_session(pd.Timestamp(_as_of), direction="previous")
@@ -135,9 +186,17 @@ class PortfolioDecisionNode:
                     _sym = _pos.get("symbol")
                     if _sym:
                         _holdings_dict[_sym] = _pos.get("quantity", 0)
-            reconcile(_prev_date, _holdings_dict)
+            _reconciled = reconcile(_prev_date, _holdings_dict)
+            self._trade_plan_log = reconcile_log_lines(_prev_date, _reconciled or [])
         except Exception as _recon_exc:
             logger.warning("[Phase 2] C2b reconcile 失败（不阻断）: %s", _recon_exc)
+            try:
+                from src.got.decision_plan import reconcile_log_lines
+                self._trade_plan_log = reconcile_log_lines(
+                    _prev_date or _as_of, [], error=str(_recon_exc)
+                )
+            except Exception:  # 日志行生成也失败：放弃留痕，绝不阻断主流程
+                self._trade_plan_log = []
 
 
         portfolio = self._get_portfolio_snapshot()
@@ -316,6 +375,11 @@ class PortfolioDecisionNode:
             ambush_exit_signals=ambush_exit_signals,
             mainline_endurance=getattr(unified_context, "mainline_endurance", []),
             sector_exposure_binding=sector_exposure_binding,
+            # 板块校验「未验证即放行」留痕（2026-10-20）：efinance 取不到板块列表时保留问财
+            # 标签，归档据此区分「真命中」与「没验过」（匹配度/精度分母口径）。由
+            # _verify_candidate_sectors 落 self；None=当日无此类票。
+            sector_verify_unverified=getattr(self, "_sector_verify_unverified", None),
+            sector_verify_evidence=getattr(self, "_sector_verify_evidence", None),
             # P1-4/OPEN-1 W2 卖出来源观测留痕（批 4.1）：影子/生效模式由 _allocate 落 self，
             # 仅留痕不参与决策（shadow 模式 allocation 本身零改动）
             sell_source_shadow=getattr(self, "_sell_source_shadow", None),
@@ -357,10 +421,23 @@ class PortfolioDecisionNode:
         # try/except 双层防（decision_plan 内部已有，接线层再加一层防 import 错误）。
         # 零决策改动，不改变 run() 返回值语义。
         try:
-            from src.got.decision_plan import assemble
-            assemble(decision, unified_context, _as_of)
+            from src.got.decision_plan import assemble, assemble_log_lines
+            _written = assemble(decision, unified_context, _as_of)
+            self._trade_plan_log += assemble_log_lines(_written or [])
         except Exception as _asm_exc:
             logger.warning("[Phase 2] C2b assemble 失败（不阻断）: %s", _asm_exc)
+            try:
+                from src.got.decision_plan import assemble_log_lines
+                self._trade_plan_log += assemble_log_lines([], error=str(_asm_exc))
+            except Exception:  # 日志行生成也失败：放弃留痕，绝不阻断主流程
+                pass
+
+        # 决策编排层结果回填（decision 在 Step 5 前已构造，此处后置 mutation；
+        # Pydantic v2 模型可变，与既有 _lane_budget_split_shadow 等透传同款做法）
+        try:
+            decision.trade_plan_log = list(self._trade_plan_log)
+        except Exception as _log_exc:  # 留痕失败不影响决策返回
+            logger.warning("[Phase 2] trade_plan_log 回填失败（已忽略）: %s", _log_exc)
 
 
         logger.info(
@@ -1532,241 +1609,331 @@ class PortfolioDecisionNode:
         finalists: list,
         sector_intel_map: Dict[str, Dict],
     ) -> list:
-        """候选股板块交叉验证（2026-08-18 新增）
+        """板块身份校验（2026-10-20 改为「联网检索证据 + LLM 判定」，efinance 退出裁决）
 
-        用 efinance.get_belong_board() 验证问财返回的板块标签是否真实。
-        防止蹭概念票（如利君股份被问财错误归类为 TOPCon电）。
+        旧实现用 efinance 板块列表比对（跨口径：东财无「液冷服务器」「数据中心(AIDC)」
+        「军贸概念」），2026-10-20 三只 finalists 被结构性误杀（其中 001400 经检索证实
+        确属「液冷服务器」）。现流程：
 
-        验证逻辑（2026-09-01 升级为别名归一化 + LLM 兜底仲裁）：
-        1. 对每只候选股，调用 efinance 获取其实际所属板块列表
-        2. L1 别名归一化匹配：处理跨口径命名差异（如"券商" vs "券商概念"）
-        3. L2 LLM 仲裁：L1 未命中时批量交由 LLM 判断是否同一概念，
-           LLM 不可用时改走保守分支（审核修复 3.3：清空标签 +
-           sector_available=False，进入 unknown 保守预算路径）
-        4. 两者都未命中，清空板块标签（sector 维度按缺失处理，权重归一化剔除）
+        1. 每只带有效板块标签的 finalist：2 条模板 × 2 个 provider 顺位检索
+           （`days=365`；概念归属是事实型不是新闻）
+        2. 结果先过来源白名单 `is_allowed_source`，再用 `evidence_supports_membership`
+           做同段身份护栏（防"别的票的军贸新闻"被当成本票证据）
+        3. 通过护栏的原文批量交 LLM 判 `member` / `not_member` / `uncertain`
 
-        注意：只在候选股数量较少时（≤15）执行，避免过多 API 调用。
+        落地：`member` 保留标签；`not_member` / `uncertain` / 无证据 一律清空标签
+        （sector 维度剔除 + Q9-B 强制 watch）。
+
+        fail-closed：响应级 LLM 失败（异常/空/无 JSON/非数组）、全部查询无任何结果 →
+        `raise SectorVerifyUnavailable`，由 orchestrator Phase 2 失败分支落
+        `status="failed"` 占位产物（进程退出码 1）。单案例脏输出（缺 index/非法 verdict）
+        只降级该票为 uncertain，不废整日。零候选（无任何带标签 finalist）直接返回。
+
+        注意：只在候选股数量较少时（≤15）执行，避免过多检索调用。
         """
         if not finalists or len(finalists) > 15:
             return finalists
 
-        from data_provider.base import DataFetcherManager
-        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+        from src.got.board_aliases import sector_name_variants
+        from src.got.sector_evidence import evidence_supports_membership, is_allowed_source
+        from src.search_service import get_search_service
+        from src.services.board_name_resolver import get_board_name_resolver
+        from urllib.parse import urlparse
 
-        manager = DataFetcherManager()
-        verified = []
-        pending: List[Dict[str, Any]] = []   # 待 LLM 仲裁的 [{tagged, boards, stock}]
+        # 待验证票：有板块标签且标签在 Node 6 板块情报表内（沿用旧跳过分支口径）
+        targets: List[tuple] = []
+        for stock in finalists:
+            tagged_sector = getattr(stock, "sector", "") or getattr(stock, "sector_name", "") or ""
+            if tagged_sector and tagged_sector in sector_intel_map:
+                targets.append((stock, tagged_sector))
+
+        if not targets:
+            # 零候选不触发检索、不抛错（"所有查询无结果"在零查询时会空洞为真）
+            logger.info("[板块验证] 无带板块标签的候选，跳过检索校验")
+            return finalists
+
+        # FXG 基线双跑复用：orchestrator._maybe_capture_fxg_baseline 会用独立实例再跑一次
+        # _score_candidates（同一批候选），同 (symbol, sector) 已有决策 → 直接复用，
+        # 不二次检索/二次 LLM。键含 sector：同票换板块标签视为新案例。
+        decision_cache = type(self)._sector_verify_decision_cache
+        fresh_targets = [
+            (s, t) for s, t in targets
+            if (getattr(s, "code", ""), t) not in decision_cache
+        ]
+        cached_count = len(targets) - len(fresh_targets)
+        if cached_count:
+            logger.info("[板块验证] 复用本进程已校验决策 %d 票，跳过重复检索", cached_count)
+        searcher = get_search_service()
+        resolver = get_board_name_resolver()
+        sem = asyncio.Semaphore(4)
+        skipped_offlist = 0
+        skipped_hosts: Counter = Counter()
+        raw_results_seen = False
+        queries_made = 0
+        # 只遍历「实际可用引擎」的顺位：未配置第二家时 offset=1 是纯等超时
+        # （实测 SearXNG 公共实例不可达，每票白等 ~5s）。配了第二家时行为不变。
+        # 死顺位记忆：offset≥1 首轮全无结果即停用（类级、进程内；主顺位 0 永不停用），
+        # 防「配置上声称可用、网络上实际不可达」的引擎拖慢每一票。
+        provider_count = min(2, getattr(searcher, "available_provider_count", 0))
+        provider_offsets = tuple(
+            o for o in range(min(2, provider_count))
+            if o == 0 or o not in type(self)._sector_verify_dead_offsets
+        )
+        offsets_saw_results = {o: False for o in provider_offsets}
+
+        async def _search_evidence(stock, tagged_sector: str) -> Optional[Dict[str, Any]]:
+            nonlocal skipped_offlist, raw_results_seen, queries_made
+            boards = [tagged_sector, *sector_name_variants(tagged_sector)]
+            try:
+                resolved, _kind = resolver.resolve_with_kind(tagged_sector)
+                if resolved:
+                    boards.append(resolved)
+            except Exception as exc:  # 仅用于扩展候选板块名，失败不影响主流程
+                logger.debug("[板块验证] resolver 解析失败（忽略）: %s", exc)
+            boards = [b for b in dict.fromkeys(b.strip() for b in boards) if b]
+
+            stock_name = getattr(stock, "name", "") or ""
+            clean_code = (
+                (getattr(stock, "code", "") or "")
+                .replace("SH", "").replace("SZ", "").replace("BJ", "")
+            )
+            templates = (
+                f"{stock_name} {clean_code} {tagged_sector} 概念股",
+                f"{stock_name} {clean_code} 核心概念 所属板块",
+            )
+            for template in templates:
+                for offset in provider_offsets:
+                    async with sem:
+                        queries_made += 1
+                        response = await asyncio.to_thread(
+                            searcher.search_generic, template,
+                            max_results=5, days=365,
+                            provider_offset=offset, max_providers=1,
+                        )
+                    if response.results:
+                        raw_results_seen = True
+                        if offset in offsets_saw_results:
+                            offsets_saw_results[offset] = True
+                    for item in response.results:
+                        item_url = getattr(item, "url", "") or ""
+                        if not is_allowed_source(item_url):
+                            skipped_offlist += 1
+                            skipped_hosts[urlparse(item_url).hostname or "?"] += 1
+                            continue
+                        quote = evidence_supports_membership(
+                            title=getattr(item, "title", "") or "",
+                            text=getattr(item, "snippet", "") or "",
+                            stock_name=stock_name, code=clean_code, boards=boards,
+                        )
+                        if quote:
+                            return {
+                                "symbol": stock.code, "sector": tagged_sector,
+                                "quote": quote, "provider": response.provider,
+                                "query": template,
+                            }
+            return None
+
+        evidence_hits: List[Dict[str, Any]] = []
+        if fresh_targets:
+            evidence_hits = [
+                hit for hit in await asyncio.gather(
+                    *(_search_evidence(stock, tagged) for stock, tagged in fresh_targets)
+                ) if hit
+            ]
+        # 死顺位收敛：offset≥1 整轮无任何结果 → 记为死顺位，本进程后续票/双跑不再等它
+        for dead in (o for o in provider_offsets if o != 0 and not offsets_saw_results[o]):
+            type(self)._sector_verify_dead_offsets.add(dead)
+            logger.info("[板块验证] 第 %d 顺位引擎整轮无结果，本进程内停用", dead + 1)
+
+        if fresh_targets and not raw_results_seen:
+            # 全部查询无任何结果 = 检索故障（判据用白名单过滤前的原始 results）。
+            # 全缓存命中（fresh_targets 空）不触发：那是双跑复用，不是检索故障。
+            self._sector_verify_degraded = True
+            self._sector_verify_pending_count = len(fresh_targets)
+            raise SectorVerifyUnavailable("板块身份检索不可用：所有 provider 均未返回结果")
+
+        if skipped_offlist:
+            logger.info(
+                "[板块验证] 非白名单来源略过 %d 条（host 分布 top5: %s）",
+                skipped_offlist,
+                ", ".join(f"{host}×{n}" for host, n in skipped_hosts.most_common(5)) or "-",
+            )
+
+        # 通过护栏的证据批量交 LLM 判定（1 次调用）；响应级失败 → fail-closed
+        verdicts: Dict[str, str] = {}
+        if evidence_hits:
+            try:
+                verdicts = await self._llm_arbitrate_sector_match(evidence_hits)
+            except SectorVerifyUnavailable:
+                self._sector_verify_degraded = True
+                self._sector_verify_pending_count = len(evidence_hits)
+                raise
+
+        evidence_by_symbol = {hit["symbol"]: hit for hit in evidence_hits}
+        decisions: Dict[str, Dict[str, Any]] = {}
+        for stock, tagged_sector in targets:
+            cache_key = (getattr(stock, "code", ""), tagged_sector)
+            if cache_key in decision_cache:
+                decisions[stock.code] = decision_cache[cache_key]
+                continue
+            hit = evidence_by_symbol.get(stock.code)
+            if not hit:
+                # 4 次查询都没通过护栏 → 证据不足（不进 LLM，清空标签）
+                decisions[stock.code] = {"sector": tagged_sector, "reason": "insufficient_evidence"}
+            else:
+                verdict = verdicts.get(stock.code, "uncertain")
+                if verdict == "member":
+                    decisions[stock.code] = {"sector": tagged_sector, "reason": None, "evidence": hit}
+                elif verdict == "not_member":
+                    decisions[stock.code] = {"sector": tagged_sector, "reason": "llm_rejected"}
+                else:
+                    decisions[stock.code] = {"sector": tagged_sector, "reason": "llm_uncertain"}
+            decision_cache[cache_key] = decisions[stock.code]
+
+        verified: List[Any] = []
+        unverified: List[Dict[str, Any]] = []
+        evidence_log: List[Dict[str, Any]] = []
+        counts = {"member": 0, "insufficient_evidence": 0, "llm_rejected": 0, "llm_uncertain": 0}
 
         for stock in finalists:
-            tagged_sector = getattr(stock, 'sector', '') or getattr(stock, 'sector_name', '') or ''
-
-            # 无板块标签或不在 sector_intel_map 中，跳过验证
-            if not tagged_sector or tagged_sector not in sector_intel_map:
+            decision = decisions.get(getattr(stock, "code", ""))
+            if decision is None:
+                verified.append(stock)
+                continue
+            sector = decision["sector"]
+            reason = decision["reason"]
+            if reason is None:
+                evidence_log.append(decision["evidence"])
+                counts["member"] += 1
+                logger.info(
+                    f"[板块验证] {stock.code} {stock.name}: ✓ 检索证据支持 '{sector}'"
+                    f"（{decision['evidence']['provider']}）: {decision['evidence']['quote'][:60]}"
+                )
                 verified.append(stock)
                 continue
 
-            try:
-                # 调用 efinance 获取实际所属板块
-                clean_code = stock.code.replace("SH", "").replace("SZ", "").replace("BJ", "")
-                boards = manager.get_belong_boards(clean_code)
-
-                if not boards:
-                    # 获取失败，保留原标签（降级为信任问财）
-                    logger.warning(
-                        f"[板块验证] {stock.code} {stock.name}: "
-                        f"efinance 获取失败，保留问财标签'{tagged_sector}'"
-                    )
-                    verified.append(stock)
-                    continue
-
-                # 提取板块名称集合
-                actual_board_names = {
-                    b.get("name", "") or b.get("board_name", "")
-                    for b in boards
-                }
-
-                # L1 别名归一化匹配：同花顺口径（"券商概念"）↔ 东财口径（"券商"）
-                tagged_canon = normalize_sector_name(tagged_sector)
-                tagged_variants = sector_name_variants(tagged_sector)
-                matched_board = next(
-                    (b for b in actual_board_names
-                     if b and (b in tagged_variants or normalize_sector_name(b) == tagged_canon)),
-                    None,
+            counts[reason] += 1
+            logger.warning(
+                f"[板块验证] {stock.code} {stock.name}: ✗ '{sector}' 判定={reason}，清空板块标签"
+            )
+            # 清空板块标签：sector 维度按缺失处理（权重归一化剔除，非零分非中性分）
+            if hasattr(stock, 'sector'):
+                stock.sector = ""
+            if hasattr(stock, 'sector_name'):
+                stock.sector_name = ""
+            # 显式标志，供打分循环 dimension_available["sector"] 消费
+            stock.sector_available = False
+            # 剥离 ai_reasoning 中的错误板块段落，防止陈旧文本透传到 reasoning.md
+            if hasattr(stock, 'ai_reasoning'):
+                stock.ai_reasoning = self._strip_sector_reasoning(
+                    getattr(stock, 'ai_reasoning', '') or ''
                 )
+            unverified.append({"symbol": stock.code, "sector": sector, "reason": reason})
+            verified.append(stock)
 
-                if matched_board:
-                    # 验证通过（精确或别名命中）
-                    logger.debug(
-                        f"[板块验证] {stock.code} {stock.name}: "
-                        f"✓ '{tagged_sector}' 命中 efinance 板块 '{matched_board}'"
-                    )
-                    verified.append(stock)
-                else:
-                    # L1 未命中 → 收集待 LLM 仲裁，不立即清空
-                    pending.append({
-                        "tagged": tagged_sector,
-                        "boards": sorted(b for b in actual_board_names if b),
-                        "stock": stock,
-                    })
-
-            except Exception as e:
-                # 验证过程出错，保留原标签（降级为信任问财）
-                logger.warning(
-                    f"[板块验证] {stock.code} {stock.name}: "
-                    f"验证出错({e})，保留问财标签'{tagged_sector}'"
-                )
-                verified.append(stock)
-
-        # L2: LLM 批量仲裁（同一(标签,板块列表)只问一次）
-        if pending:
-            case_index: Dict[tuple, int] = {}
-            unique_cases: List[Dict[str, Any]] = []
-            for item in pending:
-                key = (item["tagged"], tuple(item["boards"]))
-                if key not in case_index:
-                    case_index[key] = len(unique_cases)
-                    unique_cases.append({"tagged": item["tagged"], "boards": item["boards"]})
-
-            arbitration = await self._llm_arbitrate_sector_match(unique_cases)
-
-            if arbitration is None:
-                # 审核修复 3.3：LLM 不可用时不再静默信任问财——蹭概念票会绕过
-                # sector_available 全套守卫直接 BUY（0922 新亚制程教训）；改走保守
-                # 分支：清空板块标签 → 维度权重归一剔除 + action 强制 watch +
-                # unknown 保守预算；降级态显式透出到产物 data_quality
-                logger.warning(
-                    f"[板块验证] LLM 仲裁不可用，{len(pending)} 只待验证股改走保守处理"
-                    f"（清空板块标签，禁入买入池，data_quality 标记降级）"
-                )
-                self._sector_verify_degraded = True
-                self._sector_verify_pending_count = len(pending)
-                for item in pending:
-                    stock = item["stock"]
-                    if hasattr(stock, 'sector'):
-                        stock.sector = ""
-                    if hasattr(stock, 'sector_name'):
-                        stock.sector_name = ""
-                    stock.sector_available = False
-                    if hasattr(stock, 'ai_reasoning'):
-                        stock.ai_reasoning = self._strip_sector_reasoning(
-                            getattr(stock, 'ai_reasoning', '') or ''
-                        )
-                    verified.append(stock)
-            else:
-                for item in pending:
-                    case_idx = case_index[(item["tagged"], tuple(item["boards"]))]
-                    stock = item["stock"]
-                    matched_board = arbitration.get(case_idx)
-                    if matched_board:
-                        logger.info(
-                            f"[板块验证] {stock.code} {stock.name}: "
-                            f"LLM 仲裁 ✓ '{item['tagged']}' ≈ '{matched_board}'，保留标签"
-                        )
-                        verified.append(stock)
-                    else:
-                        logger.warning(
-                            f"[板块验证] {stock.code} {stock.name}: "
-                            f"✗ 问财标签'{item['tagged']}'与 efinance 板块{item['boards'][:5]}...不匹配，"
-                            f"清空板块标签"
-                        )
-                        # 清空板块标签：sector 维度按缺失处理（权重归一化剔除，非零分非中性分）
-                        if hasattr(stock, 'sector'):
-                            stock.sector = ""
-                        if hasattr(stock, 'sector_name'):
-                            stock.sector_name = ""
-                        # 显式标志，供打分循环 dimension_available["sector"] 消费
-                        stock.sector_available = False
-                        # 剥离 ai_reasoning 中的错误板块段落，防止陈旧文本透传到 reasoning.md
-                        if hasattr(stock, 'ai_reasoning'):
-                            stock.ai_reasoning = self._strip_sector_reasoning(
-                                getattr(stock, 'ai_reasoning', '') or ''
-                            )
-                        verified.append(stock)
-
+        self._sector_verify_unverified = unverified or None
+        self._sector_verify_evidence = evidence_log or None
         logger.info(
-            f"[板块验证] 完成: {len(finalists)} 只候选股，"
-            f"{len([s for s in verified if not (getattr(s, 'sector', '') or getattr(s, 'sector_name', ''))])} 只被清空标签"
+            "[板块验证] 检索 %d 票/%d 次查询（可用引擎 %d）: member=%d insufficient=%d "
+            "llm_rejected=%d llm_uncertain=%d",
+            len(targets), queries_made, provider_count, counts["member"],
+            counts["insufficient_evidence"], counts["llm_rejected"], counts["llm_uncertain"],
         )
 
         return verified
 
     async def _llm_arbitrate_sector_match(
         self,
-        cases: List[Dict[str, Any]],
-    ) -> Optional[Dict[int, Optional[str]]]:
-        """LLM 仲裁：判断问财标签板块与 efinance 板块列表中某个板块是否同一概念。
+        evidence_cases: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """对已通过证据护栏的案例批量判定归属（member / not_member / uncertain）。
 
         Args:
-            cases: [{"tagged": 问财标签板块名, "boards": [efinance 实际板块列表]}]
+            evidence_cases: [{"symbol","sector","quote","provider","query"}]
 
         Returns:
-            {case 索引: 命中的板块名或 None}；LLM 不可用/解析失败时返回 None，
-            由调用方改走保守分支（审核修复 3.3，不再信任问财）。
+            {symbol: verdict}。**单案例缺失或非法 → 该票 "uncertain"**（不抛错：单行脏输出
+            不该废掉整日决策，清空标签本身就是安全侧）。
+
+        Raises:
+            SectorVerifyUnavailable: **仅响应级失败**——适配器异常 / 空 content / 抽不出
+                JSON 数组 / JSON 解析失败 / 非数组。拿不到可信判定就不出决策（fail-closed）。
         """
-        if not cases:
+        if not evidence_cases:
             return {}
 
         from src.agent.llm_adapter import LLMToolAdapter
 
         lines = []
-        for i, case in enumerate(cases):
-            boards_text = ", ".join(case["boards"][:40])
-            lines.append(f'{i}. 标签板块: "{case["tagged"]}" | 实际所属板块: [{boards_text}]')
+        for i, case in enumerate(evidence_cases):
+            lines.append(
+                f'{i}. 股票: {case.get("symbol", "")} | 板块: {case.get("sector", "")} '
+                f'| 原文: {case.get("quote", "")}'
+            )
         cases_text = "\n".join(lines)
 
-        prompt = f"""你是 A 股板块分类专家。判断每个"问财标签板块"与该股"实际所属板块列表"中某个板块是否为同一概念。
+        prompt = f"""你是 A 股板块归属审核员。下面每个案例给出「股票」「板块」「一段已通过身份护栏的检索原文」。
+只依据给出的原文判断该股票是否属于该板块。
 
-## 待判断案例
+## 案例
 {cases_text}
 
-## 判断规则
-- 同一概念的命名差异算命中，如"券商"与"券商概念"、"半导体"与"半导体概念"
-- 相关但不同的概念不算命中，如"券商"与"参股券商"、"光伏"与"光伏建筑一体化"
-- matched_board 必须是该案例实际所属板块列表中的原文之一，不得自行构造名称，无命中则输出 null
-- 只输出 JSON 数组，不要其他文字：
-[{{"index": 案例编号, "matched_board": "命中的板块名或 null"}}]"""
+## 输出
+只输出 JSON 数组：{{"index": 案例号, "verdict": "member" | "not_member" | "uncertain"}}
+（原文没有明确支持该归属时填 uncertain，不要为了给结论硬填 not_member）"""
 
         try:
             adapter = LLMToolAdapter()
             response = adapter.call_text(
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=1000,
-                timeout=30,
+                max_tokens=1500,
+                timeout=60,
             )
-            if not response or not getattr(response, "content", None):
-                logger.warning("[板块验证] LLM 仲裁返回空")
-                return None
+        except Exception as e:   # 适配器/网络/超时
+            raise SectorVerifyUnavailable(f"LLM 仲裁调用失败: {e}") from e
 
-            import re
-            match = re.search(r'\[[\s\S]*\]', response.content)
-            if not match:
-                logger.warning("[板块验证] LLM 仲裁无法提取 JSON 数组")
-                return None
+        if not response or not getattr(response, "content", None):
+            raise SectorVerifyUnavailable("LLM 仲裁返回空（无 content）")
 
+        match = re.search(r'\[[\s\S]*\]', response.content)
+        if not match:
+            raise SectorVerifyUnavailable("LLM 仲裁输出无法提取 JSON 数组")
+        try:
             items = json.loads(match.group())
-            if not isinstance(items, list):
-                return None
+        except json.JSONDecodeError as e:
+            raise SectorVerifyUnavailable(f"LLM 仲裁 JSON 解析失败: {e}") from e
+        if not isinstance(items, list):
+            raise SectorVerifyUnavailable("LLM 仲裁输出不是 JSON 数组")
 
-            result: Dict[int, Optional[str]] = {i: None for i in range(len(cases))}
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    idx = int(item.get("index"))
-                except (TypeError, ValueError):
-                    continue
-                if not 0 <= idx < len(cases):
-                    continue
-                board = str(item.get("matched_board") or "").strip()
-                # 防幻觉：命中名必须存在于该案例的板块列表中，否则丢弃（matched_board 可能是字符串 "null"）
-                if board and board != "null" and board in cases[idx]["boards"]:
-                    result[idx] = board
-            return result
+        verdicts: Dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= idx < len(evidence_cases):
+                continue
+            symbol = evidence_cases[idx]["symbol"]
+            raw = str(item.get("verdict") or "").strip().lower()
+            if raw in ("member", "not_member", "uncertain"):
+                verdicts[symbol] = raw
+            else:
+                verdicts[symbol] = "uncertain"
+                logger.warning(
+                    "[板块验证] %s 的 LLM 裁决缺失或非法（%r），按 uncertain 处理", symbol, raw
+                )
 
-        except Exception as e:
-            logger.warning(f"[板块验证] LLM 仲裁失败({e})，降级为信任问财")
-            return None
+        for case in evidence_cases:
+            if case["symbol"] not in verdicts:
+                verdicts[case["symbol"]] = "uncertain"
+                logger.warning(
+                    "[板块验证] %s 的 LLM 裁决缺失或非法（None），按 uncertain 处理",
+                    case["symbol"],
+                )
+        return verdicts
 
     def _get_sector_capital_score(
         self, sector_name: str, sector_intel_map: Dict[str, Dict], global_capital: float
@@ -3655,6 +3822,9 @@ class PortfolioDecisionNode:
                 "symbol": s.get("code", ""),
                 "name": s.get("name", ""),
                 "sector_name": sector,
+                # 道标签（screener 词表 active_mainline/ambush 原样透传，2026-10-20 D4）
+                # 供 scripts/backtest_lane_budget.py D1 事后验证直接读 lane，免走 sector.json 名单匹配
+                "sector_type": s.get("sector_type", ""),
                 "family": intel.get("frame_group"),
                 "sector_score": s.get("sector_score"),
                 "is_finalist": s.get("code", "") in finalist_codes,
@@ -4095,6 +4265,9 @@ verdict 含义：
                 "fear_greed_index": getattr(sentiment_context, 'fear_greed_index', 0.5) or 0.5,
                 "sentiment_momentum": sentiment_momentum,
             },
+            # 埋伏道 G-A2 pool fast-pass 需要 Node 6 ambush_pool 白名单
+            # （归档路径 _load_got_context 已含 unified_context，此处补内存路径对齐）
+            "unified_context": unified_context.model_dump(mode="json"),
         }
 
         # 提取候选池 + 5 阶段漏斗筛选
@@ -4105,12 +4278,15 @@ verdict 含义：
             return []
 
         finalists = await asyncio.to_thread(
-            screener._filter_got_finalists, universe, got_context, 10
+            screener._filter_got_finalists, universe, got_context, 10, "union"
         )
 
         # ── 埋伏道拆分 v2：读取 screener 侧 lane shadow/trace（拦点#5/#6）──
-        # ACTIVE 门控：GOT_AMBUSH_SPLIT_ACTIVE 默认 "0"，false 时零决策改动仅 trace
-        _ambush_split_active = os.getenv("GOT_AMBUSH_SPLIT_ACTIVE", "0") == "1"
+        # ACTIVE 门控：GOT_AMBUSH_SPLIT_ACTIVE 已转正（2026-10-20 用户裁决跳过影子纪律），
+        # 默认 "1"＝拦点#1 action lift + 拦点#8 tech 折算生效，埋伏道过闸票可达 buy；
+        # ="0" 回滚影子态（仅 trace，零决策改动）。保持 call-time 直读 env（import 时求值
+        # 会让 env 覆盖失效，测试 monkeypatch 语义也会变）。
+        _ambush_split_active = os.getenv("GOT_AMBUSH_SPLIT_ACTIVE", "1") == "1"
         _lane_shadow = getattr(screener, "_ambush_lane_shadow", None)
         _screener_lane_trace = getattr(screener, "_ambush_lane_trace", None) or {}
         # 构建 lane_qualified：埋伏道过闸名单（板块+股票码），供拦点#1/#2 豁免消费
@@ -4178,12 +4354,15 @@ verdict 含义：
 
         # ── F-1 候选池快照落盘（评审 S-4）：持久化 universe + finalists（含被 Top-10 截断的
         # rank 11+ 候选），使未来交易日可离线复算“FXG 剔除后 Top-10 补位来源”。
-        # 随 FTS ENABLED=1 产出、off 态不产（逐字节不变）；任何异常降级不阻塞。──
-        if os.getenv("GOT_FAMILY_TOPPING_GATE_ENABLED", "0") == "1":
-            try:
-                self._save_candidate_pool_snapshot(universe, finalists, sector_intel_map)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[FXG] 候选池快照落盘失败（已忽略）: %s", exc)
+        # 2026-10-20 解耦：**不再挂在 GOT_FAMILY_TOPPING_GATE_ENABLED 下**——快照是纯观测的
+        # 廉价写盘（~15KB/日），而它是 D1 分道预算事后验证、板块匹配度评估的**唯一带标签
+        # 样本源**（universe 行保留验证前的原始 sector_name/sector_type）。挂在不相关闸门上
+        # 会让"关 FTS"静默断掉样本积累，且事后没人能从归档看出样本断在哪天。
+        # 异常一律降级不阻塞（同 meta.json 的"跑过就有文件"契约）。
+        try:
+            self._save_candidate_pool_snapshot(universe, finalists, sector_intel_map)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[F-1] 候选池快照落盘失败（已忽略）: %s", exc)
 
         # ── 2026-08-18 新增：候选股板块交叉验证 ──
         # 用 efinance.get_belong_board() 验证问财返回的板块标签是否真实
@@ -5186,6 +5365,12 @@ verdict 含义：
         _ee_shadow = _ee_mode == "shadow"
         _ssz_mode = os.getenv("GOT_SIGNAL_SIZE", "shadow").strip().lower()
         _ssz_shadow = _ssz_mode == "shadow"
+        # ── D3 分道预算开关（2026-10-20 生效，缺省 1）──
+        # call-time 直读 env：=0 即一键回滚旧「等分×ROLE_MULTIPLIER」路径，无需改代码；
+        # 与 GOT_AMBUSH_SPLIT_ACTIVE 同款做法（import 时求值会让 env 覆盖失效）。
+        _lane_budget_mode = os.getenv("GOT_LANE_BUDGET_ENABLED", "1") == "1"
+        _lane_weight_sum = 0.0
+        _lane_by_code: Dict[str, str] = {}
         exposure_checks: List[Dict[str, Any]] = []
         _score_by_symbol: Dict[str, float] = {}
 
@@ -5210,6 +5395,26 @@ verdict 含义：
             # 每只候选股的基础预算
             actual_buy_count = min(len(candidates), 3)
             base_budget = buy_budget / max(actual_buy_count, 1)
+
+            # ── D3 分道预算（GOT_LANE_BUDGET_ENABLED，缺省 1；上述 call-time 开关已读）──
+            # 语义 = C4 shadow(2026-10-15) 预登记的 would_be_split 公式：不再「等分×角色打折」
+            # （混合道日预算蒸发：2 主线+1 埋伏=0.85×B、纯埋伏 3 只=0.55×B），改为
+            #   per_stock_budget(c) = buy_budget × w(lane(c)) / Σ w(lane(top3))
+            # 恒等式 Σ per_stock_budget = buy_budget。选股仍取 buy_candidates 复合分降序 top3
+            # （不引入跨道单尺重排，架构边界：非 bear 禁止单尺重排）。
+            # lane 用 sector_type → _stype_to_role；与 C4 trace 同映射，保证金额可复算。
+            if _lane_budget_mode:
+                from src.got.catalyst_config import LANE_BUDGET_PARAMS
+                for _sc in candidates[:3]:
+                    # 板块身份未验证（sector_name 为空）的候选不享道权重，落 unknown 保守档
+                    # （与下方 sector_role="unknown" 分支同口径，避免 D3 把这层安全垫绕过）
+                    _sc_lane = _stype_to_role(getattr(_sc, "sector_type", "") or "")
+                    if not getattr(_sc, "sector_name", ""):
+                        _sc_lane = "unknown"
+                    _lane_by_code[_sc.symbol] = _sc_lane
+                    _lane_weight_sum += LANE_BUDGET_PARAMS.get(
+                        _sc_lane, LANE_BUDGET_PARAMS["unknown"]
+                    )
 
             for score in candidates[:3]:  # 最多买 3 只
                 # 获取实时价格（只有 3 只，很快）
@@ -5253,17 +5458,31 @@ verdict 含义：
                 # 仓位生效（sector_exposure_limits 全仓无执行消费者，仅用于落盘记录）。
                 role_budget_m = ROLE_MULTIPLIER.get(sector_role, ROLE_MULTIPLIER[DEFAULT_SECTOR_ROLE])
                 stop_loss_pct = ROLE_STOP_LOSS.get(sector_role, ROLE_STOP_LOSS[DEFAULT_SECTOR_ROLE])
-                # ── D3 分道预算生产门控骨架（三问裁决 Phase D，2026-10-15）──
-                # 缺省 0：走现状 ROLE_MULTIPLIER 路径，逐字节不变。
-                # =1：接线判据（D1 区分度报告 + Layer 2 积样）未满足 → fail-fast；
-                #     判据满足后接线时删除 raise、改读 LANE_BUDGET_PARAMS 并 bump formula version。
-                from src.got.catalyst_config import GOT_LANE_BUDGET_ENABLED
-                if GOT_LANE_BUDGET_ENABLED:
-                    raise NotImplementedError(
-                        "GOT_LANE_BUDGET_ENABLED=1：分道预算接线待 D1 标定报告出区分度"
-                        "（docs/got/verification.md C4 判据）+ Layer 2 积样后实施")
-                per_stock_budget = base_budget * role_budget_m
-                branch = sector_role
+                # ── D3 分道预算（GOT_LANE_BUDGET_ENABLED=1，2026-10-20 生效）──
+                # 旧骨架 raise 已删除：D1 标定降级为事后验证（用户 2026-10-20 裁决跳过影子纪律），
+                # 区分度不达标时用 env 一键回滚，不动代码。
+                # 现值 LANE_BUDGET_PARAMS 即 D2 登记的 ROLE_MULTIPLIER 现状值（mainline 1.0 /
+                # ambush 0.55 / cooling 0.3 / unknown 0.55），不引入新参数；regime 交互项等
+                # f() 新形态仍受 O3 纪律门控（未绑校准源不落码）。
+                lane = _lane_by_code.get(score.symbol) or (
+                    "unknown" if not score.sector_name
+                    else _stype_to_role(getattr(score, "sector_type", "") or "")
+                )
+                if _lane_budget_mode and _lane_weight_sum > 0:
+                    from src.got.catalyst_config import LANE_BUDGET_PARAMS
+                    lane_weight = LANE_BUDGET_PARAMS.get(lane, LANE_BUDGET_PARAMS["unknown"])
+                    per_stock_budget = buy_budget * lane_weight / _lane_weight_sum
+                    branch = lane
+                else:
+                    lane_weight = None
+                    per_stock_budget = base_budget * role_budget_m
+                    branch = sector_role
+                logger.info(
+                    f"[Phase 2] {score.symbol} 预算: lane={lane} "
+                    f"{'分道加权' if lane_weight is not None else '等分×角色'} "
+                    f"¥{per_stock_budget:,.0f}"
+                    + (f"（w={lane_weight:.2f}/Σ={_lane_weight_sum:.2f}）" if lane_weight is not None else "")
+                )
 
                 quantity = int(per_stock_budget / estimated_price / 100) * 100
 
@@ -5301,6 +5520,16 @@ verdict 含义：
                     "stock_limit": sector_limit,
                     "branch": branch,
                 }
+                # 2026-10-20 D3：仅 D3 生效时补 lane / lane_weight / lane_budget_applied，
+                # 使归档中的分道预算比可由 allocation 实际金额复算（verification 项 3 口径）。
+                # 必须门控在开关内：=0 回滚路径的 allocation JSON 与 C4 trace 道归属
+                # （按 sector_role）保持逐字节不变。
+                if _lane_budget_mode:
+                    sector_limit_detail.update({
+                        "lane": lane,
+                        "lane_weight": lane_weight,
+                        "lane_budget_applied": lane_weight is not None,
+                    })
 
                 allocations.append(
                     TradeAllocation(
@@ -5333,22 +5562,20 @@ verdict 含义：
         #   catalyst_supply_by_lane: 该道板块当日 confidence≥0.7 催化剂事件数（与 P5 同门槛，_score_candidates 供数）
         from src.got.catalyst_config import (
             GOT_LANE_BUDGET_SHADOW,
-            GOT_LANE_BUDGET_ENABLED,
             LANE_BUDGET_PARAMS,
             SCORING_FORMULA_VERSION,
         )
         if GOT_LANE_BUDGET_SHADOW:
             # lane 词表 = sector_role（mainline/ambush/cooling/unknown）；
-            # buy_candidates.sector_type 是 screener 词表（active_mainline/ambush），须映射后归道。
-            def _stype_to_role(_t: str) -> str:
-                return {"active_mainline": "mainline", "ambush": "ambush"}.get(_t, "unknown")
-
+            # buy_candidates.sector_type 是 screener 词表（active_mainline/ambush），
+            # 由模块级 _stype_to_role 映射后归道（D3 分道预算与 D4-a 假想预算比共用同一映射）。
             _lane_trace: Dict[str, Dict[str, Any]] = {}
             for _a in allocations:
                 if _a.action != "buy":
                     continue
                 _sld = _a.sector_limit_detail or {}
-                _lane = _sld.get("sector_role", "unknown")
+                # D3 生效时按预算实际所用道归集（'lane' 键），否则回落 sector_role（旧口径）
+                _lane = _sld.get("lane") or _sld.get("sector_role", "unknown")
                 if _lane not in _lane_trace:
                     _lane_trace[_lane] = {
                         "lane": _lane,
@@ -5356,7 +5583,7 @@ verdict 含义：
                         "allocated_weight": LANE_BUDGET_PARAMS.get(_lane, 0.55),
                         "role_budget_m": ROLE_MULTIPLIER.get(_lane, ROLE_MULTIPLIER.get(DEFAULT_SECTOR_ROLE, 1.0)),
                         "n_positions": 0,
-                        "lane_budget_applied": GOT_LANE_BUDGET_ENABLED,
+                        "lane_budget_applied": _lane_budget_mode,
                         "formula_version": SCORING_FORMULA_VERSION,
                     }
                 _lane_trace[_lane]["allocated_value"] += _a.target_value
@@ -5382,7 +5609,7 @@ verdict 含义：
                                 "allocated_weight": LANE_BUDGET_PARAMS.get(_l, 0.55),
                                 "role_budget_m": ROLE_MULTIPLIER.get(_l, ROLE_MULTIPLIER.get(DEFAULT_SECTOR_ROLE, 1.0)),
                                 "n_positions": 0,
-                                "lane_budget_applied": GOT_LANE_BUDGET_ENABLED,
+                                "lane_budget_applied": _lane_budget_mode,
                                 "formula_version": SCORING_FORMULA_VERSION,
                             }
                         _lane_trace[_l]["would_be_split"] = round(

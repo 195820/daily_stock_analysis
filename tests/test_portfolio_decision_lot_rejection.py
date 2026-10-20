@@ -84,11 +84,14 @@ def test_affordable_candidate_buys_whole_lots(node: PortfolioDecisionNode) -> No
     )
 
     assert [a.symbol for a in allocations] == ["688020"]
-    # 修复后：无 sector_name 的候选走 unknown 分支（乘数 0.55）
     # buy_budget = min(position_limit×equity, cash) = min(30_000, 100_000) = 30_000
-    # 1 只候选 → base_budget = 30_000，×0.55 = 16_500
-    # 16_500 / 145.36 / 100 = 1.13 手 → 取整 1 手 → 100 股
-    assert allocations[0].target_quantity == 100  # unknown 乘数 0.55：16.5k/145.36 → 1 手
+    # 2026-10-20 起走 D3 分道预算（GOT_LANE_BUDGET_ENABLED 缺省 1）：
+    #   单只候选 → Σw 只有它自己 → per_stock_budget = B×w/Σ = B（道权重自相抵消）。
+    # 旧路径（=0）为 base_budget×0.55 = 16,500 → 1 手；新路径 30,000 → 2 手。
+    # 无 sector_name 的候选仍落 unknown 道（lane_weight 0.55），只是单票时 Σ 同值。
+    assert allocations[0].target_quantity == 200  # 30,000 / 145.36 / 100 → 2 手
+    assert allocations[0].sector_limit_detail["lane"] == "unknown"
+    assert allocations[0].sector_limit_detail["lane_budget_applied"] is True
 
 
 def test_cleared_sector_gets_conservative_budget_branch(node: PortfolioDecisionNode) -> None:

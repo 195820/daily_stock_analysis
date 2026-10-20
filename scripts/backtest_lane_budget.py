@@ -27,10 +27,11 @@
    - unknown 道：T+5 / T+10（同 mainline）
 
 4. 分道（lane）：
-   - 从 candidate_pool.json 的 universe 元素读 sector_name
-   - 从 sector.json 的 active_mainline / ambush 列表匹配板块归属
-   - 匹配成功 → mainline / ambush
-   - 匹配失败或缺字段 → unknown（计数并在报告给出「unknown 占比」）
+   - 首选：candidate_pool.json universe 元素的道标签 sector_type（Phase 2 落盘时写入，
+     screener 词表 active_mainline / ambush → mainline / ambush；2026-10-20 起）
+   - 降级：无标签的历史归档，从 sector.json 的 active_mainline / ambush 列表按
+     sector_name 匹配板块归属（旧口径）
+   - 两条路都失败或缺字段 → unknown（计数并在报告给出「unknown 占比」）
 
 5. regime 分箱：
    - 从当日 unified.json 的 market_regime.regime 读（bull / transition / bear）
@@ -247,9 +248,17 @@ def extract_candidates(candidate_pool: Dict, lane_map: Dict[str, str]) -> List[D
                 continue  # 跳过空 symbol
             
             sector_name = item.get("sector_name", "").strip()
-            
-            # 匹配 lane
-            lane = lane_map.get(sector_name, "unknown")
+
+            # 匹配 lane（2026-10-20 D4）：优先读 Phase 2 落盘的道标签 sector_type
+            # （screener 词表 active_mainline/ambush 原样透传）；无标签的历史归档
+            # 降级走 sector.json 名单匹配 fallback（旧口径，零回归）。
+            _stype = (item.get("sector_type") or "").strip()
+            if _stype in ("active_mainline", "mainline"):
+                lane = "mainline"
+            elif _stype == "ambush":
+                lane = "ambush"
+            else:
+                lane = lane_map.get(sector_name, "unknown")
             
             candidates.append({
                 "symbol": symbol,

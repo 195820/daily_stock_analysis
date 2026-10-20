@@ -543,3 +543,117 @@ def test_shadow_progress_lines_emitted_and_clock_filtered(tmp_path: Path) -> Non
     assert "转正进度·4.1" in with_prog and "已冻结" in with_prog
     assert "转正进度·bear gate" in with_prog
     assert "转正进度·T1：" in with_prog and "影子在产" in with_prog
+
+
+# ── 2026-10-16 新增两线：Q1 low 板块救援（直连）+ 埋伏 E14 出场催化宽限（影子）──
+
+def _low_events_shadow() -> dict:
+    return {
+        "date": "20261016",
+        "switch": True,
+        "low_count": 3,
+        "review_candidates": 1,
+        "upgraded": 1,
+        "sector_impact_dist": {"high": 1, "medium": 0, "low": 0},
+        "events": [
+            {"title": "A事件", "upgraded_to": "medium"},
+            {"title": "C事件", "upgraded_to": None},
+        ],
+    }
+
+
+def _ambush_exit_grace_shadow() -> dict:
+    return {
+        "date": "20261016",
+        "window_days": 10,
+        "grace_candidates_count": 2,
+        "records": [
+            {"sector_code": "BK01", "sector_name": "低空经济",
+             "rrg_momentum_ema": 0.42, "strength_score": 44.0,
+             "qualified_event_count": 2,
+             "nearest_event": {"trade_days_away": 4, "title": "展会"},
+             "grace_would_hold": True},
+            {"sector_code": "BK02", "sector_name": "券商",
+             "rrg_momentum_ema": 0.1, "strength_score": 20.0,
+             "qualified_event_count": 0, "nearest_event": None,
+             "grace_would_hold": False},
+        ],
+    }
+
+
+def test_low_events_shadow_render_and_missing() -> None:
+    """Q1 low 救援：有内容渲染计数+分布+升级明细；None → 整线缺省不占位。"""
+    has = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={},
+        low_events_shadow=_low_events_shadow()))
+    assert "Q1 low 板块救援" in has
+    assert "low 事件 3 条" in has and "送审 1 条" in has and "升级 1 条" in has
+    assert "high 1 / medium 0 / low 0" in has
+    assert "A事件" in has
+    missing = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}))
+    assert "Q1 low 板块救援" not in missing
+
+
+def test_low_events_shadow_failure_line() -> None:
+    """failure 键存在时展开复审失败留痕行（降级=原过滤行为）。"""
+    record = _low_events_shadow()
+    record["failure"] = "ValueError: LLM 空响应"
+    text = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={},
+        low_events_shadow=record))
+    assert "复审失败" in text and "ValueError" in text
+
+
+def test_ambush_exit_grace_shadow_render_and_missing() -> None:
+    """E14 出场宽限：有内容渲染候选+逐板块读数+最近催化；None → 整线缺省。"""
+    has = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={},
+        ambush_exit_grace_shadow=_ambush_exit_grace_shadow()))
+    assert "埋伏 E14 出场催化宽限" in has
+    assert "E14 转出候选 2 个" in has and "10 交易日" in has
+    assert "低空经济" in has and "BK01" in has and "券商" in has and "BK02" in has
+    assert "mom=0.42" in has and "strength=44" in has
+    assert "grace_would_hold" in has
+    missing = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={}))
+    assert "埋伏 E14 出场催化宽限" not in missing
+
+
+def test_new_shadow_lines_disabled_and_progress(tmp_path: Path) -> None:
+    """开关关闭：low 救援单行回滚说明；进度行按 clock_start=2026-10-16 计数；
+    占位日（switch=False）与缺文件日不计入有效影子日（防占位膨胀转正进度）。
+    """
+    from datetime import date
+    import json
+    from src.got.archive import (
+        _render_shadow_low_events,
+        SHADOW_LOW_EVENTS_ARTIFACT, SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
+    )
+    base = tmp_path / "got_daily"
+    d0 = base / "20261016"           # 起算日当天：双线 enabled 真实样本
+    d0.mkdir(parents=True)
+    (d0 / SHADOW_LOW_EVENTS_ARTIFACT).write_text(
+        json.dumps({"switch": True, "low_count": 3, "review_candidates": 1,
+                    "upgraded": 0}), encoding="utf-8")
+    (d0 / SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT).write_text(
+        json.dumps({"switch": True, "grace_candidates_count": 0, "records": []}),
+        encoding="utf-8")
+    d1 = base / "20261019"           # 次交易日：low 禁用占位 + grace 开关关（缺文件）
+    d1.mkdir(parents=True)
+    (d1 / SHADOW_LOW_EVENTS_ARTIFACT).write_text(
+        json.dumps({"status": "disabled", "switch": False}), encoding="utf-8")
+
+    # 单渲染器级验证：disabled → 恰一条非空行（回滚说明）
+    low_lines = [ln for ln in _render_shadow_low_events({"status": "disabled"})
+                 if ln.strip()]
+    assert len(low_lines) == 1 and "GOT_LOW_SECTOR_RESCUE=0" in low_lines[0]
+
+    with_prog = "\n".join(_render_shadow_section(
+        glue=None, t1=None, t1h=None, code_to_name={},
+        base_dir=base, run_date=date(2026, 10, 19)))
+    assert "转正进度·low" in with_prog and "有效影子日 **1 / 需 ≥10" in with_prog
+    assert "转正进度·grace" in with_prog and "有效影子日 **1 / 需 ≥10" in with_prog
+    assert "起算 2026-10-16" in with_prog
+
+

@@ -1304,6 +1304,22 @@ class PortfolioDecision(BaseModel):
         description="板块暴露绑定信息: {sum_limits, position_limit, ratio, "
                     "buy_allocation_count, binding_count, note}（binding_count 仅可观测留痕，不参与决策）",
     )
+    # ── 板块校验「未验证即放行」留痕（2026-10-20）──
+    sector_verify_unverified: Optional[list[dict]] = Field(
+        default=None,
+        description="板块身份未被证据支持而清空标签的票: "
+                    "[{symbol, sector, reason}]，reason ∈ {insufficient_evidence, llm_rejected, "
+                    "llm_uncertain}。用途：归档里区分「真命中」与「没验过/被否」——否则任何"
+                    "匹配度/精度统计的分母都会把未验证当验证通过。None=当日无此类票。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    sector_verify_evidence: Optional[list[dict]] = Field(
+        default=None,
+        description="板块身份 web 证据留痕: [{symbol, sector, quote, provider, query}]，"
+                    "quote 为通过护栏（同段含票标识 / 指代词绑定 / 指名式概念列表）的原文片段，"
+                    "且来源在财经站白名单内。None=当日无 member 判定。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
     # ── 4d/D-3 前置：候选池归零率基线观测（项三 3a，外网对标 2026-10-11）──
     # 由 Phase 2 直调 screener._compute_funnel_stats 计算（universe 入 vs finalists 出），
     # 纯留痕不进任何判定；archive_phase2 消费后合并进 meta.json，使生产链路 D-3 基线可累积。
@@ -1376,7 +1392,8 @@ class PortfolioDecision(BaseModel):
     ambush_lane_trace: Optional[dict] = Field(
         default=None,
         description="埋伏道拆分 v2 拦点追踪: {g_a1_pass, g_a1_soft_pass, g_a1_flow_negative, "
-                    "g_a1_dde_degraded, g_a2_no_catalyst, g_a2_low_confidence, g_a2_position_unsafe, "
+                    "g_a1_dde_degraded, g_a2_pool_pass, g_a2_no_catalyst, g_a2_low_confidence, "
+                    "g_a2_position_unsafe, "
                     "g_a3_knife, g_a4_selected, cross_lane_collision, lane_overflow_n, lane_error, "
                     "action_gate_lifted, action_gate_watch, bear_gate_watch, capital_gate_watch, "
                     "sector_verify_miss, meg_fts_overheat_triggers}（Node 7 侧拦点命中统计）。"
@@ -1408,6 +1425,13 @@ class PortfolioDecision(BaseModel):
                     "bull_confirmation 行带 blocked_by='regime_pin_#14_pending'（#14 未拍板前零样本休眠）；"
                     "GOT_XNODE_ROUTING_SHADOW=0 时 None。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    # ── 决策编排层输出留痕（C2 日志透传，2026-10-20）──
+    trade_plan_log: list[str] = Field(
+        default_factory=list,
+        description="决策编排层（decision_plan.py）输出：run() 开头 reconcile 昨日对账回填 + "
+                    "run() 末尾 assemble 当日计划装配，逐条人读行；渲染进 reasoning.md Node 7 段。"
+                    "失败也记一行（不阻断）。空列表时 reasoning.md 不渲染该段。",
     )
 
 

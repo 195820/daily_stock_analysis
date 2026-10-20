@@ -1499,6 +1499,7 @@ class StockScreenerPipeline:
             AMBUSH_LANE_VOLUME_RATIO_KNIFE,
             CATALYST_CONFIDENCE_GATE,
         )
+        from src.got.board_aliases import normalize_sector_name
         from datetime import date as date_cls
 
         lane_trace: Dict[str, int] = {
@@ -1507,6 +1508,7 @@ class StockScreenerPipeline:
             "g_a1_soft_pass": 0,
             "g_a1_flow_negative": 0,
             "g_a1_dde_degraded": 0,
+            "g_a2_pool_pass": 0,
             "g_a2_no_catalyst": 0,
             "g_a2_low_confidence": 0,
             "g_a2_position_unsafe": 0,
@@ -1526,12 +1528,19 @@ class StockScreenerPipeline:
 
             # ── G-A2: 催化剂闸门 ──
             news_ctx = got_context.get("news_context", {})
+            # pool fast-pass 白名单：Node 6 ambush_pool 成员（催化证明在池准入时已完成）
+            unified_ctx = got_context.get("unified_context") or {}
+            pool_names = {
+                normalize_sector_name(c.get("sector_name", ""))
+                for c in (unified_ctx.get("ambush_pool") or [])
+            }
             # 构建板块 K 线查找函数（延迟加载，避免无埋伏候选时浪费）
             sector_kline_lookup = self._build_sector_kline_lookup(got_context)
             passed_a2, a2_trace = self._ga2_gate(
                 passed_a1, news_ctx, sector_kline_lookup,
                 AMBUSH_LANE_CATALYST_WINDOW_DAYS, CATALYST_CONFIDENCE_GATE,
                 AMBUSH_LANE_SAFETY_HIGH, AMBUSH_LANE_SAFETY_LOW,
+                ambush_pool_names=pool_names,
             )
             for k, v in a2_trace.items():
                 lane_trace[k] = lane_trace.get(k, 0) + v
@@ -1684,6 +1693,7 @@ class StockScreenerPipeline:
         safety_high: float = None,
         safety_low: float = None,
         today=None,
+        ambush_pool_names: Optional[set] = None,
     ) -> Tuple[List[Dict], dict]:
         """G-A2: 催化剂闸门
 
@@ -1691,6 +1701,16 @@ class StockScreenerPipeline:
         - g_a2_no_catalyst: 日历无该板块事件
         - g_a2_low_confidence: 有事件但 max confidence < gate
         - g_a2_position_unsafe: 位置安全带 fail
+
+        催化证明双通道（2026-10-16 修复）：
+        ①pool fast-pass——候选板块 ∈ Node 6 ambush_pool 即视为催化已证明。
+          Node 6 入池已完成语义匹配（T5/relations）与 D4/G4 折信，本闸门
+          不复算；D4 折信作用域 = pool 准入/排序，不下沉到道内闸门
+          （与 P5 同口径）。生产 --got 路径 lane 候选恒 ⊆ pool 成员，
+          此通道构造性生效；名字匹配在 --screener 回放路径仍是活的兜底，
+          勿当死代码删除。
+        ②名字匹配兜底——日历 affected_sectors 名字级匹配 + conf≥gate。
+        两通道通过后共走同一位置安全带（close/high20/ma20 三件套）。
         """
         from datetime import date as date_cls
         from src.got.board_aliases import normalize_sector_name, sector_name_variants
@@ -1711,20 +1731,31 @@ class StockScreenerPipeline:
         if safety_low is None:
             safety_low = AMBUSH_LANE_SAFETY_LOW
 
-        trace = {"g_a2_no_catalyst": 0, "g_a2_low_confidence": 0, "g_a2_position_unsafe": 0}
+        trace = {"g_a2_pool_pass": 0, "g_a2_no_catalyst": 0, "g_a2_low_confidence": 0, "g_a2_position_unsafe": 0}
         passed = []
         today = today or date_cls.today()
+        pool_names = ambush_pool_names or set()
 
         # 提取催化剂事件
         calendar_data = news_ctx.get("catalyst_calendar")
         if not calendar_data:
-            # 无日历 → 全部 no_catalyst
-            trace["g_a2_no_catalyst"] = len(candidates)
+            # 无日历 → pool fast-pass 仍生效，仅名字通道全灭
+            for c in candidates:
+                if normalize_sector_name(c.get("sector", "")) in pool_names:
+                    trace["g_a2_pool_pass"] += 1
+                    self._ga2_position_belt(c, sector_kline_lookup, safety_high, safety_low, passed, trace)
+                else:
+                    trace["g_a2_no_catalyst"] += 1
             return passed, trace
 
         events = calendar_data.get("events", [])
         if not events:
-            trace["g_a2_no_catalyst"] = len(candidates)
+            for c in candidates:
+                if normalize_sector_name(c.get("sector", "")) in pool_names:
+                    trace["g_a2_pool_pass"] += 1
+                    self._ga2_position_belt(c, sector_kline_lookup, safety_high, safety_low, passed, trace)
+                else:
+                    trace["g_a2_no_catalyst"] += 1
             return passed, trace
 
         # 按板块分桶事件（归一化 + 去重）
@@ -1743,6 +1774,12 @@ class StockScreenerPipeline:
             sector = c.get("sector", "")
             normalized_sector = normalize_sector_name(sector)
 
+            # ①pool fast-pass：Node 6 已裁决的催化证明，直接进位置安全带
+            if normalized_sector in pool_names:
+                trace["g_a2_pool_pass"] += 1
+                self._ga2_position_belt(c, sector_kline_lookup, safety_high, safety_low, passed, trace)
+                continue
+
             # 查找事件（精确 → 别名变体）
             matched_events = sector_events.get(normalized_sector, [])
             if not matched_events:
@@ -1758,6 +1795,9 @@ class StockScreenerPipeline:
                 continue
 
             # 过滤窗口内事件 + 找 max confidence
+            # 窗口含当日事件（days_to_event=0）：2026-10-16 实测当日事件
+            # （军民融合/金价地缘 conf 0.8）被旧谓词 0 < d 误杀，而 Node 6
+            # _compute_catalyst_score 的 day-0 分支（proximity 0.6）照常入池。
             in_window_events = []
             max_confidence = 0.0
             for evt in matched_events:
@@ -1766,7 +1806,7 @@ class StockScreenerPipeline:
                     if evt_date_str:
                         evt_date = date_cls.fromisoformat(str(evt_date_str)[:10])
                         days_to_event = (evt_date - today).days
-                        if 0 < days_to_event <= window_days:
+                        if 0 <= days_to_event <= window_days:
                             in_window_events.append(evt)
                             conf = float(evt.get("confidence", 0))
                             if conf > max_confidence:
@@ -1783,19 +1823,26 @@ class StockScreenerPipeline:
                 continue
 
             # 位置安全带检查
-            kline_data = sector_kline_lookup(sector)
-            if kline_data is None:
-                # 短史/查找失败 → soft pass
-                passed.append(c)
-                continue
-
-            close, high20, ma20 = kline_data
-            if close <= high20 * safety_high and close >= ma20 * safety_low:
-                passed.append(c)
-            else:
-                trace["g_a2_position_unsafe"] += 1
+            self._ga2_position_belt(c, sector_kline_lookup, safety_high, safety_low, passed, trace)
 
         return passed, trace
+
+    @staticmethod
+    def _ga2_position_belt(c, sector_kline_lookup, safety_high, safety_low, passed, trace):
+        """G-A2 位置安全带（name-match 与 pool fast-pass 共用）
+
+        close ≤ high20×safety_high 且 close ≥ ma20×safety_low → pass；
+        查无 K 线（短史/失败）→ soft pass；双高 → position_unsafe。
+        """
+        kline_data = sector_kline_lookup(c.get("sector", ""))
+        if kline_data is None:
+            passed.append(c)
+            return
+        close, high20, ma20 = kline_data
+        if close <= high20 * safety_high and close >= ma20 * safety_low:
+            passed.append(c)
+        else:
+            trace["g_a2_position_unsafe"] += 1
 
     def _ga3_gate(
         self,
@@ -1971,11 +2018,57 @@ class StockScreenerPipeline:
         return percentile_map
 
 
+    def _merge_lane_finalists(
+        self,
+        finalists: List[ScreenerStock],
+        lane_finalists: List[ScreenerStock],
+        top_n: int,
+        lane_merge_mode: str,
+        lane_trace: Dict,
+    ) -> List[ScreenerStock]:
+        """D4 合并主线 Round 5 结果与埋伏道 ``lane_finalists``（原地追加 + trace 回填）。
+
+        - ``topn_fill``（缺省）：主线优先补位，``len(finalists) >= top_n`` 后埋伏票溢出即丢。
+          ``run_got_mode``（``--screener`` 展示入口）沿用此语义，输出条数严格 ≤ top_n。
+        - ``union``：埋伏道全量追加，不受 top_n 限制（道内已有 AMBUSH_LANE_TOPK=3 兜底），
+          ``lane_overflow_n`` 恒 0——修掉「主线占满名额→埋伏道整道不可见」的生产缺陷。
+
+        两模式共用：撞票（同一 code 主线已入选）归主线，``cross_lane_collision`` 计数后跳过。
+        """
+        mainline_codes = {s.code for s in finalists}
+        _mainline_n = len(mainline_codes)
+        cross_lane_collision = 0
+        lane_overflow_n = 0
+        _union_mode = lane_merge_mode == "union"
+        for lf in lane_finalists:
+            if lf.code in mainline_codes:
+                cross_lane_collision += 1
+                continue
+            if _union_mode or len(finalists) < top_n:
+                finalists.append(lf)
+                mainline_codes.add(lf.code)
+            else:
+                lane_overflow_n += 1
+        lane_trace["lane_merge_mode"] = lane_merge_mode
+        lane_trace["cross_lane_collision"] = cross_lane_collision
+        lane_trace["lane_overflow_n"] = lane_overflow_n
+        if cross_lane_collision > 0:
+            logger.info(f"埋伏道: {cross_lane_collision} 只撞票归主线")
+        if lane_overflow_n > 0:
+            logger.info(f"埋伏道: {lane_overflow_n} 只溢出（不进 top_n）")
+        elif _union_mode:
+            logger.info(
+                f"埋伏道: union 合并，主线 {_mainline_n} 只 + 埋伏 "
+                f"{len(lane_finalists) - cross_lane_collision} 只全量并入"
+            )
+        return finalists
+
     def _filter_got_finalists(
         self,
         universe: List[Dict],
         got_context: dict,
-        top_n: int
+        top_n: int,
+        lane_merge_mode: str = "topn_fill",
     ) -> List[ScreenerStock]:
         """5 轮漏斗筛选
 
@@ -1984,6 +2077,15 @@ class StockScreenerPipeline:
         轮次 3: 波段技术确认 Top 15（MA20/布林带/周线趋势）
         轮次 4: 风险排雷 Top 8（估值/超买/波动率）
         轮次 5: 板块分散 Top N（每个板块最多 1 只）
+
+        Args:
+            lane_merge_mode: 埋伏道合并语义（2026-10-20 D4 union 修正）
+                - ``"topn_fill"``（缺省）：主线优先补位，溢出即丢。``run_got_mode``
+                  （``--screener`` 独立展示入口）沿用此语义，输出条数严格 ≤ top_n。
+                - ``"union"``：主线照常 Round 5 内部 top_n 截断，埋伏道 ``lane_finalists``
+                  全量追加、不受补位限制、无溢出丢弃（道内已有 AMBUSH_LANE_TOPK=3 兜底）。
+                  撞票仍归主线（``cross_lane_collision++``）；``lane_overflow_n`` 恒 0。
+                  Phase 2 生产路径用此语义，使埋伏道候选不被主线挤空。
         """
         from data_provider.base import DataFetcherManager
         fetcher_manager = DataFetcherManager()
@@ -2225,7 +2327,7 @@ class StockScreenerPipeline:
                 logger.info(
                     "埋伏道闸门: in={lane_in} G-A1→{a1} G-A2→{a2} G-A3→{a3} G-A4→{a4} "
                     "(soft={sp} flow_neg={fn} dde_deg={dd} no_cat={nc} low_conf={lc} "
-                    "pos_unsafe={pu} knife={kn} err={err})".format(
+                    "pos_unsafe={pu} pool_pass={pp} knife={kn} err={err})".format(
                         lane_in=lane_trace.get("lane_in", 0),
                         a1=_a1_out,
                         a2=_a2_out,
@@ -2237,6 +2339,7 @@ class StockScreenerPipeline:
                         nc=lane_trace.get("g_a2_no_catalyst", 0),
                         lc=lane_trace.get("g_a2_low_confidence", 0),
                         pu=lane_trace.get("g_a2_position_unsafe", 0),
+                        pp=lane_trace.get("g_a2_pool_pass", 0),
                         kn=lane_trace.get("g_a3_knife", 0),
                         err=lane_trace.get("lane_error", 0),
                     )
@@ -2245,26 +2348,15 @@ class StockScreenerPipeline:
                 logger.warning(f"埋伏道执行失败，降级为空: {e}")
                 lane_trace = {"lane_error": str(e)}
 
-        # 合并埋伏道结果（D4 主线优先）
+        # 合并埋伏道结果（D4：union 全量并集 / topn_fill 主线优先补位）
         if lane_finalists:
-            mainline_codes = {s.code for s in finalists}
-            cross_lane_collision = 0
-            lane_overflow_n = 0
-            for lf in lane_finalists:
-                if lf.code in mainline_codes:
-                    cross_lane_collision += 1
-                    continue
-                if len(finalists) < top_n:
-                    finalists.append(lf)
-                    mainline_codes.add(lf.code)
-                else:
-                    lane_overflow_n += 1
-            lane_trace["cross_lane_collision"] = cross_lane_collision
-            lane_trace["lane_overflow_n"] = lane_overflow_n
-            if cross_lane_collision > 0:
-                logger.info(f"埋伏道: {cross_lane_collision} 只撞票归主线")
-            if lane_overflow_n > 0:
-                logger.info(f"埋伏道: {lane_overflow_n} 只溢出（不进 top_n）")
+            finalists = self._merge_lane_finalists(
+                finalists, lane_finalists, top_n, lane_merge_mode, lane_trace
+            )
+        else:
+            # 零埋伏 finalist 日（全 G-A1 flow_negative 等）：合并块不执行，
+            # lane_merge_mode 缺键会让 funnel_stats 对比口径断档（2026-10-20 实测）。
+            lane_trace["lane_merge_mode"] = lane_merge_mode
 
         # funnel_trace 扁平汇入（单时点：合并块写入 cross_lane_collision/lane_overflow_n 之后，
         # 否则 int 按值拷贝看不到后写）。嵌套 `ambush_lane_trace` 键不再出现；

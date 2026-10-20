@@ -363,9 +363,11 @@ LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
 # 埋伏道拆分（ambush-lane-split-revision v2）
 # =============================================================================
 # 开关：GOT_AMBUSH_SPLIT_ENABLED=1 启用分道逻辑（默认开）；false 回滚到 A4 单道原始逻辑
-# GOT_AMBUSH_SPLIT_ACTIVE=1 启用 Node 7 豁免（影子先行，默认关）
+# GOT_AMBUSH_SPLIT_ACTIVE=1 启用 Node 7 豁免（拦点#1 action lift / 拦点#8 tech 折算）。
+# 已转正（2026-10-20 用户裁决跳过影子纪律），默认开；=0 回滚影子态（只留 trace 不改决策）。
+# 注：运行时真消费点在 portfolio_decision.py（call-time 直读 env），本处为登记+测试直读。
 GOT_AMBUSH_SPLIT_ENABLED = os.environ.get("GOT_AMBUSH_SPLIT_ENABLED", "1") == "1"
-GOT_AMBUSH_SPLIT_ACTIVE = os.environ.get("GOT_AMBUSH_SPLIT_ACTIVE", "0") == "1"
+GOT_AMBUSH_SPLIT_ACTIVE = os.environ.get("GOT_AMBUSH_SPLIT_ACTIVE", "1") == "1"
 
 # =============================================================================
 # Step 0 裁决资料包——四组影子观测开关（C4 / E1 / E2 / F1）
@@ -380,11 +382,20 @@ GOT_XNODE_ROUTING_SHADOW = os.environ.get("GOT_XNODE_ROUTING_SHADOW", "1") == "1
 # F1 埋伏道一致性校验影子（三规则只产提案，埋伏池本体零改动）
 GOT_AMBUSH_VALIDATION_SHADOW = os.environ.get("GOT_AMBUSH_VALIDATION_SHADOW", "1") == "1"
 
-# D3 分道预算生产门控（三问裁决 Phase D 骨架，缺省 0 = 逐字节走现状 ROLE_MULTIPLIER 路径）。
-# =1 时 _allocate 的 per_stock_budget 改从 LANE_BUDGET_PARAMS 读分道预算——但接线判据
-# （D1 前向超额区分度报告显著 + Layer 2 积样 ≥20 交易日/≥30 票）未满足前该分支 raise，
-# 误开即 fail-fast，不允许静默半接线。接线时须 bump SCORING_FORMULA_VERSION 并跑基线 diff。
-GOT_LANE_BUDGET_ENABLED = os.environ.get("GOT_LANE_BUDGET_ENABLED", "0") == "1"
+# 埋伏出场催化宽限影子（2026-10-16 RCA）：E14 转出时若日历有该板块 N 交易日内
+# 合格催化事件，记 grace_would_hold 观测。零决策改动——状态机/池/蓄水池不变。
+GOT_AMBUSH_EXIT_GRACE_SHADOW = os.environ.get("GOT_AMBUSH_EXIT_GRACE_SHADOW", "1") == "1"
+# 宽限窗口（交易日，含首尾；复用 _count_trade_days 口径）。
+# 10 = 低空案例实算 8 交易日 + 余量；N=5 会把动机案例归 false 污染转正判据（advisory 修正）。
+AMBUSH_EXIT_GRACE_WINDOW_DAYS = 10
+
+# D3 分道预算（三问裁决 Phase D；2026-10-20 用户裁决跳过影子纪律，直接生效，缺省 1）。
+# =1 时 _allocate 的 per_stock_budget 改从 LANE_BUDGET_PARAMS 读分道加权全额投放：
+#   per_stock_budget(c) = buy_budget × w(lane(c)) / Σ w(lane(top3))，Σ = buy_budget。
+# 原接线判据（D1 前向超额区分度报告 + Layer 2 积样 ≥20 交易日/≥30 票）降级为事后验证：
+# 备份归档按候选池道标签积样后重跑 scripts/backtest_lane_budget.py，区分度差即用本开关回滚。
+# =0 时逐字节走现状「等分×ROLE_MULTIPLIER」路径（独立 kill-switch）。
+GOT_LANE_BUDGET_ENABLED = os.environ.get("GOT_LANE_BUDGET_ENABLED", "1") == "1"
 
 # =============================================================================
 # #14 ④ regime jump penalty（backlog §7 #14 拍板 2026-10-15：结构性删除确认层）
@@ -435,7 +446,10 @@ IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 # 任何调参必须 bump 本值并写入归档 meta.json，供回测按版本分组（与 git commit 互补：
 # commit 定位代码，version 定位参数谱系；防"多版本逻辑混池统计导致结论失真"事故复发）。
 # 2026-10-15.1 bump：分道预算 trace(C4) / T3 路由(E1) / cross_node 路由(E2) / 埋伏校验(F1) 四组影子观测字段加入。
-SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-15.1")
+# 2026-10-20.1 bump：D3 分道加权预算生效（per_stock_budget 口径变更）+ ACTIVE 转正（拦点#1 lift /
+#   #8 tech 折算生效）+ D4 合并改 union 语义（Phase 2 选股池条数上限 10 → 13）。跨此版本的前向
+#   统计不可与前序归档混池（预算口径与池规模双变）。
+SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-20.1")
 
 # =============================================================================
 # 批次 A（竞品补强）：证据链与出处（一期只降不升，防换池）
@@ -463,6 +477,17 @@ GOT_NEWS_EVIDENCE_GATING = os.environ.get("GOT_NEWS_EVIDENCE_GATING", "false").l
 # A3——证据档→催化分乘数。一期 confirmed==reported==1.0（主力事件不变、不换池）；
 # rumor<1.0 仅为二期无源事件标注预留（一期无事件被标 rumor，故零行为变化）。
 EVIDENCE_TIER_MULTIPLIER = {"confirmed": 1.0, "reported": 1.0, "rumor": 0.8}
+
+# Q1 修复（2026-10-16 RCA，用户裁决直连）：low 事件板块级 LLM 救援。
+# 复审「全局 low 但板块 high」事件（affected_sectors 非空、非 negative），
+# LLM 按三维判定标准（共同冲击/板块占比/增量信息，文献接地见 verification.md 补登 #6）
+# 输出 sector_impact 三态；=high 的事件升级 medium 直连进链路
+# （DB/NewsContext/impact_score/日历候选池）。sector_impact 全量落 shadow_low_events.json
+# （质量观测+回滚审计）。=0 一键回滚原过滤行为。
+GOT_LOW_SECTOR_RESCUE = os.environ.get("GOT_LOW_SECTOR_RESCUE", "1") == "1"
+# 复审 LLM 参数（对齐 T2 critic 惯例：低温、批量、一次调用）
+LOW_RESCUE_TEMPERATURE = 0.2
+LOW_RESCUE_MAX_TOKENS = 2000
 
 # 临近系数：事件距当前交易日的衰减
 # 3~10 交易日 = 1.0（正常窗口）

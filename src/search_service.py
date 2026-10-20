@@ -2504,6 +2504,11 @@ class SearchService:
         """检查是否有可用的搜索引擎"""
         return any(p.is_available for p in self._providers)
 
+    @property
+    def available_provider_count(self) -> int:
+        """实际可用引擎数（供调用方决定要遍历几个 provider 顺位，避免对空位干等超时）"""
+        return sum(1 for p in self._providers if p.is_available)
+
     def _cache_key(self, query: str, max_results: int, days: int) -> str:
         """Build a cache key from query parameters."""
         return f"{query}|{max_results}|{days}"
@@ -4454,6 +4459,52 @@ class SearchService:
                 success=False,
                 error_message="增强搜索未找到相关信息"
             )
+
+    def search_generic(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 365,
+        provider_offset: int = 0,
+        max_providers: int = 2,
+    ) -> SearchResponse:
+        """通用查询：从 `_providers[provider_offset]` 起取一段 provider 切片逐个尝试。
+
+        与既有 `search_*` 的区别：只负责「这一次查询、这一段 provider」，返回首个
+        `success and results` 的响应；**不以"拿到结果"作为证据判定的终点**——
+        调用方要对每次返回的结果跑 `evidence_supports_membership`，只有通过护栏才停。
+
+        Args:
+            query: 查询串
+            max_results: 每次查询取多少条
+            days: 时间窗。概念归属是事实型不是新闻，必须显式传大值（默认 7 天会把
+                1 月/3 月的归属证据过滤掉，表现为"查无证据"）
+            provider_offset: provider 起始下标（0=第一顺位，1=第二顺位）
+            max_providers: 本次切片长度（调用方遍历时传 1）
+        """
+        if not self.is_available:
+            return SearchResponse(
+                query=query, results=[], provider="None", success=False,
+                error_message="未配置搜索能力",
+            )
+
+        errors: List[str] = []
+        for provider in self._providers[provider_offset: provider_offset + max_providers]:
+            if not provider.is_available:
+                continue
+            try:
+                response = provider.search(query, max_results=max_results, days=days)
+            except Exception as e:  # 单引擎异常不阻断切片内其它引擎
+                errors.append(f"{provider.name}: {e}")
+                continue
+            if response and response.success and response.results:
+                return response
+            errors.append(f"{provider.name}: {getattr(response, 'error_message', None) or '无结果'}")
+
+        return SearchResponse(
+            query=query, results=[], provider="None", success=False,
+            error_message="; ".join(errors) or "无可用搜索引擎",
+        )
 
     def search_stock_with_enhanced_fallback(
         self,

@@ -18,6 +18,9 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch, MagicMock
 
+# _score_candidates 驱动夹具（ACTIVE lift / Phase 2 合并语义接线用例复用）
+from tests.test_bear_entry_gate import _BearGateHarness
+
 
 # ─────────────────────────── 公共构造 ───────────────────────────
 
@@ -29,6 +32,13 @@ def _ticket(code="000001", sector="黄金概念", change_pct=-1.0, volume_ratio=
         "change_pct": change_pct, "volume_ratio": volume_ratio,
         "dde_degraded": dde_degraded, "sector_type": sector_type,
     }
+
+
+def _stock(code="000001", sector="黄金概念", sector_type="ambush"):
+    """构造 ScreenerStock（finalists 形态，D4 合并块输入）"""
+    from src.services.stock_screener import ScreenerStock
+    return ScreenerStock(code=code, name=f"票{code}", sector_name=sector,
+                         sector_type=sector_type)
 
 
 def _capital_ctx(flow_3d=None, flow_daily=None, dde_degraded=False):
@@ -277,7 +287,8 @@ class TestAmbushLaneSplit(unittest.TestCase):
         self.assertNotIn("600003", passed_codes)  # no_catalyst → fail
 
     def test_g_a2_proximity_window(self):
-        """G-A2：days_to_event ≤0 和 >14 → 视为无事件；proximity = max(0, 1−d/14)"""
+        """G-A2：days_to_event <0 和 >14 → 视为无事件；days_to_event=0 含当日（2026-10-16 修复）；
+        proximity = max(0, 1−d/14)"""
         s = _screener()
         today = date(2026, 10, 13)
         news_ctx = _news_ctx({
@@ -288,12 +299,87 @@ class TestAmbushLaneSplit(unittest.TestCase):
         })
         sector_kline = _sector_kline_lookup({"黄金概念": (10.0, 10.3, 10.0)})
         candidates = [_ticket("600001", "黄金概念")]
-        
+
         passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
-        
+
         # 断言：两个事件都不在窗口内 → no_catalyst
         self.assertIn("g_a2_no_catalyst", trace)
         self.assertEqual(len(passed), 0)
+
+    def test_g_a2_day0_event_included(self):
+        """回归（2026-10-16 军民融合死点）：当日事件 days_to_event=0 必须在窗口内，
+        旧谓词 0 < d 将当日事件剔除而 Node 6 照常入池，口径分裂致埋伏道 0 输出"""
+        s = _screener()
+        today = date(2026, 10, 16)
+        news_ctx = _news_ctx({
+            "军民融合": [
+                {"event_date": today.isoformat(), "confidence": 0.8},
+            ],
+        })
+        sector_kline = _sector_kline_lookup({"军民融合": (1560.67, 1792.9, 1676.978)})
+        candidates = [_ticket("600001", "军民融合")]
+
+        passed, trace = s._ga2_gate(candidates, news_ctx, sector_kline, today=today)
+
+        self.assertEqual(trace["g_a2_no_catalyst"], 0)
+        self.assertEqual([c["code"] for c in passed], ["600001"])
+
+    def test_g_a2_pool_fast_pass(self):
+        """回归（2026-10-16 东数西算死点）：候选板块 ∈ Node 6 ambush_pool 直接过催化判定
+        （日历名字匹配缺口：GTC 事件 affected_sectors 无「东数西算」）；
+        位置安全带在 pool 通道仍生效；pool 命中独立计数 g_a2_pool_pass"""
+        s = _screener()
+        today = date(2026, 10, 16)
+        # 日历里没有任何东数西算事件
+        news_ctx = _news_ctx({
+            "AI芯片": [{"event_date": (today + timedelta(days=11)).isoformat(), "confidence": 0.7}],
+        })
+        sector_kline = _sector_kline_lookup({"东数西算": (1560.67, 1846.7, 1542.8)})
+        candidates = [
+            _ticket("600001", "东数西算"),
+            _ticket("600002", "东数西算"),  # 同板块第二只
+        ]
+
+        passed, trace = s._ga2_gate(
+            candidates, news_ctx, sector_kline, today=today,
+            ambush_pool_names={"东数西算"},
+        )
+
+        self.assertEqual(trace["g_a2_pool_pass"], 2)
+        self.assertEqual(trace["g_a2_no_catalyst"], 0)
+        self.assertEqual(len(passed), 2)
+
+        # pool 通道不豁免位置安全带：close=1900 > high20=1792.9×1.03
+        unsafe_kline = _sector_kline_lookup({"军民融合": (1900.0, 1792.9, 1676.978)})
+        passed2, trace2 = s._ga2_gate(
+            [_ticket("600003", "军民融合")], news_ctx, unsafe_kline, today=today,
+            ambush_pool_names={"军民融合"},
+        )
+        self.assertEqual(trace2["g_a2_position_unsafe"], 1)
+        self.assertEqual(len(passed2), 0)
+
+    def test_g_a2_pool_fast_pass_no_calendar(self):
+        """pool fast-pass 在日历缺失/空事件时仍生效（催化证明在 Node 6 池准入）"""
+        s = _screener()
+        today = date(2026, 10, 16)
+        sector_kline = _sector_kline_lookup({})
+        candidates = [_ticket("600001", "军民融合"), _ticket("600002", "未知板块")]
+
+        # 无日历
+        passed, trace = s._ga2_gate(
+            candidates, {"catalyst_calendar": None}, sector_kline, today=today,
+            ambush_pool_names={"军民融合"},
+        )
+        self.assertEqual([c["code"] for c in passed], ["600001"])
+        self.assertEqual(trace["g_a2_no_catalyst"], 1)
+
+        # 空事件
+        passed2, trace2 = s._ga2_gate(
+            candidates, {"catalyst_calendar": {"events": []}}, sector_kline, today=today,
+            ambush_pool_names={"军民融合"},
+        )
+        self.assertEqual([c["code"] for c in passed2], ["600001"])
+        self.assertEqual(trace2["g_a2_no_catalyst"], 1)
 
     def test_g_a3_knife(self):
         """G-A3：下跌日 + volume_ratio ≥3.0 → fail + g_a3_knife；缺 volume → soft pass"""
@@ -340,7 +426,7 @@ class TestAmbushLaneSplit(unittest.TestCase):
         self.assertEqual(trace["g_a4_selected"], 3)
 
     def test_lane_error_fail_open_and_merge(self):
-        """G-A4 fail-open：gate 异常 → 全过 + lane_error；merge 主线优先 + 撞票计数"""
+        """G-A4 fail-open：gate 异常 → 全过 + lane_error；合并改 union 语义（2026-10-20 D4）"""
         s = _screener()
         # 构造会抛异常的 candidates
         candidates = [_ticket("600001", "黄金概念")]
@@ -356,6 +442,53 @@ class TestAmbushLaneSplit(unittest.TestCase):
             self.assertEqual(len(lane_finalists), 1)
             # 断言 lane_error
             self.assertIn("lane_error", lane_trace)
+
+        # D4 union 合并语义：主线优先占位不再丢埋伏票；撞票归主线并计数；无溢出丢弃
+        maintline = [_stock("600001", "主线A", "active_mainline")]
+        lane = [_stock("600001", "主线A"), _stock("600002", "埋伏B"),
+                _stock("600003", "埋伏C"), _stock("600004", "埋伏D")]
+        trace: dict = {}
+        merged = s._merge_lane_finalists(
+            maintline, lane, top_n=1, lane_merge_mode="union", lane_trace=trace
+        )
+        self.assertEqual(
+            [m.code for m in merged], ["600001", "600002", "600003", "600004"]
+        )
+        self.assertEqual(trace["cross_lane_collision"], 1)   # 撞票归主线
+        self.assertEqual(trace["lane_overflow_n"], 0)       # union 无溢出丢弃
+        self.assertEqual(trace["lane_merge_mode"], "union")
+
+    def test_merge_topn_fill_overflow_dropped(self):
+        """缺省 topn_fill（--screener 展示入口）：主线优先补位，溢出即丢（原语义回归）"""
+        s = _screener()
+        maintline = [_stock("600001", "主线A", "active_mainline")]
+        lane = [_stock("600002", "埋伏B"), _stock("600003", "埋伏C")]
+        trace: dict = {}
+
+        merged = s._merge_lane_finalists(
+            maintline, lane, top_n=1, lane_merge_mode="topn_fill", lane_trace=trace
+        )
+
+        self.assertEqual([m.code for m in merged], ["600001"])
+        self.assertEqual(trace["lane_overflow_n"], 2)
+        self.assertEqual(trace["cross_lane_collision"], 0)
+        self.assertEqual(trace["lane_merge_mode"], "topn_fill")
+
+    def test_merge_union_keeps_mainline_cap(self):
+        """union：主线仍受 Round 5 top_n 截断（只放开埋伏道），埋伏全量追加"""
+        s = _screener()
+        maintline = [_stock("600001", "主线A", "active_mainline")]
+        lane = [_stock(f"60001{i}", "埋伏") for i in range(1, 4)]
+        trace: dict = {}
+
+        merged = s._merge_lane_finalists(
+            maintline, lane, top_n=1, lane_merge_mode="union", lane_trace=trace
+        )
+
+        self.assertEqual(len(merged), 4)  # 1 主线 + 3 埋伏（道内 TOPK=3 兜底）
+        self.assertEqual(merged[0].code, "600001")
+        self.assertEqual({m.sector_type for m in merged[1:]}, {"ambush"})
+        self.assertEqual(trace["lane_overflow_n"], 0)
 
     def test_action_gate_shadow_trace(self):
         """ACTIVE=false，lifecycle=None ambush 票 → priority=50 → watch + action_gate_watch trace"""
@@ -434,7 +567,230 @@ class TestAmbushLaneSplit(unittest.TestCase):
         self.assertEqual(restored.unified_scoring[0].sector_type, "ambush")
 
 
+# ─────────────────── 转正：ACTIVE 缺省 1 的 action lift 生效面（2026-10-20） ───────────────────
+
+class TestActionGateActiveDefault(_BearGateHarness):
+    """GOT_AMBUSH_SPLIT_ACTIVE 缺省翻 1 后，lane 过闸埋伏票必须可达 buy。
+
+    复用 test_bear_entry_gate 的 _score_candidates 驱动夹具（同构造：mock screener +
+    板块情报 + overheat 中性），断言的是运行时真消费点（portfolio_decision.py 的
+    call-time os.getenv 缺省值），而非 catalyst_config 的登记值。
+    """
+
+    async def _ambush_stock(self):
+        from tests.test_bear_entry_gate import _make_stock
+        # 全维 40 → composite 40 → lifecycle=None 时 final=0.6×50+0.4×40=46 ≤ 50
+        # （lift 前必为 watch，lift 后 max(46,55)=55 > 50 → buy_dip）
+        return _make_stock(
+            code="600001", name="埋伏票", sector_name="半导体", sector_type="ambush",
+            sector_score=40.0, capital_score=40.0, news_score=40.0,
+            tech_wave_score=40.0, risk_score_safe=40.0,
+        )
+
+    async def test_default_active_lifts_lane_qualified_to_buy_dip(self):
+        from tests.test_bear_entry_gate import _intel
+
+        stock = await self._ambush_stock()
+        lane_shadow = {"lane_finalists": [{"code": stock.code, "sector": "半导体"}]}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOT_AMBUSH_SPLIT_ACTIVE", None)  # 真·缺省路径
+            node, res = await self._run(
+                stock, _intel(lifecycle_phase=None, lifecycle_day=None), "bull",
+                {"GOT_BEAR_ENTRY_GATE": "0", "GOT_WINRATE_STEP3_ENABLED": "1"},
+                lane_shadow=lane_shadow,
+            )
+
+        self.assertEqual(res.action_recommendation, "buy_dip")
+        self.assertIn(stock.code, node._ambush_lane_trace["action_gate_lifted"])
+        self.assertEqual(node._ambush_lane_trace["action_gate_watch"], [])
+
+    async def test_kill_switch_zero_restores_shadow_behavior(self):
+        from tests.test_bear_entry_gate import _intel
+
+        stock = await self._ambush_stock()
+        lane_shadow = {"lane_finalists": [{"code": stock.code, "sector": "半导体"}]}
+        node, res = await self._run(
+            stock, _intel(lifecycle_phase=None, lifecycle_day=None), "bull",
+            {"GOT_BEAR_ENTRY_GATE": "0", "GOT_WINRATE_STEP3_ENABLED": "1",
+             "GOT_AMBUSH_SPLIT_ACTIVE": "0"},
+            lane_shadow=lane_shadow,
+        )
+
+        self.assertEqual(res.action_recommendation, "watch")
+        self.assertEqual(node._ambush_lane_trace["action_gate_lifted"], [])
+        self.assertIn(stock.code, node._ambush_lane_trace["action_gate_watch"])
+
+
+class TestPhase2CallSiteMergeMode(_BearGateHarness):
+    """Phase 2 生产路径必须传 lane_merge_mode="union"（D4）；--screener 展示入口保持缺省。"""
+
+    async def test_score_candidates_passes_union(self):
+        from tests.test_bear_entry_gate import _intel, _make_stock
+        from unittest.mock import MagicMock as _MM
+
+        stock = _make_stock(sector_name="半导体")
+        node = _node7()
+        node._build_sector_intel_map = lambda uc: {}
+        node._adjust_score_by_sector_intel = lambda base, name, mm: base
+        node._compute_overheat_penalty = lambda name, mm, uc: 1.0
+        node._collect_shadow_t1 = lambda finalists: None
+        node._save_candidate_pool_snapshot = lambda *a, **k: None
+
+        async def _fake_verify(finalists, sector_intel_map):
+            return finalists
+        node._verify_candidate_sectors = _fake_verify
+
+        screener_mock = _MM()
+        screener_mock._extract_got_universe.return_value = [{"code": stock.code}]
+        screener_mock._filter_got_finalists.return_value = [stock]
+
+        from tests.test_bear_entry_gate import (
+            _make_capital, _make_news, _make_sector_ctx, _make_sentiment,
+            _make_unified, _market_with_regime,
+        )
+        with patch("src.services.stock_screener.StockScreenerPipeline",
+                   return_value=screener_mock):
+            await node._score_candidates(
+                _make_sector_ctx(), _make_capital(), _make_news(),
+                _market_with_regime("bull"), _make_unified(), _make_sentiment(),
+            )
+
+        _args = screener_mock._filter_got_finalists.call_args.args
+        self.assertEqual(_args[2], 10)          # top_n 不变
+        self.assertEqual(_args[3], "union")     # D4：Phase 2 收并集
+
+    def test_screener_entry_default_stays_topn_fill(self):
+        """--screener 独立展示入口（run_got_mode）不传参 → 缺省 topn_fill（输出仍 ≤ top_n）"""
+        import inspect
+        from src.services.stock_screener import StockScreenerPipeline
+
+        params = inspect.signature(
+            StockScreenerPipeline._filter_got_finalists
+        ).parameters
+        self.assertEqual(params["lane_merge_mode"].default, "topn_fill")
+
+
+
 # ─────────────────────── 修法③：G-A2 位置安全带接线（backlog §1 row 52） ───────────────────────
+
+class TestFilterGotFinalistsMergeWiring(unittest.TestCase):
+    """D4 端到端：走真实 `_filter_got_finalists` 漏斗（逐轮评分全部打桩），
+    验证 `lane_merge_mode` 穿透到合并块——不是只测合并 helper。
+    """
+
+    def _run(self, s, universe, mode):
+        lane_stocks = [_stock("600901", "埋伏A"), _stock("600902", "埋伏B")]
+        got_context = {
+            "sector_context": {"exhausted_mainline": [], "ambush": []},
+            "capital_context": _capital_ctx(),
+            "news_context": _news_ctx(),
+        }
+        with patch.dict(os.environ, {"GOT_AMBUSH_SPLIT_ENABLED": "1"}), \
+             patch("src.got.catalyst_config.AGENT_STOCK_REVIEW_ENABLED", False), \
+             patch("data_provider.base.DataFetcherManager"), \
+             patch.object(s, "_filter_stagnation", lambda cands, fm: cands), \
+             patch.object(s, "_score_capital", lambda cands, ctx: (
+                 {c["code"]: 80.0 for c in cands}, {c["code"]: True for c in cands})), \
+             patch.object(s, "_apply_capital_floor", lambda top, dropped, cands: top), \
+             patch.object(s, "_score_technical_wave", lambda cands, fm: {
+                 c["code"]: 70.0 for c in cands}), \
+             patch.object(s, "_score_risk", lambda cands, fm: {
+                 c["code"]: 80.0 for c in cands}), \
+             patch.object(s, "_apply_r4_filter", lambda cands, ctx: cands), \
+             patch.object(s, "_score_news", lambda cands, nctx, sctx=None: (
+                 {c["code"]: 60.0 for c in cands}, {c["code"]: True for c in cands})), \
+             patch.object(s, "_score_catalyst_relevance", lambda cands, ctx: ({}, {})), \
+             patch.object(s, "_compute_got_composite_score", lambda stock, ctx: 66.0), \
+             patch.object(s, "_generate_got_reasoning", lambda stock, ctx: "理由"), \
+             patch.object(s, "_build_backtest_snapshot", lambda stock, fm: {}), \
+             patch.object(s, "_get_stock_name", lambda code, fm=None, *a: f"票{code}"), \
+             patch.object(s, "_run_ambush_lane", lambda cands, ctx, fm=None: (
+                 lane_stocks,
+                 {"mode": "shadow", "lane_finalists": [
+                     {"code": st.code, "sector": st.sector_name} for st in lane_stocks]},
+                 {"lane_in": len(cands), "g_a4_selected": len(lane_stocks)},
+             )):
+            finalists = s._filter_got_finalists(
+                universe, got_context, top_n=1, lane_merge_mode=mode
+            )
+        return finalists, dict(s._last_funnel_trace)
+
+    def _universe(self):
+        tickets = [
+            _ticket("600001", "主线A", sector_type="active_mainline"),
+            _ticket("600002", "主线B", sector_type="active_mainline"),
+            _ticket("600101", "埋伏X", sector_type="ambush"),
+            _ticket("600102", "埋伏Y", sector_type="ambush"),
+        ]
+        # Round 5 构建 ScreenerStock 时直接下标读取 sector_score（非 getattr），必须显式给值
+        for t in tickets:
+            t["sector_score"] = 70.0
+        return tickets
+
+    def test_union_appends_lane_finalists_through_real_funnel(self):
+        s = _screener()
+        finalists, trace = self._run(s, self._universe(), "union")
+
+        codes = [f.code for f in finalists]
+        # 主线 Round 5 仍按 top_n=1 截断，埋伏道全量追加
+        self.assertEqual(codes, ["600001", "600901", "600902"])
+        self.assertEqual(trace["lane_merge_mode"], "union")
+        self.assertEqual(trace["lane_overflow_n"], 0)
+        self.assertEqual(trace["cross_lane_collision"], 0)
+
+    def test_default_topn_fill_drops_overflow_through_real_funnel(self):
+        s = _screener()
+        finalists, trace = self._run(s, self._universe(), "topn_fill")
+
+        self.assertEqual([f.code for f in finalists], ["600001"])
+        self.assertEqual(trace["lane_merge_mode"], "topn_fill")
+        self.assertEqual(trace["lane_overflow_n"], 2)   # 旧语义：溢出即丢
+
+    def test_zero_lane_finalists_still_records_merge_mode(self):
+        """零埋伏 finalist 日（合并块不执行）lane_merge_mode 仍落 funnel_trace"""
+        s = _screener()
+
+        def _empty_lane(cands, ctx, fm=None):
+            return (
+                [],
+                {"mode": "shadow", "lane_finalists": []},
+                {"lane_in": len(cands), "g_a1_flow_negative": len(cands)},
+            )
+
+        got_context = {
+            "sector_context": {"exhausted_mainline": [], "ambush": []},
+            "capital_context": _capital_ctx(),
+            "news_context": _news_ctx(),
+        }
+        with patch.dict(os.environ, {"GOT_AMBUSH_SPLIT_ENABLED": "1"}), \
+             patch("src.got.catalyst_config.AGENT_STOCK_REVIEW_ENABLED", False), \
+             patch("data_provider.base.DataFetcherManager"), \
+             patch.object(s, "_filter_stagnation", lambda cands, fm: cands), \
+             patch.object(s, "_score_capital", lambda cands, ctx: (
+                 {c["code"]: 80.0 for c in cands}, {c["code"]: True for c in cands})), \
+             patch.object(s, "_apply_capital_floor", lambda top, dropped, cands: top), \
+             patch.object(s, "_score_technical_wave", lambda cands, fm: {
+                 c["code"]: 70.0 for c in cands}), \
+             patch.object(s, "_score_risk", lambda cands, fm: {
+                 c["code"]: 80.0 for c in cands}), \
+             patch.object(s, "_apply_r4_filter", lambda cands, ctx: cands), \
+             patch.object(s, "_score_news", lambda cands, nctx, sctx=None: (
+                 {c["code"]: 60.0 for c in cands}, {c["code"]: True for c in cands})), \
+             patch.object(s, "_score_catalyst_relevance", lambda cands, ctx: ({}, {})), \
+             patch.object(s, "_compute_got_composite_score", lambda stock, ctx: 66.0), \
+             patch.object(s, "_generate_got_reasoning", lambda stock, ctx: "理由"), \
+             patch.object(s, "_build_backtest_snapshot", lambda stock, fm: {}), \
+             patch.object(s, "_get_stock_name", lambda code, fm=None, *a: f"票{code}"), \
+             patch.object(s, "_run_ambush_lane", _empty_lane):
+            finalists = s._filter_got_finalists(
+                self._universe(), got_context, top_n=1, lane_merge_mode="union"
+            )
+
+        self.assertEqual([f.code for f in finalists], ["600001"])
+        trace = dict(s._last_funnel_trace)
+        self.assertEqual(trace["lane_merge_mode"], "union")   # 合并块未执行也落键
+        self.assertEqual(trace["g_a1_flow_negative"], 2)      # 零 finalist 溯源保留
+
 
 class TestGA2PositionScalars(unittest.TestCase):
     """G-A2 位置安全带修法③：Node 2 预计算三标量 → lookup 读 indicators。
