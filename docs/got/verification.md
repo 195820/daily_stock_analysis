@@ -2,6 +2,197 @@
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
 ---
+## ‼️ 2026-10-20 转正补登（D3 分道预算 + ACTIVE 转正 + D4 union — 用户裁决跳过影子纪律）
+
+**性质**：**转正即生效**，非影子观测。用户 2026-10-20 明示裁决：原 C4 四判据（D1 前向超额分箱显著区分度 + Layer 2 积样 ≥20 交易日/≥30 票 + `SCORING_FORMULA_VERSION` bump + 基线 diff 归零）中的「影子 ≥10 交易日」纪律在本次不执行，直接修正生效；D1 标定**降级为事后验证**。本注记即该裁决的出处登记，防后续审计误判为纪律违规。
+
+### 三项生效改动
+
+| 项 | 开关（缺省） | 生效语义 | 一处回滚方式 |
+|---|---|---|---|
+| **D3 分道预算** | `GOT_LANE_BUDGET_ENABLED`（**1**，call-time 直读） | `_allocate` 的 `per_stock_budget(c) = buy_budget × w(lane(c)) / Σ w(lane(top3))`，恒等式 `Σ = buy_budget`。选股仍取 `buy_candidates` 复合分降序 top3（不引入跨道单尺重排）；lane 由 `sector_type` 经模块级 `_stype_to_role` 映射（`active_mainline`→`mainline`，`ambush`→`ambush`；裸 `mainline`（schema 缺省值＝道身份缺失）与其余值、以及 `sector_name` 为空的未验证票→`unknown`）；数值沿用 D2 登记的 `LANE_BUDGET_PARAMS`（1.0/0.55/0.3/0.55），无新参数 | `GOT_LANE_BUDGET_ENABLED=0` → 逐字节回「等分×`ROLE_MULTIPLIER`」旧路径 |
+| **ACTIVE 转正** | `GOT_AMBUSH_SPLIT_ACTIVE`（**1**，catalyst_config 登记 + `portfolio_decision.py` 运行时消费点两处同步） | 拦点#1 action lift（lane 过闸埋伏票 `priority = max(priority, 55)` → `buy_dip` 可达 `buy_candidates`）+ 拦点#8 tech 维折算（`ambush_rank_score×100`）；bear 闸豁免 2026-10-13 已无条件，不随本开关 | `GOT_AMBUSH_SPLIT_ACTIVE=0` → 回影子态（仅 `action_gate_watch` trace，零决策改动） |
+| **D4 合并 union** | 无开关（语义修正，非观测） | Phase 2 生产路径 `_filter_got_finalists(..., lane_merge_mode="union")`：主线仍 Round 5 top_n 截断，埋伏道 `lane_finalists` 全量追加不丢（道内 `AMBUSH_LANE_TOPK=3` 兜底），`lane_overflow_n` 恒 0，撞票仍归主线；`--screener` 展示入口保持缺省 `topn_fill`。生产 `unified_scoring` 条数上限 10 → 13 | 代码 revert |
+
+**诊断链（为何三者必须同时生效）**：D4 缺失时主线先占满 10 名额 → 埋伏候选整道不可见；ACTIVE=0 时 lane 过闸但 `lifecycle_phase=None` 的埋伏票 `priority=50` → `action=watch`（仅 trace），永远进不了 `buy_candidates`；D3 缺失时「等分×角色打折」让混合道日预算蒸发（2 主线+1 埋伏 = 0.85×B、纯埋伏 3 只 = 0.55×B）。三者任一缺失，「决策层能买到埋伏票」即不通。
+
+**路径级可观测性（新增/变更）**：`sector_limit_detail` 增 `lane`/`lane_weight`/`lane_budget_applied`（分道预算比可由 allocation 实际金额复算）；`lane_budget_split_shadow` 的 `lane_budget_applied` 改读 call-time 开关（不再恒 false），道归属改按实际生效道（`lane` 键，缺省回落 `sector_role`）；`lane_trace` 增 `lane_merge_mode`；`candidate_pool.json` universe 行增 `sector_type` 道标签（供 D1 回测直读）。`SCORING_FORMULA_VERSION` = `2026-10-20.1`——**跨此版本的前向统计不得与前序归档混池**（预算口径 + 池规模双变）。
+
+**事后验证（替代原事前判据）**：`scripts/backtest_lane_budget.py` 的 lane 判定改为「优先读 `candidate_pool.json` 的 `sector_type` 标签，无标签回退 `sector.json` 名单匹配」；新交易日自然积累带标签样本，攒到 ≥20 交易日 / ≥30 票后重跑，若出现「无 lane 主胜出」或「道间差距 <2pp」→ 用上述两个 env 分别回滚（不动代码）。该脚本的窗口/分箱/双基准/`MIN_SAMPLE_SIZE=3` 口径全部未变。
+
+**验证读数**：新增 `tests/test_lane_budget_d3.py`（7 例：混合道全额投放 + 埋伏票入 allocation / 纯埋伏 B÷3 / 纯主线等分 / `=0` 旧路径 0.85×B 回归 / 未验证板块落 unknown / 两开关缺省=1 / `_stype_to_role` 映射）+ `tests/test_trade_plan_log.py`（10 例）+ `test_ambush_lane_split.py` 改写与新增（union 全量追加 / `topn_fill` 溢出丢弃 / 撞票计数 / ACTIVE 缺省 lift→`buy_dip` 与 `=0` 对照 / Phase 2 调传 `"union"` 断言）；`test_portfolio_decision_lot_rejection.py::test_affordable_candidate_buys_whole_lots` 由 100 股改 200 股（旧断言钉在 0.55 折后预算，D3 下道权重自相抵消）。
+
+### 决策编排层留痕（第四项，零决策改动）
+
+`PortfolioDecision.trade_plan_log: list[str]` + `decision_plan.reconcile_log_lines/assemble_log_lines` 两个纯函数 + `run()` 开头 reconcile / 末尾 assemble 两处接线回填 + `archive._append_phase2_reasoning` 在 Node 7 段渲染「### 决策编排层（trade_plans 装配/对账）」。此前两处返回值在接线处被丢弃（只进 SQLite），人工复盘看不到装配/对账。空列表不渲染 → off 态 `reasoning.md` 逐字节不变；同日重跑随 Node 7 段一并丢弃重建（段落数恒 1）。
+
+### 首个观测日读数（2026-10-20 实跑 `main.py --got`，D1 事后验证第 1 个带标签日）
+
+| 检查项 | 读数 | 判定 |
+|---|---|---|
+| `candidate_pool.json` universe 道标签 | 44 / 44 行带 `sector_type`（`active_mainline`/`ambush`） | ✅ 供数就绪（D1 脚本可直接读） |
+| 埋伏道供给 | `lane_in=29 → G-A1 soft_pass=29 → G-A2 pool_pass=29 → G-A3 29 → G-A4 selected=2` | ✅ 供给非零 |
+| union 合并 | `lane_merge_mode=union`、`cross_lane_collision=0`、`lane_overflow_n=0`；`unified_scoring` 含 2 只 `sector_type=ambush`（001400 / 002076）+ 1 只主线（601778） | ✅ **埋伏道首次进入生产 Phase 2 打分池**（旧语义下被主线 10 名额挤空） |
+| ACTIVE lift | `action_gate_lifted=[]`（两只埋伏票 `lifecycle_priority` 均 >50，未落入 lift 触发带） | ⚪ 未触发（band 未命中，非开关失效） |
+| 买入侧 | `allocation` 0 条；两只埋伏票 `sector_verify_miss`（问财标签「液冷服务」/「数据中心」与 efinance 板块不匹配 → `sector_name` 清空 → Q9-B 强制 watch） | ⚠️ 供给被板块身份验证闸门吃掉，非 D3/D4/ACTIVE 缺陷 |
+| `lane_budget_split_shadow` | `[]`（当日 0 条 buy allocation，无道可归集） | ⚪ 数值语义由 `test_lane_budget_d3.py` 承保，待首个有买入的交易日复验 |
+| `reasoning.md` 决策编排层段 | 「### 决策编排层（trade_plans 装配/对账）」1 段 2 行（`昨日对账(2026-10-19): 无 pending 计划待回填` / `当日计划装配: allocation 为空，无计划写入`） | ✅ 渲染 + 幂等（重跑段落数仍为 1） |
+| `portfolio_decision.json.trade_plan_log` | 同上 2 行随 model_dump 落盘 | ✅ |
+| `meta.json.scoring_formula_version` | `2026-10-20.1` | ✅ 版本戳生效 |
+| `meta.json.funnel_stats.round_survival_counts` | 扁平含 `lane_merge_mode='union'` / `cross_lane_collision=0` / `lane_overflow_n=0` / `g_a4_selected=2` | ✅ |
+
+**已知无关告警（非本轮引入）**：`data/got_daily/20260917/portfolio_decision.json` 为历史坏档（`json.loads` 报 `Expecting value: line 298 column 18`），`_build_shadow_day_index` 扫历史日时打一条 `[Archive] 影子产物读取失败` WARNING 后降级（今日文件本身有效）。该坏档未修复（历史数据处置不在本轮范围）。
+
+**次日复验项**：① 有买入的交易日核对 `lane_budget_split_shadow[*].lane_budget_applied=true` 且分道金额与 `allocation.target_value` 复算一致；② 埋伏票穿越板块验证闸门的交易日，确认 `action=buy_dip` 且出现在 `allocation`；③ 带标签样本按 `scripts/backtest_lane_budget.py` 自然积累至 ≥20 交易日/≥30 票后重跑 D1。
+
+**🔴 阻塞项（未关闭，本轮不得判为「冒烟通过」）**：计划验收口径「lane 供给>0 的交易日 → 至少 1 只埋伏票 `action=buy_dip` 且进 `allocation`」**今日未达成**。证据链：`unified_scoring` 三只候选（001400 江顺科技 / 002076 *ST星光 均 `sector_type=ambush`、601778 主线）全部 `sector_available=false`、`sector_name=null`、`action=watch`；`ambush_lane_trace.sector_verify_miss` 同时列出 001400/002076；`allocation=[]`、`lane_budget_split_shadow=[]` → **D3 分道预算数值路径今日执行 0 次**。**RCA（2026-10-20 复核，拆两类，勿再写成单一「3/3 蹭概念」）**：`_verify_candidate_sectors`（portfolio_decision.py:1573）在 union 合并后的 3 只 finalists 上逐只校验，L1 未命中 → LLM 仲裁（`sector_verify_degraded=None` 证实非降级分支）判不匹配 → 清空 `sector_name` → Q9-B 强制 `watch`。但三条失配的成因完全不同：
+
+- **① 军贸概念（601778 主线票）= 问财成分股污染，该拦**：15 只成员里只有 4 只与军工/军贸相关（300589 江龙船艇 / 600435 北方导航 / 300065 海兰信 / 000576 甘化科工），其余 11 只（002626 金达威、600032 浙江新能、603693 江苏新能、601778 晶科科技、芯能科技、同有科技、宜安科技、亿田智能、正强股份、日盈电子、松原安全）与军贸无关 → THS 按板块名语义检索跑偏，候选集本身不可信。
+- **② 液冷服务 / 数据中心（001400 / 002076）= 词表未桥接 + 仲裁过严，不该拦**：29 只成员大体是 AI 服务器供应链（飞荣达 / 同飞股份 / 苏州天脉 / 立讯精密 / 蓝思科技 / 润建股份…）。机制：`data/wencai_board_aliases.json` 已记 `液冷服务 → 液冷服务器（source=auto, verified=2026-10-20，当日自愈写入）`，即问财查询实际跑的是 THS 板块 `液冷服务器`，而 `universe[].sector` 仍保留 Node 6 名 `液冷服务`；校验比的是**原始标签**，走另一张表 `src/got/board_aliases.normalize_sector_name`（无该桥接：`液冷服务→液冷服务`、`数据中心→数据中心`，而 THS 实名是 `液冷服务器` / `数据中心(AIDC)`，见 `data/ths_concept_boards.json`）→ **L1 结构性必失配**，只剩 LLM 仲裁兜底；且东财侧常无对应概念（001400 的 19 个东财板块无「液冷」，002076 的 23 个无「数据中心」，601778 有「算力概念/阿里概念」）→ 两套 taxonomy 不能直接等价判定。
+- **③ 设计缺口（登记待办）**：校验比对的是 Node 6 标签而非**问财实际查询板块**，且 `wencai_board_aliases` ↔ `board_aliases` ↔ `ths_concept_boards` 三张表互不相通。候选修法：`resolve_with_kind` 产物随 universe 透传作为校验标签 / 三表桥接 / GOT 信任模式（等同撤回 09-22 审核 3.3，需拍板）。
+
+与本轮改动无关（主线票同样被拦）；`action_gate_lifted=[]` 另因两只埋伏票 `lifecycle_priority`>50 未落入 lift 触发带。**关闭条件**：出现「埋伏票通过板块验证 + `action=buy_dip` + 进 `allocation`」的交易日，或在校验链路修复（标签改用 resolved board / 别名表桥接 / 降级口径）后复验；在此之前 D3 金额正确性只有单测（`test_lane_budget_d3.py` 8 例）承保，无生产读数。**同日口径校准**：`sector_available_false_count` 在 20261019 为 **3/4**（4 只候选清 3 只）、20261020 为 **3/3**、20261013 为 **3/3**——「3/3 全灭」只属 1013/1020 两天。
+
+### 板块身份校验改 fail-closed（LLM 不可用即报错，2026-10-20 用户裁决）
+
+> **已被取代（2026-10-20 晚）**：裁判已从 efinance 换成「联网检索证据 + LLM 判定」，本节的 fail-closed 语义（raise → status=failed → 退出码 1）继续保持，但 efinance 比对、`efinance_empty/efinance_error` 两个 reason 已随实现删除。现行实现见下方「板块身份校验换裁判」小节。
+
+**裁决原文**：「llm不可用报错，这是决策系统，又不是应用，断了总比拿错误数据出决策好」。据此废止审核 3.3 的「LLM 不可用 → 保守清空标签继续出决策」路径——它把「数据缺失」伪装成「判定为不匹配」，当日仍在无人察觉的降级态产出 watch/空仓建议（降级痕迹只埋在 `data_quality` 里）。
+
+| 项 | 旧（审核 3.3，已废止） | 新（fail-closed） |
+|---|---|---|
+| LLM 调用失败/超时 | 清空标签 → 维度剔除 → **继续出决策** | `raise SectorVerifyUnavailable` → Phase 2 失败 |
+| LLM 返回空 / 无 JSON 数组 / JSON 解析失败 / 非数组 | 返回 None → 同上 | 同上（raise） |
+| LLM 覆盖不全（缺案例索引） | 缺的索引默认 None → 当作"不匹配"清空 | raise（缺数据 ≠ 判定） |
+| LLM 给出列表外板名（防幻觉 guard 命中） | 丢弃该命中 → 当作"不匹配"清空 | raise（坏数据不参与裁决） |
+| LLM 判「不匹配」（判定本身可信） | 清空标签 | **不变**：清空标签 + `sector_available=false` |
+
+**落点**：`portfolio_decision.py` 模块级 `SectorVerifyUnavailable(RuntimeError)`；`_llm_arbitrate_sector_match` 六类坏输入全部 raise（含防幻觉 guard 由"丢弃"改"报错"），并用不同错误消息区分「LLM 不可用」与「LLM 输出不可信」（后者含"覆盖不全，缺案例 [..]"与"给出列表外板名"），归档里可直接定位失败类别；`_verify_candidate_sectors` 删掉保守清空分支，改为「置 `_sector_verify_degraded/_pending_count` 后原样上抛」，输入 stock 对象不被修改。
+
+**出口（必须失败，否则等于静默无决策）**：`orchestrator.run()` 的 Phase 2 except 分支 → `logger.exception` + 落 `status="failed"` 占位 `portfolio_decision.json`（`allocation=[]`、`warnings` 载原因）；`main.py --got` 分支读回决策后经 `_phase2_exit_code(decision)`：**决策缺失或 `status=="failed"` → `return 1`**（normal/partial → 0）。这样调度器/终端拿到非零退出码，占位产物只承担"区分没跑 vs 跑崩"的归档职责，不再冒充成功。
+
+**未加额外重试**：`LLMToolAdapter` 路由已配 `num_retries=2`（`llm_adapter.py:404/441`），单次网络抖动已在适配器内消化；本层再加一层会叠成 6 次调用，反而拉长整日决策延迟。
+
+**未改动（同类问题待裁决）**：`efinance.get_belong_boards` 取不到板块列表时仍「保留问财标签」继续（`portfolio_decision.py:1630-1640`）——同样是静默信任，只是失败源从 LLM 换成 efinance。按同一裁决原则应否一并 raise，待负责人拍板（该路径触发频率显著高于 LLM 仲裁失败：网络抖动即命中）。
+
+**观测补丁（同一轮，2026-10-20 review）**：既然 efinance 回退暂不改语义，**至少让它可数**——新增 `PortfolioDecision.sector_verify_unverified: [{symbol, sector, reason}]`（reason ∈ `efinance_empty` / `efinance_error`），逐票留痕并在日志 + `[板块验证] 完成` 行加计数。**动机（实测）**：20261016 的 `confirmed_sectors` 确实含 石油/石油开采/路桥（排除 `tag∉intel_map` 的跳过分支），而 `data_quality` 是 `sector_verify_degraded=null / sector_available_false_count=0`；重拉东财后这三只 L1 命中均为 False → 当日是「没验过即放行」，却与真命中在归档里**完全同形**。任何 precision/recall 的分母必须先扣掉这些行，否则回测数字不可信。
+
+**样本源解耦（同一轮）**：`candidate_pool.json` 快照不再挂在 `GOT_FAMILY_TOPPING_GATE_ENABLED` 下（原条件 `portfolio_decision.py:4258`）。它是 **D1 分道预算事后验证 + 板块匹配度评估的唯一带标签样本源**（universe 行保留验证前的原始 `sector_name`/`sector_type`），挂在无关闸门上会让「关 FTS」静默断掉样本积累，且事后无法从归档判断样本断在哪天。解耦后每日无条件落盘（try/except 降级、~15KB/日，同 `meta.json` 的「跑过就有文件」契约）。
+
+**现状口径别写错（2026-10-20 订正）**：板块标签被清空（`sector_available=false`）目前经 Q9-B（`portfolio_decision.py:4492-4496`）**强制 `action=watch` ⇒ 当日买不进**；「只剔板块维度权重、不强制 watch」是 **B 方案**（尚未拍板），不得当成既成行为描述。
+
+#### 行为证据判别实验（否定结论，2026-10-20；零代码改动、无消费点）
+
+**动机**：同源自证不可行（mobile 问财不支持「按股票反查概念清单」，四种问法均 0 行），跨 taxonomy（东财）结构性误杀，于是考虑"用市场行为判归属"：剔除市场因子后的**残差相关 + 超额同号率**。一次性探针（mootdx 日线，基准 881100 中证全指，窗口 20/40 日）
+
+| 票 | 板块 | 20 日 ρ | 40 日 ρ | 同号率 20/40 | 先验期望 |
+|---|---|---|---|---|---|
+| 601778 晶科科技 | 军贸→**代理 880507 国防军工** | 0.415 | 0.348 | 0.45 / 0.52 | 不联动 |
+| 000799 酒鬼酒 | 880381 白酒 | 0.489 | 0.518 | 0.70 / 0.65 | 联动 |
+| 001400 江顺科技 | 880685 液冷服务 | −0.080 | 0.073 | 0.70 / 0.68 | 未知（只记录） |
+
+**结论：不可作为闸门，也不得作为排序特征消费，只能观测**。理由四条：① 正负例 ρ 只差 0.07–0.17，在 N=20/40 的噪声带内，任何阈值（如 0.45）都是 2 样本过拟合；② 负例同号率 20 日 0.45 / 40 日 0.52，不构成"不联动"；③ 001400 出现 ρ≈0（−0.08/0.07）与同号率 0.70 的**指标分裂**，说明口径本身不稳；④ 只减单一市场基准的残差仍含风格/市值暴露（601778×国防军工 的 0.42 很可能来自共同的小盘成长暴露，与板块归属无关）；且军贸概念在 TDX 无对应板块（只有 国防军工/军工信息/军民融合），只能用代理。
+
+**检索证据校验组件（2026-10-20 落码并在当晚接线）**：`src/got/sector_evidence.py::evidence_supports_membership` —— 针对「检索 + LLM 判板块归属」的证据护栏。**只做 span 存在性校验不够**：601778 的检索结果里唯一出现「军贸」的片段讲的是**另一只票**（晶品特装 688084 军贸+内装），纯 span 校验会把它当成本票证据。规则三条：① 板块名与股票标识（名称或 6 位代码）须在**同一 segment**；② segment 内出现其他 6 位代码一律判否（同句混谈多票 ⇒ 归属不可归因）；③ 仅板块名无标的时，须同时满足「含指代词（该股/该公司/该标的）+ 结果标题含本票标识 + 段内无其他代码」，或 T3 指名式概念列表（见下节）。同文件提供来源白名单 `is_allowed_source`。
+
+**若将来仍要做行为闸门，前置条件（预登记，缺一不可）**：风格中性化（市场 + 市值 + 成长代理，或行业中位数调整）；带标注 (stock, board) 观测 ≥100 对；阈值与窗口预登记并跑 ≥2 个 walk-forward 窗口；单列观测产物（不接 `unified_scoring`/`allocation`）。在此之前，行为指标**不得**参与任何买卖决策。
+
+**测试**：`tests/test_verify_candidate_sectors.py` **11 passed**——新增/改写 4 例 fail-closed 与留痕（LLM 异常 raise 且不修改输入、列表外板名 raise、覆盖不全 raise、efinance 空/异常保留标签并记 `sector_verify_unverified`），原「命中保留 / 判不匹配清空 / 别名命中免 LLM」三例不变；`tests/test_family_topping_suppression.py` **57 passed**（新增 1 例：FTS 闸门关闭时 `candidate_pool` 快照仍落盘）。
+
+### 板块身份校验换裁判：联网检索证据 + LLM 判定（2026-10-20 晚实施，efinance 退役）
+
+**为什么换**：efinance 板块列表与问财/同花顺是两套 taxonomy，跨概念名结构性误杀——2026-10-20 三只 finalists 全被清空，其中 001400 江顺科技经检索证实确属「液冷服务器」。同日实测：军贸概念 15 只成员里 11 只与军贸无关（011/15 与同花顺该概念的真实成员不符），而液冷/数据中心 29 只大体是 AI 服务器链——**两种失败形态不同**，无法用"跨口径比对"统一裁决。
+
+**现行流程**（`_verify_candidate_sectors`，每只带有效板块标签的 finalist）：
+
+| 步骤 | 内容 |
+|---|---|
+| 1. 检索 | 2 条模板 × 最多 2 个 provider 顺位（`provider_offset` 0/1），**以护栏通过为停止条件**；单票 ≤4 次逻辑查询，`days=365`（概念归属是事实型，默认 7 天会漏证）。**死顺位收敛**：offset≥1 的引擎整轮无结果 → 类级记死顺位，本进程后续票/FXG 双跑不再等它（主顺位 0 永不停用）；`available_provider_count` 只数 `is_available` 的引擎，不保证网络可达 |
+| 2. 白名单 | `is_allowed_source(url)`：`urlparse().hostname` 精确/后缀匹配 12 个财经域名（stockstar/eastmoney/10jqka/cfi/cninfo/hx168/dabanke/sina/qq/163/hexun/jrj），防营销稿与 `evil.com/?x=stockstar.com` 伪造 |
+| 3. 身份护栏 | `evidence_supports_membership`：T1 同段含票标识 / T2 指代词+标题绑定 / T3 指名式概念列表（`核心概念 白酒概念`，段长 ≤120、段内无他票代码） |
+| 4. LLM 判定 | 通过护栏的原文批量一次调用，`verdict ∈ {member, not_member, uncertain}`，prompt 只给「票名/代码/板块/原文」并禁止引用未给内容 |
+| 5. 落地 | `member` 保留标签；`not_member`/`uncertain`/无证据 一律清空标签（Q9-B 强制 watch），reason 分别 `llm_rejected`/`llm_uncertain`/`insufficient_evidence` |
+| 6. 双跑复用 | FXG 基线影子（`_maybe_capture_fxg_baseline`）会用独立实例再跑一次 `_score_candidates`：类级 `(symbol, sector) → 决策` 缓存命中 → **零检索零 LLM**，检索/LLM 次数不翻倍（实测双跑 0 查询/0.0s vs 首跑 13 查询/24s） |
+
+**失败语义（决策系统口径）**：响应级 LLM 失败（异常/空/无 JSON 数组/解析失败/非数组）或**全部查询零结果**（有新票待查时） → `SectorVerifyUnavailable` → Phase 2 `status="failed"` 占位 + 进程退出码 1；**单案例脏输出**（缺 index / 非法 verdict）只把该票降为 `uncertain`，不废整日；**零候选**（无任何带标签 finalist）直接返回、零查询不抛错；**有结果但全被白名单滤掉** → `insufficient_evidence`，不判为检索故障；**全缓存命中**（双跑第二轮）不触发检索故障判据。
+
+**留痕**：`portfolio_decision.json.sector_verify_evidence`（member 票的 `quote/provider/query`）+ `sector_verify_unverified`（三 reason）+ `reasoning.md` Node 7 段「### 板块身份校验（web 证据）」；日志 `[板块验证] 检索 N 票/M 次查询（可用引擎 K）`、`非白名单来源略过 N 条（host 分布 top5）`、`第 N 顺位引擎整轮无结果，本进程内停用`、`复用本进程已校验决策 N 票`。
+
+**实测读数（2026-10-20 探针，Bocha 单引擎实跑）**：
+
+| 票 | 判定 | 证据 |
+|---|---|---|
+| 001400 江顺科技 × 液冷服务器 | **member** | 证券之星「1月7日江顺科技涨停:液冷服务器,有色金属,航天概念热股」 |
+| 601778 晶科科技 × 军贸概念 | insufficient_evidence | 唯一含「军贸」片段讲晶品特装(688084)，被护栏规则 2 拒；白名单内无证据 |
+| 000799 酒鬼酒 × 白酒概念 | insufficient_evidence | 见下「白名单召回损失摊开」 |
+| 002076 *ST星光 × 数据中心 | insufficient_evidence | 白名单内仅证券之星「信息安全子公司」一条，与板块无关 |
+
+**白名单召回损失摊开（31 条原始结果逐条判定，2026-10-20）**：白名单放行 9 条（stockstar×4 / news.qq×2 / 163×1 / cfi×1 / finance.stockstar×1），滤掉 22 条。滤掉的 22 条里：`q.stock.sohu.com`×11 **全是行情页**（「酒鬼酒:54.99 -0.02% 000799」，无板块词，扩了也过不了身份护栏）；`stock.qianzhan.com`×4、`s.askci.com`×2 均为财报/主营页（snippet 无板块词）；`m.southmoney.com`×2 题材页（snippet 不含板块词）；`caijing.chinadaily.com.cn`×2；`xueqiu.com`×1 为 UGC 帖——**唯一一条过了身份护栏的 off-list 结果**（snippet 中票标识与白酒板块词绑定成立），被白名单挡下属 UGC 信任取舍（雪球股主帖是散户观点，本就是白名单要挡的来源），是当天唯一真实召回损失。**其余 21 条 off-list 全部过不了身份护栏，扩白名单（sohu/qianzhan/askci/southmoney）零召回收益**；000799 判 insufficient = Bocha 对该票只返回行情/财报页 + F10 概念列表页（hx168/dabanke）未被召回（检索源覆盖问题）+ 雪球 UGC 有意排除。当天买不进，安全侧。
+
+**测试**：`tests/test_sector_evidence.py` **11 passed**（原 6 + T3 3 + 白名单 2 组）、`tests/test_search_generic.py` **4 passed**（单 provider 切片语义）、`tests/test_verify_candidate_sectors.py` **14 passed**（证据命中/无证据/白名单滤空/LLM 三态/非法枚举/响应级失败/全空/零候选/部分空/601778 反例 + 新增：死顺位整轮停用 + FXG 双跑决策缓存复用）。
+
+**e2e 生产链路验证（2026-10-20 21:31–21:54 `--got` 重跑，exit=0，status=normal；16:04 归档为旧 efinance 裁判末轮不计）**：
+
+| 核对项 | 结果 |
+|---|---|
+| 新裁判在生产生效 | ✓ 4 只主线终选票走完 检索→白名单→护栏→LLM 仲裁：601778/603619/002946 `insufficient_evidence`、300164 `llm_uncertain`，全清标签 → Q9-B watch（13 次查询，`sector_verify_unverified` reason 枚举为新值，efinance 旧路径无此产出） |
+| `sector_verify_evidence`/`unverified` 落盘 | ✓ 键均在（evidence=None：本日 0 例 member，正常） |
+| 三条评审加固实战生效 | ✓ 死顺位引擎整轮停用（第 2 顺位 SearXNG 无结果即类级记死）；FXG 双跑决策缓存复用（第 2 次 `_score_candidates` 0 查询 vs 首跑 13）；白名单略过 19 条落 host 分布 top5（sohu×12/qianzhan×4/southmoney×2/baogaobox×1） |
+| D4/D3 配套 | ✓ meta `scoring_formula_version=2026-10-20.1`；candidate_pool universe 37 行全带 `sector_type`（ambush 22/mainline 15）；union 接线确认（pd.py:4281 `"union"`）；trade_plan_log 2 条（对账+空 allocation 留痕） |
+| 分道预算明细 | 当日无产出（allocation=[] → `lane_budget_split_shadow=[]`）：22 只埋伏全部 G-A1 flow_negative 零 finalists、主线终选 1 票 watch——结构代码就位（pd.py:5587 lane_trace 含 `lane/lane_weight/formula_version`），首个买单日可见。~~注：`funnel_stats.lane_merge_mode` 仅 `--screener` 路径落盘~~ **已修（同日）**：合并块被 `if lane_finalists:` 守卫致零 finalist 日缺键，`stock_screener.py:2356` 补 else 分支无条件落 `lane_merge_mode`，`test_zero_lane_finalists_still_records_merge_mode` 回归覆盖 |
+| 当日语义 | 安全侧拒买：检索源覆盖不足（Bocha 单引擎，第二顺位未配）→ 真实成员也可能 insufficient → 全 watch/空仓。运营项不变：配 Tavily/Brave 或自建 SearXNG 后自动恢复双顺位 |
+
+---
+## ‼️ 2026-10-16 补登（G-A2 催化闸门双死点修复 — pool fast-pass + day-0 窗口口径对齐）
+
+**性质**：修复即转正对象（同 2026-10-13 埋伏道遮蔽修复先例——两死点均为「生产路径构造性失效」，无影子判据，登记重放/回归读数供复核）。
+
+| 项 | 内容 |
+|---|---|
+| 死因（当日两跑实测） | 埋伏道 `G-A1→15 G-A2→0` 连续 0 输出。①首跑东数西算：G-A2 日历名字级匹配缺口——GTC 事件 affected_sectors 无「东数西算」且 board_aliases 无桥接别名；②重跑军民融合：三要素两过（affected_sectors 直含 + conf 0.8≥0.7）但事件 dated today，旧谓词 `0 < days_to_event` 剔除当日事件，而 Node 6 `_compute_catalyst_score` day-0 分支照常入池——两套窗口口径分裂。两死点互相独立，只修一个漏另一个 |
+| 修法（用户拍板：窗口 + pool 放行） | ①G-A2 增 `ambush_pool_names` 参数，候选板块 ∈ Node 6 `ambush_pool` 直接通过催化判定进位置安全带（`g_a2_pool_pass` 独立计数）；Node 6 入池已完成语义匹配（T5/relations）与 D4/G4 折信，道内不复算——D4 折信作用域 = pool 准入/排序，不下沉道内闸门（与 P5 同口径），不拿折后值对原置信 gate；②窗口谓词 `0 <` → `0 <=`；位置安全带抽 `_ga2_position_belt` 共用，pool 通道不豁免 close/high20/ma20 |
+| 接线 | pool 白名单来源 `got_context.unified_context.ambush_pool`：归档路径 `_load_got_context` 本就装载；Node 7 内存装配（portfolio_decision.py got_context dict）补 `unified_context` 键对齐。生产 `--got` lane 候选恒 ⊆ pool 成员（aggregator pool-members-only + Node 7 actionable 裁剪）⇒ pool fast-pass 构造性生效、G-A2 催化谓词退化为纯位置安全带（设计接受）；`--screener` 回放路径名字匹配兜底仍是活的，勿当死代码删除 |
+| 回归锚点 | `tests/test_ambush_lane_split.py` **23 passed**（新增 3 例：day-0 事件入窗 / pool fast-pass + 位置安全带不豁免 + `g_a2_pool_pass` 计数 / 无日历+空事件双分支 pool 放行）；catalyst/ambush/screener 选择集 **147 passed** |
+| 端到端回放（真实归档） | 20261016 归档 context（`_load_got_context`，pool=[军民融合]）+ 15 只军民融合合成 lane 输入 → `G-A1→15 G-A2→15(pool_pass=15, no_catalyst=0) G-A3→15 G-A4→1`；对照修复前当日实测 `G-A2→0`。G-A4 后排序/TopK 边界未实测（依赖完整问财 universe，属生产实跑职责） |
+| 新可观测性 | 日志埋伏道闸门行增 `pool_pass=` 字段；`funnel_stats.round_survival_counts` / `portfolio_decision.json.ambush_lane_trace` 随扁平合并自动携带 `g_a2_pool_pass`；schemas.py `ambush_lane_trace` description 同步 |
+
+---
+
+## ‼️ 2026-10-16 补登 #6（Q1 low 事件板块级救援直连 + 埋伏 E14 出场催化宽限影子）
+
+**RCA 背景**：Q1 排查发现 Node 4 三级过滤把 `impact_level=low` 事件无痕蒸发——其中混有「全局 low 但板块级 high」事件（如行业性利好只影响单板块时全局显著度低）。该类事件本应进 `major_events` → NewsContext → impact_score → 日历候选池，现被一级过滤整体丢弃，埋伏/主线候选池系统性缺粮。同一 RCA 下第二发现：埋伏道 E14（催化临近转出）把「转出后 10 交易日内有合格催化」的板块直接清出场，宽限判据存在但从未生效，属潜在误杀线。两条线同日落码，**Fix 1 用户裁决直连（覆盖影子先行缺省）**，Fix 2 照影子惯例零决策改动。
+
+**开关**（`src/got/catalyst_config.py`）：
+
+| 开关 | 缺省 | 说明 |
+|---|---|---|
+| `GOT_LOW_SECTOR_RESCUE` | `1`（直连） | Q1 low 板块救援总开关；`0` 一键回滚原过滤行为（回滚语义=不升级） |
+| `LOW_RESCUE_TEMPERATURE` | `0.2` | 救援复审 LLM 温度（判定任务低温） |
+| `LOW_RESCUE_MAX_TOKENS` | `2000` | 救援复审输出 token 上限 |
+| `GOT_AMBUSH_EXIT_GRACE_SHADOW` | `1` | 埋伏 E14 出场催化宽限影子开关（只算只落盘） |
+| `AMBUSH_EXIT_GRACE_WINDOW_DAYS` | `10` | 宽限窗口（交易日） |
+
+**两线落码**：
+
+| 线 | 位置 | 行为 |
+|---|---|---|
+| Fix 1 救援 | `news_analysis.py` `_rescue_low_events`（run() Step 3.1 接线） | 复审候选=affected_sectors 非空且 sentiment≠negative 的 low 事件；LLM 三维判定（冲击共性/板块占比/增量信息，few-shot 文献接地）→ `sector_impact=high` 事件**原地升级 medium**（NewsEvent 可变，全字段保留）直连进 DB/NewsContext/impact_score（medium=1.0 权重）/日历候选池；LLM/解析失败→方法内消化（降级原过滤，**仍落 failure 影子**）；开关关→disabled 占位影子 |
+| Fix 1 留痕 | `data/got_daily/{date}/shadow_low_events.json` | 全量 low 事件逐条 sector_impact（含未送审行）+ 三态分布 + failure 说明；`archive.py` 搬运/渲染/进度四件套齐 |
+| Fix 2 宽限 | `aggregator.py` `_compute_ambush_exit_grace_shadow`（run() 挂载） | E14 识别=前日 ambush→今日 neutral（排 E12b+复验 E14）；合格催化=confidence≥CATALYST_CONFIDENCE_GATE 且 direction≠negative；窗口 1≤交易日至 event_date≤10；`grace_would_hold` 判定**只落盘不改判**；replay_mode 跳过；DB 失败→warning+空样本落盘（漏记不误记） |
+| Fix 2 留痕 | `data/got_daily/{date}/shadow_ambush_exit_grace.json` | records[]（sector/判据/grace_would_hold/nearest_event）+ grace_candidates_count；reasoning.md 🧪 段渲染体 + 转正进度行 |
+
+**转正/质量判据**：
+- **Fix 1（直连，观测即验收）**：升级率（upgraded/review_candidates）与升级事件次日板块表现抽查并行走 10 交易日；`sector_impact_dist` 高位事件应能复现「板块级利好被全局低显著度掩盖」形态。
+- **Fix 2（影子，≥10 交易日）**：`grace_candidates_count>0` 天数占比；`grace_would_hold=true` 的板块后续 5 日 `strength_trajectory` 对照转出组（若宽限组显著更优→立案转正评估；无差异/更差→影子作废，E14 判据不动）。
+
+**回滚判据**：
+- Fix 1：升级率 >50% 且抽查多数无板块级影响（LLM 过度乐观）→ `GOT_LOW_SECTOR_RESCUE=0` 回滚并复盘 prompt；
+- Fix 2：影子期内 grace 组转出后板块走弱（strength_trajectory 负向占优）→ 维持 E14 现判据，影子线关闭。
+
+**登记日 / clock_start**：均 2026-10-16（进度行 `required=10`）。
+
+---
+
 ## ‼️ 2026-10-15 补登 #5（决策编排层 B 门五项拍板落地第一版 — thesis 四态状态机 + 全账户聚合）
 
 **资料包**：[`plans/决策编排层_step0_裁决资料包_20261015.md`](plans/%E5%86%B3%E7%AD%96%E7%BC%96%E6%8E%92%E5%B1%82_step0_%E8%A3%81%E5%86%B3%E8%B5%84%E6%96%99%E5%8C%85_20261015.md)；**实施计划**：[`plans/GOT三问架构裁决_实施计划_20261015.md`](plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261015.md)。五项裁决按资料包推荐倾向落第一版。
@@ -115,13 +306,15 @@
 
 ### D3 分道预算门控骨架（零决策，fail-fast）
 
+> **⚠️ 已被取代（2026-10-20）**：门控块与 `raise NotImplementedError` 已删除，D3 分道预算转正生效（`GOT_LANE_BUDGET_ENABLED` 缺省 `1`），见本文件「2026-10-20 转正补登」节。下文保留为历史判据记录。
+
 `GOT_LANE_BUDGET_ENABLED`（catalyst_config.py:387，缺省 `0`）→ `_allocate` 预算行前插入门控块（portfolio_decision.py:5205-5209）：`=1` 时 `raise NotImplementedError`——**接线被 D1 标定判据阻塞，按 O3 纪律不允许静默等权旁路**。转正判据：`scripts/backtest_lane_budget.py` 前向超额分箱出显著区分度（lane 主胜出且差距 ≥2pp）+ Layer 2 积样 ≥20 交易日/≥30 票 + `SCORING_FORMULA_VERSION` bump + 基线 diff 归零，四条同时满足才允许把门控块替换为真实预算接线。
 
 ### D4 trace 增强（`GOT_LANE_BUDGET_SHADOW=1` 时 lane_budget_split_shadow 道条目内新增两键）
 
 | 字段 | 语义 | 供数 |
 |---|---|---|
-| `lane_budget_applied` | 该道当日 D3 是否生效（bool，恒 false 直至 D3 转正） | `GOT_LANE_BUDGET_ENABLED` 直读 |
+| `lane_budget_applied` | 该道当日 D3 是否生效（bool；2026-10-20 转正后缺省 true，`GOT_LANE_BUDGET_ENABLED=0` 时 false） | `_allocate` call-time 直读 `GOT_LANE_BUDGET_ENABLED` |
 | `would_be_split` | 若 D3 生效，该道假想预算比 = `LANE_BUDGET_PARAMS[lane]×n / Σ`（`buy_candidates[:3]`，screener `sector_type` 词表经 `_stype_to_role` 映射到 sector_role 词表，miss→unknown；纯计算，不重排不触碰 allocation） | `:5310-5335` |
 | `catalyst_supply_by_lane` | 该道板块当日 confidence≥0.7 催化剂事件数（与 P5 同门槛 `CATALYST_CONFIDENCE_GATE`） | `_score_candidates` 末尾 `_last_catalyst_supply`（catalyst_calendar.events → normalize_sector_name 归一化键，`:4090-4118`）；查询侧同归一化（`:5339-5349`） |
 
@@ -201,8 +394,8 @@
 | 回归锚点 | `tests/test_ambush_lane_split.py` 14 绿（含 2 新例：全链路断言 `_run_ambush_lane` 恰调 1 次；失败注入验证 failing-before/passing-after 闭环） |
 | **重放读数（归档上下文+真实闸门函数）** | 50 票 → A1 50 过（`g_a1_pass=40 soft_pass=10 flow_negative=0`）→ A2 30 过（`no_catalyst=20`）→ A3 30 过 → A4 Top3=黄金/有色/小金属。逐板块：影视音像 **no_catalyst**（唯一事件 event_date=2026-10-13=运行日，`0 < days_to_event` 排除同日）；黄金概念 **no_catalyst**（事件只挂「黄金」「有色金属」，无别名变体）；黄金/有色/小金属 pass（conf 0.8/0.8/0.7）→ 三板块本应各出 TopK 候选 |
 | 重放局限 | ① 逐票 change_pct/volume_ratio 归档无 → G-A3 用中性值（knife 判定不敏感）；② **G-A2 位置安全带是生产级 schema 缺口，非重放产物**：`SectorDetail`（`schemas.py:267+`）无 `klines` 字段且 `archive.py` 全量 model_dump ⇒ 归档 `sector.json` ambush 条目永不带 K 线，而 `_load_got_context` 消费的正是这些归档 JSON ⇒ `_build_sector_kline_lookup` 生产恒空缓存 → `position_unsafe` 分支**生产也恒 soft-pass**（~~已登 backlog 待接线~~ → **2026-10-14 修法③接线完成，见「2026-10-14 补登」节**） |
-| 新可观测性 | 下一实跑起：日志 `埋伏道闸门: in=… G-A1→… G-A2→… G-A3→… G-A4→… (soft= flow_neg= dde_deg= no_cat= low_conf= pos_unsafe= knife= err=)`（合并块后单时点扁平汇入 `funnel_trace`，含合并块写入的 `cross_lane_collision`/`lane_overflow_n`）；`meta.json.funnel_stats.round_survival_counts` 直接含 `lane_in/g_a1_pass/…/cross_lane_collision/lane_overflow_n` 扁平键（嵌套 `ambush_lane_trace` 键不再出现；trace 全量仍独立落 `portfolio_decision.json.ambush_lane_trace`） |
-| 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`。〔② candidate_pool.json 写入器键错位已不属于本节：2026-10-14 修复拍板（dict 直修·窄契约），迁 backlog §7 #13〕 |
+| 新可观测性 | 下一实跑起：日志 `埋伏道闸门: in=… G-A1→… G-A2→… G-A3→… G-A4→… (soft= flow_neg= dde_deg= no_cat= low_conf= pos_unsafe= pool_pass= knife= err=)`（合并块后单时点扁平汇入 `funnel_trace`，含合并块写入的 `cross_lane_collision`/`lane_overflow_n`）；`meta.json.funnel_stats.round_survival_counts` 直接含 `lane_in/g_a1_pass/…/cross_lane_collision/lane_overflow_n` 扁平键（嵌套 `ambush_lane_trace` 键不再出现；trace 全量仍独立落 `portfolio_decision.json.ambush_lane_trace`）。2026-10-16 增 `g_a2_pool_pass` 键（见「2026-10-16 补登」节） |
+| 待裁决（登记不修） | ① 同日事件窗口语义：`0 < d <= 14` 使运行日当天事件（如 OpenAI 发布会→影视音像）不可作催化剂——是否改 `0 <= d`。〔**已裁决并实施（2026-10-16，见「2026-10-16 补登」节）**：改 `0 <= d`〕〔② candidate_pool.json 写入器键错位已不属于本节：2026-10-14 修复拍板（dict 直修·窄契约），迁 backlog §7 #13〕 |
 
 ---
 
