@@ -18,6 +18,7 @@ import json
 import logging
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,7 +28,12 @@ from src.got.schemas import (
     DataQuality,
 )
 from src.got.news_feeds import fetch_all_news
-from src.got.catalyst_config import GOT_NEWS_EVIDENCE_GATING
+from src.got.catalyst_config import (
+    GOT_NEWS_EVIDENCE_GATING,
+    GOT_LOW_SECTOR_RESCUE,
+    LOW_RESCUE_TEMPERATURE,
+    LOW_RESCUE_MAX_TOKENS,
+)
 from src.storage import DatabaseManager, Node4EventRecord, Node4RawNewsRecord
 
 logger = logging.getLogger(__name__)
@@ -134,6 +140,48 @@ REASONING_PROMPT = """你是资深市场策略师。根据以下消息面分析�
 
 输出格式：纯文本（不要JSON）"""
 
+LOW_RESCUE_PROMPT = """你是 A 股板块研究员。以下事件被一审判为对大盘「low（轻微影响）」——大盘口径没错，但其中部分事件对**特定板块**可能是「high（重大影响）」。你的任务是逐条判定每个事件**对其映射板块**的影响等级。
+
+判定核心（一条主线）：该事件对映射板块是**共同冲击**还是**份额重分配**？
+共同冲击 = 改变板块整体的共同基本面——行业需求扩张/收缩、技术路线验证或证伪、政策管辖变化、供应链成本变化；板块内多数公司同向受益/受损。
+份额重分配 = 只改变板块内部竞争格局——竞对受损、个别公司拿单/抢份额；板块整体不动。份额重分配不是板块级利好，sector_impact 封顶 medium。
+
+当前板块精选概念列表：{concept_list}
+
+候选事件（一审 low，已有板块映射）：
+{events_json}
+
+## 三维判定标准
+
+1. **冲击共性**：事件是否作用于映射板块的共同基本面（行业需求、技术路线、政策管辖、供应链成本）？竞对破产、竞对丢单等零和事件即使直接作用于板块内公司，也只是份额重分配，判 low。
+2. **板块占比**：板块内是否有相当数量或较大权重的公司把事件主题作为主要收入来源或核心叙事？个别公司沾边撑不起板块级影响。
+3. **增量信息**（两级）：
+   硬规则——首报 vs 追进：事件是否为该进展的**首次披露**？同一事实的追进报道、重复确认、已兑现回声无增量信息，判 low（与催化剂日历 D1 回声守卫同口径）。
+   先验——量化 vs 软故事：含具体数字/日期/量级（订单金额、产能、税率、交付节点）的量化事件市场欠反应、漂移可观；发布会、人物言论、宏观评论等软故事易过度反应。软故事存疑时在 high/medium 之间降档，不硬排除。
+
+## sector_impact 分级
+
+**high**：维度 1（共同冲击）与维度 2（板块占比）同时满足，且为首报、非回声。事件是板块级需求/技术/政策叙事的增量催化。
+**medium**：板块相关但不满足全部条件——共同冲击但板块占比不足；或板块占比足但属份额重分配；或首报但软故事存疑。
+**low**：份额重分配、追进/回声、或对板块仅情绪面间接传导（与大盘口径无实质差异）。
+
+## Few-shot
+
+事件：「特斯拉 Roadster 完成首次飞行演示」，板块：[汽车零部件, 飞行汽车]
+→ eVTOL 技术可行性首次实证，改变低空经济板块整体商用化进程预期（维度1 共同冲击✓）；板块核心叙事即商用化进展（维度2✓）；演示当日实际发生=进展实证首报、非预告重申（维度3✓）→ sector_impact=high
+
+事件：「某新能源公司获 10GWh 储能大单」，板块：[储能]
+→ 订单仅个别公司受益，不改板块整体供需格局（维度1 份额重分配✗）→ sector_impact=low
+
+事件：「某省发布促消费若干措施」，板块：[零售]
+→ 政策非直接作用于零售具体业务（维度1✗）；板块叙事多元不以此为核（维度2✗）→ sector_impact=low
+
+## 输出
+
+输出 JSON 数组，每项：
+{{"index": 0, "sector_impact": "high|medium|low", "reason": "判定理由（引用命中的维度，一句话）"}}
+只输出 JSON。index 对应候选事件列表的 0-based 序号。宁严勿松：拿不准 high 还是 medium 时给 medium。"""
+
 
 class NewsAnalysisNode:
     """消息面分析节点"""
@@ -189,8 +237,17 @@ class NewsAnalysisNode:
         # Step 3: 多源确认
         events = self._apply_source_count(events, raw_news)
 
-        # 过滤 low-impact 的事件（不参与 major_events 输出）
-        events = [e for e in events if e.impact_level != "low"]
+        # Step 3.1: low 事件板块级救援（Q1 修复，GOT_LOW_SECTOR_RESCUE=1 缺省直连，用户裁决 2026-10-16）：
+        # LLM 按三维判定标准复审 low 事件的板块级影响，sector_impact=high 的事件升级 medium
+        # 进链路（DB/NewsContext/impact_score/日历候选池自然吃到），终结 low 无痕蒸发。
+        # 复审范围=affected_sectors 非空且非 negative（D2）；sector_impact 全量落影子 JSON（D4）。
+        try:
+            events = await self._rescue_low_events(events)
+        except Exception as exc:  # noqa: BLE001 — 救援旁路：失败降级=保持原过滤行为
+            logger.warning("[Node 4] low 事件板块级救援失败（降级为原过滤行为）: %s", exc)
+            events = [e for e in events if e.impact_level != "low"]
+        else:
+            events = [e for e in events if e.impact_level != "low"]
 
         # Step 3.5: 事件持久化（跨日记忆）
         self._save_events_to_db(events, raw_news)
@@ -699,6 +756,204 @@ class NewsAnalysisNode:
                 ))
 
         return events
+
+    # =================================================================
+    # Step 3.1: low 事件板块级救援（Q1，2026-10-16 RCA，用户裁决直连）
+    # =================================================================
+
+    async def _rescue_low_events(self, events: List[NewsEvent]) -> List[NewsEvent]:
+        """复审「全局 low 但板块 high」事件：affected_sectors 非空且 sentiment != "negative"
+        的 low 事件送 LLM 三维判定（冲击共性/板块占比/增量信息，文献接地见
+        docs/got/verification.md 补登 #6），sector_impact=high 的事件原地升级 medium
+        直连进链路（DB/NewsContext/impact_score/日历候选池自然吃到），终结无痕蒸发。
+
+        sector_impact 全量留痕 shadow_low_events.json（质量观测+回滚审计）。
+        降级语义：LLM 失败/解析失败 → 异常上抛由 run() 回退原过滤；开关关 → 不调 LLM
+        落 disabled 占位；落盘失败 → 仍返回升级结果（留痕失败≠救援失败）。
+        """
+        day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+        low_all = [e for e in events if e.impact_level == "low"]
+
+        # 开关关：disabled 占位 JSON（行为开关关=显式留痕，非「缺开关=缺文件」惯例）
+        if not GOT_LOW_SECTOR_RESCUE:
+            self._write_low_rescue_shadow(day_dir, {
+                "date": date.today().strftime("%Y%m%d"),
+                "switch": False,
+                "status": "disabled",
+                "low_count": len(low_all),
+                "review_candidates": 0,
+                "upgraded": 0,
+                "sector_impact_dist": {},
+                "events": [
+                    {"title": e.title, "affected_sectors": list(e.affected_sectors),
+                     "sentiment": e.sentiment, "sector_impact": None,
+                     "reason": "开关关闭，未送审", "upgraded_to": None}
+                    for e in low_all
+                ],
+                "note": "GOT_LOW_SECTOR_RESCUE=0 已回滚原过滤行为",
+            })
+            return events
+
+        # D2: 复审候选 = 板块映射非空 且 非 negative
+        candidates = [
+            e for e in low_all
+            if e.affected_sectors and e.sentiment != "negative"
+        ]
+
+        if not candidates:
+            self._write_low_rescue_shadow(day_dir, {
+                "date": date.today().strftime("%Y%m%d"),
+                "switch": True,
+                "low_count": len(low_all),
+                "review_candidates": 0,
+                "upgraded": 0,
+                "sector_impact_dist": {},
+                "events": [
+                    {"title": e.title, "affected_sectors": list(e.affected_sectors),
+                     "sentiment": e.sentiment, "sector_impact": None,
+                     "reason": "无板块映射或负面事件，未送审", "upgraded_to": None}
+                    for e in low_all
+                ],
+                "note": "无复审候选（有效样本：0 命中≠0 数据）",
+            })
+            return events
+
+        events_json = json.dumps(
+            [
+                {"index": i, "title": e.title, "summary": e.summary,
+                 "affected_sectors": list(e.affected_sectors), "sentiment": e.sentiment}
+                for i, e in enumerate(candidates)
+            ],
+            ensure_ascii=False,
+        )
+        # 复用 Node 4 自有 _call_llm（T2 critic 串行形态）；解析不走 _extract_json
+        # （其 dict-only 截断修复对数组协议形状错配——会把截断数组静默解析成首事件对象）
+        try:
+            raw = await asyncio.to_thread(
+                self._call_llm,
+                LOW_RESCUE_PROMPT.format(
+                    concept_list=self._build_concept_list_str(),
+                    events_json=events_json,
+                ),
+                temperature=LOW_RESCUE_TEMPERATURE,
+                max_tokens=LOW_RESCUE_MAX_TOKENS,
+            )
+            verdicts = self._parse_low_rescue_verdicts(raw)
+        except Exception as exc:  # noqa: BLE001 — LLM 失败/解析失败：降级不升级，仍落影子（T4/T5 契约）
+            logger.warning("[Node 4] low 救援 LLM/解析失败（降级为原过滤行为）: %s", exc)
+            self._write_low_rescue_shadow(day_dir, {
+                "date": date.today().strftime("%Y%m%d"),
+                "switch": True,
+                "low_count": len(low_all),
+                "review_candidates": len(candidates),
+                "upgraded": 0,
+                "sector_impact_dist": {},
+                "events": [
+                    {"title": e.title, "affected_sectors": list(e.affected_sectors),
+                     "sentiment": e.sentiment, "sector_impact": None,
+                     "reason": "LLM/解析失败，未获判定", "upgraded_to": None}
+                    for e in low_all
+                ],
+                "failure": f"{type(exc).__name__}: {exc}",
+                "note": "LLM 复审失败降级：不升级=回滚语义；失败留痕供质量观测",
+            })
+            return events
+        by_index = {
+            v["index"]: v for v in verdicts
+            if isinstance(v.get("index"), int)
+            and 0 <= v["index"] < len(candidates)
+            and v.get("sector_impact") in ("high", "medium", "low")
+        }
+
+        upgraded = 0
+        verdict_by_candidate: Dict[int, Dict[str, Any]] = {}
+        for i, e in enumerate(candidates):
+            v = by_index.get(i)
+            if v is None:
+                continue  # LLM 漏判/非法条目：不升级不臆测
+            was_upgraded = False
+            if v["sector_impact"] == "high" and e.impact_level == "low":
+                e.impact_level = "medium"  # 原地升级，全字段保留（source_url/timestamp/affected_stocks 不丢）
+                was_upgraded = True
+                upgraded += 1
+            verdict_by_candidate[id(e)] = {**v, "upgraded_to": "medium" if was_upgraded else None}
+
+        # 全量留痕：low 事件逐条（含未送审），sector_impact_dist 三态分布
+        candidate_ids = {id(e) for e in candidates}
+        events_out = []
+        for e in low_all:
+            if id(e) in candidate_ids and id(e) in verdict_by_candidate:
+                v = verdict_by_candidate[id(e)]
+                events_out.append({
+                    "title": e.title,
+                    "affected_sectors": list(e.affected_sectors),
+                    "sentiment": e.sentiment,
+                    "sector_impact": v["sector_impact"],
+                    "reason": v.get("reason"),
+                    "upgraded_to": v.get("upgraded_to"),
+                })
+            else:
+                events_out.append({
+                    "title": e.title,
+                    "affected_sectors": list(e.affected_sectors),
+                    "sentiment": e.sentiment,
+                    "sector_impact": None,
+                    "reason": "无板块映射或负面事件，未送审" if id(e) not in candidate_ids
+                              else "LLM 未返回该条目判定",
+                    "upgraded_to": None,
+                })
+        dist = {"high": 0, "medium": 0, "low": 0}
+        for v in verdict_by_candidate.values():
+            dist[v["sector_impact"]] += 1
+        self._write_low_rescue_shadow(day_dir, {
+            "date": date.today().strftime("%Y%m%d"),
+            "switch": True,
+            "low_count": len(low_all),
+            "review_candidates": len(candidates),
+            "upgraded": upgraded,
+            "sector_impact_dist": dist,
+            "events": events_out,
+            "note": "Q1 low 事件板块级救援（直连，用户裁决 2026-10-16）；"
+                    "sector_impact 全量留痕（三维判定·文献接地），≥10 交易日质量观测",
+        })
+        return events
+
+    @staticmethod
+    def _parse_low_rescue_verdicts(raw: str) -> List[Dict[str, Any]]:
+        """解析救援复审输出（T2 critic 内联惯例：剥 ``` 围栏 → json.loads → list 守卫）。
+
+        数组协议不走 _extract_json：其 dict-only 截断修复会把截断数组静默解析成
+        首事件对象（形状错配非报错）。失败 raise，由 run() 降级为原过滤行为。
+        """
+        if not raw or not raw.strip():
+            raise ValueError("low 救援复审 LLM 空响应")
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        items = json.loads(cleaned)
+        if not isinstance(items, list):
+            raise ValueError(f"low 救援复审输出非数组: {type(items).__name__}")
+        return [v for v in items if isinstance(v, dict)]
+
+    @staticmethod
+    def _write_low_rescue_shadow(day_dir: Path, record: Dict[str, Any]) -> None:
+        """落 shadow_low_events.json（tmp+replace 原子写，jump/antibias 同款惯例）。"""
+        try:
+            day_dir.mkdir(parents=True, exist_ok=True)
+            out = day_dir / "shadow_low_events.json"
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(out)
+            logger.info(
+                "[Node 4] low 救援影子落盘: low=%d candidates=%d upgraded=%d",
+                record.get("low_count", 0),
+                record.get("review_candidates", 0),
+                record.get("upgraded", 0),
+            )
+        except OSError as exc:
+            # 留痕失败≠救援失败：升级结果照常返回，只告警
+            logger.warning("[Node 4] shadow_low_events.json 落盘失败（已忽略）: %s", exc)
 
     # =================================================================
     # Step 3.5: 事件持久化（跨日记忆）

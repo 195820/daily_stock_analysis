@@ -75,6 +75,8 @@ from src.got.catalyst_config import (
     GLUE_PIPELINE_ENABLED,
     GOT_A6_ENABLED,
     GOT_AMBUSH_VALIDATION_SHADOW,
+    GOT_AMBUSH_EXIT_GRACE_SHADOW,
+    AMBUSH_EXIT_GRACE_WINDOW_DAYS,
     GOT_REGIME_JUMP_SHADOW,
     GOT_REGIME_JUMP_PENALTY,
     REGIME_JUMP_LAMBDA,
@@ -477,6 +479,14 @@ class AggregatorNode:
         ambush_lane_validation = self._build_ambush_lane_validation(
             ambush_pool, ambush_reservoir, sector
         )
+
+        # 埋伏出场催化宽限影子（2026-10-16 RCA，GOT_AMBUSH_EXIT_GRACE_SHADOW=1 缺省）：
+        # E14-only、只算只落盘、零决策改动。replay_mode 跳过（0903 A1 契约：回放不产生持久化副作用）。
+        if GOT_AMBUSH_EXIT_GRACE_SHADOW and not replay_mode:
+            try:
+                self._compute_ambush_exit_grace_shadow(sector, news)
+            except Exception as exc:  # noqa: BLE001 — 影子旁路：降级不阻塞主链路
+                logger.warning("[Node 6] 出场宽限影子计算失败（已忽略）: %s", exc)
 
         unified = UnifiedContext(
             status="manual_review_required" if self._has_critical(temporal) else "normal",
@@ -2838,6 +2848,133 @@ class AggregatorNode:
             logger.info(f"[Node 6] 升格支路 relations 补挂快照: {_DISCARD_STATS}")
 
         return promoted_pool, remaining
+    def _compute_ambush_exit_grace_shadow(
+        self, sector: SectorContext, news: NewsContext
+    ) -> None:
+        """埋伏出场催化宽限影子（2026-10-16 RCA，零决策改动观测线）
+
+        E14 动量转负/低分出场是纯技术判据，催化剂日历从不参与。本影子只观测：
+        当日发生「前日 ambush → 今日 neutral」的 E14 转出时，日历若存在该板块
+        N 交易日内合格催化事件，记 grace_would_hold（假使宽限转正，该板块当日本会
+        保留在 ambush）。零决策改动——状态机/埋伏池/蓄水池全部不变。
+
+        谓词源（计划 §2.2b）：前日 state 用 DB node2_sector_trends（状态机写入真相源）；
+        当日 E14 判据用当日 DB 行（rrg_momentum_ema / strength_score，0-100 口径，
+        与 _apply_state_machine 同源落库）。落 shadow_ambush_exit_grace.json。
+        """
+        from src.storage import DatabaseManager, Node2SectorTrendRecord
+
+        today = self._run_date
+        prev_rows: list = []
+        today_rows: list = []
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                # 前日行：limit(200) 覆盖近 2-3 日（单日约 80-90 板块），按 code 去重取最新
+                prev_rows = (
+                    session.query(Node2SectorTrendRecord)
+                    .filter(Node2SectorTrendRecord.tracking_date < today)
+                    .order_by(Node2SectorTrendRecord.tracking_date.desc())
+                    .limit(200)
+                    .all()
+                )
+                today_rows = (
+                    session.query(Node2SectorTrendRecord)
+                    .filter(Node2SectorTrendRecord.tracking_date == today)
+                    .all()
+                )
+        except Exception as exc:  # noqa: BLE001 — DB 缺表/空库：warning + 空样本落盘（漏记不误记）
+            logger.warning("[Node 6] 出场宽限影子 DB 读取失败（按空样本落盘）: %s", exc)
+
+        prev_states: dict[str, tuple] = {}
+        for row in prev_rows:
+            if row.sector_code not in prev_states:
+                prev_states[row.sector_code] = (
+                    row.tracking_date, row.state, int(row.dwell_days or 0),
+                )
+        today_by_code = {row.sector_code: row for row in today_rows}
+
+        calendar = getattr(news, "catalyst_calendar", None)
+        events_by_sector = self._group_events_by_sector(calendar.events if calendar else [])
+
+        candidates: list[dict] = []
+        # E14 当日转出识别：前日 ambush + 今日 neutral + E14 判据复验 + 排 E12b 飞刀。
+        # 前日 dwell>=2 不复验——「前日 ambush→今日 neutral」且非飞刀已唯一指向 E14
+        # （E16 起点 defensive_rotation 非 ambush；E13 结果是 active_mainline 非 neutral）。
+        for code, row in today_by_code.items():
+            prev = prev_states.get(code)
+            if not prev or prev[1] != "ambush":
+                continue
+            if row.state != "neutral":
+                continue
+            mom = float(row.rrg_momentum_ema or 0.0)
+            strength = float(row.strength_score or 0.0)
+            if mom < 0.2 and strength < 25:
+                continue  # E12b 飞刀硬退出，不属宽限对象（D7）
+            if not (mom < 0.5 or strength < 50):
+                continue  # E14 判据不复匹配（防御：当日行被其他路径改写时）
+
+            sector_name = (row.sector_name or "").strip()
+            sector_events = (
+                self._lookup_sector_events(sector_name, events_by_sector)
+                if sector_name else []
+            )
+            # 与埋伏池路径同款 0.7 预滤 + 负面排除
+            qualified = [
+                e for e in sector_events
+                if e.confidence >= CATALYST_CONFIDENCE_GATE and e.direction != "negative"
+            ]
+            nearest = None
+            grace_would_hold = False
+            for e in qualified:
+                td = _count_trade_days(today, e.event_date)
+                if not 1 <= td <= AMBUSH_EXIT_GRACE_WINDOW_DAYS:
+                    continue  # past 事件（≤0）与超窗（>10）自然排除
+                grace_would_hold = True
+                if nearest is None or td < nearest["trade_days_away"]:
+                    nearest = {
+                        "event_id": e.event_id,
+                        "title": e.title,
+                        "event_date": e.event_date.isoformat(),
+                        "confidence": float(e.confidence),
+                        "direction": e.direction,
+                        "trade_days_away": td,
+                    }
+            candidates.append({
+                "sector_code": code,
+                "sector_name": sector_name,
+                "prev_state": prev[1],
+                "prev_dwell": prev[2],
+                "today_state": row.state,
+                "rrg_momentum_ema": mom,
+                "strength_score": strength,
+                "e14_only": True,
+                "qualified_event_count": len(qualified),
+                "nearest_event": nearest,
+                "grace_would_hold": grace_would_hold,
+            })
+
+        record = {
+            "date": today.strftime("%Y%m%d"),
+            "switch": True,
+            "window_days": AMBUSH_EXIT_GRACE_WINDOW_DAYS,
+            "grace_candidates_count": len(candidates),
+            "records": candidates,
+            "note": "影子观测：E14 出场催化宽限，零决策改动（状态机/池/蓄水池不变，"
+                    "≥10 交易日转正判据见 docs/got/verification.md 补登 #6）",
+        }
+        day_dir = Path("data/got_daily") / today.strftime("%Y%m%d")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        out = day_dir / "shadow_ambush_exit_grace.json"
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(out)
+        logger.info(
+            "[Node 6] 出场宽限影子: %d 候选, %d grace_would_hold",
+            len(candidates),
+            sum(1 for c in candidates if c["grace_would_hold"]),
+        )
+
     @staticmethod
     def _build_ambush_lane_validation(
         ambush_pool: list[AmbushCandidate],
