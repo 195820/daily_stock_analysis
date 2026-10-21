@@ -4005,6 +4005,11 @@ class AggregatorNode:
         impact_weight = IMPACT_WEIGHT.get(top_event.impact_level, 0.3)
 
         # 临近系数：事件距今天的交易日数
+        # 口径（2026-10-21）：**实跑**日历不再含已过事件日的记录（_load_active_events 按
+        # event_date >= today 过滤），故 else 0 分支只在两种场景命中——① 事件日=今天
+        # （_count_trade_days 含首尾 → 1）；② 回放/单测直接传入含过去事件的上下文。
+        # 事件后的漂移收益不靠这里补：P6 兑现通道（catalyst_realized，day_3 超额）另立，
+        # CATALYST_DRIFT_TAIL_TRADE_DAYS 现只约束 catalyst_events.expires_at 的库内保留期。
         trade_days = _count_trade_days(today, top_event.event_date) if top_event.event_date >= today else 0
         if trade_days <= ANTICIPATION_THRESHOLD_DAYS:
             proximity = ANTICIPATION_DECAY_NEAR  # 0.6（anticipation 大半走完）

@@ -374,5 +374,35 @@ class TestForwardWindowLoad(unittest.TestCase):
         self.assertEqual([e.event_id for e in events], ["today", "future"])
 
 
+class TestGlobalMapStaleNewsDoesNotPoisonAnchor(unittest.TestCase):
+    """2026-10-21：仍在发酵的旧跟踪行不得钉死聚合锚。
+
+    病灶：hits 取「最早 first_seen」，而新闻窗口按 last_seen 选行——一条 10-16 的
+    财报跟踪行（last_seen 10-21 仍在窗口）会让 10-22 的新财报锚定到 10-19 < start，
+    整条 mapping 被 continue 丢弃，新事件永远上不来（实测复现：10-16+10-22 → 0 事件）。
+    """
+
+    def test_fresh_news_anchors_even_when_old_tracking_news_present(self):
+        builder = _builder({"CPO"})
+        events = builder._map_global_events(
+            [
+                _news("英伟达财报发布，超预期", "2026-10-16"),
+                _news("英伟达财报指引上调", "2026-10-22"),
+            ],
+            date(2026, 10, 22), date(2026, 11, 5),
+        )
+        self.assertEqual(len(events), 1, "旧跟踪行不得吞掉今天的新事件")
+        self.assertEqual(events[0].event_date, date(2026, 10, 23))
+        self.assertEqual(events[0].source_news, "英伟达财报指引上调")
+
+    def test_out_of_window_only_news_still_produces_nothing(self):
+        builder = _builder({"CPO"})
+        events = builder._map_global_events(
+            [_news("英伟达财报发布，超预期", "2026-10-16")],
+            date(2026, 10, 22), date(2026, 11, 5),
+        )
+        self.assertEqual(events, [], "纯旧新闻不产事件（与过滤前一致）")
+
+
 if __name__ == "__main__":
     unittest.main()

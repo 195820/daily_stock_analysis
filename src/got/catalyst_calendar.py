@@ -588,6 +588,12 @@ class CatalystCalendarBuilder:
                 ):
                     continue
                 news_date = date.fromisoformat(news.first_seen) if news.first_seen else date.today()
+                # 锚定可行性守卫（2026-10-21）：+1 交易日锚定已落在窗口前的旧跟踪新闻，
+                # 不参与聚合。否则 hits 的「最早 first_seen」会被仍在发酵的旧行钉死
+                # （实测：10-16 的财报跟踪行 + 10-22 的新财报 → 聚合取 10-16 → 锚定 10-19
+                # < start → 整条 mapping 被 continue 丢弃，真正的新事件永远上不来）。
+                if min(_trade_days_offset(news_date, 1), end) < start:
+                    continue
                 key = mapping["global_event"]
                 if key not in hits or news_date < hits[key][1]:
                     hits[key] = (mapping, news_date, news.title)
