@@ -1514,15 +1514,30 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
         )
 
     def _load_active_events(self, target_date: date) -> List[CatalystEvent]:
-        """加载 expires_at >= target_date 的有效事件"""
+        """加载前瞻窗口内的有效事件：expires_at >= target_date 且 event_date >= target_date。
+
+        2026-10-21 修正：旧口径只按 expires_at 过滤，**已过事件日**的记录会继续留在
+        前瞻日历里（1021 归档实测：社融 10-13 ×2、LPR 10-20 ×2 仍出现在 10-21 日历，
+        且增量路径每日原样重发，用户读到的就是「持续传导的旧事件还在」）。
+        日历是前瞻窗口（target_date ~ +CATALYST_WINDOW_DAYS），已过事件属 P6 兑现追踪
+        范畴；剔除后同一事件只在事件日当天出现，次日即落历。
+        """
         from src.storage import DatabaseManager, CatalystEventRecord
         db = DatabaseManager()
 
         with db.get_session() as session:
-            records = (
+            rows = (
                 session.query(CatalystEventRecord)
                 .filter(CatalystEventRecord.expires_at >= target_date)
                 .all()
+            )
+
+        records = [r for r in rows if r.event_date >= target_date]
+        dropped = len(rows) - len(records)
+        if dropped:
+            logger.info(
+                "[CatalystCalendar] 前瞻窗口剔除已过事件日记录: %d/%d（target=%s）",
+                dropped, len(rows), target_date,
             )
 
         return [

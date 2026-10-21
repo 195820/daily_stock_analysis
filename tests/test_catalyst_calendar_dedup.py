@@ -331,5 +331,48 @@ class TestSaveEventsExpiryAnchoring(unittest.TestCase):
         fake_session.add.assert_not_called()  # 走 UPDATE、不新建
 
 
+class TestForwardWindowLoad(unittest.TestCase):
+    """2026-10-21：`_load_active_events` 必须剔除已过事件日的记录。
+
+    实测病灶：1021 归档 22 条里 4 条 event_date 早于当日（社融 10-13 ×2 / LPR 10-20 ×2），
+    增量路径按 expires_at 载入后每日原样重发——日历是前瞻窗口，已过事件归 P6 兑现追踪。
+    """
+
+    @staticmethod
+    def _row(event_date, expires_at, event_id):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            event_id=event_id, event_date=event_date, event_type="macro",
+            title="t", sector="券商", impact_level=2, direction="binary",
+            confidence=1.0, consensus_expectation="", source="macro_rule",
+            category_tag="binary", evidence_tier="reported", source_url=None,
+            is_global=False, source_news=None, affected_sectors=None,
+            expires_at=expires_at,
+        )
+
+    def test_past_dated_rows_excluded_from_load(self):
+        target = date(2026, 10, 21)
+        rows = [
+            self._row(date(2026, 10, 13), date(2026, 10, 22), "past-1"),
+            self._row(date(2026, 10, 20), date(2026, 10, 22), "past-2"),
+            self._row(date(2026, 10, 21), date(2026, 10, 23), "today"),
+            self._row(date(2026, 10, 31), date(2026, 11, 14), "future"),
+        ]
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.all.return_value = rows
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+
+        with patch("src.storage.DatabaseManager", return_value=fake_db):
+            events = CatalystCalendarBuilder()._load_active_events(target)
+
+        self.assertEqual(
+            [e.event_date for e in events], [date(2026, 10, 21), date(2026, 10, 31)],
+            "事件日当天保留（day-0 催化），已过事件日剔除",
+        )
+        self.assertEqual([e.event_id for e in events], ["today", "future"])
+
+
 if __name__ == "__main__":
     unittest.main()
