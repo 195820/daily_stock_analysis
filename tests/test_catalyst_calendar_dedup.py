@@ -419,6 +419,23 @@ class TestGlobalMapHbmAnchorGuard(unittest.TestCase):
         )
         self.assertEqual(events, [], "工艺类新闻不构成财报/HBM 指引催化")
 
+    def test_hbm_supply_gap_headline_is_blocked(self):
+        """HBM 产业新闻曾因 anchor 含 HBM 继续伪造 ★★★ 财报催化（2026-10-21 收紧后）。"""
+        builder = _builder({"存储芯片"})
+        events = builder._map_global_events(
+            [_news("HBM供需缺口持续拉大 产业链景气度维持高位", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertEqual(events, [])
+
+    def test_price_move_headline_is_blocked(self):
+        builder = _builder({"存储芯片"})
+        events = builder._map_global_events(
+            [_news("SK海力士涨超7%，存储芯片板块走强", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertEqual(events, [])
+
     def test_earnings_news_still_maps(self):
         builder = _builder({"存储芯片"})
         events = builder._map_global_events(
