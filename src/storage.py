@@ -1207,6 +1207,24 @@ class CatalystEventRecord(Base):
     )
 
 
+class CatalystIdentityRecord(Base):
+    """global_map 事件身份锚定表（2026-10-21）——同一真实事件的多次新闻命中只锚定一次
+
+    根因：event_id = MD5(source|type|sector|date) 把日期编进 ID，新闻每日再命中同一模板
+    即生成新 event_id → 新 P6 行（SK 海力士在「先进封装」19 行，08-20~10-19）。
+    本表以 global_event 身份为单位锚定首次 catalyst_date，窗口内永不再滚动。
+    """
+    __tablename__ = 'catalyst_identities'
+
+    identity_key = Column(String(64), primary_key=True)   # MD5('global_identity|' + global_event)
+    first_anchor_date = Column(Date, nullable=False)      # 首次锚定新闻日期
+    catalyst_date = Column(Date, nullable=False)          # 首次锚定算出的事件日（窗口内不再滚动）
+    source_news = Column(String(200), nullable=True)      # 首次锚定新闻标题
+    anchor_count = Column(Integer, default=1)             # 累计再命中次数（观测）
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+
 class CatalystRefreshTracker(Base):
     """日历刷新节奏追踪（单行记录，UPSERT 语义）。"""
 

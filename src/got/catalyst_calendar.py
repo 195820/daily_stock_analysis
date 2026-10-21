@@ -121,6 +121,89 @@ def _make_event_id(source: str, event_type: str, sector: str, event_date: date) 
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+
+def _identity_key(global_event: str) -> str:
+    """事件身份键：与日期/板块无关，同一真实事件的多次新闻命中共享同一身份。"""
+    return hashlib.md5(f"global_identity|{global_event}".encode()).hexdigest()
+
+
+class _IdentityAnchorStore:
+    """global_map 身份锚定存储（SQLite 懒加载）。
+
+    所有方法吞异常并降级（返回 None / -1 / False）——日历构建绝不能因本表故障而失败。
+    """
+
+    def load(self, identity_key: str) -> Optional[dict]:
+        """返回 None 或 {"first_anchor_date": date, "catalyst_date": date, "anchor_count": int}"""
+        try:
+            from src.storage import DatabaseManager, CatalystIdentityRecord
+            db = DatabaseManager()
+            with db.get_session() as session:
+                row = (
+                    session.query(CatalystIdentityRecord)
+                    .filter(CatalystIdentityRecord.identity_key == identity_key)
+                    .first()
+                )
+                if row is None:
+                    return None
+                return {
+                    "first_anchor_date": row.first_anchor_date,
+                    "catalyst_date": row.catalyst_date,
+                    "anchor_count": row.anchor_count,
+                }
+        except Exception as exc:
+            logger.debug("[IdentityAnchorStore] load 失败,降级: %s", exc)
+            return None
+
+    def touch(self, identity_key: str) -> int:
+        """原子 anchor_count += 1，返回新计数；失败返回 -1"""
+        try:
+            from src.storage import DatabaseManager, CatalystIdentityRecord
+            db = DatabaseManager()
+            with db.get_session() as session:
+                row = (
+                    session.query(CatalystIdentityRecord)
+                    .filter(CatalystIdentityRecord.identity_key == identity_key)
+                    .first()
+                )
+                if row is None:
+                    return -1
+                row.anchor_count += 1
+                session.commit()
+                return row.anchor_count
+        except Exception as exc:
+            logger.debug("[IdentityAnchorStore] touch 失败,降级: %s", exc)
+            return -1
+
+    def upsert(self, identity_key: str, news_date: date, catalyst_date: date, source_news: str) -> bool:
+        """首次锚定写入；若身份已存在则覆写并重置 anchor_count=1。返回是否成功。"""
+        try:
+            from src.storage import DatabaseManager, CatalystIdentityRecord
+            db = DatabaseManager()
+            with db.get_session() as session:
+                row = (
+                    session.query(CatalystIdentityRecord)
+                    .filter(CatalystIdentityRecord.identity_key == identity_key)
+                    .first()
+                )
+                if row is None:
+                    session.add(CatalystIdentityRecord(
+                        identity_key=identity_key,
+                        first_anchor_date=news_date,
+                        catalyst_date=catalyst_date,
+                        source_news=source_news,
+                    ))
+                else:
+                    row.first_anchor_date = news_date
+                    row.catalyst_date = catalyst_date
+                    row.source_news = source_news
+                    row.anchor_count = 1
+                session.commit()
+                return True
+        except Exception as exc:
+            logger.debug("[IdentityAnchorStore] upsert 失败,降级: %s", exc)
+            return False
+
 def _is_cn_trading_day(d: date) -> bool:
     """单日 A 股交易日判定（WI-P1-9 真实交易日历）。
 
@@ -190,6 +273,9 @@ class CatalystCalendarBuilder:
         # 但 _save_events 落库/注册 P6 前必须过滤——audit_20260922 Q6-C①：
         # Run 3 孤儿行成因正是「影子 DROP 后仍写盘」）
         self._critic_drop_ids: Set[str] = set()
+        # 身份锚定存储（None 禁用锚定——单测钩子）
+        self._identity_store: Optional[_IdentityAnchorStore] = _IdentityAnchorStore()
+        self._identity_hits: Dict[str, int] = {}  # 本轮 identity 再命中计数（供日志）
 
     @property
     def concept_set(self) -> Set[str]:
@@ -475,6 +561,10 @@ class CatalystCalendarBuilder:
 
         反应新闻守卫（2026-08-31）：+1 交易日偏移的前提是事前新闻；事后反应报道
         （市值暴涨等）再 +1 属传导链双重计算，聚合前先过滤（复用 D3 时态标记口径）。
+
+        身份锚定（2026-10-21）— 同一 global_event 身份在首次锚定后 CATALYST_WINDOW_DAYS
+        个日历日内不重锚；增量路径（start=today, days=1）因此不会每日滚动；到期实例
+        由窗口谓词淘汰，超窗再现才视为新事件实例。
         """
         # 聚合命中：key = global_event 名 → (mapping, 最早新闻日期, 锚定新闻标题)
         hits: Dict[str, Tuple[Dict[str, Any], date, str]] = {}
@@ -505,7 +595,33 @@ class CatalystCalendarBuilder:
         results = []
         for _key, (mapping, news_date, anchor_title) in hits.items():
             # 估算事件日期（新闻日期 + 1 交易日传导）
-            catalyst_date = min(_trade_days_offset(news_date, 1), end)
+            fresh_anchor = min(_trade_days_offset(news_date, 1), end)
+            catalyst_date = fresh_anchor
+            ikey = _identity_key(mapping["global_event"])
+            store = self._identity_store
+            if store is not None:
+                existing = store.load(ikey)
+                # 重锚判据（2026-10-21 修正）：只看「首次锚定距今是否已超窗口」。
+                # 不可用「catalyst_date 是否仍在窗口」——增量路径 start=today 且只载 1 天新闻，
+                # 该判据会在锚定到期次日必然重锚（新 event_id → 新 P6 行），等于没修。
+                stale = (
+                    existing is not None
+                    and (news_date - existing["first_anchor_date"]).days >= CATALYST_WINDOW_DAYS
+                )
+                if existing is not None and not stale:
+                    # 同一事件实例：沿用首次锚定日期，日期永不滚动；
+                    # 已过窗口的实例由下面的 `if catalyst_date < start: continue` 自然落历（不重锚）
+                    # （Tetlock 2011：重复报道 = stale news，无增量信息只会稀释 P6 样本）
+                    catalyst_date = existing["catalyst_date"]
+                    n = store.touch(ikey)
+                    self._identity_hits[ikey] = n if n >= 0 else existing["anchor_count"] + 1
+                    logger.info(
+                        "[CatalystCalendar] 身份已锚定,不再滚动: %s (anchor#%d, catalyst=%s)",
+                        mapping["global_event"], self._identity_hits[ikey], catalyst_date,
+                    )
+                elif fresh_anchor >= start:
+                    # 首次锚定，或首次锚定已超窗口（真实新事件，如明年 FOMC）→ 写入/覆写
+                    store.upsert(ikey, news_date, fresh_anchor, anchor_title or "")
             if catalyst_date < start:
                 continue
 

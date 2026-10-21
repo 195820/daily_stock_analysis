@@ -187,6 +187,13 @@ GOT_MACRO_SECTOR_ALIGN_ENABLED = os.environ.get("GOT_MACRO_SECTOR_ALIGN_ENABLED"
 GOT_MACRO_FANOUT_ENABLED = os.environ.get("GOT_MACRO_FANOUT_ENABLED", "true").lower() == "true"
 # 开关关闭时仅保留的“旧口径真实板块”（历史唯一能命中 concept_set 的三个宏观扇出目标）。
 MACRO_FANOUT_LEGACY_BOARDS = frozenset({"券商", "银行", "房地产"})
+
+# 催化剂价值分级（2026-10-21）：例行宏观数据（macro_rule: PMI/CPI/社融/LPR）无 surprise 时
+# 无方向性 alpha——catalyst_realizations 实测方向正确率 1/10（n=10 已兑现）；Savor & Wilson (2013)
+# 宏观公告溢价文献：价值在「事件日风险补偿」而非板块方向。true = 退出评分/排序/晋级入口，
+# 仍入日历与归档（事件日属性可作 regime 层参考）。回滚：GOT_CATALYST_MACRO_AS_REGIME_REF=false。
+CATALYST_MACRO_AS_REGIME_REF = os.environ.get("GOT_CATALYST_MACRO_AS_REGIME_REF", "true").lower() == "true"
+
 NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
 AGENT_STOCK_REVIEW_ENABLED = os.environ.get("AGENT_STOCK_REVIEW_ENABLED", "false").lower() == "true"  # T1: Agent 终审
 AGENT_STOCK_REVIEW_SHADOW = os.environ.get("AGENT_STOCK_REVIEW_SHADOW", "true").lower() == "true"  # T1: 影子模式（跑审查但不执行降级）

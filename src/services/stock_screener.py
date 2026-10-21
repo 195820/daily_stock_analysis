@@ -87,6 +87,7 @@ class ScreenerStock:
     tech_wave_score: float = 0.0           # 波段技术评分 0-100
     risk_score_safe: float = 100.0         # 风险评分 0-100（越高越安全，与 risk_score 相反）
     sector_type: str = ""                  # 板块类型: active_mainline / ambush
+    sector_query_board: str = ""           # 问财实际查询的板块名（resolve_with_kind 产物，可能与 Node6 标签不同）
     ambush_rank_score: Optional[float] = None  # 埋伏道排序分（G-A4 产物，主线票为 None）
     backtest_snapshot: Optional[Dict[str, Any]] = None  # 回测快照
 
@@ -1098,6 +1099,8 @@ class StockScreenerPipeline:
                     "change_pct": stock_info.get("change_pct", 0),
                     "turnover_rate": stock_info.get("turnover_rate", 0),
                     "volume": stock_info.get("volume", 0),
+                    # 问财实际查询的板块名（resolve_with_kind 产物，可能与 Node 6 标签不同）
+                    "sector_query_board": stock_info.get("sector_query_board", ""),
                 })
 
         # 去重（同一股票可能在多个板块）
@@ -1216,6 +1219,9 @@ class StockScreenerPipeline:
                 "商业航天": ["航天", "军工", "航空", "卫星", "国防", "机械设备"],
                 "国防军工": ["军工", "国防", "航空", "航天", "兵器", "船舶"],
                 "无人机":   ["航空", "无人机", "军工", "飞行器", "机械设备"],
+                # 2026-10-20 backlog §7 #18：问财对「军贸概念」应答语义不稳定
+                # （两组探针 30 只互斥，混入绿电/消费票），无本行则行业过滤整段跳过
+                "军贸概念": ["军工", "国防", "航空", "航天", "兵器", "船舶", "雷达", "导弹"],
 
                 # ── 2026-08-18 补全：其他科技 ──
                 "人形机器": ["机器人", "机械", "自动化", "伺服", "减速器", "电气设备"],
@@ -1294,6 +1300,9 @@ class StockScreenerPipeline:
                             "change_pct": s.change_pct,
                             "turnover_rate": s.turnover_rate,
                             "volume": s.volume,
+                            # 本次实际命中查询的板块名（可能已别名改写/自愈），
+                            # 供 Node 7 板块校验用真实板块名检索而非 Node 6 标签
+                            "sector_query_board": _board_name,
                         }
                         for s in filtered_stocks[:max_results]
                     ]
@@ -1572,6 +1581,7 @@ class StockScreenerPipeline:
                     source="got",
                     sector_name=c.get("sector", ""),
                     sector_type="ambush",
+                    sector_query_board=c.get("sector_query_board", ""),
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
@@ -1618,6 +1628,7 @@ class StockScreenerPipeline:
                     source="got",
                     sector_name=c.get("sector", ""),
                     sector_type="ambush",
+                    sector_query_board=c.get("sector_query_board", ""),
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
@@ -1719,6 +1730,7 @@ class StockScreenerPipeline:
             CATALYST_CONFIDENCE_GATE,
             AMBUSH_LANE_SAFETY_HIGH,
             AMBUSH_LANE_SAFETY_LOW,
+            CATALYST_MACRO_AS_REGIME_REF,
         )
 
         # 默认值从 catalyst_config 取
@@ -1757,6 +1769,10 @@ class StockScreenerPipeline:
                 else:
                     trace["g_a2_no_catalyst"] += 1
             return passed, trace
+
+        # 价值分级（2026-10-21）：例行宏观数据不入催化闸门评分（仍入日历）
+        if CATALYST_MACRO_AS_REGIME_REF:
+            events = [evt for evt in events if evt.get("source") != "macro_rule"]
 
         # 按板块分桶事件（归一化 + 去重）
         sector_events: Dict[str, List[dict]] = {}
@@ -2283,6 +2299,7 @@ class StockScreenerPipeline:
                     sector_name=c["sector"],
                     sector_score=c["sector_score"],
                     sector_type=c["sector_type"],
+                    sector_query_board=c.get("sector_query_board", ""),
                     # 审核修复 W10/2.1：候选来源可观测性透传
                     dde_degraded=c.get("dde_degraded", False),
                     capital_floor_restored=c.get("capital_floor_restored", False),
@@ -3363,6 +3380,7 @@ verdict 含义：
         Returns:
             (scores, details): 评分字典 + 催化剂详情字典
         """
+        from src.got.catalyst_config import CATALYST_MACRO_AS_REGIME_REF
         import re
 
         # ── 加载催化剂日历 ──
@@ -3373,6 +3391,10 @@ verdict 含义：
             return {}, {}
 
         events = calendar_data.get("events", [])
+
+        # 价值分级（2026-10-21）：例行宏观数据不参与 P5 催化剂重排
+        if CATALYST_MACRO_AS_REGIME_REF:
+            events = [evt for evt in events if evt.get("source") != "macro_rule"]
         if not events:
             logger.info("[P5催化剂] 催化剂日历无事件，跳过重排")
             return {}, {}

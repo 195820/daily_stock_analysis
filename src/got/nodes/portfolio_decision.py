@@ -1616,7 +1616,10 @@ class PortfolioDecisionNode:
         确属「液冷服务器」）。现流程：
 
         1. 每只带有效板块标签的 finalist：2 条模板 × 2 个 provider 顺位检索
-           （`days=365`；概念归属是事实型不是新闻）
+           （`days=365`；概念归属是事实型不是新闻）。检索词用候选的
+           `sector_query_board`（问财**实际查询**的板块名；2026-10-20 修 §7 #19：
+           Node 6 标签「液冷服务」被别名表改写为 THS 实名「液冷服务器」后，
+           用原标签检索与真实板块名错位 → 001400/002076 误拦），空则回落标签。
         2. 结果先过来源白名单 `is_allowed_source`，再用 `evidence_supports_membership`
            做同段身份护栏（防"别的票的军贸新闻"被当成本票证据）
         3. 通过护栏的原文批量交 LLM 判 `member` / `not_member` / `uncertain`
@@ -1683,7 +1686,17 @@ class PortfolioDecisionNode:
 
         async def _search_evidence(stock, tagged_sector: str) -> Optional[Dict[str, Any]]:
             nonlocal skipped_offlist, raw_results_seen, queries_made
-            boards = [tagged_sector, *sector_name_variants(tagged_sector)]
+            # 检索词用问财**实际查询**的板块名（screener 侧 resolve_with_kind / 别名改写产物），
+            # Node 6 标签仍是归档/审计字段（sector_intel_map 键、FXG 剔除名单、family 归因
+            # 全部按标签工作），不在这里改写。空串（旧调用方/缓存行未带该键）→ 回落标签，
+            # 行为与改造前逐字节一致。
+            verify_board = getattr(stock, "sector_query_board", "") or tagged_sector
+            if verify_board != tagged_sector:
+                logger.debug(
+                    "[板块验证] %s 检索用实际板块名 %r（Node6 标签 %r）",
+                    getattr(stock, "code", ""), verify_board, tagged_sector,
+                )
+            boards = [verify_board, tagged_sector, *sector_name_variants(tagged_sector)]
             try:
                 resolved, _kind = resolver.resolve_with_kind(tagged_sector)
                 if resolved:
@@ -1698,7 +1711,7 @@ class PortfolioDecisionNode:
                 .replace("SH", "").replace("SZ", "").replace("BJ", "")
             )
             templates = (
-                f"{stock_name} {clean_code} {tagged_sector} 概念股",
+                f"{stock_name} {clean_code} {verify_board} 概念股",
                 f"{stock_name} {clean_code} 核心概念 所属板块",
             )
             for template in templates:
@@ -3827,6 +3840,8 @@ class PortfolioDecisionNode:
                 "sector_type": s.get("sector_type", ""),
                 "family": intel.get("frame_group"),
                 "sector_score": s.get("sector_score"),
+                # 问财实际查询的板块名（D1 事后验证可核对「Node6 标签 vs 实际查询名」差异样本）
+                "sector_query_board": s.get("sector_query_board", ""),
                 "is_finalist": s.get("code", "") in finalist_codes,
                 "agent_verdict": "",
             }
@@ -4328,10 +4343,12 @@ verdict 含义：
             _cal = getattr(news_context, "catalyst_calendar", None)
             _cal_events = list(getattr(_cal, "events", None) or [])
             if _cal_events:
-                from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE
+                from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE, CATALYST_MACRO_AS_REGIME_REF
                 from src.got.board_aliases import normalize_sector_name
                 _supply: Dict[str, int] = {}
                 for _evt in _cal_events:
+                    if CATALYST_MACRO_AS_REGIME_REF and getattr(_evt, "source", "") == "macro_rule":
+                        continue
                     if float(getattr(_evt, "confidence", 0) or 0) < CATALYST_CONFIDENCE_GATE:
                         continue
                     _affected = getattr(_evt, "affected_sectors", None) or []

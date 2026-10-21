@@ -2,6 +2,25 @@
 > **原位置**：`docs/got_shadow_verification.md`（2026-09-17 文档结构重排移入当前位置）
 
 ---
+
+## ‼️ 2026-10-21 补登（催化剂价值分级 #1：identity 重锚 + macro 退出评分池 — 用户裁决跳过影子）
+
+**性质**：用户 2026-10-21 裁决「全套重构、不加影子」——两件直接生效改动：① `catalyst_identities` 身份表以 `global_event` 为单位锁定首次 catalyst_date：重锚判据是**陈旧度**（`news_date - first_anchor_date >= CATALYST_WINDOW_DAYS`，即 14 日历日）而非「catalyst_date 是否仍在窗口」——增量路径 `start=today` 且只载 1 天新闻，用窗口判据会在锚定到期次日必然重锚、新 event_id 造新 P6 行（等于没修）；同一事件实例内只递增 `anchor_count`、日期永不滚动，到期实例由 `catalyst_date < start` 谓词自然落历（根治「同一 SK 海力士事件 19 行」的日期进 ID 永生问题，Tetlock 2011 陈旧新闻证据）；② `CATALYST_MACRO_AS_REGIME_REF=true` 把 PMI/CPI/社融/LPR 从聚合/选股/Phase2 三个评分入口排除（macro 实测方向正确率 1/10 + Savor-Wilson 2013 公告溢价=事件日属性，非板块方向催化剂），事件仍入 `catalyst_events` 与归档。**回滚键**：`GOT_CATALYST_MACRO_AS_REGIME_REF=false` 一键恢复旧行为（macro 重新参与评分）；identity 锚定无开关，回退 = 回退代码。
+
+### 三条判据（机械可核对）
+
+1. **identity 表增速**：每日 `catalyst_identities` 新增行数 ≤ 当日 global 模板命中组数；同一 identity 的重命中必须走 `anchor_count` 递增而非新行；`catalyst_realizations` 中同一 (sector,title) 的重复行日增速应趋 0（首跑基线见 calibration 报告 §1）。核对 SQL：`SELECT identity_key, anchor_count, catalyst_date FROM catalyst_identities ORDER BY updated_at DESC LIMIT 20;`
+2. **macro 评分入口 zero-count**：归档日 `unified.json`/`catalyst_calendar` 中 `source=macro_rule` 事件仍在，但 `events_by_sector` 派生物与 P5/`_ga2_gate` 消费侧不出现 macro_rule；抽查方式 = 在归档 `portfolio_decision.json` 的 `lane_budget_split_shadow`/`t3_routing_shadow` 与 `unified.json` 的催化相关字段中 grep `macro_rule` 应为 0（日历本体除外）。
+3. **calibration 报告作为调参依据**：`reports/catalyst_value_tier_20261021.md` 的 §2/§5 kept/excess/正确率表是 conf 闸与 identity 冷却窗口的唯一调参凭据；样本 <30 的行不得出结论（`calibration script --min-samples 30` 纪律）。
+
+### 已知未闭合（等 calibration 报告拍板，不在本次范围）
+
+- **重锚窗口取值**：当前用 `CATALYST_WINDOW_DAYS`（14 日历日）作为「同一实例」的判定边界；7/30 日的替代取值待 calibration 报告 §5 的 kept/excess 表拍板（代码内常量引用，非新增开关）。
+- **conf 闸下调**：0.65-0.7 段质量与 ≥0.7 相当（已兑现样本正确率 52.9% vs 51.6%），0.7 闸砍掉的是可用样本；是否下调到 0.65 待 calibration 报告 §2 分档数据拍板。
+- **T-1 前瞻窗检验**：文献 Hu et al. (2019) / Gao-Hu-Zhang (2022) 指出事件价值分布在公告前而非公告后，但当前 schema 无 T-1 收益列，需另立数据 WI 才能检验。calibration 报告 §4 诚实 SKIP 并登记数据缺口。
+
+
+---
 ## ‼️ 2026-10-20 转正补登（D3 分道预算 + ACTIVE 转正 + D4 union — 用户裁决跳过影子纪律）
 
 **性质**：**转正即生效**，非影子观测。用户 2026-10-20 明示裁决：原 C4 四判据（D1 前向超额分箱显著区分度 + Layer 2 积样 ≥20 交易日/≥30 票 + `SCORING_FORMULA_VERSION` bump + 基线 diff 归零）中的「影子 ≥10 交易日」纪律在本次不执行，直接修正生效；D1 标定**降级为事后验证**。本注记即该裁决的出处登记，防后续审计误判为纪律违规。

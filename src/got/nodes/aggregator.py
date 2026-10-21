@@ -83,6 +83,7 @@ from src.got.catalyst_config import (
     REGIME_JUMP_THETA_BULL,
     REGIME_JUMP_THETA_BEAR,
     LLM_CALL_TIMEOUT_S,
+    CATALYST_MACRO_AS_REGIME_REF,
 )
 from src.got import glue_pipeline as _glue_pipeline_mod
 from src.got.catalyst_calendar import _count_trade_days
@@ -331,7 +332,7 @@ class AggregatorNode:
             if _code:
                 code_to_name.setdefault(_code, _name)
         refine_events_map = self._glue_aware_events_map(
-            self._group_events_by_sector,
+            lambda evs: self._group_events_by_sector(self._exclude_macro_regime_ref(evs)),
             refine_calendar.events if refine_calendar else [],
             glue=glue,
             code_to_name=code_to_name,
@@ -2729,6 +2730,7 @@ class AggregatorNode:
         strength_lookup = getattr(sector_ctx, "strength_lookup", {})
         calendar = getattr(news_ctx, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
+        all_events = self._exclude_macro_regime_ref(all_events)
         events_by_sector = self._group_events_by_sector(all_events)
         # relations 补挂（与今日候选支路同源）：优先复用本日 run 缓存的索引（当日 glue），
         # 独立调用时（单测/回放）自行载入前日归档回退；开关关→空索引→恒 no-op
@@ -2895,6 +2897,7 @@ class AggregatorNode:
         today_by_code = {row.sector_code: row for row in today_rows}
 
         calendar = getattr(news, "catalyst_calendar", None)
+        # 影子观测路径：刻意不排除 macro_rule（保持影子读数与历史可比，2026-10-21）
         events_by_sector = self._group_events_by_sector(calendar.events if calendar else [])
 
         candidates: list[dict] = []
@@ -3114,6 +3117,7 @@ class AggregatorNode:
         hot_sectors = list(ths_hot_map.keys())  # 板块名列表，供 G2/G3 闸门使用
         calendar = getattr(news, "catalyst_calendar", None)
         all_events = calendar.events if calendar else []
+        all_events = self._exclude_macro_regime_ref(all_events)
         events_by_sector = self._group_events_by_sector(all_events)
         # 与今日候选支路同形（L217）：锚定 _run_date，回放时 today=回放日
         today = getattr(self, "_run_date", None) or date.today()
@@ -3553,6 +3557,18 @@ class AggregatorNode:
         except Exception as e:
             logger.warning(f"[Node 6] Agent提名评审失败（降级：全部不提名）: {e}")
             return {}
+
+    @staticmethod
+    def _exclude_macro_regime_ref(events: list) -> list:
+        """价值分级（2026-10-21）：例行宏观数据退出催化剂评分入口。
+
+        依据：macro_rule 方向正确率 1/10（catalyst_realizations 本地回测）+ 宏观公告溢价
+        文献（事件日风险补偿，非板块方向）。事件仍入日历/归档，只不参与评分排序。
+        回滚：GOT_CATALYST_MACRO_AS_REGIME_REF=false 恢复旧行为。
+        """
+        if not CATALYST_MACRO_AS_REGIME_REF:
+            return events
+        return [e for e in events if getattr(e, "source", "") != "macro_rule"]
 
     @staticmethod
     def _group_events_by_sector(

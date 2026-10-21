@@ -40,6 +40,7 @@ def _news(title: str, first_seen: str) -> NewsEvent:
 def _builder(concepts) -> CatalystCalendarBuilder:
     builder = CatalystCalendarBuilder()
     builder._concept_set = set(concepts)  # 绕过 CONCEPT_UNIVERSE 加载
+    builder._identity_store = None  # 单测禁用真实 DB 身份锚定（2026-10-21）
     return builder
 
 
