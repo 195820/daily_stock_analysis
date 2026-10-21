@@ -135,10 +135,11 @@
 
 | 核对项 | 结果 |
 |---|---|
-| 新裁判在生产生效 | ✓ 4 只主线终选票走完 检索→白名单→护栏→LLM 仲裁：601778/603619/002946 `insufficient_evidence`、300164 `llm_uncertain`，全清标签 → Q9-B watch（13 次查询，`sector_verify_unverified` reason 枚举为新值，efinance 旧路径无此产出） |
+| 新裁判在生产生效 | ✓ 4 只主线终选票走完 检索→白名单→护栏→LLM 仲裁（**该 4 票漏斗属 FXG 双跑的基线实例**，veto 正式跑 universe 构造前已剔 3 族、仅 1 票走缓存复用，见下两行）：601778/603619/002946 `insufficient_evidence`、300164 `llm_uncertain`，全清标签 → Q9-B watch（13 次查询 = Bocha 7 + SearXNG 空转 6，`sector_verify_unverified` reason 枚举为新值，efinance 旧路径无此产出） |
 | `sector_verify_evidence`/`unverified` 落盘 | ✓ 键均在（evidence=None：本日 0 例 member，正常） |
-| 三条评审加固实战生效 | ✓ 死顺位引擎整轮停用（第 2 顺位 SearXNG 无结果即类级记死）；FXG 双跑决策缓存复用（第 2 次 `_score_candidates` 0 查询 vs 首跑 13）；白名单略过 19 条落 host 分布 top5（sohu×12/qianzhan×4/southmoney×2/baogaobox×1） |
+| 三条评审加固实战生效 | ✓ 死顺位引擎整轮停用（第 2 顺位 SearXNG 无结果即类级记死）；FXG 双跑决策缓存复用（正式跑 0 查询 vs 基线 13——**缓存为节点实例共享态**：基线独立实例产出 verdict 后由类级缓存供正式跑复用）；白名单略过 19 条落 host 分布 top5（sohu×12/qianzhan×4/southmoney×2/baogaobox×1） |
 | D4/D3 配套 | ✓ meta `scoring_formula_version=2026-10-20.1`；candidate_pool universe 37 行全带 `sector_type`（ambush 22/mainline 15）；union 接线确认（pd.py:4281 `"union"`）；trade_plan_log 2 条（对账+空 allocation 留痕） |
+| FXG 族差归因口径（当日退化） | ⚠ 20261020 的 `fxg_pair_report` 族差对照不可用：验证清标签先于基线捕获执行（13 次检索即基线实例所跑），`fxg_baseline_scoring.json` 4 行 sector/family 全 None → 族差归因须读 universe 集合差（候选池）而非 baseline-vs-veto 评分行；验证清标签与基线捕获的先后顺序为结构性耦合，改任一处都会污染 FXG 对照 |
 | 分道预算明细 | 当日无产出（allocation=[] → `lane_budget_split_shadow=[]`）：22 只埋伏全部 G-A1 flow_negative 零 finalists、主线终选 1 票 watch——结构代码就位（pd.py:5587 lane_trace 含 `lane/lane_weight/formula_version`），首个买单日可见。~~注：`funnel_stats.lane_merge_mode` 仅 `--screener` 路径落盘~~ **已修（同日）**：合并块被 `if lane_finalists:` 守卫致零 finalist 日缺键，`stock_screener.py:2356` 补 else 分支无条件落 `lane_merge_mode`，`test_zero_lane_finalists_still_records_merge_mode` 回归覆盖 |
 | 当日语义 | 安全侧拒买：检索源覆盖不足（Bocha 单引擎，第二顺位未配）→ 真实成员也可能 insufficient → 全 watch/空仓。运营项不变：配 Tavily/Brave 或自建 SearXNG 后自动恢复双顺位 |
 
