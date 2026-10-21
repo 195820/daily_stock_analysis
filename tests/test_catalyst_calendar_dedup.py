@@ -404,5 +404,31 @@ class TestGlobalMapStaleNewsDoesNotPoisonAnchor(unittest.TestCase):
         self.assertEqual(events, [], "纯旧新闻不产事件（与过滤前一致）")
 
 
+class TestGlobalMapHbmAnchorGuard(unittest.TestCase):
+    """2026-10-21：公司名裸命中不得伪造 ★★★ 财报催化（三星 8nm 工艺新闻实测）。
+
+    旧配置 #12 无 anchor_keywords：「三星8纳米…」工艺新闻被映射成
+    「SK 海力士/三星财报及 HBM 指引」(impact 3)，读起来就是无关的历史传导。
+    """
+
+    def test_process_news_without_earnings_semantics_is_blocked(self):
+        builder = _builder({"存储芯片"})
+        events = builder._map_global_events(
+            [_news("三星8纳米再延续一代，8LPU+年内推出主攻汽车与边缘AI芯片", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertEqual(events, [], "工艺类新闻不构成财报/HBM 指引催化")
+
+    def test_earnings_news_still_maps(self):
+        builder = _builder({"存储芯片"})
+        events = builder._map_global_events(
+            [_news("SK海力士财报发布，HBM 指引超预期", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].impact_level, 3)
+        self.assertEqual(events[0].event_date, date(2026, 10, 21))
+
+
 if __name__ == "__main__":
     unittest.main()

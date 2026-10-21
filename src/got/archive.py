@@ -414,8 +414,9 @@ def _write_reasoning_md(
     news_ctx = contexts.get("news")
     cal = getattr(news_ctx, "catalyst_calendar", None) if news_ctx else None
     if cal and cal.events:
-        from datetime import date as _date_cls
-        today = _date_cls.today()
+        # 2026-10-21：用 run_date 而非 date.today()——重渲染历史归档时，今日/未来分界
+        # 必须锚定该归档日，否则隔天重跑会把旧归档的「未来事件」错判成过去。
+        today = run_date
         high_conf = [e for e in cal.events if e.confidence >= 0.7]
         three_star = [e for e in cal.events if e.impact_level == 3]
 

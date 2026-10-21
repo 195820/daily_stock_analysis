@@ -127,6 +127,9 @@ GLOBAL_TO_A_SHARE_MAP = [
         "id": 12,
         "global_event": "SK 海力士/三星财报及 HBM 指引",
         "global_keywords": ["SK海力士", "三星", "HBM", "存储芯片", "DRAM", "NAND"],
+        # 锚定词守卫（2026-10-21）：公司名裸命中会把工艺/投资类新闻伪造成 ★★★ 财报催化
+        # （实测：三星8纳米 8LPU 工艺新闻被映射成「财报及 HBM 指引」，读起来像无关的历史传导）
+        "anchor_keywords": ["财报", "业绩", "earnings", "季报", "指引", "展望", "HBM", "DRAM", "NAND", "存储"],
         "a_share_sectors": ["存储芯片", "先进封装", "接口芯片", "PCB"],
         "base_impact_level": 3,
         "direction": "binary",
