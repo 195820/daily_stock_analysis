@@ -422,7 +422,11 @@ def _write_reasoning_md(
         lines.append(f"## 📅 催化剂日历（{len(cal.events)} 事件，{len(three_star)} 个 ★★★）— {cal.refresh_mode}")
         lines.append("")
 
-        # ── 今日关键事件（拆分：今日发生 vs 持续传导，避免历史事件被误读为今日发生） ──
+        # ── 今日关键事件（2026-10-21：按日期而非来源分类） ──
+        # 旧口径把 source==global_map / category_tag==drift 一律塞进「持续传导（历史事件
+        # 延续至生效，非今日发生）」——与日期无关：10-20 新闻 → 10-21 次日反应的
+        # SK 海力士事件 event_date=今天、就是今日催化，却被标成「历史事件传导」。
+        # 日历已按 event_date >= today 过滤（_load_active_events），事件日=今天即今日事件。
         today_events = [e for e in high_conf if e.event_date == today]
         if today_events:
             arrow_map = {"positive": "📈", "negative": "📉", "binary": "⚖️", "drift": "🌀"}
@@ -433,20 +437,10 @@ def _write_reasoning_md(
                 tag = f" `{e.category_tag}`" if e.category_tag else ""
                 return f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%})"
 
-            fresh = [e for e in today_events if e.source != "global_map" and e.category_tag != "drift"]
-            carry = [e for e in today_events if e.source == "global_map" or e.category_tag == "drift"]
-
-            if fresh:
-                lines.append(f"**今日（{today}）{len(fresh)} 个事件:**")
-                for e in sorted(fresh, key=lambda x: -x.impact_level)[:6]:
-                    lines.append(_fmt_event(e))
-                lines.append("")
-
-            if carry:
-                lines.append(f"**持续传导（{len(carry)} 个，历史事件延续至生效，非今日发生）:**")
-                for e in sorted(carry, key=lambda x: -x.impact_level)[:6]:
-                    lines.append(_fmt_event(e) + " ←历史事件传导")
-                lines.append("")
+            lines.append(f"**今日（{today}）{len(today_events)} 个事件:**")
+            for e in sorted(today_events, key=lambda x: (-x.impact_level, -x.confidence))[:8]:
+                lines.append(_fmt_event(e))
+            lines.append("")
 
         # ── 未来 2 周按日期展示（每日 Top 事件）──
         future_events = [e for e in high_conf if e.event_date > today]
