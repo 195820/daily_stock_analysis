@@ -293,7 +293,7 @@ class TestAskCommandMultiStock(unittest.TestCase):
                     dashboard=TestAskCommandMultiStock._dashboard(code),
                 )
 
-        with patch("bot.commands.ask.get_db", side_effect=lambda: call_order.append("db")) as mock_get_db:
+        with patch("src.storage.get_db", side_effect=lambda: call_order.append("db")) as mock_get_db:
             with patch("src.agent.factory.build_agent_executor", return_value=FakeExecutor()):
                 with patch.object(command, "_build_portfolio_section", return_value=""):
                     with patch("src.agent.conversation.conversation_manager") as mock_cm:

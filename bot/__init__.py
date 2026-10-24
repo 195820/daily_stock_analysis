@@ -31,14 +31,32 @@
 - /status             - 系统状态
 """
 
-from bot.models import BotMessage, BotResponse, ChatType, WebhookResponse
-from bot.dispatcher import CommandDispatcher, get_dispatcher
+# PEP 562 懒导出：`import bot`（例如 bot.platforms.feishu_stream 触发）不再
+# 连带拉起 dispatcher -> commands -> data_provider.base -> pandas/akshare
+# （实测 +116 MB RSS）。命令分发只在真正处理 /command 消息时才需要。
+_LAZY = {
+    "BotMessage": ("bot.models", "BotMessage"),
+    "BotResponse": ("bot.models", "BotResponse"),
+    "ChatType": ("bot.models", "ChatType"),
+    "WebhookResponse": ("bot.models", "WebhookResponse"),
+    "CommandDispatcher": ("bot.dispatcher", "CommandDispatcher"),
+    "get_dispatcher": ("bot.dispatcher", "get_dispatcher"),
+}
 
-__all__ = [
-    'BotMessage',
-    'BotResponse',
-    'ChatType',
-    'WebhookResponse',
-    'CommandDispatcher',
-    'get_dispatcher',
-]
+__all__ = list(_LAZY)
+
+
+def __getattr__(name):
+    entry = _LAZY.get(name)
+    if entry is None:
+        raise AttributeError(f"module 'bot' has no attribute {name!r}")
+    import importlib
+
+    module = importlib.import_module(entry[0])
+    value = getattr(module, entry[1])
+    globals()[name] = value  # 缓存，二次访问不再走 __getattr__
+    return value
+
+
+def __dir__():
+    return sorted(list(globals()) + __all__)

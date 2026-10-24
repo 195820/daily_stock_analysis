@@ -17,9 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from bot.commands.base import BotCommand
 from bot.models import BotMessage, BotResponse
-from data_provider.base import canonical_stock_code
 from src.config import get_config
-from src.storage import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +85,9 @@ class AskCommand(BotCommand):
 
     def _parse_stock_codes(self, raw: str) -> List[str]:
         """Parse one or more stock codes from the first argument."""
+        # 方法内 import：data_provider.base 顶层拉 pandas/akshare，不能进常驻监听 import 链
+        from data_provider.base import canonical_stock_code
+
         parts = [p.strip().upper() for p in raw.replace("，", ",").split(",") if p.strip()]
         return [canonical_stock_code(part) for part in parts]
 
@@ -316,6 +317,9 @@ class AskCommand(BotCommand):
                 return (stock_code, None, str(exc))
 
         # Warm up DB connections before parallel history writes.
+        # 方法内 import：src.storage 顶层拉 SQLAlchemy（+19 MB），不进监听 import 链
+        from src.storage import get_db
+
         get_db()
         pool = ThreadPoolExecutor(max_workers=min(len(codes), 5))
         future_map = {pool.submit(_run_one, code): code for code in codes}

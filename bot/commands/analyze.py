@@ -13,7 +13,6 @@ from typing import List, Optional
 
 from bot.commands.base import BotCommand
 from bot.models import BotMessage, BotResponse
-from data_provider.base import canonical_stock_code
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +66,10 @@ class AnalyzeCommand(BotCommand):
     
     def execute(self, message: BotMessage, args: List[str]) -> BotResponse:
         """执行分析命令"""
+        # 方法内 import：data_provider.base 顶层 import pandas/akshare（+116 MB），
+        # 不能让 `/analyze` 的 import 链拖累常驻监听进程。
+        from data_provider.base import canonical_stock_code
+
         code = canonical_stock_code(args[0])
         
         # 检查是否需要完整报告（默认精简，传 full/完整/详细 切换）
