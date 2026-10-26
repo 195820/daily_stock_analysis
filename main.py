@@ -1110,6 +1110,20 @@ def start_bot_stream_clients(config: Config) -> None:
         except Exception as exc:
             logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
 
+    # 启动 ntfy 双向订阅（手机 → 服务器指令）
+    if getattr(config, 'ntfy_stream_enabled', False):
+        try:
+            from bot.platforms import start_ntfy_stream_background, NTFY_STREAM_AVAILABLE
+            if NTFY_STREAM_AVAILABLE:
+                if start_ntfy_stream_background():
+                    logger.info("[Main] Ntfy stream subscriber started in background.")
+                else:
+                    logger.warning("[Main] Ntfy stream enabled but NTFY_URL/NTFY_CMD_URL missing.")
+            else:
+                logger.warning("[Main] Ntfy stream enabled but subscriber is unavailable.")
+        except Exception as exc:
+            logger.error(f"[Main] Failed to start Ntfy stream subscriber: {exc}")
+
 
 def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
     """Scheduled runs should always read the latest persisted watchlist."""

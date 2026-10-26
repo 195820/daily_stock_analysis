@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Optional, Tuple
-from urllib.parse import unquote, urlparse, urlunparse
+from typing import List, Optional, Tuple
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import requests
 
@@ -14,6 +14,11 @@ from src.config import Config
 
 
 logger = logging.getLogger(__name__)
+
+# ntfy 服务端默认 message-size-limit=4096（自建改大也会让 FCM/APNS 失效），留余量
+MAX_MESSAGE_BYTES = 3800
+# 超长正文以附件形式上传时保留的摘要长度（字符，非字节）
+SUMMARY_CHARS = 1200
 
 
 def resolve_ntfy_endpoint(ntfy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -47,6 +52,45 @@ def resolve_ntfy_endpoint(ntfy_url: Optional[str]) -> Tuple[Optional[str], Optio
     return server_url, topic
 
 
+def split_message(content: str, limit: int = MAX_MESSAGE_BYTES) -> List[str]:
+    """Split ``content`` into pieces whose UTF-8 size stays under ``limit`` bytes.
+
+    Prefers line boundaries; a single over-long line is hard-split on characters.
+    """
+    chunks: List[str] = []
+    current: List[str] = []
+    current_bytes = 0
+
+    for line in content.splitlines(keepends=True):
+        line_bytes = len(line.encode("utf-8"))
+        if line_bytes > limit:
+            if current:
+                chunks.append("".join(current))
+                current, current_bytes = [], 0
+            buf: List[str] = []
+            buf_bytes = 0
+            for char in line:
+                char_bytes = len(char.encode("utf-8"))
+                if buf_bytes + char_bytes > limit:
+                    chunks.append("".join(buf))
+                    buf, buf_bytes = [], 0
+                buf.append(char)
+                buf_bytes += char_bytes
+            if buf:
+                current, current_bytes = buf, buf_bytes
+            continue
+
+        if current_bytes + line_bytes > limit:
+            chunks.append("".join(current))
+            current, current_bytes = [], 0
+        current.append(line)
+        current_bytes += line_bytes
+
+    if current:
+        chunks.append("".join(current))
+    return chunks or [content]
+
+
 class NtfySender:
     """Send Markdown text notifications through the ntfy JSON publish API."""
 
@@ -61,6 +105,89 @@ class NtfySender:
     def _resolve_ntfy_endpoint(self) -> Tuple[Optional[str], Optional[str]]:
         return resolve_ntfy_endpoint(self._ntfy_url)
 
+    def _auth_headers(self) -> dict:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "daily_stock_analysis",
+        }
+        token = (self._ntfy_token or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _post_message(
+        self,
+        server_url: str,
+        payload: dict,
+        timeout_seconds: Optional[float],
+    ) -> Optional[requests.Response]:
+        try:
+            response = requests.post(
+                server_url,
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=timeout_seconds or 10,
+                verify=self._webhook_verify_ssl,
+            )
+        except requests.exceptions.Timeout:
+            logger.error("发送 ntfy 消息失败: 请求超时")
+            return None
+        except requests.exceptions.RequestException as exc:
+            logger.error("发送 ntfy 消息失败: 网络请求异常")
+            logger.debug("ntfy 请求异常类型: %s", type(exc).__name__)
+            return None
+        except Exception as exc:
+            logger.error("发送 ntfy 消息失败: 未知异常")
+            logger.debug("ntfy 未知异常类型: %s", type(exc).__name__)
+            return None
+
+        if 200 <= response.status_code < 300:
+            return response
+        logger.error("ntfy 请求失败: HTTP %s", response.status_code)
+        logger.debug("ntfy 响应内容: %s", response.text)
+        return None
+
+    def _upload_attachment(
+        self,
+        server_url: str,
+        topic: str,
+        content: str,
+        title: str,
+        timeout_seconds: Optional[float],
+    ) -> Optional[str]:
+        """Upload ``content`` as a file attachment and return its public URL."""
+        headers = {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "User-Agent": "daily_stock_analysis",
+            "Filename": f"{title[:40]}.md".replace("/", "_"),
+            "Title": title,
+        }
+        token = (self._ntfy_token or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            response = requests.put(
+                f"{server_url}/{quote(topic, safe='')}",
+                data=content.encode("utf-8"),
+                headers=headers,
+                timeout=timeout_seconds or 30,
+                verify=self._webhook_verify_ssl,
+            )
+        except Exception as exc:
+            logger.warning("ntfy 附件上传失败: %s", type(exc).__name__)
+            return None
+
+        if not 200 <= response.status_code < 300:
+            logger.warning("ntfy 附件上传失败: HTTP %s", response.status_code)
+            return None
+
+        try:
+            attachment = (response.json() or {}).get("attachment") or {}
+        except ValueError:
+            return None
+        return attachment.get("url")
+
     def send_to_ntfy(
         self,
         content: str,
@@ -68,7 +195,11 @@ class NtfySender:
         *,
         timeout_seconds: Optional[float] = None,
     ) -> bool:
-        """Publish a notification to ntfy using a JSON body with UTF-8 text."""
+        """Publish a notification to ntfy using a JSON body with UTF-8 text.
+
+        ntfy 单条消息默认上限 4 KB；超出时先按附件上传全文，再用摘要消息引用它，
+        附件不可用时退回分段发送，保证长报告（GOT reasoning.md 约 28 KB）不丢。
+        """
         if not self._is_ntfy_configured():
             logger.warning("ntfy URL 未配置，跳过推送")
             return False
@@ -82,44 +213,37 @@ class NtfySender:
             date_str = datetime.now().strftime("%Y-%m-%d")
             title = f"📈 股票分析报告 - {date_str}"
 
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "daily_stock_analysis",
-        }
-        token = (self._ntfy_token or "").strip()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        payload = {
-            "topic": topic,
-            "title": title,
-            "message": content,
-            "markdown": True,
-        }
-
-        try:
-            response = requests.post(
-                server_url,
-                json=payload,
-                headers=headers,
-                timeout=timeout_seconds or 10,
-                verify=self._webhook_verify_ssl,
-            )
-            if 200 <= response.status_code < 300:
+        if len(content.encode("utf-8")) <= MAX_MESSAGE_BYTES:
+            payload = {"topic": topic, "title": title, "message": content, "markdown": True}
+            if self._post_message(server_url, payload, timeout_seconds) is not None:
                 logger.info("ntfy 消息发送成功")
                 return True
+            return False
 
-            logger.error("ntfy 请求失败: HTTP %s", response.status_code)
-            logger.debug("ntfy 响应内容: %s", response.text)
-            return False
-        except requests.exceptions.Timeout:
-            logger.error("发送 ntfy 消息失败: 请求超时")
-            return False
-        except requests.exceptions.RequestException as exc:
-            logger.error("发送 ntfy 消息失败: 网络请求异常")
-            logger.debug("ntfy 请求异常类型: %s", type(exc).__name__)
-            return False
-        except Exception as exc:
-            logger.error("发送 ntfy 消息失败: 未知异常")
-            logger.debug("ntfy 未知异常类型: %s", type(exc).__name__)
-            return False
+        attach_url = self._upload_attachment(server_url, topic, content, title, timeout_seconds)
+        if attach_url:
+            summary = content[:SUMMARY_CHARS].rstrip()
+            payload = {
+                "topic": topic,
+                "title": title,
+                "message": f"{summary}\n\n……（全文 {len(content)} 字符，见附件）",
+                "markdown": True,
+                "attach": attach_url,
+            }
+            if self._post_message(server_url, payload, timeout_seconds) is not None:
+                logger.info("ntfy 长消息已按附件发送成功")
+                return True
+
+        chunks = split_message(content)
+        logger.info("ntfy 长消息改分段发送: %d 段", len(chunks))
+        ok = True
+        for index, chunk in enumerate(chunks, start=1):
+            payload = {
+                "topic": topic,
+                "title": f"{title} ({index}/{len(chunks)})",
+                "message": chunk,
+                "markdown": True,
+            }
+            if self._post_message(server_url, payload, timeout_seconds) is None:
+                ok = False
+        return ok

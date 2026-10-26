@@ -33,6 +33,11 @@ __all__ = [
     "get_feishu_stream_client",
     "start_feishu_stream_background",
     "FEISHU_SDK_AVAILABLE",
+    # ntfy 双向（订阅端）
+    "NtfyStreamClient",
+    "get_ntfy_stream_client",
+    "start_ntfy_stream_background",
+    "NTFY_STREAM_AVAILABLE",
 ]
 
 _LAZY = {
@@ -48,6 +53,11 @@ _LAZY = {
     "get_feishu_stream_client": ("bot.platforms.feishu_stream", "get_feishu_stream_client"),
     "start_feishu_stream_background": ("bot.platforms.feishu_stream", "start_feishu_stream_background"),
     "FEISHU_SDK_AVAILABLE": ("bot.platforms.feishu_stream", "FEISHU_SDK_AVAILABLE"),
+    # ntfy 双向（订阅端）
+    "NtfyStreamClient": ("bot.platforms.ntfy_stream", "NtfyStreamClient"),
+    "get_ntfy_stream_client": ("bot.platforms.ntfy_stream", "get_ntfy_stream_client"),
+    "start_ntfy_stream_background": ("bot.platforms.ntfy_stream", "start_ntfy_stream_background"),
+    "NTFY_STREAM_AVAILABLE": ("bot.platforms.ntfy_stream", "NTFY_STREAM_AVAILABLE"),
 }
 
 

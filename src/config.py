@@ -830,6 +830,9 @@ class Config:
     # ntfy 配置（完整 topic endpoint，例如 https://ntfy.sh/my-topic）
     ntfy_url: Optional[str] = None
     ntfy_token: Optional[str] = None
+    # ntfy 双向：入站 topic 收指令（手机 → 服务器），与 ntfy_url 同服务器
+    ntfy_cmd_url: Optional[str] = None
+    ntfy_stream_enabled: bool = False
 
     # Gotify 配置（server base URL；sender 会拼接 /message）
     gotify_url: Optional[str] = None
@@ -1671,6 +1674,8 @@ class Config:
             pushover_api_token=os.getenv('PUSHOVER_API_TOKEN'),
             ntfy_url=os.getenv('NTFY_URL'),
             ntfy_token=os.getenv('NTFY_TOKEN'),
+            ntfy_cmd_url=os.getenv('NTFY_CMD_URL'),
+            ntfy_stream_enabled=os.getenv('NTFY_STREAM_ENABLED', 'false').lower() == 'true',
             gotify_url=os.getenv('GOTIFY_URL'),
             gotify_token=os.getenv('GOTIFY_TOKEN'),
             pushplus_token=os.getenv('PUSHPLUS_TOKEN'),
