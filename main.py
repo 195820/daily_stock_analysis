@@ -438,6 +438,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--bot',
+        action='store_true',
+        help='仅启动机器人消息订阅（飞书/钉钉 Stream、ntfy 双向），不跑分析、不起 Web'
+    )
+
+    parser.add_argument(
         '--port',
         type=int,
         default=8000,
@@ -1238,6 +1244,18 @@ def main() -> int:
     # 兼容旧版 WEBUI_ENABLED 环境变量
     if config.webui_enabled and not (args.serve or args.serve_only):
         args.serve = True
+
+    # === 仅机器人监听模式：只跑 Stream/ntfy 订阅，不跑分析、不起 Web ===
+    if getattr(args, 'bot', False):
+        logger.info("模式: 仅机器人消息订阅")
+        start_bot_stream_clients(config)
+        logger.info("按 Ctrl+C 退出...")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("\n用户中断，程序退出")
+        return 0
 
     # === 启动 Web 服务 (如果启用) ===
     start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"

@@ -138,6 +138,8 @@ class NtfyStreamClient:
         self._stop_event = threading.Event()
         self._last_id: Optional[str] = None
         self._active_response: Optional[Any] = None
+        # 首连不重放历史：从本进程启动时刻起收，避免把旧指令（可能带 LLM 调用）再执行一遍
+        self._started_at = int(time.time())
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -186,8 +188,9 @@ class NtfyStreamClient:
 
     def _subscribe_url(self) -> str:
         base = f"{self._cmd_server}/{self._cmd_topic}/json"
-        # 首连只看最近 15 分钟，避免把历史指令当新指令重放
-        return f"{base}?since={self._last_id}" if self._last_id else f"{base}?since=15m"
+        # 首连从进程启动时刻起（不重放历史指令）；此后用最后一条消息 id 精确续传
+        marker = self._last_id or str(self._started_at)
+        return f"{base}?since={marker}"
 
     def _consume_once(self) -> None:
         logger.info("[Ntfy] 订阅 %s/%s", self._cmd_server, self._cmd_topic)

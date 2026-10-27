@@ -211,7 +211,8 @@ class TestNtfyStreamClient(unittest.TestCase):
         client._consume_once()
         client._consume_once()
 
-        self.assertIn("since=15m", session.get_calls[0]["url"])
+        # 首连锚定进程启动时间戳，绝不重放历史指令
+        self.assertIn(f"since={client._started_at}", session.get_calls[0]["url"])
         self.assertIn("since=m9", session.get_calls[1]["url"])
 
     def test_long_reply_is_chunked_under_byte_limit(self):

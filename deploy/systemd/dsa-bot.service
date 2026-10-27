@@ -1,0 +1,21 @@
+[Unit]
+Description=DSA bot listener (ntfy / Feishu stream / DingTalk stream)
+Documentation=file:///opt/dsa/code/docs/CHANGELOG.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dsa
+Group=dsa
+WorkingDirectory=/opt/dsa/code
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dsa/venv/bin/python main.py --bot
+Restart=on-failure
+RestartSec=10
+# 常驻监听：空闲时只持有订阅连接与基础运行时；命令路径按需拉 pandas（约 +120 MB）
+MemoryMax=700M
+SyslogIdentifier=dsa-bot
+
+[Install]
+WantedBy=multi-user.target
