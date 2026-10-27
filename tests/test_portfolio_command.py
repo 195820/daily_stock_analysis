@@ -166,6 +166,29 @@ class TestPortfolioCommand(unittest.TestCase):
         self.assertIn("解析失败", response.text)
         self.assertNotIn("dsa-topic", portfolio_module._PENDING)
 
+    def test_unmatched_symbol_is_excluded_from_trades(self):
+        class _NoSymbolOcr(_FakeOcr):
+            def generate_initial_trades(self, holdings, trade_date=None):
+                return []
+
+        class _NoSymbolIngest(_FakeIngest):
+            def __init__(self):
+                super().__init__()
+                self._ocr = _NoSymbolOcr()
+
+            def ingest_path(self, image_path):
+                item = HoldingItem(name="某只新股", symbol=None, quantity=100,
+                                   cost_price=10.0, current_price=11.0)
+                return IngestResult(ok=True, holdings=[item], summary="识别到 1 只持仓")
+
+        portfolio = _FakePortfolio()
+        command = PortfolioCommand(ingest_service=_NoSymbolIngest(), portfolio_service=portfolio)
+
+        response = command.execute(_message("/tmp/new.png"), [])
+
+        self.assertIn("未匹配到股票代码", response.text)
+        self.assertEqual(portfolio.recorded, [])
+
     def test_no_image_shows_snapshot(self):
         portfolio = _FakePortfolio({"SH600519": 100.0})
         command = self._command(portfolio_service=portfolio)

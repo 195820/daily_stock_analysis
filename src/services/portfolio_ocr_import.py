@@ -304,6 +304,16 @@ class PortfolioOcrImportService:
                 logger.info("[OCR] 名称模糊匹配 %s → %s (%.2f)", name, best_name, best_score)
 
         if code is None:
+            # 项目内既有解析器：本地 STOCK_NAME_MAP 反查 + 拼音 + 自带 akshare 缓存，
+            # 与 forum_sentiment / import_parser 同一套口径；命名未命中才现查东财。
+            try:
+                from src.services.name_to_code_resolver import resolve_name_to_code
+
+                code = resolve_name_to_code(name)
+            except Exception as exc:
+                logger.debug("[OCR] 项目解析器未命中 %s: %s", name, type(exc).__name__)
+
+        if code is None:
             try:
                 code = self.match_stock_name(name)
             except Exception as exc:  # 离线/限流都不阻塞主流程

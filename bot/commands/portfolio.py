@@ -102,10 +102,20 @@ class PortfolioCommand(BotCommand):
         accounts, system_positions = self._load_system_positions(portfolio)
         account_id = accounts[0].get("account_id") if accounts else None
 
+        # 未匹配到代码的持仓不能进交易（record_trade 需要 symbol），单独回执提示
+        matched = [h for h in result.holdings if getattr(h, "symbol", None)]
+        unmatched = [h for h in result.holdings if not getattr(h, "symbol", None)]
+        if not matched:
+            return BotResponse.text_response(
+                result.summary
+                + "\n\n⚠️ 全部持仓未匹配到股票代码，无法生成交易。"
+                "请确认截图里含名称列，或稍后重试（名称库可能正在拉取）。"
+            )
+
         if system_positions:
-            trades = service.reconcile(result.holdings, system_positions)
+            trades = service.reconcile(matched, system_positions)
         else:
-            trades = service._ocr.generate_initial_trades(result.holdings)
+            trades = service._ocr.generate_initial_trades(matched)
 
         _PENDING[key] = {
             "trades": trades,
@@ -114,6 +124,9 @@ class PortfolioCommand(BotCommand):
         }
 
         reply = service.build_reply(result, trades)
+        if unmatched:
+            names = "、".join(h.name for h in unmatched)
+            reply += f"\n\n⚠️ 未匹配到代码（不写入）：{names}"
         if trades:
             reply += "\n\n回复 `/portfolio confirm` 写入，或 `/portfolio cancel` 放弃（30 分钟内有效）。"
         return BotResponse.markdown_response(reply)
