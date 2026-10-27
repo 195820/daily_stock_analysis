@@ -5,6 +5,8 @@
 映射表中 a_share_sectors 为关键词列表，运行时与 CONCEPT_UNIVERSE 模糊匹配。
 """
 
+import os
+
 
 # =============================================================================
 # 全球→A股映射表 v1.2
@@ -19,6 +21,13 @@
 #    category_tag。二者为正交维度，不得混用（历史 13 条曾把类型塞进 direction，
 #    导致 _check_direction 对 drift/fade 恒判 False、35% 样本误判）。
 
+# 6. 【事件目录治理，2026-10-22】本表是**固定事件目录**，不是小事件收容所：
+#    - 每条必带 event_type_fixed（earnings/policy/product/data/macro/geo/commodity）与 review_note；
+#    - 日期确定型（earnings/policy/data/macro）缺 anchor_keywords → _map_global_events
+#      fail-closed 跳过并 warning（防实体裸命中伪造事件日期；实测：三星 8nm 工艺新闻顶了财报名头）；
+#    - recurring 映射只在事件临近时加入，且必须同时给 anchor_keywords + event_type_fixed + review_note；
+#    - 一次性大事件走单列通道 src/got/global_events_manual.py，不塞进关键词映射表。
+
 GLOBAL_TO_A_SHARE_MAP = [
     {
         "id": 1,
@@ -28,6 +37,11 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 3,
         "direction": "binary",
         "category_tag": "binary",
+        "event_type_fixed": "policy",
+        # 锚定词守卫（2026-10-22）：FOMC 无 macro_rule 兜底（那四条只有 PMI/CPI/社融/LPR），
+        # 砍掉即净损失 → 用会议语义锚定词保留，同时排除「鲍威尔/美联储/Fed」裸提法的讲话类新闻。
+        "anchor_keywords": ["FOMC", "议息", "利率决议", "会议", "点阵图"],
+        "review_note": "2026-10-22 复核：议息属日期确定型政策事件且无 macro_rule 兜底，补会议语义锚定词保留（裸提法不再伪造日期）",
     },
     {
         "id": 2,
@@ -37,6 +51,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "binary",
         "category_tag": "binary",
+        "event_type_fixed": "data",
+        "review_note": "2026-10-22 复核：数据公布属日期确定型事件，缺锚定词 → fail-closed 暂不产事件（国内 CPI/PPI 已由 macro_rule 日历覆盖）",
     },
     {
         "id": 3,
@@ -48,6 +64,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 3,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "earnings",
+        "review_note": "2026-10-22 复核：锚定词=财报语义（2026-10-21 加），保留；仅财报语义可锚定事件日期",
     },
     {
         "id": 4,
@@ -57,6 +75,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "positive",
         "category_tag": "fade",
+        "event_type_fixed": "product",
+        "review_note": "2026-10-22 复核：发布会/模型发布即事件本体（产物型），无需财报锚定词",
     },
     {
         "id": 5,
@@ -66,6 +86,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "positive",
         "category_tag": "fade",
+        "event_type_fixed": "product",
+        "review_note": "2026-10-22 复核：发布会/产品（iPhone/WWDC）为事件本体，按产物型放行；财报语义不再靠公司名伪造日期",
     },
     {
         "id": 6,
@@ -75,6 +97,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "product",
+        "review_note": "2026-10-22 复核：Optimus/FSD/Robotaxi 产品进展为事件本体，按产物型放行；纯行情播报仍靠事件价值筛选剔除",
     },
     {
         "id": 7,
@@ -84,6 +108,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "earnings",
+        "review_note": "2026-10-22 复核：财报属日期确定型事件，缺锚定词 → fail-closed 暂不产事件（补财报语义锚定词后恢复）",
     },
     {
         "id": 8,
@@ -93,6 +119,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "earnings",
+        "review_note": "2026-10-22 复核：财报/临床读出属日期确定型事件，缺锚定词 → fail-closed 暂不产事件（补财报语义锚定词后恢复）",
     },
     {
         "id": 9,
@@ -104,6 +132,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "direction": "binary",
         "category_tag": "binary",
         "note": "突发 ★★★，例会 ★★",
+        "event_type_fixed": "commodity",
+        "review_note": "2026-10-22 复核：OPEC 会议/地缘突发即事件本体（大宗商品型），无需锚定词",
     },
     {
         "id": 10,
@@ -113,6 +143,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "commodity",
+        "review_note": "2026-10-22 复核：库存/价格异动即事件本体（大宗商品型），无需锚定词",
     },
     {
         "id": 11,
@@ -122,6 +154,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 2,
         "direction": "positive",
         "category_tag": "drift",
+        "event_type_fixed": "geo",
+        "review_note": "2026-10-22 复核：地缘升级/金价异动即事件本体（地缘型），无需锚定词",
     },
     {
         "id": 12,
@@ -135,6 +169,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "base_impact_level": 3,
         "direction": "binary",
         "category_tag": "drift",
+        "event_type_fixed": "earnings",
+        "review_note": "2026-10-22 复核：锚定词只认财报语义（2026-10-21 收紧），保留",
     },
     {
         "id": 13,
@@ -145,6 +181,8 @@ GLOBAL_TO_A_SHARE_MAP = [
         "direction": "positive",
         "category_tag": "fade",
         "note": "偏主题情绪，跳票=落空退出",
+        "event_type_fixed": "product",
+        "review_note": "2026-10-22 复核：试飞/发射即事件本体（产物型），无需锚定词",
     },
 ]
 
@@ -157,6 +195,15 @@ CATALYST_WINDOW_DAYS = 14           # 前瞻窗口（日历日，约 10 交易�
 CATALYST_DRIFT_TAIL_TRADE_DAYS = 3  # 缺陷②：drift 型（个股/全球传导类）到期尾巴
                                      # 压到 3 交易日（以首次入库日为锚），旧传导不再霸屏
 CATALYST_CONFIDENCE_GATE = 0.7      # TODO: 待校准 (当前样本量: 0) — 低于此值不入评分（只进日历展示标"参考"）
+# 2026-10-22 架构修正（docs/got/verification.md「2026-10-22 架构修正」）：ambush **准入**专用低档闸。
+# 依据（本地回测，已兑现 llm_narrative+global_map conf>=0.6，n=401）：conf>=0.6/0.65/0.7 三档的
+# 方向正确率 0.40/0.42/0.40、平均收益 +0.10%/+0.15%/+0.24%，Wilson95 区间全部重叠
+# → 自报置信度只具备 ordinal 排序能力，不支撑 cardinal 硬闸（"Ordinal Gates, Cardinal Bets", 2026）。
+# 本档**仅放宽准入**；B 公式里 confidence 仍是乘数（0.6 事件自然排 0.8 事件之后），
+# 确定性提升（_deterministic_catalyst_promotion）与蓄水池升格（_check_reservoir_promotion）
+# 仍用 0.7 —— 加重注的动作严一档。
+# 回滚：GOT_CATALYST_CONFIDENCE_GATE_LOW=0.7 逐字节回现状。
+CATALYST_CONFIDENCE_GATE_LOW = float(os.environ.get("GOT_CATALYST_CONFIDENCE_GATE_LOW", "0.6"))
 CATALYST_FULL_REFRESH_INTERVAL = 5  # 全量刷新间隔（交易日）
 CATALYST_MAX_POOL_SIZE = 10         # 正式池上限（宁缺毋滥）
 CATALYST_RESERVOIR_WEEKS = 4        # [遗留] 已被 RESERVOIR_EXPIRY_DAYS=10 替代，不再使用
@@ -176,7 +223,6 @@ AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 �
 # 影子模式开关（Track B agent 增强）
 # =============================================================================
 
-import os
 SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "false").lower() == "true"   # T5: 事件→板块对齐层（2026-09-01 转正；影子观察已验证无异常，回滚设 SECTOR_ALIGN_SHADOW=true）
 # 项一②b（外网对标 2026-10-11）：macro_rule 事件是否也走 T5 语义对齐（扇出感知当日埋伏候选/蓄水池）。
 # 【2026-10-15 负责人拍板翻 true】与 GOT_MACRO_FANOUT_ENABLED 同日开启开始影子读数；转正判据见
@@ -197,11 +243,89 @@ MACRO_FANOUT_LEGACY_BOARDS = frozenset({"券商", "银行", "房地产"})
 # 宏观公告溢价文献：价值在「事件日风险补偿」而非板块方向。true = 退出评分/排序/晋级入口，
 # 仍入日历与归档（事件日属性可作 regime 层参考）。回滚：GOT_CATALYST_MACRO_AS_REGIME_REF=false。
 CATALYST_MACRO_AS_REGIME_REF = os.environ.get("GOT_CATALYST_MACRO_AS_REGIME_REF", "true").lower() == "true"
+# 宏观日历（PMI/CPI/社融/LPR）是否进入催化剂日历（2026-10-22 用户裁决：退出）。
+# 依据：catalyst_realizations 已兑现 macro 12 条中仅 1 条 |收益|>2%（PMI 两条 ±0.5%），
+# 且 reports/catalyst_value_tier_20261021.md §5.1 判定 macro n=17 样本不足。
+# 2026-10-21 已先退出评分入口（CATALYST_MACRO_AS_REGIME_REF），本次退出日历生成/展示/
+# 增量加载/P6 注册（存量行由全量重建清理）。回滚：GOT_MACRO_CALENDAR_ENABLED=true。
+GOT_MACRO_CALENDAR_ENABLED = os.environ.get("GOT_MACRO_CALENDAR_ENABLED", "false").lower() == "true"
 
 NARRATIVE_CRITIC_SHADOW = os.environ.get("NARRATIVE_CRITIC_SHADOW", "true").lower() == "true"  # T2: 叙事校验者（影子 2 周）
 AGENT_STOCK_REVIEW_ENABLED = os.environ.get("AGENT_STOCK_REVIEW_ENABLED", "false").lower() == "true"  # T1: Agent 终审
 AGENT_STOCK_REVIEW_SHADOW = os.environ.get("AGENT_STOCK_REVIEW_SHADOW", "true").lower() == "true"  # T1: 影子模式（跑审查但不执行降级）
 AGENT_STOCK_REVIEW_MAX = 2           # T1: Agent 终审最大调用数（R7 成本预算）
+
+# =============================================================================
+# Node 4 两段式：全量标题 LLM 初筛（2026-10-22）
+# =============================================================================
+# 设计依据：
+# - FrugalGPT（arXiv:2305.05176）：LLM cascade 用便宜的前置调用筛掉大部分输入，
+#   成本/效果权衡优于「一次大调用塞全部正文」。
+# - Lost in the Middle（arXiv:2307.03172）：长上下文存在位置偏差，按 weight 排序后
+#   晚到的优质标题排在 50 条截断线之外/中后部，被永久淹没；粗筛只读标题可覆盖全量。
+# - Drowning in Documents（arXiv:2411.11767）：reranker 收益随深排文档数递减甚至反转，
+#   因此短名单必须小（缺省 12）。
+# 阶段 1：当日全部候选标题（无条数上限、无规则打分、无 weight 排序）一次性交 LLM 初筛；
+# 阶段 2：只对选中的 ≤N 条细读抽事件。weight 仍用于展示顺序与 NGA 保底，不决定 LLM 能否看到。
+GOT_NEWS_TITLE_SHORTLIST_ENABLED = os.environ.get("GOT_NEWS_TITLE_SHORTLIST_ENABLED", "true").lower() == "true"
+GOT_NEWS_TITLE_SHORTLIST_SIZE = int(os.environ.get("GOT_NEWS_TITLE_SHORTLIST_SIZE", "12"))
+# 昨日漏读补读：把 node4_raw_news 中近 N 日未抽成事件的标题前缀 [昨日]/[N日前] 回灌粗筛池
+# （扩围后含当日更早时点快照行与周末/假日批；[今日早前] 前缀）
+GOT_NEWS_CARRY_PREV_TITLES = os.environ.get("GOT_NEWS_CARRY_PREV_TITLES", "true").lower() == "true"
+# 补读窗口（自然日，缺省 3）：覆盖周五→周一；逢 4 天以上连休（周五→周二）调 5。
+GOT_NEWS_CARRY_DAYS = int(os.environ.get("GOT_NEWS_CARRY_DAYS", "3"))
+# 补读池硬上限（缺省 1500）：LLM 输入预算护栏，超出按最新优先截断并告警（非热度筛选）。
+# 1500 ≈ 行情日唯一标题 360–680 条 × 4 日窗口（周五→周一实测可达 ~1500），粗筛输入约 57k 字符；
+# 仍远低于渠道上下文上限（百炼 983k），输出上限不变。定得太小会让周末批被截掉最旧的一半。
+GOT_NEWS_CARRY_MAX = int(os.environ.get("GOT_NEWS_CARRY_MAX", "1500"))
+
+# =============================================================================
+# 催化剂日历架构修正（2026-10-22，docs/got/verification.md「2026-10-22 架构修正」）
+# 三条独立开关，可分别回退；全 false 时逐字节回现状。
+# =============================================================================
+# 第 2 步：Node 4 当日事件直接进埋伏通道。此前 _build_ambush_channel 只读日历，
+# 实测 10-21 的 11 个产业级事件（稀土出口管制/厄尔尼诺/MLCC 交期/液氩涨价）对埋伏
+# 零贡献；59 个归档日里正式池 >0 仅 16 天（27%），均值 0.47 个/日。
+GOT_NODE4_AMBUSH_EVENTS_ENABLED = os.environ.get("GOT_NODE4_AMBUSH_EVENTS_ENABLED", "true").lower() == "true"
+
+# 第 6 步：跨日发酵原始新闻直入 llm_narrative prompt。复用 NewsAnalysisNode._detect_fermenting_events
+# （appearance_count>=3 且跨日>=2 天），该函数此前全仓零调用——唯一实现「跨日发酵」信号的
+# 机制却从未进入任何 prompt（厄尔尼诺×农业反例：8-24 起 37 条原始新闻只抽出 3 条事件）。
+GOT_NARRATIVE_FERMENTING_INPUT = os.environ.get("GOT_NARRATIVE_FERMENTING_INPUT", "true").lower() == "true"
+FERMENTING_INPUT_MAX = 20  # 发酵原始新闻入 prompt 上限（按 appearance_count 降序）
+# 发酵信号的时效与形态边界（2026-10-22 真库核查后补）：
+# `_detect_fermenting_events` 的查询本身**无时效上界**，且 `node4_raw_news.lifecycle_state`
+# 恒为 'active'（无任何代码推进该列）→ 真库 13,392 行里 170 行恒满足
+# `appearance_count>=3 且跨日>=2`，最老 first_seen=2026-08-24。按 count 降序取前 20
+# 全为陈旧论坛长文/裸个股名（巨化股份 49× 至 10-16、汉钟精机 31× 至 10-08），
+# 每日注入等于把旧噪声钉进 prompt —— 与「热度代理价值」是同一类误判。
+# 故在**调用侧**加两道形态/时效边界（不改共享检测器，其行为仍供未来复用）：
+FERMENTING_RECENCY_DAYS = int(os.environ.get("GOT_FERMENTING_RECENCY_DAYS", "3"))  # last_seen 落在 [today-N, today]
+FERMENTING_MIN_TITLE_LEN = 8  # 裸实体标题（「中际旭创」「宁德时代」）不含事件信息，不构成发酵信号
+
+# 第 7 步：阶段 1 短名单（缺省 12 条）之外的产业级事件召回。DeepInfer×算力反例：
+# 「DeepSeek开源推理框架DeepInfer…」appearance_count=1、无涨停/政策热度词，被 12 条短名单
+# 挤出（788 条压到 12 条），LLM 从未看到它 → 日历不可能产出国产算力推理链催化。
+GOT_INDUSTRY_RECALL_ENABLED = os.environ.get("GOT_INDUSTRY_RECALL_ENABLED", "true").lower() == "true"
+INDUSTRY_RECALL_MAX = int(os.environ.get("GOT_INDUSTRY_RECALL_MAX", "8"))
+# 词表是**形态过滤**而非价值判断：只描述「供给侧动作 + 产业实体」这一形态，
+# 影响大小仍由 LLM 判（与「事件价值只交 LLM」原则一致，见 GOT_NEWS_TITLE_SHORTLIST 注释）。
+# 匹配规则：标题同时命中 ≥1 供给侧动作词 与 ≥1 产业实体词 → 召回；影响锚词仅日志标注。
+INDUSTRY_RECALL_KEYWORDS = {
+    "supply_action": [
+        "开源", "量产", "投产", "扩产", "招标", "中标", "涨价", "提价", "减产", "停产",
+        "断供", "出口管制", "反倾销", "新国标", "豁免", "许可",
+    ],
+    "industry_entity": [
+        "算力", "推理", "昇腾", "光刻", "HBM", "DRAM", "NAND", "MLCC", "存储", "封装",
+        "电池", "锂", "硅料", "组件", "航运", "油轮", "糖", "稻", "小麦", "玉米",
+        "大豆", "天然橡胶",
+    ],
+    "impact_anchor": [
+        "成本", "供需", "产能", "交期", "订单", "盈利", "毛利率", "国产替代",
+        "自主可控", "产业链", "供应链",
+    ],
+}
 
 # =============================================================================
 # Phase 6-1: 盘中 0→1 确认闸门（docs/got/plans/Phase6-1_盘中闸门影子期实施稿_20261015.md）
@@ -474,7 +598,11 @@ CATALYST_SOURCE_TIER = {
     "akshare_lockup": "confirmed",
     "macro_rule": "confirmed",
     "global_map": "reported",
+    "global_manual": "reported",
     "llm_narrative": "reported",
+    # 2026-10-22：Node 4 当日事件进埋伏通道后由 Phase 2 补登 P6（catalyst_realizations），
+    # 属「权威传导」档（同 llm_narrative），不改证据乘数。
+    "node4_event": "reported",
 }
 # 证据档默认（未知 source 回退）
 CATALYST_TIER_DEFAULT = "reported"
@@ -516,7 +644,7 @@ MACRO_CALENDAR_RULES = [
     {
         "event_type": "macro",
         "title": "官方制造业PMI",
-        "day_rule": "month_end",      # 月末最后一天或次日
+        "day_rule": "month_end",      # 月末最后一天（规则不平移；逢周末记发布日，交易反应顺延至下一交易日）
         "impact_level": 2,
         "affected_sectors": ["券商", "有色金属", "钢铁", "化工", "工程机械"],
         "direction": "binary",

@@ -20,7 +20,7 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.got.schemas import (
     NewsContext,
@@ -31,6 +31,14 @@ from src.got.news_feeds import fetch_all_news
 from src.got.catalyst_config import (
     GOT_NEWS_EVIDENCE_GATING,
     GOT_LOW_SECTOR_RESCUE,
+    GOT_NEWS_TITLE_SHORTLIST_ENABLED,
+    GOT_NEWS_TITLE_SHORTLIST_SIZE,
+    GOT_NEWS_CARRY_PREV_TITLES,
+    GOT_NEWS_CARRY_DAYS,
+    GOT_NEWS_CARRY_MAX,
+    GOT_INDUSTRY_RECALL_ENABLED,
+    INDUSTRY_RECALL_KEYWORDS,
+    INDUSTRY_RECALL_MAX,
     LOW_RESCUE_TEMPERATURE,
     LOW_RESCUE_MAX_TOKENS,
 )
@@ -60,10 +68,30 @@ RISK_SUMMARY_MAX_TOKENS = 300
 REASONING_TEMPERATURE = 0.3
 REASONING_MAX_TOKENS = 400
 
+# 标题粗筛（阶段 1）：输出上限依据 ≤12 条 × ~40 token/条
+TITLE_SHORTLIST_TEMPERATURE = 0.2
+TITLE_SHORTLIST_MAX_TOKENS = 1500
+# 回滚路径（GOT_NEWS_TITLE_SHORTLIST_ENABLED=false）沿用的旧截断条数
+LEGACY_PROMPT_MAX_ITEMS = 50
+
 
 # =============================================================================
 # Prompt 模板
 # =============================================================================
+
+TITLE_SHORTLIST_PROMPT = """你是 A 股消息面筛选员。下面是今日全部候选新闻标题（已按编号列出，共 {total} 条）。
+
+{titles}
+
+任务：挑出对**中国经济与 A 股板块**可能产生实质影响的条目，最多 {limit} 条。
+按"影响深度"判断，不按标题炸裂程度，也不按公司规模：
+- 挑：能改变供需格局/政策方向/技术路线/资金成本的事件——财报与业绩指引、产业政策与监管、重大技术发布（开源/量产/突破）、产业链供需与价格异动、地缘与大宗商品、宏观数据与央行操作、大额资本动作、影响行业的公司级事件。
+- 不挑：单纯行情播报（"XX涨超X%""多股涨停"）、论坛口水、无主体的评论转载、软文、与 A 股无关的境外社会新闻、标题无法判断主体的条目。
+- 关键区分：一条"某小公司三季报"若只影响自身，影响低于"改变全行业供需/政策的产业级事件"；反之若该公司是产业链关键环节，则影响深远。
+- [今日早前]/[昨日]/[N日前] 前缀的是此前已出现但未分析的条目（数字为距今天的自然日数；跨周末/假日时其市场时效以重新开盘计，不按日龄折减），若具实质影响同样要挑。
+- 每条标题最多被挑一次；挑中的要给一句话理由（引用标题里的实体与影响链条）。
+输出 JSON：{{"selected":[{{"index":3,"reason":"..."}}]}}
+index 必须是上面出现过的编号。只输出 JSON。"""
 
 EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提取影响A股的重要事件。
 
@@ -84,13 +112,15 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
    - affected_sectors: 受影响板块列表（尽量映射到概念列表中的概念）
    - affected_stocks: 事件中明确提到的具体个股名称或代码列表（如"中际旭创"、"300750"）。没有提到具体个股则留空[]
    - source_type: 事件的主要信息来源类型——"professional"（专业媒体/通讯社）或 "retail_forum"（散户论坛/社区讨论）。如果事件主要由[NGA论坛]等论坛标签的新闻首先提及或讨论，标记为"retail_forum"{src_index_req}
+   - onset_days: 估计该事件对板块产生可观测影响的滞后期，单位交易日，1-10 的整数；无法判断填 null（不要猜）
 2. 不要遗漏重要事件，也不要重复
 3. 同一事件被多家媒体报道时，合并为一个事件
 4. 如果当前新闻中的事件与历史事件相关（同一主题或因果关系），请在 summary 中标注"延续自：[历史事件标题]"
 5. 严格按 importance 排序，high 在前
+6. 素材中带 [产业] 前缀的条目是按产业链动作词表（开源/量产/涨价/出口管制…）补召回的，可能不在初筛短名单里；若具实质影响同样要提取
 
 输出 JSON 格式（不要 markdown 代码块）：
-{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional"{src_index_example}}}]}}"""
+{{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional", "onset_days": 3{src_index_example}}}]}}"""
 
 CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
 
@@ -181,6 +211,20 @@ LOW_RESCUE_PROMPT = """你是 A 股板块研究员。以下事件被一审判为
 输出 JSON 数组，每项：
 {{"index": 0, "sector_impact": "high|medium|low", "reason": "判定理由（引用命中的维度，一句话）"}}
 只输出 JSON。index 对应候选事件列表的 0-based 序号。宁严勿松：拿不准 high 还是 medium 时给 medium。"""
+
+
+def _carry_age_prefix(item: Dict) -> str:
+    """补读条目的自然日龄前缀（0=当日更早时点 / 1=昨日 / n=n 自然日前）。
+
+    只标注来源与日龄，不改排序也不打影响分（市场时效不按自然日龄折减，
+    跨周末/假日由 LLM 结合题材自行判断）。
+    """
+    age = item.get("carried_age_days")
+    if age == 0:
+        return "[今日早前] "
+    if age:
+        return "[昨日] " if age == 1 else f"[{age}日前] "
+    return ""
 
 
 class NewsAnalysisNode:
@@ -297,12 +341,21 @@ class NewsAnalysisNode:
     # Step 1: 新闻采集
     # =================================================================
 
-    async def _fetch_news(self) -> Tuple[List[Dict[str, Any]], DataQuality]:
-        """5+1 源并发采集新闻（新浪/CLS/华尔街见闻/东财/NewsNow + Intelligence），返回合并结果 + DataQuality。"""
-        merged, stats = await asyncio.to_thread(fetch_all_news)
+    async def _fetch_news(
+        self,
+        skip_sources: Iterable[str] = (),
+        include_intelligence: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], DataQuality]:
+        """7 源串行采集（新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）+ Intelligence 合并，返回 DataQuality。
+
+        `skip_sources` / `include_intelligence` 供定时快照采集降载：跳过论坛/热榜/情报热榜，
+        只留滚动新闻线（CLS 1–3h、东财/见闻/NewsNow 数小时，必须高频采才不会整段丢失）；
+        NGA/同花顺热榜/情报热榜非时效源，仍由每日 GOT 全量采集。
+        """
+        merged, stats = await asyncio.to_thread(fetch_all_news, skip_sources)
 
         # §6 Intelligence 通道：与 5 源并行，合并去重后送 LLM
-        intelligence_items = await self._fetch_intelligence()
+        intelligence_items = await self._fetch_intelligence() if include_intelligence else []
         if intelligence_items:
             # 去重合并（基于标题相似度）
             merged = self._merge_with_intelligence(merged, intelligence_items)
@@ -383,15 +436,284 @@ class NewsAnalysisNode:
         return merged
 
     # =================================================================
-    # Step 2: 3 并发 LLM 分析
+    # Step 2: 4 次串行 LLM 分析（标题粗筛 → 事件提取 → 概念发现 → 风险总结）
     # =================================================================
+
+    def _shortlist_titles(self, raw_news: List[Dict]) -> List[Dict]:
+        """把当日**全部**候选标题一次性交 LLM 初筛，返回选中条目（输入不设条数上限）。
+
+        事件价值判定交给 LLM：weight 只度量「媒体多热」，不度量「对 A 股的影响深度」
+        （实测一条个股涨停播报 22.2 > 产业级开源发布/全球气候异常 14.8），规则打分已被
+        证伪（同 Node 6 A6 阶段 2 「规则价值判断不可靠」教训）。粗筛只读标题不带摘要：
+        成本低于细读，且覆盖全量不受长上下文位置偏差影响（Lost in the Middle,
+        arXiv:2307.03172）。
+
+        失效契约（**不降级到规则排序**）：LLM 空响应 / JSON 解析失败 / 有效 index 为 0
+        → 返回 []，当日不产事件。用 weight 兜底等于 LLM 失效时主动选择错误事件——
+        宁可漏，不可错。
+        """
+        ordered = [it for it in raw_news if (it.get("title") or "").strip()]
+        if not ordered:
+            return []
+
+        lines = []
+        for i, item in enumerate(ordered, 1):
+            prefix = _carry_age_prefix(item)
+            lines.append(f"{i}. {prefix}{item['title'].strip()}")
+        prompt = TITLE_SHORTLIST_PROMPT.format(
+            total=len(ordered),
+            limit=GOT_NEWS_TITLE_SHORTLIST_SIZE,
+            titles="\n".join(lines),
+        )
+
+        raw_result = self._call_llm(
+            prompt,
+            temperature=TITLE_SHORTLIST_TEMPERATURE,
+            max_tokens=TITLE_SHORTLIST_MAX_TOKENS,
+        )
+        if not raw_result:
+            logger.warning(
+                "[Node 4] 标题粗筛失败，当日不产事件（不降级到规则排序）: LLM 空响应"
+            )
+            return []
+
+        data = self._extract_json(raw_result)
+        selected = data.get("selected") if isinstance(data, dict) else None
+        if not isinstance(selected, list):
+            logger.warning(
+                "[Node 4] 标题粗筛失败，当日不产事件（不降级到规则排序）: "
+                "JSON 解析失败（输出前120字: %s）",
+                raw_result[:120],
+            )
+            return []
+
+        picked: List[Dict] = []
+        seen = set()
+        for entry in selected:
+            if len(picked) >= GOT_NEWS_TITLE_SHORTLIST_SIZE:
+                break
+            if not isinstance(entry, dict):
+                continue
+            entry_index = entry.get("index")
+            if isinstance(entry_index, bool):
+                continue
+            try:
+                idx = int(entry_index)
+            except (TypeError, ValueError):
+                continue
+            if idx in seen or not (1 <= idx <= len(ordered)):
+                continue
+            seen.add(idx)
+            picked.append(ordered[idx - 1])
+
+        if not picked:
+            logger.warning(
+                "[Node 4] 标题粗筛失败，当日不产事件（不降级到规则排序）: 有效 index 为 0"
+            )
+            return []
+        return picked
+
+    def _recall_industry_candidates(
+        self, raw_news: List[Dict], exclude: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """产业级事件召回（2026-10-22）：补阶段 1 短名单装不下的产业链信号。
+
+        反例（DeepInfer×算力）：`DeepSeek开源推理框架DeepInfer，V4.1 Flash登顶Agent Arena
+        开源榜`（10-20，source_count=1）没有涨停/暴涨/政策类热度词、也不是多源重复，
+        788 条压到 12 条时排在第 12 名外 → LLM 从未看到它 → 日历不可能产出国产算力催化。
+
+        词表是**形态过滤**而非价值判断（`INDUSTRY_RECALL_KEYWORDS`）：
+        标题**同时**命中 ≥1 供给侧动作词 与 ≥1 产业实体词 → 召回；影响锚词不计入必要
+        条件，仅用于日志（最终影响大小仍由 LLM 判，本方法不排序价值）。
+
+        量控：命中数 > INDUSTRY_RECALL_MAX 时按 source_count 降序取前 N（与短名单 12 条
+        合计 ≤20 条进细读，控制在原细读成本 2 倍内）。
+        开关 GOT_INDUSTRY_RECALL_ENABLED=false → []（逐字节回现状）。
+        """
+        if not GOT_INDUSTRY_RECALL_ENABLED or not raw_news:
+            return []
+
+        supply_actions = INDUSTRY_RECALL_KEYWORDS["supply_action"]
+        entities = INDUSTRY_RECALL_KEYWORDS["industry_entity"]
+        anchors = INDUSTRY_RECALL_KEYWORDS["impact_anchor"]
+
+        excluded_titles = {
+            self._normalize_title(it.get("title", "")) for it in (exclude or [])
+        }
+
+        hits: List[Dict] = []
+        seen: set[str] = set()
+        for item in raw_news:
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
+            norm = self._normalize_title(title)
+            if norm in excluded_titles or norm in seen:
+                continue
+            if not any(kw in title for kw in supply_actions):
+                continue
+            if not any(kw in title for kw in entities):
+                continue
+            seen.add(norm)
+            recalled = dict(item)  # 浅拷贝：不改调用方 raw_news（概念发现/持久化仍读原对象）
+            recalled["recalled_industry"] = True
+            recalled["_recall_anchor_hit"] = any(kw in title for kw in anchors)
+            hits.append(recalled)
+
+        # source_count 降序（缺失按 1）——与短名单「多源确认优先」口径一致，时间序保持稳定
+        hits.sort(key=lambda it: int(it.get("source_count") or 1), reverse=True)
+        if len(hits) > INDUSTRY_RECALL_MAX:
+            hits = hits[:INDUSTRY_RECALL_MAX]
+
+        if hits:
+            logger.info(
+                "[Node 4] 产业召回: %d 条（含影响锚 %d 条），上限 %d",
+                len(hits), sum(1 for h in hits if h.get("_recall_anchor_hit")),
+                INDUSTRY_RECALL_MAX,
+            )
+            for h in hits[:5]:
+                logger.info("[Node 4] 产业召回命中: %s", (h.get("title") or "")[:60])
+        return hits
+
+    def _load_unabsorbed_titles(self, days: Optional[int] = None) -> List[Dict]:
+        """漏读补读：近 N 个自然日已落库、但尚未被任何事件吸收的原始标题（全量，不做预截断）。
+
+        背景（2026-10-20 实测）：当日 364 条原始新闻，Node 4 只把 weight 前 50 条
+        喂给 LLM，《DeepSeek开源推理框架DeepInfer…》从未进入 node4_events，次日
+        催化剂日历完全没有它。原始标题已在 node4_raw_news 落库，直接回灌粗筛池。
+
+        **扩围（2026-10-22）**：窗口从「昨日及更早」扩到 **含当日更早时点**（定时快照
+        写入的行，`fetched_date <= today`）。GOT 13:20 运行时的实时窗口看不到 09:30 前
+        已滚出的短窗源条目，靠本通道补回；自然日龄经 `carried_age_days` 显式曝给 LLM
+        （0=当日更早/1=昨日/n=n 自然日前），**不做信息强度数值衰减**——判定权在粗筛，
+        跨周末/假日的市场时效不按自然日龄折减。
+
+        **不做热度排序/预截断**（2026-10-22 真库实测教训）：按 `appearance_count`
+        降序取前 20 条，被多轮热榜刷高计数的娱乐/社会条目占满，`appearance_count=1`
+        的优质单次新闻（实测 DeepInfer）全部挤掉——这正是 weight 热度项的同类误判。
+        候选价值只由 LLM 粗筛判定；本函数只做**标题归一化去重**（同一新闻多源重复）。
+
+        排除已吸收：直接按 `Node4EventRecord.title`（`last_seen` 覆盖 N+1 天）做归一化
+        比较——不用 `_load_recent_news_events`，后者按 lifecycle 只保留 emerging/
+        fermenting/peak，已 fading 的已吸收事件会让对应原稿被重复回灌。归一化复用
+        `_normalize_title`，不另写第二套。窗口缺省 `GOT_NEWS_CARRY_DAYS`（3 日，覆盖
+        周五→周一）；池超 `GOT_NEWS_CARRY_MAX` 按最新优先截断（LLM 输入预算护栏）。
+        查询异常 → []，不阻断主流程。
+        """
+        days = GOT_NEWS_CARRY_DAYS if days is None else days
+        today = date.today()
+        try:
+            # 局部导入：单测按既有范式 patch("src.storage.DatabaseManager") 即可注入假 session
+            from src.storage import DatabaseManager
+
+            db = DatabaseManager()
+            with db.get_session() as session:
+                rows = (
+                    session.query(Node4RawNewsRecord)
+                    .filter(
+                        Node4RawNewsRecord.fetched_date >= today - timedelta(days=days),
+                        # 原为 < today：纳入当日更早时点快照行（GOT 实时窗口已滚出的条目）
+                        Node4RawNewsRecord.fetched_date <= today,
+                        Node4RawNewsRecord.lifecycle_state == "active",
+                    )
+                    .order_by(
+                        Node4RawNewsRecord.fetched_date.desc(),
+                        Node4RawNewsRecord.id.desc(),
+                    )
+                    .all()
+                )
+                candidates = [
+                    (
+                        r.title_original or "", r.source or "", r.url or "",
+                        str(r.published_at or ""), r.fetched_date,
+                    )
+                    for r in rows
+                ]
+                absorbed_rows = (
+                    session.query(Node4EventRecord.title)
+                    .filter(
+                        Node4EventRecord.last_seen >= today - timedelta(days=days + 1),
+                    )
+                    .all()
+                )
+        except Exception as exc:
+            logger.warning("[Node 4] 未吸收标题读取失败（跳过补读）: %s", exc)
+            return []
+
+        absorbed = {self._normalize_title(title or "") for (title,) in absorbed_rows}
+        carried: List[Dict] = []
+        seen = set()
+        for title, source, url, published_at, fetched_date in candidates:
+            norm = self._normalize_title(title)
+            if not norm or norm in absorbed or norm in seen:
+                continue
+            seen.add(norm)
+            fetched = fetched_date
+            if isinstance(fetched, datetime):
+                fetched = fetched.date()
+            elif isinstance(fetched, str):
+                try:
+                    fetched = date.fromisoformat(fetched[:10])
+                except ValueError:
+                    fetched = None
+            # 缺失/不可解析 → 1：保守沿用旧「昨日补读」语义
+            age = (today - fetched).days if isinstance(fetched, date) else 1
+            carried.append({
+                "title": title,
+                "snippet": "",
+                "source": source,
+                "source_type": source,
+                "url": url,
+                "published_date": published_at,
+                "carried_age_days": age,
+            })
+        if len(carried) > GOT_NEWS_CARRY_MAX:
+            logger.warning(
+                "[Node 4] 补读池 %d 条超上限 %d，按最新优先截断（非热度筛选）",
+                len(carried), GOT_NEWS_CARRY_MAX,
+            )
+            carried = carried[:GOT_NEWS_CARRY_MAX]
+        return carried
 
     async def _analyze_with_llm(
         self, raw_news: List[Dict],
     ) -> Tuple[List[NewsEvent], List[Dict], List[str]]:
-        """3 次 LLM 调用：事件提取 → 概念发现 → 风险总结（串行，避免 API 并发空响应）。"""
+        """4 次 LLM 调用：标题粗筛 → 事件提取 → 概念发现 → 风险总结（串行，避免 API 并发空响应）。"""
         gated = GOT_NEWS_EVIDENCE_GATING
-        news_text, ordered_items = self._format_news_for_prompt(raw_news, gated=gated)
+        # 两段式：阶段 1 全量标题初筛，阶段 2 只对选中条目细读抽事件。
+        # GOT_NEWS_TITLE_SHORTLIST_ENABLED=false 回滚到旧口径（weight 前 50 条直接喂细读）。
+        if GOT_NEWS_TITLE_SHORTLIST_ENABLED:
+            pool_for_shortlist = list(raw_news)
+            carried: List[Dict] = []
+            if GOT_NEWS_CARRY_PREV_TITLES:
+                carried = self._load_unabsorbed_titles()
+                if carried:
+                    today_norms = {
+                        self._normalize_title(it.get("title", "")) for it in raw_news
+                    }
+                    carried = [
+                        c for c in carried
+                        if self._normalize_title(c.get("title", "")) not in today_norms
+                    ]
+                pool_for_shortlist = raw_news + carried
+            shortlist = self._shortlist_titles(pool_for_shortlist)
+            # 产业级召回（2026-10-22）：短名单之外按「供给侧动作×产业实体」补召回，
+            # 与短名单合并去重后一起进阶段 2 细读（DeepInfer 类单源产业发布不再缺席）
+            recalled = self._recall_industry_candidates(raw_news, exclude=shortlist)
+            extraction_pool = shortlist + recalled
+            logger.info(
+                "[Node 4] 标题粗筛: %d → %d 条（含补读 %d、产业召回 %d）",
+                len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
+            )
+            news_text, ordered_items = self._format_news_for_prompt(extraction_pool, gated=gated)
+            # 概念发现/风险总结仍读全量 raw_news（标题+摘要）：概念发现依赖跨条目的
+            # 重复主题，喂 12 条短名单会让它失效。
+            all_news_text, _ = self._format_news_for_prompt(raw_news, gated=gated)
+        else:
+            news_text, ordered_items = self._format_news_for_prompt(
+                raw_news, max_items=LEGACY_PROMPT_MAX_ITEMS, gated=gated,
+            )
+            all_news_text = news_text
         # A-2 (2026-10-11)：概念列表不再硬编码"科技成长"，改为从 CONCEPT_UNIVERSE
         # 子类标签派生（含周期/资源/消费/机械/医药扩展），使事件提取的
         # affected_sectors 不再只偏科技（glue 埋伏支路的上游事件供给）。
@@ -402,21 +724,27 @@ class NewsAnalysisNode:
         historical_context = self._format_historical_context_for_prompt(historical_events)
 
         # 事件提取（注入历史上下文）
-        events_result = await asyncio.to_thread(
-            self._call_llm,
-            EVENT_EXTRACTION_PROMPT.format(
-                concept_list=concept_list_str,
-                news_data=news_text,
-                historical_context=historical_context,
-                src_index_req=(
-                    "\n   - source_index: 该事件**出处**对应的新闻编号（新闻数据前 [#n] 的 n，1-based）；"
-                    "取最核心来源编号，无法定位则省略（系统按此编号回填真实 url/发布时间，勿自行生成 url）"
-                ) if gated else "",
-                src_index_example=", \"source_index\": 3" if gated else "",
-            ),
-            temperature=EVENT_EXTRACTION_TEMPERATURE,
-            max_tokens=EVENT_EXTRACTION_MAX_TOKENS,
-        )
+        # 素材为空 = 粗筛无选中（LLM 失效或当日无值得分析条目）→ 直接跳过提取调用，
+        # 既不烧钱也不给「空新闻列表」留幻觉空间；概念/风险仍用全量文本独立产出。
+        events_result = ""
+        if news_text:
+            events_result = await asyncio.to_thread(
+                self._call_llm,
+                EVENT_EXTRACTION_PROMPT.format(
+                    concept_list=concept_list_str,
+                    news_data=news_text,
+                    historical_context=historical_context,
+                    src_index_req=(
+                        "\n   - source_index: 该事件**出处**对应的新闻编号（新闻数据前 [#n] 的 n，1-based）；"
+                        "取最核心来源编号，无法定位则省略（系统按此编号回填真实 url/发布时间，勿自行生成 url）"
+                    ) if gated else "",
+                    src_index_example=", \"source_index\": 3" if gated else "",
+                ),
+                temperature=EVENT_EXTRACTION_TEMPERATURE,
+                max_tokens=EVENT_EXTRACTION_MAX_TOKENS,
+            )
+        else:
+            logger.warning("[Node 4] 素材为空（粗筛无选中）→ 跳过事件提取，当日不产事件")
         events = self._parse_events(events_result, ordered_items)
 
         # 概念发现（注入历史上下文）
@@ -424,7 +752,7 @@ class NewsAnalysisNode:
             self._call_llm,
             CONCEPT_DISCOVERY_PROMPT.format(
                 current_concepts=concept_list_str,
-                news_data=news_text,
+                news_data=all_news_text,
                 historical_context=historical_context,
             ),
             temperature=CONCEPT_DISCOVERY_TEMPERATURE,
@@ -435,7 +763,7 @@ class NewsAnalysisNode:
         # 风险总结（可从事件中规则兜底）
         risks_result = await asyncio.to_thread(
             self._call_llm,
-            RISK_SUMMARY_PROMPT.format(news_data=news_text),
+            RISK_SUMMARY_PROMPT.format(news_data=all_news_text),
             temperature=RISK_SUMMARY_TEMPERATURE,
             max_tokens=RISK_SUMMARY_MAX_TOKENS,
         )
@@ -459,14 +787,17 @@ class NewsAnalysisNode:
     _RESERVED_SOURCE_TYPES = ("nga_forum", "intelligence")
 
     @staticmethod
-    def _format_news_for_prompt(news_items: List[Dict], max_items: int = 50, *, gated: bool = False) -> Tuple[str, List[Dict]]:
+    def _format_news_for_prompt(news_items: List[Dict], max_items: Optional[int] = None, *, gated: bool = False) -> Tuple[str, List[Dict]]:
         """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA/Intelligence 保底）。
 
         返回 (文本, 有序条目列表)：有序列表与文本中序号 1..N 严格对齐，供 `_parse_events`
         按 LLM 输出的 source_index **确定性回连**真实 url/发布时间（防幻觉，禁 LLM 造 URL）。
+        max_items=None（缺省）：**不截断**，全量入 prompt（两段式的阶段 2 与粗筛后的全量
+        辅助调用都走这条）；只保留旧的 50 条截断作为回滚路径的显式传参
+        （`LEGACY_PROMPT_MAX_ITEMS`）。
         gated=False（缺省）：素材行逐字同改造前，仅返回列表供回连（实际无 source_index 则回连 None）。
         """
-        top_items = list(news_items[:max_items])
+        top_items = list(news_items) if max_items is None else list(news_items[:max_items])
 
         def _ensure_min(source_type: str, min_count: int) -> None:
             """保底：确保 top_items 中至少有 min_count 条 source_type 条目。
@@ -488,8 +819,10 @@ class NewsAnalysisNode:
                         top_items[j] = cand
                         break
 
-        _ensure_min("nga_forum", NewsAnalysisNode._NGA_MIN_FOR_LLM)
-        _ensure_min("intelligence", NewsAnalysisNode._INTEL_MIN_FOR_LLM)
+        # 全量入 prompt 时无需保底（不存在截断线，尾部条目本就在池内）
+        if max_items is not None:
+            _ensure_min("nga_forum", NewsAnalysisNode._NGA_MIN_FOR_LLM)
+            _ensure_min("intelligence", NewsAnalysisNode._INTEL_MIN_FOR_LLM)
 
         lines = []
         for i, item in enumerate(top_items, 1):
@@ -514,16 +847,20 @@ class NewsAnalysisNode:
                 tag = source or "搜索"
 
             pub_date = item.get("published_date", "")
+            # 补读日龄前缀 + 产业召回前缀（只标注来源与日龄，不改排序/影响判断）
+            prefix = _carry_age_prefix(item)
+            if item.get("recalled_industry"):
+                prefix += "[产业] "
             if gated:
                 # A2 素材行前缀：[#idx | 发布时间]——供 LLM 引用 source_index + 时效判断（url 不入 prompt，回连走代码侧）
                 head = f"{i}. [#{i}"
                 if pub_date:
                     head += f" | {pub_date}"
-                head += f"|{tag}] {title}\n   {snippet}"
+                head += f"|{tag}] {prefix}{title}\n   {snippet}"
                 lines.append(head)
             else:
                 # 改造前原行格式（零决策面变更）
-                lines.append(f"{i}. [{tag}] {title}\n   {snippet}")
+                lines.append(f"{i}. [{tag}] {prefix}{title}\n   {snippet}")
         return "\n".join(lines), top_items
 
     @staticmethod
@@ -618,6 +955,31 @@ class NewsAnalysisNode:
         except json.JSONDecodeError:
             return None
 
+    # 埋伏通道催化剂权重映射（2026-10-22）：impact_level 为基数，负面事件减半。
+    # 非概率：仅用于 ambush 准入过滤与 B 公式排序（替代 CalendarEvent.confidence 语义）。
+    _NODE4_IMPACT_WEIGHT = {"high": 0.8, "medium": 0.6, "low": 0.4}
+
+    @classmethod
+    def _derive_catalyst_weight(cls, impact_level: str, sentiment: str) -> float:
+        """impact_level×sentiment → ambush 专用权重（0~1）。非法输入按 medium/neutral 处理。"""
+        base = cls._NODE4_IMPACT_WEIGHT.get(str(impact_level or "").lower(), 0.6)
+        if str(sentiment or "").lower() == "negative":
+            base *= 0.5
+        return round(base, 3)
+
+    @staticmethod
+    def _parse_onset_days(raw: Any) -> Optional[int]:
+        """LLM onset_days → Optional[int]（1~10）；null/越界/非数值 → None（未知）。"""
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            days = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if not (1 <= days <= 10):
+            return None
+        return days
+
     @staticmethod
     def _parse_events(result, ordered_items: Optional[List[Dict]] = None) -> List[NewsEvent]:
         """解析事件提取 LLM 输出。
@@ -625,6 +987,9 @@ class NewsAnalysisNode:
         A2 确定性回连：按 LLM 输出的 source_index（1-based）从 ordered_items 取**真实**
         url/发布时间回填到 NewsEvent.source_url/timestamp；越界/缺失→留空（不伪造）。
         LLM 不输出 url，防幻觉。
+
+        2026-10-22：同时填 `catalyst_weight`（impact×sentiment 确定性映射）与
+        `catalyst_onset_days`（LLM 自评滞后期，可空），供 Node 6 埋伏通道消费。
         """
         if isinstance(result, Exception) or not result:
             return []
@@ -645,18 +1010,22 @@ class NewsAnalysisNode:
                     ref = ordered_items[idx - 1] or {}
                     src_url = (ref.get("url") or "").strip() or None
                     src_time = (ref.get("published_date") or "").strip() or None
+                impact_level = item.get("impact_level", "medium")
+                sentiment = item.get("sentiment", "neutral")
                 events.append(NewsEvent(
                     event_type=item.get("event_type", "industry"),
                     title=item.get("title", ""),
                     summary=item.get("summary", ""),
-                    impact_level=item.get("impact_level", "medium"),
-                    sentiment=item.get("sentiment", "neutral"),
+                    impact_level=impact_level,
+                    sentiment=sentiment,
                     affected_sectors=item.get("affected_sectors", []),
                     affected_stocks=item.get("affected_stocks", []),
                     source_type=item.get("source_type", "professional"),
                     source_count=1,
                     source_url=src_url,
                     timestamp=src_time,
+                    catalyst_weight=NewsAnalysisNode._derive_catalyst_weight(impact_level, sentiment),
+                    catalyst_onset_days=NewsAnalysisNode._parse_onset_days(item.get("onset_days")),
                 ))
             except Exception as exc:
                 logger.debug("[Node 4] 事件解析失败: %s — item=%s", exc, item)
@@ -1067,21 +1436,25 @@ class NewsAnalysisNode:
         union = bigrams_a | bigrams_b
         return len(intersection) / len(union)
 
-    def _persist_raw_news(self, raw_news: List[Dict]) -> None:
+    def _persist_raw_news(self, raw_news: List[Dict]) -> Tuple[int, int]:
         """原始新闻持久化（P1-1）：精确匹配 + 相似度兜底去重。
 
         每次 _fetch_news() 后调用，将全量原始数据写入 node4_raw_news 表。
         同一新闻跨日重复出现时：appearance_count += 1, last_seen_date 更新。
+
+        Returns:
+            (persisted, updated)：本次新增行数 / 命中去重后刷新的行数；
+            空输入或持久化异常 → (0, 0)（异常已被内部吞掉，不阻断主流程）。
         """
         if not raw_news:
-            return
+            return 0, 0
 
         today = date.today()
+        persisted = 0
+        updated = 0
         try:
             db = DatabaseManager()
             with db.get_session() as session:
-                persisted = 0
-                updated = 0
                 for item in raw_news:
                     title = item.get("title", "").strip()
                     source = item.get("source", "unknown")
@@ -1153,6 +1526,8 @@ class NewsAnalysisNode:
                     )
         except Exception as e:
             logger.warning(f"[Node 4] 原始新闻持久化失败: {e}")
+            return 0, 0
+        return persisted, updated
 
     def _detect_fermenting_events(self) -> List[Node4RawNewsRecord]:
         """检测发酵中的原始新闻：跨日出现 ≥3 次 AND 跨度 ≥2 天。

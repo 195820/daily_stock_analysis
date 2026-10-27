@@ -1,0 +1,17 @@
+[Unit]
+Description=DSA news snapshot collector (Node 4 raw news, no LLM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dsa
+Group=dsa
+WorkingDirectory=/opt/dsa/code
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dsa/venv/bin/python main.py --news-collect
+# journal 里按 dsa-news-collect 标签检索：journalctl -t dsa-news-collect
+SyslogIdentifier=dsa-news-collect
+# 单次采集纯 HTTP（5 源、无 LLM 无论坛），实测 ~25s；给 10 min 上限防某个源挂死
+TimeoutStartSec=600
+MemoryMax=700M

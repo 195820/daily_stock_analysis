@@ -1,0 +1,16 @@
+[Unit]
+Description=DSA news snapshots (5 rolling news wires, hourly)
+
+[Timer]
+# 每小时一批（24/7）。间隔由实测源窗口决定（2026-10-27 13:35 盘中）：
+# CLS 单次只给约 20 条 ≈ 35–40 分钟（200 条请求仅 21 条唯一，分页返回重复，深度不可再加深）、
+# 东财 30 条 ≈ 80 分钟、华尔街见闻 30 条 ≈ 2.5h、新浪 159 条 ≈ 4.2h。
+# 所以 ≤1h 才保住后三条线，CLS 峰值仍会漏约 20 分钟/小时；2h 会让 CLS/东财盘中成段丢。
+# 与 13:20 GOT 错开 10 分钟（快照约 30s，13:10 批早于 GOT 起跑）。
+OnCalendar=*-*-* *:10:00
+# 与 dsa-got.timer 刻意不同：采集补跑无害（纯落库、无决策），开机补上错过的快照
+Persistent=true
+Unit=dsa-news-collect.service
+
+[Install]
+WantedBy=timers.target

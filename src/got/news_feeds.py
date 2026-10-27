@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -88,79 +88,41 @@ _SOURCE_WEIGHTS = {
     "caixin": 24,        # 专业
 }
 
-# 热度关键词
-_HOT_KEYWORDS = {
-    "涨停": 20, "跌停": 20, "暴涨": 18, "暴跌": 18,
-    "大涨": 15, "大跌": 15, "利好": 12, "利空": 12,
-    "政策": 15, "国务院": 16, "证监会": 14, "央行": 14,
-    "IPO": 16, "上市": 14, "新股": 14, "首日": 16,
-    "并购": 12, "重组": 12,
-    "芯片": 13, "半导体": 13, "AI": 12, "机器人": 13,
-    "存储": 14, "DRAM": 14, "长鑫": 16,
-    "固态电池": 14, "光伏": 11, "锂电": 11,
-    "美联储": 10, "降息": 12, "加息": 12,
-    "熔断": 16, "重挫": 15, "跳水": 14,
-    # 地缘政治/贸易制裁（2026-08-05 补充，防止遗漏重大政策风险）
-    "禁止": 18, "制裁": 18, "关税": 16, "贸易战": 18,
-    "出口管制": 17, "光模块": 15, "美国": 14, "中国": 12,
-    "进口": 13, "封锁": 16, "实体清单": 17,
-}
-
 
 def _calculate_weight(item: Dict) -> float:
-    """
-    计算新闻权重分数。
+    """信息源质量分（非事件价值）：来源 40% + 时效 35% + 多源确认 25%。
 
-    来源权重 30% + 时效性 25% + 热度 20% + source_count 25%
+    2026-10-22 删除「热度」项：实测该把一条个股涨停播报（22.4）排在产业级开源
+    发布/全球气候异常（各 11.6）之前 1.9 倍——它度量媒体热度，不度量事件对
+    A 股的影响深度。事件价值只由 LLM 全量初筛判定（见 news_analysis
+    `_shortlist_titles`），本分数仅用于展示顺序与 NGA 保底，不决定 LLM 能否看到。
     """
-    # 来源权重
-    source_type = item.get("source_type", "other")
-    source_score = _SOURCE_WEIGHTS.get(source_type, 10)
+    source_score = _SOURCE_WEIGHTS.get(item.get("source_type", "other"), 10)
 
-    # 时效性权重（越新越重要）
-    time_score = 10  # 默认中等
+    time_score = 10  # 解析不出时间 → 默认中等
     pub_date = item.get("published_date", "")
     if pub_date:
-        try:
-            # 尝试解析时间
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                try:
-                    news_time = datetime.strptime(pub_date[:19], fmt)
-                    hours_diff = (datetime.now() - news_time).total_seconds() / 3600
-                    if hours_diff <= 1:
-                        time_score = 25
-                    elif hours_diff <= 4:
-                        time_score = 20
-                    elif hours_diff <= 8:
-                        time_score = 15
-                    elif hours_diff <= 16:
-                        time_score = 10
-                    else:
-                        time_score = 5
-                    break
-                except ValueError:
-                    continue
-        except Exception:
-            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                news_time = datetime.strptime(pub_date[:19], fmt)
+            except ValueError:
+                continue
+            hours_diff = (datetime.now() - news_time).total_seconds() / 3600
+            if hours_diff <= 1:
+                time_score = 25
+            elif hours_diff <= 4:
+                time_score = 20
+            elif hours_diff <= 8:
+                time_score = 15
+            elif hours_diff <= 16:
+                time_score = 10
+            else:
+                time_score = 5
+            break
 
-    # 热度关键词
-    title = item.get("title", "")
-    hot_score = 0
-    for keyword, score in _HOT_KEYWORDS.items():
-        if keyword in title:
-            hot_score = max(hot_score, score)
+    count_score = min(item.get("source_count", 1) * 10, 30)
 
-    # source_count（多源确认）
-    source_count = item.get("source_count", 1)
-    count_score = min(source_count * 10, 30)
-
-    # 总分
-    return (
-        source_score * 0.30
-        + time_score * 0.25
-        + hot_score * 0.20
-        + count_score * 0.25
-    )
+    return source_score * 0.40 + time_score * 0.35 + count_score * 0.25
 
 
 # =============================================================================
@@ -631,13 +593,19 @@ def merge_news(
     return deduped
 
 
-def fetch_all_news() -> Tuple[List[Dict], Dict[str, int]]:
+def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[str, int]]:
     """
-    串行采集 6 源新闻，返回合并结果 + 各源统计。
+    串行采集 7 源新闻，返回合并结果 + 各源统计。
+
+    Args:
+        skip_sources: 跳过的源名（`sina`/`cls`/`wallstreetcn`/`eastmoney`/`newsnow`/
+            `nga_forum`/`ths_hot`）。快照采集按小时跑，跳过论坛/热榜这类非时效源，
+            避免高频抓取触发反爬（它们仍由每日 GOT 采集）。
 
     Returns:
         (merged_news, source_stats)
-        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N, "ths_hot": N}
+        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N, "nga_forum": N, "ths_hot": N}
+        （被跳过的源不出现在 stats 中，与「该源返回空」区分开）
     """
     sources = {
         "sina": fetch_sina_news,
@@ -648,6 +616,12 @@ def fetch_all_news() -> Tuple[List[Dict], Dict[str, int]]:
         "nga_forum": fetch_nga_forum_news,
         "ths_hot": fetch_ths_hot_topics,
     }
+    skipped = set(skip_sources)
+    if skipped:
+        unknown = skipped - set(sources)
+        if unknown:
+            logger.warning("[news_feeds] 未知跳过源（忽略）: %s", sorted(unknown))
+        sources = {k: v for k, v in sources.items() if k not in skipped}
 
     results: Dict[str, List[Dict]] = {}
     stats: Dict[str, int] = {}

@@ -402,6 +402,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--news-collect',
+        action='store_true',
+        help='单次新闻快照采集（Node 4 原始新闻落库，无 LLM；供 GOT 运行时补读）'
+    )
+
+    parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
@@ -1440,6 +1446,28 @@ def main() -> int:
                 logger.exception("[盘中闸门] 执行失败: %s", e)
                 return 1
 
+        # 模式1.5c: Node 4 新闻快照定时采集（无 LLM，仅采集+落库）
+        if args.news_collect:
+            logger.info("模式: 新闻快照采集（Node 4 raw news，无 LLM）")
+            try:
+                from src.patches.eastmoney_patch import eastmoney_patch
+                eastmoney_patch()
+
+                import asyncio
+                from src.got.news_collector import collect_news_snapshot
+
+                stats = asyncio.run(collect_news_snapshot())
+                logger.info(
+                    "[news-collect] 完成 — 原始=%d, 新增=%d, 更新=%d, 可用源=%s, 缺失源=%s",
+                    stats.get("raw", 0), stats.get("persisted", 0),
+                    stats.get("updated", 0),
+                    stats.get("available_fields"), stats.get("missing_fields"),
+                )
+                return 0
+            except Exception as e:
+                logger.exception("[news-collect] 执行失败: %s", e)
+                return 1
+
         # 模式1.5b: GOT 回放（只跑 Node 6，从归档加载数据）
         if args.got_replay:
             logger.info("模式: GOT 回放 — 日期: %s", args.got_replay)
@@ -1645,39 +1673,18 @@ def main() -> int:
                     # ── GOT 通知 hook（C3）──
                     if os.environ.get("GOT_NOTIFY_ENABLED", "1") == "1":
                         try:
-                            from src.notification import get_notification_service
-                            _notify_lines = [f"📊 GOT 每日决策 — {date.today().isoformat()}", f"操作总结: {decision.summary}"]
-                            _ra = decision.risk_assessment
-                            _notify_lines.append(
-                                f"风险: 仓位上限 {_ra.position_limit:.0%} / 当前 {_ra.current_position_ratio:.0%} / 止损 {_ra.stop_loss_threshold:.0%}"
+                            from src.got.notify_payload import (
+                                build_got_notify_content,
+                                build_got_notify_summary,
                             )
-                            _top_alloc = decision.allocation[:3]
-                            if _top_alloc:
-                                _notify_lines.append(f"\n交易建议 Top {len(_top_alloc)}:")
-                                for _al in _top_alloc:
-                                    _at = {"buy": "BUY", "sell": "SELL", "hold": "HOLD"}.get(_al.action, "?")
-                                    _notify_lines.append(
-                                        f"  [{_at}] {_al.name}({_al.symbol}) "
-                                        f"区间 {_al.price_range[0]:.2f}~{_al.price_range[1]:.2f}"
-                                    )
-                            if decision.rotation_signals:
-                                _notify_lines.append(f"\n轮动信号 ({len(decision.rotation_signals)}):")
-                                for _rs in decision.rotation_signals[:3]:
-                                    _notify_lines.append(f"  [{_rs['type']}] {_rs['reason']}")
-                            if decision.crowding_warnings:
-                                _notify_lines.append(f"\n拥挤警告 ({len(decision.crowding_warnings)}):")
-                                for _cw in decision.crowding_warnings[:3]:
-                                    _sv = "⚠️高" if _cw['severity'] == 'high' else "⚡中"
-                                    _notify_lines.append(f"  {_sv} {_cw['suggestion']}")
-                            if decision.warnings:
-                                _notify_lines.append(f"\n风险提示 ({len(decision.warnings)}):")
-                                for _w in decision.warnings[:5]:
-                                    _notify_lines.append(f"  [!] {_w}")
+                            from src.notification import get_notification_service
+                            _notify_day = date.today()
                             _notify_svc = get_notification_service()
                             _notify_svc.send(
-                                content="\n".join(_notify_lines),
+                                content=build_got_notify_content(decision, _notify_day),
+                                summary=build_got_notify_summary(decision, _notify_day),
                                 severity="info",
-                                dedup_key=f"got_daily_{date.today().isoformat()}",
+                                dedup_key=f"got_daily_{_notify_day.isoformat()}",
                             )
                         except Exception as e:
                             logger.warning(f"[GOT] 通知发送失败（不阻断）: {e}")

@@ -17,7 +17,8 @@
 | 能力 | 状态 |
 |---|---|
 | 每工作日 13:20 跑完整 GOT（Phase 1+2）+ 写归档 | ✅ 已生效（`dsa-got.timer`，NEXT 见 `systemctl list-timers`） |
-| GOT 报告推送到 IM | ❌ 未生效：`.env` 无真实通道，`Config.has_notification=false`；**工作日 13:20 会跑、会归档**（推送取决于通道配置） |
+| GOT 之外的新闻快照采集（每小时 5 个滚动新闻线，补读晚间/周末/当日已滚出条目） | ✅ 已上线（2026-10-27 14:01 起 `dsa-news-collect.timer` enabled，首跑 14:10 成功） |
+| GOT 报告推送到 IM | ✅ 已生效（ntfy 单通道）：13:20 跑完自动推送。2026-10-27 实测 journal `已配置 1 个通知渠道：ntfy` → `ntfy 消息发送成功`。正文 = 摘要块 + 当日 `reasoning.md` 全文（>3800 B 由 `NtfySender` 自动改「摘要 + 附件」，公共 ntfy.sh 附件 3 h 过期）。**2026-10-27 已同步 `main.py`/`notify_payload.py`/`ntfy_sender.py`/`archive.py` 到 ECS（md5 一致），次日 13:20 起按新正文推送**；双向收图仍未接，见下 |
 | 消息里发持仓截图自动更新持仓 | ❌ 未接：`bot/platforms/feishu_stream.py:413-415` 仍丢弃非文本消息；OCR/解析/对账三层已就绪（见下节），当前只能「给图片路径 → 拿持仓与调仓预览」 |
 | 手动给一张截图得到识别结果 | ✅ 可用（`ingest_path`，服务器实测 3 只持仓） |
 
@@ -57,6 +58,43 @@ journalctl -u dsa-got.service -n 30 --no-pager
   所以 timer 不需要自己维护节假日表。
 - 15:30 前手动跑也能跑，只是归档标 `bar_complete=false`，被 P6 兑现追踪当盘中快照分组；要干净归档就收盘后跑。
 - 旧方案的 `main.py --schedule` 跑的是「选股 + 常规分析」链，**不含 GOT**，与本次目标不符，已下线。
+
+## 定时任务：dsa-news-collect.timer（新闻快照，零 LLM）
+
+Node 4 的滚动源保留窗口只有数小时（**CLS 电报 1–3h**、华尔街见闻/东财/NewsNow 数小时、新浪 21h 归档）。
+只在 13:20 GOT 时刻采集会整段丢掉：**13:20→次日 09:30（20h）** 与 **周日 21:00→周一 09:30（12.5h）**
+之间的晚间政策/外盘条目——新浪没转载的就永久丢失。
+该 timer **每小时整点后 10 分采一批（24/7）**，落 `node4_raw_news`（**零 LLM、不改任何决策产物、不写 `got_daily/`**），
+GOT 运行时由 `NewsAnalysisNode._load_unabsorbed_titles` 补读（前缀 `[今日早前]`/`[昨日]`/`[N日前]`，只标注自然日龄、不做数值衰减）。
+
+| 文件 | 作用 |
+|---|---|
+| `deploy/systemd/dsa-news-collect.service` | `Type=oneshot`，`ExecStart=/opt/dsa/venv/bin/python main.py --news-collect`，`TimeoutStartSec=600`，`MemoryMax=700M` |
+| `deploy/systemd/dsa-news-collect.timer` | `OnCalendar=*-*-* *:10:00`（每小时，24/7）；**设 `Persistent=true`**（纯落库无决策，开机补采错过的快照无害） |
+
+```bash
+install -m 644 deploy/systemd/dsa-news-collect.service deploy/systemd/dsa-news-collect.timer /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now dsa-news-collect.timer
+systemctl list-timers dsa-news-collect.timer   # 期望 NEXT = 下一个整点后 10 分
+journalctl -t dsa-news-collect -n 20 --no-pager
+```
+
+语义说明：
+
+- **间隔由实测源窗口决定**（2026-10-27 13:35 盘中实测）：CLS 单次只返回约 20 条 ≈ **35–40 分钟**（深度不可加深——请求 200 条只得 21 条唯一，分页在返回重复）、东财 30 条 ≈ **80 分钟**、华尔街见闻 30 条 ≈ **2.5 h**、新浪 159 条 ≈ **4.2 h**。因此 ≤1 h 能保住后三条线与新浪，CLS 峰值仍会漏约 20 分钟/小时；**2 h 会让 CLS/东财盘中成段丢**。每批约 17 个 HTTP（新浪 1 + CLS 1 + 见闻 1 + 东财 1 + NewsNow 8 等），24 批/日 ≈ 400 请求，约 0.3 请求/分钟。
+- **只采 5 个滚动新闻线**（新浪/CLS/华尔街见闻/东财/NewsNow），跳过 NGA 论坛、同花顺热榜与 Intelligence 热榜
+  （`news_collector.SNAPSHOT_SKIP_SOURCES`）：后三者不是按小时失效的时效源，每小时抓论坛/热榜只会招反爬；
+  它们仍由每日 13:20 GOT 全量采集。单批实测 ~30 s。
+- 采集进程**不做交易日 gate**：节假日落在工作日时照常采集（假日新闻对下一交易日有效）。
+- 与 13:20 GOT 错开 10 分钟；SQLite 已开 WAL + busy_timeout（`src/storage.py`），无写冲突。
+- 同日重复采集只刷新 `last_seen_date`，`appearance_count` 仅跨日 +1——多批次快照不会给发酵计数灌水
+  （`appearance_count_run_based` 是影子字段，会随批次数增长，属预期）。
+- 补读窗口缺省 3 自然日（`GOT_NEWS_CARRY_DAYS`），4 天以上连休调到 5；补读池上限 `GOT_NEWS_CARRY_MAX`（缺省 1500），
+  超限会打 `[Node 4] 补读池 N 条超上限` warning——出现即说明窗口或上限该调了。1500 的依据：行情日唯一标题实测 360–680 条，
+  周五→周一 4 日窗口合计可到 ~1500，粗筛输入约 57k 字符（远低于渠道上下文上限）。
+- 若新浪/东财出现限流迹象，先降频到 `OnCalendar=*-*-* 00/2:10:00`（每 2h）——代价是 CLS（35–40 min 窗）与东财（80 min 窗）盘中条目成段丢失，需自行权衡。
+- logrotate 无需改动：现规则 `/opt/dsa/logs/*.log` 已覆盖；journal 走 `SyslogIdentifier=dsa-news-collect`。
+- 采集无输出内容（全部源失败）时打 warning 并以 0 退出；采集整体异常以 1 退出（systemd 记为 failed，可 `journalctl -t dsa-news-collect` 定位）。
 
 ## 推送（当前未配置，必须补）
 
@@ -218,6 +256,8 @@ swapon --show; sysctl -n vm.swappiness net.core.somaxconn
 |---|---|---|
 | `dsa-got.timer` | 工作日 13:20 触发 `dsa-got.service` | enabled / active |
 | `dsa-got.service` | oneshot `main.py --got`，MemoryMax 1000M | 按需，无触发时 inactive |
+| `dsa-news-collect.timer` | 每小时 `*:10` 触发 `dsa-news-collect.service`（24/7，5 个滚动新闻源） | 安装 unit 后 enabled / active（此前不存在） |
+| `dsa-news-collect.service` | oneshot `main.py --news-collect`（零 LLM），MemoryMax 700M | 按需，无触发时 inactive |
 
 无 WebUI：8000 端口无监听，`dsa-web` / `dsa-schedule` 已 `disable --now` 并删除 unit。
 日志轮转 `/etc/logrotate.d/dsa-web` → `/opt/dsa/logs/*.log`，weekly / rotate 4 / compress（名字沿用，实际覆盖全部 log）。
