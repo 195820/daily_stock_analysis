@@ -43,7 +43,7 @@ NTFY_TOKEN   = <可选，自建或受保护 topic 需要>
 | 项 | 值 | 影响 |
 |---|---|---|
 | 单条 `message` 上限 | **4096 字节**（服务端默认 `message-size-limit`） | 中文约 **1300 字/条**；本仓库阈值取 **3800 B** 分段，中文回复多时会更碎 |
-| 超长正文 | 以附件形式上传（`PUT <server>/<topic>` + `Filename` 头），再发「摘要 + `attach`」 | `NtfySender` 已实现，>3.8 KB 自动走此路径 |
+| 超长正文 | 同一次 `PUT <server>/<topic>` 携带 `Filename` 头（ASCII）+ `?title=&message=` query 参数（URL 编码） | 用户侧**一条消息 = 结论 + 附件**；`NtfySender` >3.8 KB 自动走此路径，仍失败才分段 |
 | 公共 ntfy.sh 附件 | 2 MB/次、20 MB/visitor、**3 小时过期** | 28 KB 的 `reasoning.md` 无压力 |
 | 公共 ntfy.sh 消息量 | 250 条/日、200 MB/日、30 个并发订阅 | 多项目共用公共实例要注意配额 |
 | keepalive | 45 秒一次 | 订阅读超时须 > 45 s（本实现 90 s） |
@@ -54,7 +54,7 @@ NTFY_TOKEN   = <可选，自建或受保护 topic 需要>
 
 | 文件 | 职责 |
 |---|---|
-| `src/notification_sender/ntfy_sender.py` | 出站：≤3800 B 直发；超限先传附件再发摘要；上传失败按字节分段（CJK 按字符硬切） |
+| `src/notification_sender/ntfy_sender.py` | 出站：≤3800 B 直发；超限把 `summary` 当消息正文与附件同一次 PUT 发布（单条气泡）；上传失败按字节分段（CJK 按字符硬切）；头部只放 ASCII 文件名（中文标题走 query） |
 | `bot/platforms/ntfy_stream.py` | 入站：长连接订阅 → `BotMessage` → `CommandDispatcher` → 回帖；含回声过滤、`since` 续传、附件下载（图片 ≤15 MB）、`stop()` 关流 |
 | `main.py --bot` | 只起 Stream/ntfy 订阅，不跑分析、不起 Web；无可用订阅时 **exit 1**（避免僵尸服务） |
 | `deploy/systemd/dsa-bot.service` | `Type=simple`、`MemoryMax=700M`、`Restart=on-failure`；空闲 RSS 约 80 MB |

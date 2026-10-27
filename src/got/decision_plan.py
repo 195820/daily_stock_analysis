@@ -146,6 +146,12 @@ def assemble(
             from src.storage import DatabaseManager
             db = DatabaseManager()
             session = db.get_session()
+            # 返回值在 finally close() 之后才被接线层读取（assemble_log_lines）；
+            # sessionmaker 缺省 expire_on_commit=True 会在 commit 时过期全部属性，
+            # 关闭后读取即 DetachedInstanceError → 成功装配被误报成「装配失败」。
+            # 自建 session 关闭后不再复用，仅要求属性可读，故关掉自动过期；
+            # 外部传入 session 的生命周期归调用方，不在此改动。
+            session.expire_on_commit = False
         
         # 预计算 valid_until（today + 3 交易日）
         valid_until = _add_trading_days(today, 3)
@@ -270,6 +276,9 @@ def reconcile(
             from src.storage import DatabaseManager
             db = DatabaseManager()
             session = db.get_session()
+            # 同 assemble：返回值在 close() 后由 reconcile_log_lines 读取，关掉 commit 过期，
+            # 否则对账成功也会被日志层 DetachedInstanceError 误报成「对账失败」。
+            session.expire_on_commit = False
         
         # 读昨日 pending 计划
         pending_plans = session.query(TradePlanRecord).filter(

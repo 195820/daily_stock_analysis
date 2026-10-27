@@ -2180,6 +2180,7 @@ class NotificationService(
         image_bytes: Optional[bytes],
         email_stock_codes: Optional[List[str]],
         email_send_to_all: bool,
+        summary: Optional[str] = None,
     ) -> bool:
         use_image = self._should_use_image_for_channel(channel, image_bytes)
         if channel == NotificationChannel.WECHAT:
@@ -2204,7 +2205,7 @@ class NotificationService(
         if channel == NotificationChannel.PUSHOVER:
             return self.send_to_pushover(content)
         if channel == NotificationChannel.NTFY:
-            return self.send_to_ntfy(content)
+            return self.send_to_ntfy(content, summary=summary)
         if channel == NotificationChannel.GOTIFY:
             return self.send_to_gotify(content)
         if channel == NotificationChannel.PUSHPLUS:
@@ -2235,6 +2236,7 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        summary: Optional[str] = None,
     ) -> NotificationDispatchResult:
         """
         Send a notification and return per-channel diagnostics.
@@ -2387,6 +2389,7 @@ class NotificationService(
                     image_bytes=image_bytes,
                     email_stock_codes=email_stock_codes,
                     email_send_to_all=email_send_to_all,
+                    summary=summary,
                 )
                 latency_ms = int((time.monotonic() - started_at) * 1000)
 
@@ -2448,9 +2451,14 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        summary: Optional[str] = None,
     ) -> bool:
         """
         统一发送接口 - 向所有已配置的渠道发送。
+
+        Args:
+            summary: 结论/摘要（可选）；ntfy 长消息转附件时用它当消息正文，
+                未给则回落到正文前 N 字符。其他渠道忽略。
 
         Returns:
             是否至少有一个渠道发送成功
@@ -2463,6 +2471,7 @@ class NotificationService(
             severity=severity,
             dedup_key=dedup_key,
             cooldown_key=cooldown_key,
+            summary=summary,
         )
         return bool(result.success)
    

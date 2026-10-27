@@ -63,7 +63,7 @@ class TestNtfySenderLongMessage(unittest.TestCase):
 
     @mock.patch("src.notification_sender.ntfy_sender.requests.put")
     @mock.patch("src.notification_sender.ntfy_sender.requests.post")
-    def test_long_message_uploads_attachment_then_posts_summary(self, mock_post, mock_put):
+    def test_long_message_publishes_single_message_with_attachment(self, mock_post, mock_put):
         mock_put.return_value = mock.Mock(
             status_code=200,
             json=lambda: {"attachment": {"url": "https://ntfy.sh/file/report.md"}},
@@ -72,7 +72,7 @@ class TestNtfySenderLongMessage(unittest.TestCase):
 
         content = "行内容\n" * 8000  # 约 28 KB，与 GOT reasoning.md 同量级
         self.assertGreater(len(content.encode("utf-8")), MAX_MESSAGE_BYTES)
-        self.assertTrue(_sender().send_to_ntfy(content, title="GOT 报告"))
+        self.assertTrue(_sender().send_to_ntfy(content, title="GOT 报告", summary="结论一行"))
 
         self.assertEqual(mock_put.call_count, 1)
         upload_url = mock_put.call_args.args[0]
@@ -80,11 +80,13 @@ class TestNtfySenderLongMessage(unittest.TestCase):
         self.assertEqual(mock_put.call_args.kwargs["data"], content.encode("utf-8"))
         self.assertIn("Filename", mock_put.call_args.kwargs["headers"])
 
-        self.assertEqual(mock_post.call_count, 1)
-        payload = mock_post.call_args.kwargs["json"]
-        self.assertEqual(payload["attach"], "https://ntfy.sh/file/report.md")
-        self.assertIn("见附件", payload["message"])
-        self.assertLessEqual(len(payload["message"].encode("utf-8")), MAX_MESSAGE_BYTES)
+        # 附件与结论同一次 PUT 发布：用户侧只有一条消息，不再额外 POST 摘要气泡
+        params = mock_put.call_args.kwargs["params"]
+        self.assertEqual(params["title"], "GOT 报告")
+        self.assertTrue(params["message"].startswith("结论一行"))
+        self.assertIn("见附件", params["message"])
+        self.assertLessEqual(len(params["message"].encode("utf-8")), MAX_MESSAGE_BYTES)
+        self.assertEqual(mock_post.call_count, 0)
 
     @mock.patch("src.notification_sender.ntfy_sender.requests.put")
     @mock.patch("src.notification_sender.ntfy_sender.requests.post")

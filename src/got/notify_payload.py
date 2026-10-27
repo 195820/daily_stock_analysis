@@ -17,11 +17,16 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from src.got.archive import reasoning_md_path
+from src.got.archive import _default_base_dir
 
 logger = logging.getLogger(__name__)
 
 FULL_REPORT_SEPARATOR = "\n\n---\n\n"
+
+
+def _reasoning_md_path(run_date: date, base_dir: Optional[Path] = None) -> Path:
+    """当日 reasoning.md 路径；归档根目录复用 archive 的唯一来源。"""
+    return (base_dir or _default_base_dir()) / run_date.strftime("%Y%m%d") / "reasoning.md"
 
 
 def build_got_notify_summary(decision, run_date: date) -> str:
@@ -90,7 +95,7 @@ def build_got_notify_content(
 
 def _read_full_report(run_date: date, base_dir: Optional[Path]) -> str:
     """读当日 reasoning.md；缺失或不可读返回空串（推送退化为摘要）。"""
-    path = reasoning_md_path(run_date, base_dir=base_dir)
+    path = _reasoning_md_path(run_date, base_dir=base_dir)
     try:
         return path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:

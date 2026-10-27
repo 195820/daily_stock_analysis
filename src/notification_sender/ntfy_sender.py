@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -21,6 +22,22 @@ MAX_MESSAGE_BYTES = 3800
 SUMMARY_CHARS = 1200
 # 机器产出标记：双向监听端据此跳过自己发的日报（同 topic 对话模式必需）
 MACHINE_TAG = "robot"
+# 附件消息的正文走 query 参数（URL 编码），压到 2 KB 内避免长 URL 被中间代理拒绝
+QUERY_MESSAGE_MAX_BYTES = 2000
+
+
+def _clip_utf8(text: str, limit: int) -> str:
+    """按 UTF-8 字节裁剪，不切断多字节字符。"""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:limit].decode("utf-8", "ignore")
+
+
+def attachment_filename(title: str, fallback: str = "got-daily-report") -> str:
+    """标题 → HTTP 头可用的 ASCII 文件名（emoji/中文在 header 里只能 latin-1）。"""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", title or "").strip("-._")
+    return f"{stem[:60] or fallback}.md"
 
 
 def resolve_ntfy_endpoint(ntfy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -155,14 +172,21 @@ class NtfySender:
         topic: str,
         content: str,
         title: str,
+        message: str,
         timeout_seconds: Optional[float],
     ) -> Optional[str]:
-        """Upload ``content`` as a file attachment and return its public URL."""
+        """Upload ``content`` as a file attachment and return its public URL.
+
+        附件与正文在同一次 PUT 里发布（``title``/``message`` 走 query 参数，UTF-8 安全），
+        得到「一条消息 = 结论 + 附件」，不再额外 POST 摘要消息。
+        """
+        # HTTP 头只能 latin-1：标题含 emoji/中文时 requests 直接抛 UnicodeEncodeError
+        # （2026-10-27 实测长消息整条退化成十几段纯文本）。文件名压成 ASCII，
+        # 标题/正文走 query 参数（URL 编码），附件侧不设 Title/Message 头。
         headers = {
             "Content-Type": "text/markdown; charset=utf-8",
             "User-Agent": "daily_stock_analysis",
-            "Filename": f"{title[:40]}.md".replace("/", "_"),
-            "Title": title,
+            "Filename": attachment_filename(title),
         }
         token = (self._ntfy_token or "").strip()
         if token:
@@ -171,6 +195,7 @@ class NtfySender:
         try:
             response = requests.put(
                 f"{server_url}/{quote(topic, safe='')}",
+                params={"title": title, "message": message},
                 data=content.encode("utf-8"),
                 headers=headers,
                 timeout=timeout_seconds or 30,
@@ -195,12 +220,15 @@ class NtfySender:
         content: str,
         title: Optional[str] = None,
         *,
+        summary: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
     ) -> bool:
         """Publish a notification to ntfy using a JSON body with UTF-8 text.
 
-        ntfy 单条消息默认上限 4 KB；超出时先按附件上传全文，再用摘要消息引用它，
-        附件不可用时退回分段发送，保证长报告（GOT reasoning.md 约 28 KB）不丢。
+        ntfy 单条消息默认上限 4 KB；超出时把全文当附件上传，**同一次 PUT 里**带上
+        ``title``/``message``（query 参数），得到「一条消息 = 结论 + 附件」——
+        旧实现先 PUT 附件、再 POST 摘要，用户侧会看到两条气泡。
+        ``summary`` 未给时回落到正文前 ``SUMMARY_CHARS`` 字符；附件上传失败才退回分段。
         """
         if not self._is_ntfy_configured():
             logger.warning("ntfy URL 未配置，跳过推送")
@@ -228,20 +256,16 @@ class NtfySender:
                 return True
             return False
 
-        attach_url = self._upload_attachment(server_url, topic, content, title, timeout_seconds)
+        message = (summary if summary else content[:SUMMARY_CHARS]).strip()
+        message = _clip_utf8(message, QUERY_MESSAGE_MAX_BYTES)
+        message = f"{message}\n\n……（全文 {len(content)} 字符，见附件）"
+
+        attach_url = self._upload_attachment(
+            server_url, topic, content, title, message, timeout_seconds
+        )
         if attach_url:
-            summary = content[:SUMMARY_CHARS].rstrip()
-            payload = {
-                "topic": topic,
-                "title": title,
-                "message": f"{summary}\n\n……（全文 {len(content)} 字符，见附件）",
-                "markdown": True,
-                "attach": attach_url,
-                "tags": [MACHINE_TAG],
-            }
-            if self._post_message(server_url, payload, timeout_seconds) is not None:
-                logger.info("ntfy 长消息已按附件发送成功")
-                return True
+            logger.info("ntfy 长消息已按附件发送成功（单条消息）")
+            return True
 
         chunks = split_message(content)
         logger.info("ntfy 长消息改分段发送: %d 段", len(chunks))
