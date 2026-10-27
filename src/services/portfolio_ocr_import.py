@@ -773,14 +773,21 @@ class PortfolioOcrImportService:
             if key in current_by_key:
                 continue
             last_price = float(pos.get('last_price') or 0.0)
+            note = f'OCR同步清仓-{sym}'
             if last_price <= 0:
-                # record_trade 对 price<=0 直接 raise，整批写入会因此失败；
-                # 这里不产出注定写不进去的交易，改为留痕交人工定价。
+                # 截图里已消失，拿不到现价时退回成本价（盈亏按 0 计），
+                # 否则该票会永久留在系统持仓里，越积越多。
+                fallback = float(pos.get('avg_cost') or pos.get('cost_price') or 0.0)
+                if fallback <= 0:
+                    logger.warning(
+                        "[OCR] 清仓行既无现价也无成本（%s），跳过并留待人工处理", sym
+                    )
+                    continue
+                last_price = fallback
+                note = f'OCR同步清仓-{sym}（缺现价，按成本价）'
                 logger.warning(
-                    "[OCR] 清仓行缺有效价格（%s last_price=%s），跳过并留待人工处理",
-                    sym, pos.get('last_price'),
+                    "[OCR] 清仓行缺现价（%s），按成本价 %.3f 生成卖出", sym, fallback
                 )
-                continue
             trades.append({
                 'symbol': sym,
                 'trade_date': trade_date,
@@ -789,7 +796,7 @@ class PortfolioOcrImportService:
                 'price': last_price,
                 'fee': 0.0,
                 'tax': 0.0,
-                'note': f'OCR同步清仓-{sym}',
+                'note': note,
             })
 
         # Quantity changes
