@@ -1084,14 +1084,20 @@ def _is_truthy_env(var_name: str, default: str = "true") -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-def start_bot_stream_clients(config: Config) -> None:
-    """Start bot stream clients when enabled in config."""
+def start_bot_stream_clients(config: Config) -> int:
+    """Start bot stream clients when enabled in config.
+
+    Returns:
+        成功启动的订阅客户端数量；0 表示配置缺失或依赖不可用（--bot 据此非零退出）。
+    """
+    started = 0
     # 启动钉钉 Stream 客户端
     if config.dingtalk_stream_enabled:
         try:
             from bot.platforms import start_dingtalk_stream_background, DINGTALK_STREAM_AVAILABLE
             if DINGTALK_STREAM_AVAILABLE:
                 if start_dingtalk_stream_background():
+                    started += 1
                     logger.info("[Main] Dingtalk Stream client started in background.")
                 else:
                     logger.warning("[Main] Dingtalk Stream client failed to start.")
@@ -1107,6 +1113,7 @@ def start_bot_stream_clients(config: Config) -> None:
             from bot.platforms import start_feishu_stream_background, FEISHU_SDK_AVAILABLE
             if FEISHU_SDK_AVAILABLE:
                 if start_feishu_stream_background():
+                    started += 1
                     logger.info("[Main] Feishu Stream client started in background.")
                 else:
                     logger.warning("[Main] Feishu Stream client failed to start.")
@@ -1122,6 +1129,7 @@ def start_bot_stream_clients(config: Config) -> None:
             from bot.platforms import start_ntfy_stream_background, NTFY_STREAM_AVAILABLE
             if NTFY_STREAM_AVAILABLE:
                 if start_ntfy_stream_background():
+                    started += 1
                     logger.info("[Main] Ntfy stream subscriber started in background.")
                 else:
                     logger.warning("[Main] Ntfy stream enabled but NTFY_URL/NTFY_CMD_URL missing.")
@@ -1129,6 +1137,8 @@ def start_bot_stream_clients(config: Config) -> None:
                 logger.warning("[Main] Ntfy stream enabled but subscriber is unavailable.")
         except Exception as exc:
             logger.error(f"[Main] Failed to start Ntfy stream subscriber: {exc}")
+
+    return started
 
 
 def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
@@ -1248,8 +1258,14 @@ def main() -> int:
     # === 仅机器人监听模式：只跑 Stream/ntfy 订阅，不跑分析、不起 Web ===
     if getattr(args, 'bot', False):
         logger.info("模式: 仅机器人消息订阅")
-        start_bot_stream_clients(config)
-        logger.info("按 Ctrl+C 退出...")
+        started = start_bot_stream_clients(config)
+        if started == 0:
+            logger.error(
+                "没有可用的机器人订阅：检查 NTFY_STREAM_ENABLED/NTFY_URL/NTFY_CMD_URL，"
+                "或 FEISHU_STREAM_ENABLED / DINGTALK_STREAM_ENABLED 及其 SDK"
+            )
+            return 1
+        logger.info(f"已启动 {started} 个订阅客户端，按 Ctrl+C 退出...")
         try:
             while True:
                 time.sleep(1)

@@ -1,0 +1,18 @@
+[Unit]
+Description=DSA GOT daily run (Phase 1 + Phase 2 + notify)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dsa
+Group=dsa
+WorkingDirectory=/opt/dsa/code
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dsa/venv/bin/python main.py --got
+# journal 里按 dsa-got 标签检索：journalctl -t dsa-got
+SyslogIdentifier=dsa-got
+# 单次跑批实测 15 min（2 vCPU）；给 1h 上限防挂死
+TimeoutStartSec=3600
+# 无 WebUI 常驻；给未来 dsa-bot（长连接收图，实测 ~330 MB）预留，故上限 1000M + 2G swap 兜底
+MemoryMax=1000M

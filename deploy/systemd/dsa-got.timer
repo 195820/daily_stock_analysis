@@ -1,0 +1,12 @@
+[Unit]
+Description=DSA GOT daily timer (A股交易日 18:00 CST 跑全链路)
+
+[Timer]
+# 只在工作日触发；节假日由 GOT 内部 is_market_open() 跳过并以 0 退出
+OnCalendar=Mon..Fri 18:00
+# 刻意不设 Persistent：错过就跳过。否则周五 18:00 关机、周一 09:00 开机时
+# systemd 会补跑，那时盘未收（bar_complete=false），GOT 会拿不完整 bar 出决策并推送。
+Unit=dsa-got.service
+
+[Install]
+WantedBy=timers.target
