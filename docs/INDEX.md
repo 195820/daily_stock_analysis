@@ -50,6 +50,7 @@
 | --- | --- |
 | [Bot 命令与接入](guide/bot-command.md) | Bot 命令、Webhook、平台接入和回调说明 |
 | [Bot 平台配置](bot/) | 飞书、钉钉、Discord 等 Bot 配置截图和补充说明 |
+| [ntfy 双向通道](bot/ntfy-channel.md) | ntfy 接入、4096 B/附件等硬限额、回声防护、多项目复用与排错对照表 |
 | [实时告警中心](guide/alerts.md) | EventMonitor 基线、Web 规则管理、通知结果、冷却状态和 Phase 边界 |
 | [分析上下文包](guide/analysis-context-pack.md) | AnalysisContextPack 契约、运行态消费与可见性（P0–P6） |
 | [诊断可靠性 Phase 0–3](guide/run-diagnostics-p0.md) | [P0](guide/run-diagnostics-p0.md) / [P1](guide/run-diagnostics-p1.md) / [P2](guide/run-diagnostics-p2.md) / [P3](guide/run-diagnostics-p3.md) 运行诊断链路 |
