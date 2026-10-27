@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_BYTES = 3800
 # 超长正文以附件形式上传时保留的摘要长度（字符，非字节）
 SUMMARY_CHARS = 1200
+# 机器产出标记：双向监听端据此跳过自己发的日报（同 topic 对话模式必需）
+MACHINE_TAG = "robot"
 
 
 def resolve_ntfy_endpoint(ntfy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -214,7 +216,13 @@ class NtfySender:
             title = f"📈 股票分析报告 - {date_str}"
 
         if len(content.encode("utf-8")) <= MAX_MESSAGE_BYTES:
-            payload = {"topic": topic, "title": title, "message": content, "markdown": True}
+            payload = {
+                "topic": topic,
+                "title": title,
+                "message": content,
+                "markdown": True,
+                "tags": [MACHINE_TAG],
+            }
             if self._post_message(server_url, payload, timeout_seconds) is not None:
                 logger.info("ntfy 消息发送成功")
                 return True
@@ -229,6 +237,7 @@ class NtfySender:
                 "message": f"{summary}\n\n……（全文 {len(content)} 字符，见附件）",
                 "markdown": True,
                 "attach": attach_url,
+                "tags": [MACHINE_TAG],
             }
             if self._post_message(server_url, payload, timeout_seconds) is not None:
                 logger.info("ntfy 长消息已按附件发送成功")
@@ -243,6 +252,7 @@ class NtfySender:
                 "title": f"{title} ({index}/{len(chunks)})",
                 "message": chunk,
                 "markdown": True,
+                "tags": [MACHINE_TAG],
             }
             if self._post_message(server_url, payload, timeout_seconds) is None:
                 ok = False

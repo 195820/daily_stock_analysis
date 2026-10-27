@@ -36,8 +36,15 @@ logger = logging.getLogger(__name__)
 
 NTFY_STREAM_AVAILABLE = True
 
-# 自己发出的消息一律带该 tag，订阅端据此跳过（防回声）
-ECHO_TAG = "bot"
+# 机器产出的消息（本进程回帖 + NtfySender 日报）统一打该 tag，订阅端据此跳过。
+# 同 topic 对话模式（NTFY_CMD_URL == NTFY_URL）下，这是唯一防自激/防"日报被当指令"的闸门。
+ECHO_TAG = "robot"
+# 兼容早期已发出的 "bot" 标记
+LEGACY_ECHO_TAGS = ("bot",)
+# 同 topic 对话模式的兜底：未打标记又明显是整段机器文本（超长/多行）不进 dispatch；
+# 短自由文本仍交给 dispatcher 的 NL 路由，但不把它当作"在叫我"（不触发问候）
+BULK_TEXT_CHARS = 200
+BULK_TEXT_LINES = 10
 # 服务端 message-size-limit 默认 4096：回复按 3800 字节分段
 MAX_MESSAGE_BYTES = 3800
 # (connect, read)；read 必须大于 keepalive 间隔（默认 45s）
@@ -222,7 +229,7 @@ class NtfyStreamClient:
             return
 
         tags = event.get("tags") or []
-        if ECHO_TAG in tags:
+        if ECHO_TAG in tags or any(tag in tags for tag in LEGACY_ECHO_TAGS):
             return
 
         text = (event.get("message") or "").strip()
@@ -242,10 +249,23 @@ class NtfyStreamClient:
             chat_type=ChatType.PRIVATE,
             content=text,
             raw_content=text,
-            mentioned=True,  # ntfy 是 1:1 通道，无需 @
+            mentioned=True,
             timestamp=datetime.now(),
             raw_data=event,
         )
+
+        # 与 dispatcher 同一套解析：命中 "/cmd" 或中文命令词表才算"在叫机器人"。
+        # 未命中时：整段机器文本（无标记的第三方推送）直接丢弃；
+        # 短自由文本保留 NL 路由，但 mentioned=False，避免每条闲聊都回一次问候。
+        command, _ = bot_message.get_command_and_args("/")
+        if command is None:
+            if len(text) > BULK_TEXT_CHARS or text.count("\n") > BULK_TEXT_LINES:
+                logger.info(
+                    "[Ntfy] 跳过疑似机器文本（%d 字符 / %d 行），未进入 dispatch",
+                    len(text), text.count("\n"),
+                )
+                return
+            bot_message.mentioned = False
 
         response = self._dispatch(bot_message)
         reply = (response.text or "").strip() if response else ""

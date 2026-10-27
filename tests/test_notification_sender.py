@@ -737,6 +737,7 @@ class TestNtfySender(unittest.TestCase):
                 "title": "中文标题",
                 "message": "正文 **Markdown**",
                 "markdown": True,
+                "tags": ["robot"],
             },
         )
         self.assertEqual(call_kw["headers"]["Authorization"], "Bearer secret-token")

@@ -41,6 +41,24 @@ class TestNtfySenderLongMessage(unittest.TestCase):
         payload = mock_post.call_args.kwargs["json"]
         self.assertEqual(payload["message"], "短消息")
         self.assertNotIn("attach", payload)
+        self.assertEqual(payload["tags"], ["robot"], "日报必须打机器标记，否则同 topic 下会被当成指令")
+
+    @mock.patch("src.notification_sender.ntfy_sender.requests.post")
+    def test_echo_tagged_message_is_skipped_in_stream(self, mock_post):
+        session = _FakeSession(
+            [{"event": "message", "id": "r1", "message": "日报正文", "tags": ["robot"]},
+             {"event": "message", "id": "r2", "message": "旧标记", "tags": ["bot"]}]
+        )
+        dispatcher = _FakeDispatcher("reply")
+        client = ntfy_stream.NtfyStreamClient(
+            "https://ntfy.sh/out", "https://ntfy.sh/out", session=session,
+            dispatcher_factory=lambda: dispatcher,
+        )
+
+        client._consume_once()
+
+        self.assertEqual(dispatcher.messages, [], "打 robot/bot 标记的机器产出不得进入 dispatch")
+        self.assertEqual(session.post_calls, [])
 
     @mock.patch("src.notification_sender.ntfy_sender.requests.put")
     @mock.patch("src.notification_sender.ntfy_sender.requests.post")
@@ -242,6 +260,34 @@ class TestNtfyStreamClient(unittest.TestCase):
     def test_invalid_endpoint_raises(self):
         with self.assertRaises(ValueError):
             ntfy_stream.NtfyStreamClient("not-a-url", "https://ntfy.sh/cmd", session=_FakeSession([]))
+
+    def test_bulk_untagged_text_is_dropped_before_dispatch(self):
+        long_text = "日报正文" * 80  # 320 字符，无标记、无命令前缀
+        session = _FakeSession(
+            [{"event": "message", "id": "b1", "message": long_text}]
+        )
+        dispatcher = _FakeDispatcher("reply")
+        client = self._client(session, dispatcher)
+
+        client._consume_once()
+
+        self.assertEqual(dispatcher.messages, [], "整段机器文本不得进入 dispatch")
+        self.assertEqual(session.post_calls, [])
+
+    def test_short_free_text_keeps_nl_routing_without_greeting(self):
+        session = _FakeSession(
+            [{"event": "message", "id": "c1", "message": "茅台怎么样"}]
+        )
+        dispatcher = _FakeDispatcher("ok")
+        client = self._client(session, dispatcher)
+
+        client._consume_once()
+
+        self.assertEqual(len(dispatcher.messages), 1)
+        self.assertFalse(
+            dispatcher.messages[0].mentioned,
+            "非命令短文本应保留 NL 路由，但不得伪装成 @机器人（避免每条都回问候）",
+        )
 
     def test_stop_closes_active_stream_and_reports_stopped(self):
         closed = []
