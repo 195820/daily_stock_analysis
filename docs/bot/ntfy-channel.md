@@ -45,6 +45,7 @@ NTFY_TOKEN   = <可选，自建或受保护 topic 需要>
 | 单条 `message` 上限 | **4096 字节**（服务端默认 `message-size-limit`） | 中文约 **1300 字/条**；本仓库阈值取 **3800 B** 分段，中文回复多时会更碎 |
 | 超长正文 | 同一次 `PUT <server>/<topic>` 携带 `Filename` 头（ASCII）+ `?title=&message=` query 参数（URL 编码） | 用户侧**一条消息 = 结论 + 附件**；`NtfySender` >3.8 KB 自动走此路径，仍失败才分段 |
 | 公共 ntfy.sh 附件 | 2 MB/次、20 MB/visitor、**3 小时过期** | 28 KB 的 `reasoning.md` 无压力 |
+| 附件 MIME | 服务端按**内容嗅探**判定（Go `http.DetectContentType`），请求的 `Content-Type` 与 `Filename` 扩展名都不参与（官方示例注释 `// Does not matter`） | `.md` 正文一律存成 `text/plain; charset=utf-8`，存储 URL 后缀变 `.txt`；`Content-Disposition` 仍为 `filename="xxx.md"`，文件名与安卓侧识别不受影响；`text/markdown` 直传不可能 |
 | 公共 ntfy.sh 消息量 | 250 条/日、200 MB/日、30 个并发订阅 | 多项目共用公共实例要注意配额 |
 | keepalive | 45 秒一次 | 订阅读超时须 > 45 s（本实现 90 s） |
 | 订阅协议 | `GET <server>/<topic>/json` NDJSON（也有 `/sse`、`/ws`） | 长连接 + 断线用 `since=<最后 id>` 续传 |
