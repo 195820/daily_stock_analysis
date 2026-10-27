@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 import threading
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse, urlunparse
@@ -45,6 +47,9 @@ LEGACY_ECHO_TAGS = ("bot",)
 # 短自由文本仍交给 dispatcher 的 NL 路由，但不把它当作"在叫我"（不触发问候）
 BULK_TEXT_CHARS = 200
 BULK_TEXT_LINES = 10
+# 手机发图更新持仓：只收图片附件，超过上限直接忽略
+MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+ATTACHMENT_TIMEOUT = 30
 # 服务端 message-size-limit 默认 4096：回复按 3800 字节分段
 MAX_MESSAGE_BYTES = 3800
 # (connect, read)；read 必须大于 keepalive 间隔（默认 45s）
@@ -232,13 +237,21 @@ class NtfyStreamClient:
         if ECHO_TAG in tags or any(tag in tags for tag in LEGACY_ECHO_TAGS):
             return
 
-        text = (event.get("message") or "").strip()
-        if not text:
-            return
-
+        # 任何见过的消息都推进游标，断线重连不会重放（含被下面规则跳过的）
         message_id = str(event.get("id") or "")
         if message_id:
             self._last_id = message_id
+
+        image_path = self._download_image(event.get("attachment") or {})
+
+        text = (event.get("message") or "").strip()
+        if not text and not image_path:
+            return
+        caption = text
+        if image_path and not text.startswith("/"):
+            # ntfy 对纯附件会自动填 "You received a file: xxx"，不能据此走自由文本分支。
+            # 图片 + 非命令文本 ⇒ 一律按「发图更新持仓」处理，原文本留作 caption。
+            text = "/portfolio"
 
         bot_message = BotMessage(
             platform="ntfy",
@@ -251,7 +264,10 @@ class NtfyStreamClient:
             raw_content=text,
             mentioned=True,
             timestamp=datetime.now(),
-            raw_data=event,
+            raw_data=(
+                {**event, "image_path": image_path, "caption": caption}
+                if image_path else event
+            ),
         )
 
         # 与 dispatcher 同一套解析：命中 "/cmd" 或中文命令词表才算"在叫机器人"。
@@ -267,10 +283,52 @@ class NtfyStreamClient:
                 return
             bot_message.mentioned = False
 
-        response = self._dispatch(bot_message)
-        reply = (response.text or "").strip() if response else ""
-        if reply:
-            self.publish(reply, markdown=bool(getattr(response, "markdown", False)))
+        try:
+            response = self._dispatch(bot_message)
+            reply = (response.text or "").strip() if response else ""
+            if reply:
+                self.publish(reply, markdown=bool(getattr(response, "markdown", False)))
+        finally:
+            if image_path:
+                Path(image_path).unlink(missing_ok=True)
+
+    def _download_image(self, attachment: Dict[str, Any]) -> Optional[str]:
+        """下载图片附件到临时文件；非图片/超限/失败一律返回 None。"""
+        url = (attachment or {}).get("url")
+        if not url:
+            return None
+        mime = str(attachment.get("type") or "")
+        if mime and not mime.startswith("image/"):
+            logger.info("[Ntfy] 忽略非图片附件: %s", mime)
+            return None
+        size = attachment.get("size") or 0
+        if size and size > MAX_ATTACHMENT_BYTES:
+            logger.warning("[Ntfy] 附件过大(%.1f MB)，已忽略", size / 1024 / 1024)
+            return None
+
+        suffix = Path(str(attachment.get("name") or "image")).suffix or ".png"
+        try:
+            response = self._session.get(
+                url, timeout=ATTACHMENT_TIMEOUT, verify=self._verify_ssl
+            )
+            response.raise_for_status()
+            data = response.content
+        except Exception as exc:
+            logger.warning("[Ntfy] 附件下载失败: %s", type(exc).__name__)
+            return None
+
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            logger.warning("[Ntfy] 附件下载后超限，已丢弃")
+            return None
+
+        handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            handle.write(data)
+            handle.flush()
+        finally:
+            handle.close()
+        logger.info("[Ntfy] 收到图片附件 %s (%d KB)", suffix, len(data) // 1024)
+        return handle.name
 
     def _dispatch(self, message: BotMessage) -> Optional[BotResponse]:
         try:

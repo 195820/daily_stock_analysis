@@ -11,9 +11,25 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 表头/导航词：不当作股票名（中信/华泰等 APP 的两种版面都会出现）
+_HEADER_WORDS = {
+    "市值", "盈亏", "持仓", "可用", "成本", "现价", "总资产", "浮动盈亏", "当日参考盈亏",
+    "持仓股", "总市值", "逆回购", "可取", "转账", "买入", "卖出", "撤单", "查询", "仓位",
+    "查看已清仓股票", "持仓管理", "批量买入", "批量卖出", "止盈止损", "持仓资讯",
+    "资产分析", "首页", "行情", "自选", "交易", "资讯", "理财", "人民币账户A股",
+    "持仓/可用", "成本/现价", "名称", "代码", "数量", "参考市值", "现价/成本",
+}
+
+# 名称 → 代码 的进程内缓存（取一次全表，失败则保持 None 不重试）
+_NAME_MEMO: Dict[str, Optional[str]] = {}
+# 名称 → 裸码 全表缓存（优先 TDX，其次 akshare；落盘避免每次重取）
+_NAME_MAP: Dict[str, str] = {}
+_NAME_MAP_PATH = Path("data/stock_name_cache.json")
 
 
 @dataclass(frozen=True)
@@ -23,64 +39,465 @@ class HoldingItem:
     quantity: int       # 持仓数量
     cost_price: float   # 成本价
     current_price: float  # 现价
-    symbol: Optional[str] = None  # 股票代码（匹配后填充）
+    symbol: Optional[str] = None  # 6 位裸码（与 portfolio_positions 存储一致）
 
 
 class PortfolioOcrImportService:
     """OCR screenshot → holdings → trade events."""
 
+    # A 股代码前缀：000/001/002/003(深主板)、300/301/302(创业)、600/601/603/605(沪)、688/689(科创)、8xx/9xx(北交)
+    _CODE_PREFIXES = (
+        "000", "001", "002", "003", "004",
+        "300", "301", "302",
+        "600", "601", "603", "605",
+        "688", "689",
+        "830", "831", "832", "833", "834", "835", "836", "837", "838", "839",
+        "870", "871", "872", "873", "920",
+    )
+
     def __init__(self):
         self._ocr = None
+        self._backend: Optional[str] = None
+
+    def _load_backend(self) -> str:
+        """选定 OCR 后端：paddle 优先，缺失时退到 rapidocr（ONNX 版 PP-OCR）。
+
+        Python 3.14 上 paddlepaddle 无 wheel（`pip index versions paddlepaddle` → No matching），
+        因此服务器实际走 rapidocr；两者都是 PP-OCR 模型，输出框格式统一在本类里归一化。
+        """
+        if self._backend is not None:
+            return self._backend
+        try:
+            import paddleocr  # noqa: F401
+            self._backend = "paddle"
+        except Exception:  # noqa: BLE001 - 缺失或二进制不兼容都退级
+            try:
+                import rapidocr_onnxruntime  # noqa: F401
+                self._backend = "rapidocr"
+            except Exception as exc:  # noqa: BLE001
+                raise ImportError(
+                    "未安装 OCR 后端。paddlepaddle 在 Python 3.14 无 wheel，请装 rapidocr："
+                    " pip install rapidocr-onnxruntime（另需 apt install libgl1）"
+                ) from exc
+        logger.info("[OCR] 后端: %s", self._backend)
+        return self._backend
 
     def _get_ocr(self):
-        """Lazy-load PaddleOCR to avoid import overhead when not used."""
+        """Lazy-load OCR engine."""
         if self._ocr is None:
-            try:
+            backend = self._load_backend()
+            if backend == "paddle":
                 from paddleocr import PaddleOCR
-                # PaddleOCR 3.x uses different params than 2.x
                 try:
                     self._ocr = PaddleOCR(lang='ch')
                 except TypeError:
-                    # Fallback for older versions
                     self._ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
-            except ImportError:
-                raise ImportError(
-                    "PaddleOCR not installed. Run: pip install paddlepaddle paddleocr"
-                )
+            else:
+                from rapidocr_onnxruntime import RapidOCR
+                self._ocr = RapidOCR()
         return self._ocr
 
-    def ocr_screenshot(self, image_path: str) -> str:
-        """Run OCR on screenshot, return raw text."""
+    def ocr_boxes(self, image_path: str, min_score: float = 0.5) -> List[Dict[str, Any]]:
+        """OCR → 归一化文本框列表 [{text, score, x0, y0, x1, y1}]，按 (y, x) 排序。"""
+        backend = self._load_backend()
         ocr = self._get_ocr()
-        # PaddleOCR 3.x returns dict format, 2.x returns list format
+        boxes: List[Dict[str, Any]] = []
+
+        if backend == "paddle":
+            try:
+                result = ocr.ocr(image_path)
+            except Exception:
+                result = ocr.predict(image_path)
+            if isinstance(result, list) and result and result[0]:
+                for line in result[0]:
+                    bbox, (text, score) = line
+                    if float(score) >= min_score:
+                        xs = [p[0] for p in bbox]
+                        ys = [p[1] for p in bbox]
+                        boxes.append({
+                            "text": text, "score": float(score),
+                            "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys),
+                        })
+            elif isinstance(result, dict):
+                for text, score, poly in zip(
+                    result.get("rec_texts", []), result.get("rec_scores", []), result.get("rec_polys", [])
+                ):
+                    if float(score) >= min_score:
+                        xs = [p[0] for p in poly]
+                        ys = [p[1] for p in poly]
+                        boxes.append({
+                            "text": text, "score": float(score),
+                            "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys),
+                        })
+        else:
+            result, _elapse = ocr(str(image_path))
+            for item in result or []:
+                bbox, text, score = item[0], item[1], item[2]
+                if float(score) >= min_score:
+                    xs = [p[0] for p in bbox]
+                    ys = [p[1] for p in bbox]
+                    boxes.append({
+                        "text": text, "score": float(score),
+                        "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys),
+                    })
+
+        boxes.sort(key=lambda b: (b["y0"], b["x0"]))
+        return boxes
+
+    def ocr_screenshot(self, image_path: str) -> str:
+        """Run OCR on screenshot, return raw text（按视觉顺序逐行拼接）。"""
+        return "\n".join(b["text"] for b in self.ocr_boxes(image_path))
+
+    @classmethod
+    def _is_stock_code(cls, token: str) -> bool:
+        return len(token) == 6 and token.isdigit() and token.startswith(cls._CODE_PREFIXES)
+
+    @staticmethod
+    def _row_split(boxes: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """按 y 中心聚类成行（容差取中位行高的 0.6 倍），行内按 x 排序。"""
+        if not boxes:
+            return []
+        heights = sorted(b["y1"] - b["y0"] for b in boxes)
+        median_h = heights[len(heights) // 2] or 1.0
+        tol = max(6.0, median_h * 0.6)
+
+        rows: List[List[Dict[str, Any]]] = []
+        for box in sorted(boxes, key=lambda b: (b["y0"] + b["y1"]) / 2):
+            center = (box["y0"] + box["y1"]) / 2
+            if rows:
+                last = rows[-1]
+                last_center = sum((b["y0"] + b["y1"]) / 2 for b in last) / len(last)
+                if abs(center - last_center) <= tol:
+                    last.append(box)
+                    continue
+            rows.append([box])
+        return [sorted(row, key=lambda b: b["x0"]) for row in rows]
+
+    @staticmethod
+    def _number_variants(token: str) -> List[float]:
+        """把 OCR 数字串解析成候选值。
+
+        券商截图的千分位常被 OCR 读成 '.'（`68.484.00`、`-2.942.86`），而价格又可能是
+        `54.945` 这种三位小数，单看一个 token 无法确定语义，因此返回全部合理读法，
+        由 `qty × (price - cost) ≈ pnl` 的恒等式挑选。
+        """
+        raw = str(token).strip().replace("，", ",").replace(" ", "")
+        raw = raw.replace("%", "").replace("+", "")
+        if not raw or not re.fullmatch(r"-?\d[\d.,]*", raw):
+            return []
+        neg = raw.startswith("-")
+        body = raw.lstrip("-")
+        variants: List[float] = []
+
+        # 千分位（一个或多个 . / , 分隔的三位组），可能再带两位小数
+        m = re.fullmatch(r"(\d{1,3}(?:[.,]\d{3})+)(?:[.,](\d{1,2}))?", body)
+        if m:
+            int_part = re.sub(r"[.,]", "", m.group(1))
+            frac = m.group(2) or ""
+            variants.append(float(int_part + ("." + frac if frac else "")))
+            # 单个分隔符 + 三位尾数既是千分位也是三位小数（价格常见 54.945 / 11.200）
+            if body.count(".") + body.count(",") == 1:
+                variants.append(float(body.replace(",", ".")))
+        else:
+            m2 = re.fullmatch(r"(\d+)(?:[.,](\d+))?", body)
+            if m2:
+                int_part, frac = m2.group(1), m2.group(2)
+                if frac is None:
+                    variants.append(float(int_part))
+                else:
+                    variants.append(float(f"{int_part}.{frac}"))
+                    # 三位尾数也可能其实是千分位
+                    if len(frac) == 3 and len(int_part) <= 3:
+                        variants.append(float(int_part + frac))
+
+        seen: List[float] = []
+        for value in variants:
+            if value not in seen:
+                seen.append(-value if neg else value)
+        return seen
+
+    @staticmethod
+    def _bare_code(code: str) -> str:
+        """SH600519 / 600519.SH / 600519 → 600519（positions 表存裸码）。"""
+        digits = re.sub(r"\D", "", str(code))
+        return digits[-6:] if len(digits) >= 6 else str(code).upper()
+
+    def _load_name_map(self) -> Dict[str, str]:
+        """全量名称→裸码表：磁盘缓存 → TDX(mootdx) → akshare 三级。"""
+        global _NAME_MAP
+        if _NAME_MAP:
+            return _NAME_MAP
+
         try:
-            result = ocr.ocr(image_path)
-        except Exception:
-            result = ocr.predict(image_path)
+            import json as _json
 
-        if not result:
-            return ""
+            if _NAME_MAP_PATH.exists():
+                cached = _json.loads(_NAME_MAP_PATH.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and cached:
+                    _NAME_MAP = {str(k): str(v) for k, v in cached.items()}
+                    logger.info("[OCR] 名称库命中磁盘缓存 %d 条", len(_NAME_MAP))
+                    return _NAME_MAP
+        except Exception as exc:
+            logger.debug("[OCR] 名称库缓存读取失败: %s", type(exc).__name__)
 
-        lines = []
-        # Handle both 2.x and 3.x result formats
-        if isinstance(result, list) and result[0]:
-            # 2.x format: list of (bbox, (text, confidence))
-            for line in result[0]:
-                bbox, (text, confidence) = line
-                if confidence > 0.5:
-                    lines.append(text)
-        elif isinstance(result, dict):
-            # 3.x format: dict with 'rec_texts' and 'rec_scores'
-            rec_texts = result.get('rec_texts', [])
-            rec_scores = result.get('rec_scores', [])
-            for text, score in zip(rec_texts, rec_scores):
-                if score > 0.5:
-                    lines.append(text)
+        mapping: Dict[str, str] = {}
+        try:  # TDX TCP：复用 MootdxFetcher 的验活/故障转移节点池，不受 HTTP 反爬影响
+            from data_provider.mootdx_fetcher import MootdxFetcher
 
-        return "\n".join(lines)
+            with MootdxFetcher()._mootdx_session() as client:
+                frame = client.stock_all()
+            for row in frame.to_dict("records"):
+                code = str(row.get("code") or "")
+                name = str(row.get("name") or "").replace("\u0000", "").strip()
+                if len(code) == 6 and code.isdigit() and name:
+                    mapping.setdefault(name, code)
+            logger.info("[OCR] 名称库来自 TDX，共 %d 条", len(mapping))
+        except Exception as exc:
+            logger.warning("[OCR] TDX 名称库失败: %s: %s", type(exc).__name__, str(exc)[:80])
+
+        if not mapping:
+            try:  # akshare 兜底（HTTP，可能被限流/断连）
+                import akshare as ak
+
+                frame = ak.stock_zh_a_spot_em()
+                for row in frame.to_dict("records"):
+                    name = str(row.get("名称") or "").strip()
+                    code = str(row.get("代码") or "").strip()
+                    if len(code) == 6 and code.isdigit() and name:
+                        mapping.setdefault(name, code)
+                logger.info("[OCR] 名称库来自 akshare，共 %d 条", len(mapping))
+            except Exception as exc:
+                logger.warning("[OCR] akshare 名称库失败: %s", type(exc).__name__)
+
+        if mapping:
+            _NAME_MAP = mapping
+            try:
+                import json as _json
+
+                _NAME_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _NAME_MAP_PATH.write_text(
+                    _json.dumps(mapping, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception as exc:
+                logger.debug("[OCR] 名称库缓存写入失败: %s", type(exc).__name__)
+        return _NAME_MAP
+
+    def _resolve_symbol(self, name: str) -> Optional[str]:
+        """名称 → 裸码：全量表精确匹配 → 模糊匹配 → akshare 单查兜底。"""
+        if name in _NAME_MEMO:
+            return _NAME_MEMO[name]
+
+        code: Optional[str] = None
+        name_map = self._load_name_map()
+        if name in name_map:
+            code = name_map[name]
+        elif name_map:
+            from difflib import SequenceMatcher
+
+            best_name, best_score = None, 0.0
+            for candidate in name_map:
+                score = SequenceMatcher(None, name, candidate).ratio()
+                if score > best_score:
+                    best_name, best_score = candidate, score
+            if best_name and best_score >= 0.85:
+                code = name_map[best_name]
+                logger.info("[OCR] 名称模糊匹配 %s → %s (%.2f)", name, best_name, best_score)
+
+        if code is None:
+            try:
+                code = self.match_stock_name(name)
+            except Exception as exc:  # 离线/限流都不阻塞主流程
+                logger.warning("[OCR] 名称匹配失败 %s: %s", name, type(exc).__name__)
+
+        code = self._bare_code(code) if code else None
+        _NAME_MEMO[name] = code
+        return code
+
+    def _parse_two_row_layout(self, boxes: List[Dict[str, Any]]) -> List[HoldingItem]:
+        """解析「一只票横跨两行」的 APP 版面（中信证券等）。
+
+        形如：
+            市值 | 盈亏 | 持仓/可用 | 成本/现价      ← 表头
+            润建股份 | -2.942.86 | 1300 | 54.945     ← 名称/盈亏/数量/成本
+            68.484.00 | 4.120% | 1300 | 52.680       ← 市值/涨幅/可用/现价
+
+        该版面**没有股票代码列**，名称需另行解析；数量在上下两行重复出现，
+        成本在上行、现价在下行，用 `qty × (现价 - 成本) ≈ 盈亏` 校验并挑选读数。
+        """
+        rows = self._row_split(boxes)
+        holdings: List[HoldingItem] = []
+
+        for index, row in enumerate(rows[:-1]):
+            tokens = [b["text"].strip() for b in row if str(b["text"]).strip()]
+            names = [
+                t for t in tokens
+                if re.fullmatch(r"[\u4e00-\u9fff]{2,8}", t) and t not in _HEADER_WORDS
+            ]
+            if len(names) != 1:
+                continue
+            name = names[0]
+
+            upper = [self._number_variants(t) for t in tokens if self._number_variants(t)]
+            lower_texts = [b["text"].strip() for b in rows[index + 1] if str(b["text"]).strip()]
+            lower = [self._number_variants(t) for t in lower_texts if self._number_variants(t)]
+            if len(upper) < 2 or len(lower) < 2:
+                continue
+
+            best: Optional[Tuple[float, int, float, float, float]] = None
+            for qty_variants in upper:
+                for qty in qty_variants:
+                    if qty <= 0 or qty != int(qty) or qty > 100_000_000:
+                        continue
+                    if not any(qty in variants for variants in lower):
+                        continue
+                    for cost in [v for variants in upper for v in variants if v != qty]:
+                        for price in [v for variants in lower for v in variants if v != qty]:
+                            if cost <= 0 or price <= 0:
+                                continue
+                            for pnl in [v for variants in upper for v in variants
+                                        if v not in (qty, cost)]:
+                                residual = abs(qty * (price - cost) - pnl)
+                                tolerance = max(5.0, abs(pnl) * 0.02, qty * max(cost, price) * 0.002)
+                                if residual <= tolerance and (best is None or residual < best[0]):
+                                    best = (residual, int(qty), cost, price, pnl)
+
+            if best is None:
+                logger.warning("[OCR] 两行版面校验失败，跳过: %s", " | ".join(tokens))
+                continue
+
+            _, quantity, cost_price, current_price, _pnl = best
+            holdings.append(HoldingItem(
+                name=name,
+                quantity=quantity,
+                cost_price=round(cost_price, 3),
+                current_price=round(current_price, 3),
+                symbol=self._resolve_symbol(name),
+            ))
+            logger.info(
+                "[OCR] 两行版面命中: %s qty=%s cost=%.3f price=%.3f",
+                name, quantity, cost_price, current_price,
+            )
+
+        return holdings
+
+    def parse_holdings_from_boxes(self, boxes: List[Dict[str, Any]]) -> List[HoldingItem]:
+        """按版面（行/列语义）解析持仓，避免把 6 位股票代码当数量。
+
+        旧 `parse_holdings_from_ocr` 的正则要求「名称 数量 成本 现价」紧邻，遇到券商常见的
+        「名称 000001 1000 11.20 11.35」会把 `000001` 当数量（int→1 股）、成本变 1000，静默毁数据。
+        这里按语义取列：名称=CJK 串、代码=6 位且前缀合法、数量=整数、价格=小数；
+        并用「数量×现价≈市值」在存在市值列时做自检。
+        """
+        holdings: List[HoldingItem] = []
+        pending_name: Optional[str] = None
+
+        for row in self._row_split(boxes):
+            tokens = [b["text"].strip() for b in row if b["text"].strip()]
+            if not tokens:
+                continue
+
+            name = next((t for t in tokens if re.fullmatch(r"[一-鿿]{2,8}", t)), None)
+            code = next((t for t in tokens if self._is_stock_code(t)), None)
+            floats = [
+                float(t.replace(",", ""))
+                for t in tokens
+                if re.fullmatch(r"\d[\d,]*\.\d+", t)
+            ]
+            ints = [
+                int(t.replace(",", ""))
+                for t in tokens
+                if re.fullmatch(r"\d{1,7}", t) and not self._is_stock_code(t)
+            ]
+            money = next(
+                (float(t.replace(",", "")) for t in tokens if re.fullmatch(r"\d{1,3}(,\d{3})+\.\d{2}", t)),
+                None,
+            )
+
+            if name and not (floats or ints):
+                # 只有名称的行：可能是「名称/代码」行，数字在下一行
+                pending_name = name
+                continue
+
+            if name is None and pending_name:
+                name = pending_name
+
+            if not name:
+                continue
+
+            quantity = next((v for v in ints if 1 <= v <= 10_000_000), None)
+            cost_price = floats[0] if floats else None
+            current_price = floats[1] if len(floats) > 1 else None
+
+            if quantity is None or cost_price is None or current_price is None:
+                logger.warning("[OCR] 行内字段不全，跳过: %s", " | ".join(tokens))
+                pending_name = None
+                continue
+
+            if money is not None:
+                expected = quantity * current_price
+                if expected > 0 and abs(expected - money) / max(money, 1.0) > 0.05:
+                    logger.warning(
+                        "[OCR] 数量×现价与市值不符（%s vs %s），按版面列取值: %s",
+                        f"{expected:.2f}", f"{money:.2f}", " | ".join(tokens),
+                    )
+
+            holdings.append(HoldingItem(
+                name=name,
+                quantity=quantity,
+                cost_price=cost_price,
+                current_price=current_price,
+                # 存裸码：`record_trade` 落库走 canonical_stock_code（只做 upper），
+                # portfolio_positions 的键就是 `600519` 这种形态；匹配函数给的是 `SH600519`，
+                # 两者在 compute_sync_trades 里由 _symbol_key 归一化后比较。
+                symbol=code,
+            ))
+            pending_name = None
+
+        # 无代码列、且一只票横跨两行的券商版面（中信证券等）。
+        # 不与主解析二选一：同页可能既有「单行带代码」也有「两行无代码」，
+        # 两行解析带恒等式校验（qty×(现价-成本)≈盈亏），命中时覆盖同名结果。
+        fallback = self._parse_two_row_layout(boxes)
+        if not fallback:
+            return holdings
+
+        # 以两行解析（强校验）为基准，主解析仅补齐它没覆盖的名称，保持页面顺序
+        merged: Dict[str, HoldingItem] = {item.name: item for item in fallback}
+        for item in holdings:
+            merged.setdefault(item.name, item)
+        logger.info(
+            "[OCR] 版面合并: 主解析 %d 条 + 两行解析 %d 条 → %d 条",
+            len(holdings), len(fallback), len(merged),
+        )
+        return list(merged.values())
+
+
+    def parse_holdings(
+        self,
+        *,
+        image_path: Optional[str] = None,
+        boxes: Optional[List[Dict[str, Any]]] = None,
+        ocr_text: Optional[str] = None,
+    ) -> List[HoldingItem]:
+        """统一入口：有坐标就按版面解析，否则退回旧文本正则。
+
+        券商 APP 截图普遍带「代码」列，走 `parse_holdings_from_ocr` 的纯文本正则会把它当数量；
+        因此默认路径是 boxes（`ocr_boxes()` 的产物）。文本路径保留只为兼容无坐标的老数据。
+        """
+        if boxes is None and image_path is not None:
+            boxes = self.ocr_boxes(image_path)
+        if boxes is not None:
+            return self.parse_holdings_from_boxes(boxes)
+        if ocr_text:
+            logger.warning("[OCR] 无坐标信息，退回旧文本正则（含代码列的多列截图可能误读）")
+            return self.parse_holdings_from_ocr(ocr_text)
+        raise ValueError("parse_holdings 需要 image_path / boxes / ocr_text 之一")
 
     def parse_holdings_from_ocr(self, ocr_text: str) -> List[HoldingItem]:
         """Parse OCR text into structured holdings.
+
+        ⚠️ 仅用于无坐标的纯文本。`pattern1` 是「名称 数量 成本 现价」紧邻匹配，遇到
+        「平安银行 000001 1000 11.20 11.35」会把 `000001` 当数量（int→1 股、成本变 1000）。
+        带代码列的截图必须走 `parse_holdings_from_boxes`。
 
         Expected format (CITIC Securities):
             株冶集团    2,708.15    1400    24.404
@@ -286,6 +703,20 @@ class PortfolioOcrImportService:
 
         return trades
 
+    @staticmethod
+    def _symbol_key(symbol: str) -> str:
+        """比较用键：直接用仓内权威归一化 `normalize_stock_code`。
+
+        持仓表里的键是裸码（`record_trade` → `canonical_stock_code` 只做 upper，
+        见 portfolio_service.py:195/1156），而 `match_stock_name()` 返回 `SH600519`。
+        直接按字符串做集合差会把同一只票同时判成「新增买入」和「清仓卖出」。
+        `normalize_stock_code` 同时覆盖 `SH600519` / `600519.SH` / `BJ920748` / `HK00700`，
+        自写前缀表容易漏北交与港美股形态。
+        """
+        from data_provider.base import normalize_stock_code
+
+        return normalize_stock_code(symbol)
+
     def compute_sync_trades(
         self,
         current_holdings: List[HoldingItem],
@@ -306,12 +737,16 @@ class PortfolioOcrImportService:
             trade_date = date.today()
 
         trades = []
-        current_symbols = {h.symbol for h in current_holdings if h.symbol}
-        system_symbols = set(system_positions.keys())
+        current_by_key = {
+            self._symbol_key(h.symbol): h for h in current_holdings if h.symbol
+        }
+        system_by_key = {
+            self._symbol_key(sym): (sym, pos) for sym, pos in system_positions.items()
+        }
 
         # New stocks in screenshot (not in system)
-        for h in current_holdings:
-            if h.symbol and h.symbol not in system_symbols:
+        for key, h in current_by_key.items():
+            if key not in system_by_key:
                 trades.append({
                     'symbol': h.symbol,
                     'trade_date': trade_date,
@@ -324,23 +759,33 @@ class PortfolioOcrImportService:
                 })
 
         # Stocks disappeared from screenshot (sell all)
-        for sym in system_symbols - current_symbols:
-            pos = system_positions[sym]
+        for key, (sym, pos) in system_by_key.items():
+            if key in current_by_key:
+                continue
+            last_price = float(pos.get('last_price') or 0.0)
+            if last_price <= 0:
+                # record_trade 对 price<=0 直接 raise，整批写入会因此失败；
+                # 这里不产出注定写不进去的交易，改为留痕交人工定价。
+                logger.warning(
+                    "[OCR] 清仓行缺有效价格（%s last_price=%s），跳过并留待人工处理",
+                    sym, pos.get('last_price'),
+                )
+                continue
             trades.append({
                 'symbol': sym,
                 'trade_date': trade_date,
                 'side': 'sell',
                 'quantity': float(pos['quantity']),
-                'price': pos.get('last_price', 0.0),
+                'price': last_price,
                 'fee': 0.0,
                 'tax': 0.0,
                 'note': f'OCR同步清仓-{sym}',
             })
 
         # Quantity changes
-        for h in current_holdings:
-            if h.symbol and h.symbol in system_symbols:
-                sys_qty = system_positions[h.symbol]['quantity']
+        for key, h in current_by_key.items():
+            if key in system_by_key:
+                sys_qty = system_by_key[key][1]['quantity']
                 diff = h.quantity - sys_qty
                 if diff > 0:
                     trades.append({

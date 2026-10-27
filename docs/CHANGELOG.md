@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 本地工作（GOT 及仓库自维护，非上游发布内容）
 
+- [feat(portfolio)] **手机发持仓截图 → OCR → 对账 → 确认落库（2026-10-27，真实券商截图驱动）**：
+  **通道**：`bot/platforms/ntfy_stream.py` 新增附件接收——只收 `image/*`（≤15 MB），下载到临时文件后以 `/portfolio` 分发，处理完立即删除；ntfy 对纯附件自动填的 `You received a file: x` 不再被当成自由文本（首版实测因此没进 dispatch）。
+  **命令**：新增 `bot/commands/portfolio.py`（别名 持仓/pf/p）：发图即 OCR + 对账，**只预览不落库**；`/portfolio confirm` 才逐笔 `record_trade`，`/portfolio cancel` 丢弃，预览 30 分钟过期；无图则显示当前持仓快照。清单注册数 10 → 11。
+  **真实版面解析**：用户真实截图（中信证券 APP）暴露出两个既有解析器盲区——① **一只票横跨两行**（上行=名称/盈亏/数量/成本，下行=市值/涨幅/可用/现价）且**无代码列**；② OCR 把千分位读成 `.`（`68.484.00`、`-2.942.86`）。`portfolio_ocr_import.py` 新增 `_number_variants`（一个 token 给出全部合理读数）+ `_parse_two_row_layout`（用 `qty×(现价-成本)≈盈亏` 恒等式挑选读数，容差 `max(5, 2%|pnl|, 0.2%×qty×price)`，不满足则整行丢弃）。主解析与两行解析**合并**而非二选一（强校验结果优先，主解析补齐未覆盖名称）。
+  **名称→代码**：新增 `_load_name_map()` 三级来源——磁盘缓存 `data/stock_name_cache.json` → **TDX(mootdx `stock_all()`，复用 `MootdxFetcher._mootdx_session()` 的验活节点池)** → akshare 兜底；命中失败退化为 `None` 不阻塞预览。裸码经 `_bare_code()` 归一（`SH600519`/`600519.SH` → `600519`）。
+  **实测（真实截图 466 KB）**：`润建股份(002929) 1300 股 成本 54.945 现价 52.680 市值 68,484 盈亏 -2,945`——与图面 `-2,942.86` 相差 1.6（恒等式自校验通过）；系统持仓为空 → 生成 1 笔初始买入预览。akshare 名称库当时被东财断连，TDX 通道一次成功并落盘缓存。
+  **验证**：`tests/test_portfolio_ocr_two_row.py` 4 例（千分位/三位小数歧义、两行版面、数值不自洽拒绝、多只持仓）、`tests/test_portfolio_command.py` 8 例（预览不写库、confirm 落库、cancel、无待确认、过期、OCR 失败、快照、"发图"提示）、`tests/test_ntfy_bidirectional.py` 19 例（含附件下载→`/portfolio`、非图片忽略、占位文案映射）；本地 `-k "portfolio or ntfy or bot or notification"` **534 passed**；服务器端到端：发图 → 解析 → 预览回帖 → `/portfolio cancel` 成功。
+
 - [feat(notify)] **ntfy 双向通道落地：手机发指令 → CommandDispatcher → 回帖 out topic（2026-10-26）**：
   **背景**：服务器出网实测 `api.telegram.org`（IPv4 `202.160.130.145` TCP 超时 / 无全局 IPv6）、`web.telegram.org`、`discord.com`、`matrix.org`、`api.line.me` 全部 `000`，Cloudflare WARP 出口 `engage.cloudflareclient.com:2408` 也被封——**Telegram/Discord/Matrix 均不可达**；`ntfy.sh` 发布/订阅/附件全通（`speed.cloudflare.com` 通但仍无隧道价值）。国内可达的钉钉/飞书/企微/Server酱/PushPlus 均有内容审核，PushDeer/Bark/Gotify 单向，故取 **ntfy**（开源、无审核、可自建、topic 分项目、收发同协议）。
   **新增 `bot/platforms/ntfy_stream.py`**：`GET <server>/<cmd-topic>/json` NDJSON 长连接（实测 keepalive 45 s、流可持活）→ 逐事件解析 → 只处理 `event=message` → 转 `BotMessage(platform="ntfy")` → 既有 `CommandDispatcher.dispatch()` → 回复分段（≤3800 B）发回 out topic；**回声防护**：本进程发出的消息带 `bot` tag，订阅端见 tag 即跳过，故 cmd 与 out 可同 topic；**断线续传**：`since=<最后一条 id>`，首连用 `since=15m` 不回放历史指令；`stop()` 关闭活动响应解除读流阻塞。入口 `start_ntfy_stream_background()`，`main.py:start_bot_stream_clients` 按 `NTFY_STREAM_ENABLED` 启动。

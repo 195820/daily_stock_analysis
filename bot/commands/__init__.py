@@ -23,6 +23,7 @@ _COMMANDS = {
     "ResearchCommand": ("bot.commands.research", "ResearchCommand"),
     "StrategiesCommand": ("bot.commands.strategies", "StrategiesCommand"),
     "HistoryCommand": ("bot.commands.history", "HistoryCommand"),
+    "PortfolioCommand": ("bot.commands.portfolio", "PortfolioCommand"),
 }
 
 # All available commands (for auto-registration)。
@@ -31,7 +32,7 @@ _COMMANDS = {
 _ORDER = [
     "HelpCommand", "StatusCommand", "AnalyzeCommand", "MarketCommand",
     "BatchCommand", "AskCommand", "ChatCommand", "ResearchCommand",
-    "StrategiesCommand", "HistoryCommand",
+    "StrategiesCommand", "HistoryCommand", "PortfolioCommand",
 ]
 
 __all__ = [

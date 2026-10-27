@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -130,14 +131,27 @@ class _FakeStreamResponse:
         # 模拟流结束（真实环境是长连接）
 
 
+class _FakeDownload:
+    def __init__(self, content):
+        self.content = content
+
+    def raise_for_status(self):
+        return None
+
+
 class _FakeSession:
-    def __init__(self, events, post_status=200):
+    def __init__(self, events, post_status=200, downloads=None):
         self.events = events
         self.post_status = post_status
+        self.downloads = downloads or {}
         self.get_calls = []
         self.post_calls = []
+        self.download_calls = []
 
     def get(self, url, **kwargs):
+        if url in self.downloads:
+            self.download_calls.append({"url": url, **kwargs})
+            return _FakeDownload(self.downloads[url])
         self.get_calls.append({"url": url, **kwargs})
         return _FakeStreamResponse(self.events)
 
@@ -193,7 +207,8 @@ class TestNtfyStreamClient(unittest.TestCase):
 
         self.assertEqual(dispatcher.messages, [])
         self.assertEqual(session.post_calls, [])
-        self.assertIsNone(client._last_id)
+        # 见过的消息都推进游标（含被跳过的），避免重连时重放
+        self.assertEqual(client._last_id, "2")
 
     def test_dispatches_message_and_replies_to_out_topic_with_echo_tag(self):
         session = _FakeSession(
@@ -219,6 +234,84 @@ class TestNtfyStreamClient(unittest.TestCase):
         self.assertEqual(payload["message"], "状态正常")
         self.assertEqual(payload["tags"], [ntfy_stream.ECHO_TAG])
         self.assertEqual(client._last_id, "m1")
+
+    def test_image_attachment_downloaded_and_dispatched_as_portfolio(self):
+        seen_paths = []
+
+        class _SpyDispatcher:
+            def dispatch(self, message):
+                seen_paths.append(message.raw_data.get("image_path"))
+                self.message = message
+                return BotResponse.text_response("已识别")
+
+        dispatcher = _SpyDispatcher()
+        session = _FakeSession(
+            [{
+                "event": "message",
+                "id": "img1",
+                "topic": "dsa-out-topic",
+                "message": "",
+                "attachment": {
+                    "name": "holdings.png",
+                    "type": "image/png",
+                    "size": 2048,
+                    "url": "https://ntfy.sh/file/holdings.png",
+                },
+            }],
+            downloads={"https://ntfy.sh/file/holdings.png": b"\x89PNG fake bytes"},
+        )
+        client = self._client(session, dispatcher)
+
+        client._consume_once()
+
+        self.assertEqual(dispatcher.message.content, "/portfolio", "无文字图片应合成 /portfolio 指令")
+        self.assertEqual(len(seen_paths), 1)
+        downloaded = seen_paths[0]
+        self.assertTrue(downloaded and downloaded.endswith(".png"))
+        # 临时文件在 dispatch 结束后必须清理
+        self.assertFalse(Path(downloaded).exists(), "临时图片文件应在处理完删除")
+
+    def test_attachment_placeholder_text_still_maps_to_portfolio(self):
+        """ntfy 给纯附件自动填 "You received a file: x"，不能因此走自由文本分支。"""
+        session = _FakeSession(
+            [{
+                "event": "message",
+                "id": "img2",
+                "message": "You received a file: holdings.png",
+                "attachment": {"name": "holdings.png", "type": "image/png", "size": 2048,
+                               "url": "https://ntfy.sh/file/holdings.png"},
+            }],
+            downloads={"https://ntfy.sh/file/holdings.png": b"\x89PNG fake"},
+        )
+        dispatcher = _FakeDispatcher("ok")
+        client = self._client(session, dispatcher)
+
+        client._consume_once()
+
+        self.assertEqual(dispatcher.messages[0].content, "/portfolio")
+        self.assertEqual(
+            dispatcher.messages[0].raw_data.get("caption"),
+            "You received a file: holdings.png",
+        )
+
+    def test_non_image_attachment_is_ignored(self):
+        session = _FakeSession(
+            [{
+                "event": "message",
+                "id": "doc1",
+                "message": "",
+                "attachment": {"name": "a.pdf", "type": "application/pdf", "size": 10,
+                               "url": "https://ntfy.sh/file/a.pdf"},
+            }],
+            downloads={"https://ntfy.sh/file/a.pdf": b"%PDF-1.4"},
+        )
+        dispatcher = _FakeDispatcher("reply")
+        client = self._client(session, dispatcher)
+
+        client._consume_once()
+
+        self.assertEqual(dispatcher.messages, [])
+        self.assertEqual(session.download_calls, [])
 
     def test_resume_uses_last_message_id(self):
         session = _FakeSession(
