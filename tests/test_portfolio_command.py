@@ -3,7 +3,9 @@
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from datetime import date
 from types import SimpleNamespace
 
@@ -94,6 +96,15 @@ def _message(image_path=None, chat_id="dsa-topic"):
 class TestPortfolioCommand(unittest.TestCase):
     def setUp(self):
         portfolio_module._PENDING.clear()
+        # 每个用例独立的落盘队列，避免污染仓库 data/
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_pending_path = portfolio_module.PENDING_PATH
+        portfolio_module.PENDING_PATH = Path(self._tmpdir.name) / "pending.json"
+
+    def tearDown(self):
+        portfolio_module.PENDING_PATH = self._orig_pending_path
+        portfolio_module._PENDING.clear()
+        self._tmpdir.cleanup()
 
     def _command(self, ingest=None, portfolio=None, portfolio_service=None):
         return PortfolioCommand(
@@ -165,6 +176,22 @@ class TestPortfolioCommand(unittest.TestCase):
 
         self.assertIn("解析失败", response.text)
         self.assertNotIn("dsa-topic", portfolio_module._PENDING)
+
+    def test_confirm_survives_process_restart(self):
+        """预览后进程重启（内存清空）仍应能 confirm —— 队列已落盘。"""
+        portfolio = _FakePortfolio({"SH600519": 100.0})
+        command = self._command(portfolio_service=portfolio)
+        command.execute(_message("/tmp/holdings.png"), [])
+
+        # 模拟重启：内存态清空，只剩磁盘
+        portfolio_module._PENDING.clear()
+        restarted = self._command(portfolio_service=portfolio)
+
+        response = restarted.execute(_message(), ["confirm"])
+
+        self.assertIn("已写入 1/1", response.text)
+        self.assertEqual(len(portfolio.recorded), 1)
+        self.assertEqual(portfolio.recorded[0]["trade_date"], date(2026, 10, 27))
 
     def test_unmatched_symbol_is_excluded_from_trades(self):
         class _NoSymbolOcr(_FakeOcr):

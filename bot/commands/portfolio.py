@@ -13,8 +13,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from bot.commands.base import BotCommand
@@ -26,6 +30,67 @@ logger = logging.getLogger(__name__)
 PENDING_TTL_SECONDS = 1800
 # chat_id -> {"trades": [...], "account_id": int|None, "created_at": float}
 _PENDING: Dict[str, Dict[str, Any]] = {}
+# 落盘：确认队列是跨进程状态，服务重启/发版后不能丢（否则用户确认时"没有截图"）
+PENDING_PATH = Path(os.getenv("PORTFOLIO_PENDING_PATH", "data/pending_portfolio.json"))
+
+
+def _serialize_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for trade in trades:
+        item = dict(trade)
+        trade_date = item.get("trade_date")
+        if hasattr(trade_date, "isoformat"):
+            item["trade_date"] = trade_date.isoformat()
+        out.append(item)
+    return out
+
+
+def _deserialize_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for trade in trades:
+        item = dict(trade)
+        trade_date = item.get("trade_date")
+        if isinstance(trade_date, str):
+            try:
+                item["trade_date"] = date.fromisoformat(trade_date)
+            except ValueError:
+                pass
+        out.append(item)
+    return out
+
+
+def _write_pending_file() -> None:
+    try:
+        PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            key: {**entry, "trades": _serialize_trades(entry.get("trades") or [])}
+            for key, entry in _PENDING.items()
+        }
+        PENDING_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[Portfolio] 待确认队列写入失败: %s", type(exc).__name__)
+
+
+def _load_pending(key: str) -> Optional[Dict[str, Any]]:
+    """内存优先，未命中则从磁盘恢复（服务重启后仍能 confirm）。"""
+    entry = _PENDING.get(key)
+    if entry is None:
+        try:
+            raw = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        entry = raw.get(key)
+        if not entry:
+            return None
+        entry["trades"] = _deserialize_trades(entry.get("trades") or [])
+        _PENDING[key] = entry
+    # TTL 由调用方判断，便于区分「没有预览」与「预览已过期」两种回执
+    return entry
+
+
+def _drop_pending(key: str) -> None:
+    _PENDING.pop(key, None)
+    _write_pending_file()
 
 
 class PortfolioCommand(BotCommand):
@@ -78,7 +143,7 @@ class PortfolioCommand(BotCommand):
         if action in ("confirm", "确认", "ok"):
             return self._confirm(key)
         if action in ("cancel", "取消"):
-            _PENDING.pop(key, None)
+            _drop_pending(key)
             return BotResponse.text_response("已取消本次持仓更新，未写入任何交易。")
 
         image_path = (message.raw_data or {}).get("image_path")
@@ -122,6 +187,7 @@ class PortfolioCommand(BotCommand):
             "account_id": account_id,
             "created_at": time.time(),
         }
+        _write_pending_file()
 
         reply = service.build_reply(result, trades)
         if unmatched:
@@ -144,11 +210,11 @@ class PortfolioCommand(BotCommand):
         return accounts, system_positions
 
     def _confirm(self, key: str) -> BotResponse:
-        pending = _PENDING.get(key)
+        pending = _load_pending(key)
         if not pending:
             return BotResponse.text_response("没有待确认的持仓更新。先发一张持仓截图。")
-        if time.time() - pending["created_at"] > PENDING_TTL_SECONDS:
-            _PENDING.pop(key, None)
+        if time.time() - float(pending.get("created_at", 0)) > PENDING_TTL_SECONDS:
+            _drop_pending(key)
             return BotResponse.text_response("预览已过期（超过 30 分钟），请重新发一次截图。")
 
         account_id = pending.get("account_id")
@@ -164,7 +230,7 @@ class PortfolioCommand(BotCommand):
             except Exception as exc:
                 failed.append(f"{trade.get('symbol')} {trade.get('side')}: {exc}")
 
-        _PENDING.pop(key, None)
+        _drop_pending(key)
         lines = [f"✅ 已写入 {done}/{len(pending['trades'])} 笔交易。"]
         if failed:
             lines.append("失败明细：")
