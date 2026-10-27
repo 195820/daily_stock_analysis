@@ -7,8 +7,14 @@ using PaddleOCR, then generate trade events to initialize/sync positions.
 
 from __future__ import annotations
 
+import gc
+import json
 import logging
+import os
 import re
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -27,6 +33,17 @@ _HEADER_WORDS = {
 
 # 名称 → 代码 的进程内缓存（取一次全表，失败则保持 None 不重试）
 _NAME_MEMO: Dict[str, Optional[str]] = {}
+
+# OCR 引擎（ONNX 模型，实测常驻 +350 MB）不用时自动卸载：空闲超过该秒数即释放。
+# 0 表示不自动卸载。下次发图会重新加载（冷启动约 10-30 s，视机器而定）。
+OCR_IDLE_UNLOAD_SECONDS = int(os.getenv("OCR_IDLE_UNLOAD_SECONDS", "180"))
+_OCR_WATCHDOG_INTERVAL = 30
+# 子进程 OCR：模型跑完即退出，内存全归还（常驻进程不再背 ~350 MB）。
+# Linux 默认开；Windows 默认关（开发机免去每次起进程的开销）。
+OCR_SUBPROCESS = os.getenv(
+    "OCR_SUBPROCESS", "1" if os.name == "posix" else "0"
+).strip().lower() not in ("0", "false", "no", "off")
+OCR_SUBPROCESS_TIMEOUT = int(os.getenv("OCR_SUBPROCESS_TIMEOUT", "300"))
 # 名称 → 裸码 全表缓存（优先 TDX，其次 akshare；落盘避免每次重取）
 _NAME_MAP: Dict[str, str] = {}
 _NAME_MAP_PATH = Path("data/stock_name_cache.json")
@@ -55,9 +72,16 @@ class PortfolioOcrImportService:
         "870", "871", "872", "873", "920",
     )
 
-    def __init__(self):
+    def __init__(self, prefer_subprocess: Optional[bool] = None):
         self._ocr = None
         self._backend: Optional[str] = None
+        self._prefer_subprocess = (
+            OCR_SUBPROCESS if prefer_subprocess is None else bool(prefer_subprocess)
+        )
+        self._ocr_lock = threading.RLock()
+        self._last_used = 0.0
+        self._watchdog: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
 
     def _load_backend(self) -> str:
         """选定 OCR 后端：paddle 优先，缺失时退到 rapidocr（ONNX 版 PP-OCR）。
@@ -82,8 +106,46 @@ class PortfolioOcrImportService:
         logger.info("[OCR] 后端: %s", self._backend)
         return self._backend
 
+    def release_engine(self) -> bool:
+        """卸载 OCR 引擎并回收内存；返回是否真的释放了。"""
+        with self._ocr_lock:
+            if self._ocr is None:
+                return False
+            self._ocr = None
+        gc.collect()
+        # glibc 会把释放的内存留在 arena 里，主动 trim 才能真正还给 OS（Linux）
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+        logger.info("[OCR] 引擎已卸载（空闲 %.0fs，阈值 %ss）",
+                    time.time() - self._last_used, OCR_IDLE_UNLOAD_SECONDS)
+        return True
+
+    def _ensure_watchdog(self) -> None:
+        if OCR_IDLE_UNLOAD_SECONDS <= 0:
+            return
+        if self._watchdog and self._watchdog.is_alive():
+            return
+        self._watchdog = threading.Thread(
+            target=self._watchdog_loop, name="OcrIdleUnload", daemon=True
+        )
+        self._watchdog.start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(_OCR_WATCHDOG_INTERVAL):
+            if self._ocr is None:
+                continue
+            idle = time.time() - self._last_used
+            if idle >= OCR_IDLE_UNLOAD_SECONDS:
+                self.release_engine()
+
     def _get_ocr(self):
         """Lazy-load OCR engine."""
+        self._last_used = time.time()
+        self._ensure_watchdog()
         if self._ocr is None:
             backend = self._load_backend()
             if backend == "paddle":
@@ -97,10 +159,50 @@ class PortfolioOcrImportService:
                 self._ocr = RapidOCR()
         return self._ocr
 
+    def _ocr_boxes_in_subprocess(self, image_path: str) -> List[Dict[str, Any]]:
+        """在子进程里跑 OCR；失败抛异常由调用方回退到进程内。"""
+        import subprocess
+
+        env = dict(os.environ)
+        env["OCR_SUBPROCESS"] = "0"  # 防递归
+        root = str(Path(__file__).resolve().parents[2])
+        env["PYTHONPATH"] = os.pathsep.join(
+            [root, env.get("PYTHONPATH", "")] if env.get("PYTHONPATH") else [root]
+        )
+        completed = subprocess.run(
+            [sys.executable, "-m", "src.services.ocr_worker", image_path],
+            capture_output=True,
+            text=True,
+            timeout=OCR_SUBPROCESS_TIMEOUT,
+            env=env,
+            cwd=root,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                (completed.stderr or "").strip()[:300] or f"ocr_worker exit {completed.returncode}"
+            )
+        payload = json.loads(completed.stdout.strip() or "{}")
+        boxes = payload.get("boxes")
+        if not isinstance(boxes, list):
+            raise RuntimeError("ocr_worker 输出缺少 boxes")
+        logger.info("[OCR] 子进程识别完成: %d 个文本框", len(boxes))
+        return boxes
+
     def ocr_boxes(self, image_path: str, min_score: float = 0.5) -> List[Dict[str, Any]]:
         """OCR → 归一化文本框列表 [{text, score, x0, y0, x1, y1}]，按 (y, x) 排序。"""
+        if self._prefer_subprocess:
+            try:
+                return self._ocr_boxes_in_subprocess(image_path)
+            except Exception as exc:
+                logger.warning("[OCR] 子进程不可用，改用进程内: %s", str(exc)[:120])
+
+        return self._ocr_boxes_inprocess(image_path, min_score)
+
+    def _ocr_boxes_inprocess(self, image_path: str, min_score: float = 0.5) -> List[Dict[str, Any]]:
         backend = self._load_backend()
-        ocr = self._get_ocr()
+        with self._ocr_lock:
+            ocr = self._get_ocr()
+            self._last_used = time.time()
         boxes: List[Dict[str, Any]] = []
 
         if backend == "paddle":
