@@ -70,6 +70,174 @@
 
 ---
 
+## ‼️ 2026-10-22 架构修正（Node 4 事件进埋伏通道 + 置信度改排序权重 + 产业级事件召回 — 用户批准方案直接生效）
+
+**性质**：修复即生效（用户批准，方案 `local://node4-ambush-events-plan.md`）。四问驱动（日历与 Node 4 区别 / 谁先出现 / 是否专注预期新闻 / 阈值是否该降），三路并行研究（外网文献 + 归档回测 + 代码审阅）后定为**方案 B**：Node 4 事件直接进埋伏通道 + 置信度由硬闸改排序权重 + 短名单之外的产业级召回。三条各自独立开关，可单独回退。
+
+### 已核实现状问题（归档回测）
+
+| # | 问题 | 数据（n=已兑现 `llm_narrative`+`global_map` conf≥0.6 共 401 条） |
+|---|---|---|
+| 1 | 埋伏通道只读日历、不读 Node 4 事件 | `_build_ambush_channel` 只消费 `news.catalyst_calendar.events`；10-21 实测 11 个产业级事件（稀土出口管制/厄尔尼诺/MLCC 交期 52 周/液氩涨价）对埋伏**零贡献**；`major_events` × 当日 ambush 板块重叠率 **7%**（720 条中 53 条）——进了也少命中，但「完全不进」连这 7% 都拿不到 |
+| 2 | 0.7 硬闸把 LLM 保守输出全杀 | 10-21 实测 6 条 narrative `confidence` 0.50–0.65 全被拦，正式池 **0**、蓄水池 15 条大量 `no_catalyst`；59 个归档日中正式池 >0 仅 **16 天（27%）**，均值 0.47 个/日 |
+| 3 | 阈值本身无区分度 | 见下表——**降阈值不损失质量**（低档 Wilson 区间覆盖高档点估计） |
+| 4 | 提前量与正确率无关 | lead≥2d 组 0.41 / lead 0–1d 组 0.38（区间重叠）；但「未来事件池」有 P6 样本连续性优势（`catalyst_realizations` 已按 `event_date` 兑现） |
+| 5 | P5 选股重排同样只认日历 | `_score_catalyst_relevance`（`stock_screener.py:3364`）与 G-A2 闸门（`:1703`）都只读日历 + 同一个 0.7 闸 → **本次不动**（它们是位置/下单层，严一档合理） |
+
+| 置信档 | 已兑现条数 | 方向正确率 | Wilson 95% | 平均收益 |
+|---|---|---|---|---|
+| conf ≥ 0.6 | (低档集合) | 0.40 | 与另两档全部重叠 | +0.10% |
+| conf ≥ 0.65 | (中档集合) | 0.42 | 全部重叠 | +0.15% |
+| conf ≥ 0.7 | (高档集合) | 0.40 | 全部重叠 | +0.24% |
+
+**文献依据**：Lucca & Moench (2015) pre-FOMC drift 30bp、Campbell et al. (2006) 机构公告前建仓 → 「预期发酵可交易」成立；ConfidenceBench (2025) + “Ordinal Gates, Cardinal Bets” (2026) → **LLM 自报置信度只适合 ordinal ranking，不适合 cardinal 硬闸**；FinMem (AAAI 2024) 分层记忆 Sharpe +30% → 「事件池」结构有据。A 股开源生态无同类完整实现。
+
+### 用户核心命题「LLM 判断的带发酵潜在事件」的数据裁决
+
+口径：`llm_narrative` 且 `confidence≥0.6`；提前量 = `event_date − created_at`；埋伏迹象 = 该 sector 在 `[run_date, event_date]` 内进入过 `unified.json` 的 `ambush_pool/reservoir`。
+
+| 项 | 结果 |
+|---|---|
+| 产出结构（语义分类归档 narrative 标题） | fermentation 类 **395** / node 类 83 / 其他 377 —— 发酵类**已是主要产出**，不是缺失能力 |
+| 三类正确率（已兑现） | fermentation 0.32（n=44，Wilson [0.20,0.47]）/ node 0.38（n=39，[0.25,0.54]）/ other 0.51（n=121，[0.42,0.60]）——区间大面积重叠，**无证据支持专挑发酵类**；ferm 平均收益 −0.55% 为三类最差 |
+| 「发酵→后续埋伏迹象」组合 | 313 条发酵事件中仅 80 条（**26%**）板块在 event_date 前进入过池/蓄水池；这 80 条兑现正确率 **0.30**（n=23）**低于**未出现迹象的 0.50（n=66）——组合优势不成立（两组区间重叠、样本均 <30，不能定论，但足以否掉「显然成立」） |
+| 被浪费的能力 | `news_analysis._detect_fermenting_events()`（`appearance_count≥3` 且跨日≥2 天）**全仓零调用**（grep 确认，tests 亦无引用）→ 第 6 步以「接入 narrative prompt」的方式首次利用，不新建第二套检测 |
+
+**结论**：本期不按「发酵/节点」二分重构日历、不单独建池；阈值问题与事件类型无关，由第 3 步统一解决；`catalyst_onset_days` 字段与第 6 步发酵信号为此留好扩展点（若日后 fermentation 档 dir_correct 显著高于 node 档且 Wilson 不重叠，再单独立项）。
+
+### 用户两个反例的根因（都成立，但根因不是「事件类型选错」，而是事件没进候选池）
+
+| 反例 | 数据事实 | 根因 |
+|---|---|---|
+| 厄尔尼诺 × 农业 | 原始新闻 8-24 起连续 37 条（「地表最强厄尔尼诺来袭！种植链再掀涨停潮」8-31、「超强厄尔尼诺持续发酵」9-01 出现 3 次、气象局 9-02、发改委 9-22）；`node4_events` 只抽出 3 条（9-02/9-22/10-21），8-24~9-29 期间日历**零农业板块催化**；同期农业板块状态是 `active_mainline`/`exhausted_mainline`、`ambush_days` 恒 0 | Node 4 只抽到「气象局通报/发改委预案」这类**二手转述**，没抽到「种植链涨停潮/印尼甘蔗减产 25%」这类**价格与供需事实**；且板块 8-20 前后已进主线，埋伏窗口早已过去 → 修法在第 6 步（跨日发酵原始新闻直入 narrative prompt） |
+| DeepInfer × 算力 | raw id=12870（10-20，sina 转载华尔街见闻）`DeepSeek开源推理框架DeepInfer，V4.1 Flash登顶Agent Arena开源榜` + id=9278（9-30 昇腾基础设施组件开源）；两条 `appearance_count` 均 =1、`lifecycle=active`，**都没进 `node4_events`**（10-20 当日 22 条事件无一条关于 DeepInfer） | 两段式阶段 1 把 788 条压到 12 条时，这条没有「涨停/暴涨/政策」热度词、也不是多源重复的产业级开源发布排在 12 名外，LLM 从未看到 → 修法在第 7 步（独立召回通道，不依赖当日标题热度） |
+
+### 开关与回滚
+
+| 开关 | 缺省 | 关时行为 |
+|---|---|---|
+| `GOT_NODE4_AMBUSH_EVENTS_ENABLED` | true | `_build_node4_event_index` 返回 `{}` → 埋伏通道只读日历（逐字节回现状） |
+| `GOT_CATALYST_CONFIDENCE_GATE_LOW` | 0.6 | 置 0.7 回现状（准入与提升同档） |
+| `GOT_NARRATIVE_FERMENTING_INPUT` | true | 不拼「跨日发酵信号」段（narrative prompt 逐字节回现状） |
+| `GOT_FERMENTING_RECENCY_DAYS` | 3 | 发酵原始新闻的 `last_seen_date ∈ [today−N, today]` 时效窗（真库 170 行→6 行） |
+| `GOT_INDUSTRY_RECALL_ENABLED` / `GOT_INDUSTRY_RECALL_MAX` | true / 8 | 不召回（细读池大小回 12 条） |
+| — | — | 三者互不依赖：任一步回退不影响另外两步 |
+
+### 判据（机械可核对）
+
+1. **次日 ambush 池 >0 的天数占比**是否从 27%（16/59）上升；读数口径：归档 `portfolio_decision.json` / `unified.json` 的 `ambush_pool`。
+2. **Node 4 事件入池板块的 3 日超额**（`gate_notes` 含 `Node4事件(` 的候选）；`ambush_position_snapshots` 为空表，暂用 `catalyst_realizations` 的 `day_3` 近似。
+3. **P6 新增 `node4_event` 样本的 dir_correct** 与既有 `llm_narrative` 档是否同区间（若显著更差 → 说明 Node 4 事件准入过松，先收紧 `_NODE4_IMPACT_WEIGHT` 再考虑关开关）。
+4. **接入发酵原始新闻后** narrative 事件日均产出条数与 `confidence` 分布是否变化（若 conf 分布整体下移而无正确率提升 → 回滚该步）。
+5. **产业召回后** `node4_events` 中「供给侧动作 + 产业实体」类事件占比是否上升，且 DeepInfer 类单源产业发布**次日**能入事件。
+
+### 实测读数（落地当日）
+
+| 项 | 结果 |
+|---|---|
+| 新增单测 | `tests/test_node4_ambush_events.py` **15 passed**（Node 4 入池+P4 fade 出口可达/别名 L2/负面排除/日历优先/开关回退/0.6 准入/0.58 拦截/提升仍 0.7/P6 登记/发酵 prompt/发酵开关/发酵时效与裸实体过滤/周末守卫/DeepInfer 召回+source_index 回连/召回上限与关键词组） |
+| 回归矩阵 | 计划 10 文件 **146 passed**（本方案 15 + `test_node4_title_shortlist` 15 + `test_news_weight_scrub` 4 + `test_catalyst_calendar_dedup` 38 + `test_catalyst_calendar_stock_events` 5 + `test_catalyst_identity_anchor` 10 + `test_evidence_chain` 7 + `test_node6_ambush_funnel` 11 + `test_ambush_lane_split` 32 + `test_a6_wiring` 9）；并入 `test_news_grounding` 后 11 文件 **154 passed** |
+| GOT 范围全量回归 | **1041 passed / 0 failed**（got/catalyst/node/ambush/news/aggregator/screener/phase/decision/archive/glue/portfolio/low_sector/market_theme/disagreement/evidence 16 类 106 文件）。唯一红项 `test_news_grounding::test_event_prompt_off_state_formats_and_matches_pre_batch` 是**逐字 prompt 快照**（钉 `source_type` 后紧跟 `}`），`onset_days` 属无条件字段契约、不随 `GOT_NEWS_EVIDENCE_GATING` → 该用例改为结构断言（不泄露 `source_index` + 示例可解析 + 覆盖 `onset_days`），不重钉快照 |
+| 真库冒烟（临时 SQLite） | `CATALYST_SOURCE_TIER["node4_event"]=="reported"`；`_make_event_id("node4_event","narrative","有色",today)` 幂等；`register_event` 同 `event_id` 二次调用**不产生重复行**（1 行，`source=node4_event`、`source_type=forward`） |
+| 真库只读复核（发酵输入） | 生产库 `node4_raw_news` **13,392 行恒为 `lifecycle_state='active'`**（无任何代码推进该列）→ `_detect_fermenting_events` 命中 **170 行**、最老 `first_seen=2026-08-24`；按 `appearance_count` 降序前 20 全是陈旧论坛长文/裸个股名（巨化股份 49× 至 10-16、汉钟精机 31× 至 10-08、中际旭创 29×）。**故在调用侧加两道边界**：`last_seen_date ∈ [today−3, today]`（兼作回放前视守卫）+ 标题长度 ≥8（裸实体无事件信息）→ 170 → **6 条**（`长文拆解…宝丰能源` 45×、`牧原股份…黄金猪` 20×、`吹票纯血机器人零部件` 7×、`印度央行抛售美元` 3× 等），剩余为当日仍在出现的论坛帖，prompt 明示「没有则忽略」，开关可整体关 |
+| P4 出口复核 | `top_event_date` 由 `None` 改为 **`today`**（Node 4 事件即当日事件，与 P6 `event_date=today` 同口径）：`_ambush_exit_signal` 的 fade 分支判据是 `event_date and today > event_date`，留 `None` 会让 fade 型持仓**永远走不到「事件日次日卖」**（只剩 −7% 止损）。已加断言：事件日当天不卖、次日 `fade_sell` |
+
+### 已知缺陷 / 后续
+
+- **Node 4 事件无 `event_date`**：B 公式 proximity 固定 0.5（等价「中等临近」）。若回测显示固定值扭曲排序，再把 `catalyst_onset_days`（字段已落）接进 `_compute_catalyst_score`——本次不接。候选侧 `top_event_date` 已取 `today`（P4 出口可达），不参与该公式。
+- **发酵输入仍可能带论坛帖**：时效 3 日 + 标题长度 ≥8 两道边界后，真库 6 条里仍有「晚间复盘：今天买了什么？」这类重复栏目帖——它们是当日仍在出现的长文本（机械意义上的「跨日发酵」），价值判断交 LLM（prompt 明示「没有未来节点则忽略」）；若实测拖累产出，先把 `GOT_FERMENTING_RECENCY_DAYS` 收到 2 或整体关 `GOT_NARRATIVE_FERMENTING_INPUT`。
+- **G-A2 / P5 的 0.7 闸本次不动**：全链路统一放宽属独立决策（下单层风险不同）。
+- **「发酵事件专项池」本期不做**：数据未证明其优于节点类（见上表），扩展点已留。
+
+---
+
+## ‼️ 2026-10-22 补登（Node 4 两段式全量标题初筛 + global_map 事件目录治理 — 用户批准直接生效）
+
+**性质**：修复即生效（用户批准的实施方案，非影子观测）。两项改动：
+① Node 4 由「weight 排序取前 50 条喂细读」改为两段式——阶段 1 把当日**全部**候选标题（无条数上限、无规则打分、无 weight 排序）交 LLM 初筛 ≤12 条，阶段 2 只对选中条目细读抽事件；weight 删除「热度」项（只留来源 40%/时效 35%/多源 25%，仅用于展示顺序与 NGA 保底），LLM 失效时**不降级到规则排序**（宁可当日无事件，不可产出错事件）。
+② `GLOBAL_TO_A_SHARE_MAP` 收紧为固定事件目录：13 条全补 `event_type_fixed`/`review_note`；日期确定型（earnings/policy/data/macro）缺 `anchor_keywords` → fail-closed；一次性大事件单列登记到 `src/got/global_events_manual.py`（缺省空表）。
+
+**补读口径修正（真库实测当天，取代计划原案）**：计划原定「`appearance_count` 降序取前 20 条」。真库只读复跑显示该排序被多轮热榜刷高计数的娱乐/社会条目占满（云南锗业 / 肖战演唱会 / 唐禹哲缓刑…），`appearance_count=1` 的 DeepInfer 被挤掉——与 weight 热度项同一类误判（用「热度」代理「价值」）。改为：**不做热度排序/预截断**，近 3 日窗口（覆盖周末；`[today-3, today)`）内未吸收标题**全量**回灌，仅按 `_normalize_title` 去重；候选价值只由 LLM 粗筛判定。吸收判定直查 `Node4EventRecord.title`（`last_seen` 覆盖 N+1 天），不用按 lifecycle 过滤的 `_load_recent_news_events`（fading 事件会让已吸收原稿被重复回灌）。
+
+### 开关与回滚
+
+| 开关 | 缺省 | 关时行为 |
+|---|---|---|
+| `GOT_NEWS_TITLE_SHORTLIST_ENABLED` | true | 回旧路径：`_format_news_for_prompt(raw_news, max_items=50)`（weight 已是三项版） |
+| `GOT_NEWS_TITLE_SHORTLIST_SIZE` | 12 | 调整细读条数（漏检多→20，成本超支→8） |
+| `GOT_NEWS_CARRY_PREV_TITLES` | true | 不回灌昨日漏读标题 |
+| map 治理字段 | 无开关 | 缺 `anchor_keywords` 的日期确定型映射不产事件；补锚定词即恢复 |
+
+### 判据（机械可核对）
+
+1. **粗筛覆盖率** = 进入粗筛 prompt 的当日标题数 / 本轮 `_fetch_news()` 返回条数，应 = 1.0（旧口径 = 50/N）。⚠️ 分母口径：`_fetch_news()` 的返回 = `merge_news` 排序后 `MAX_MERGED_NEWS=150` 截断 **+ `_merge_with_intelligence` 追加**（Intelligence 在截断之后并入），实测 2026-10-21 为 **246**；`node4_raw_news` 的 364/660 行是跨轮累计，**不得**当分母。昨日补读条目另计（不占当日分母）。核对：日志 `[Node 4] 标题粗筛: N → M 条`（N 减补读数即当日分母）；单测 `test_shortlist_sees_all_titles` 钉 200/200。
+2. **昨日发酵条目次日入事件比例**：`node4_raw_news` 中近 3 日未吸收标题被 `[昨日]` 回灌后进入 `node4_events` 的比例；DeepInfer 类条目次日应可见（真库只读复跑已确认 carried 含 DeepInfer；单测 `test_deepinfer_scenario_end_to_end` 构造性证明全链路）。
+3. **weight 热度项删除后的分差**：同来源/同源数/同时效下，含「涨停」与不含的标题得分必须**相等**（差 0，旧 20 分）；跨来源榜单口径（同花顺热榜 3 源 vs 新浪单源）实测 22.2 / 14.8 = **1.50×**（旧 1.93×），剩余差异全部来自信息源质量项。⚠️ 原计划写的「≤1.3×」与计划自身的预期数字（19.4/13.4≈1.45×）不自洽，且与「保留来源/多源质量」的设计冲突——本页按**实测口径**登记：同条件差 0、跨来源 ≤1.6×。
+4. **误纳入行情播报**：次日 `major_events` 中「XX涨超X%」「多股涨停」类条目应为 0（粗筛 prompt 明列排除；若出现按 `GOT_NEWS_TITLE_SHORTLIST_SIZE`/prompt 迭代，不回退规则）。
+
+### 实测读数（2026-10-22）
+
+| 项 | 结果 |
+|---|---|
+| 单测矩阵（6 文件） | **79 passed**：`test_node4_title_shortlist` 15 / `test_news_weight_scrub` 4 / `test_global_events_manual` 7 / `test_catalyst_calendar_dedup` 38（+9）/ `test_catalyst_calendar_stock_events` 5 / `test_catalyst_identity_anchor` 10 |
+| 全量受影响回归 | 与上表 6 文件合并跑 14 文件 **170 passed**（+ `test_catalyst_gate_forensics` 5 / `test_node6_ambush_funnel` 11 / `test_low_sector_rescue` 13 / `test_ambush_lane_split` 32 / `test_a6_wiring` 9 / `test_evidence_chain` 7 / `test_news_grounding` 8 / `test_news_pulse` 6） |
+| weight 回放 | 涨停潮(ths_hot,3源) **22.2** / 英伟达财报(wallstreetcn,3源) 21.0 / 宁德·DeepInfer·厄尔尼诺(sina,1源) 各 **14.8**；同条件含/不含「涨停」均 14.8 |
+| 真库冒烟（临时 SQLite） | 4 条 raw（今日 1 / 昨日 2 / 前日 1）+ 1 条 **fading** 已吸收事件 → 只回灌两条未吸收标题（昨日 DeepInfer + 前日未吸收），今日行与已吸收行均被排除；`sources_seen` 为空的历史行不再让日历加载失败（`max(1, len(...))` 护栏） |
+| 真库只读复跑（2026-10-21 晚） | `_load_unabsorbed_prev_titles()` 返回 **545 条**未吸收标题（近 3 日去重后）且**含 DeepInfer**；对照原计划 `appearance_count` 降序前 20 条 → **不含** DeepInfer（全为热榜娱乐/社会条目）→ 已按上方「补读口径修正」改掉热度排序与预截断 |
+
+### 真实运行观察（2026-10-21 晚 21:39–21:52，用户授权整跑 `--got`，日历强制 full 重建）
+
+| 项 | 读数 |
+|---|---|
+| 标题粗筛 | **788 → 12 条**（今日 `_fetch_news` 246 条 + 近 3 日补读 542 条）；一轮小调用覆盖全池，旧口径只喂 50 条 |
+| 事件抽取 | `major_events` **11** 条（旧归档 8 条）。新增产业/政策级：厄尔尼诺全球农业能源影响、液氩 7 天涨 25%、三星电机 MLCC 交期 52 周、日本稀土储备+出口管制、长川科技净利 +98~110%；**旧版的「创新药概念再度活跃，多股涨停」类行情播报不再入选** |
+| DeepInfer | 在补读池内但**未被 LLM 选中**（当日 11 条事件竞争）——机制覆盖到位，选择权在 LLM（符合「不按规则预筛」） |
+| 催化剂日历 | `refresh_mode=full`，**11 事件 = macro_rule 5 + llm_narrative 6**，global_map **0**；#2/#7/#8 fail-closed 警告按预期出现。**global=0 归因（逐条核库）**：① OpenAI 拟融资 / 苹果 iPhone Duo 供应链 / 三星 8nm 三条 `last_seen=10-20`、`lifecycle=fading`，被 `_load_recent_news_events` 的 emerging/fermenting/peak 过滤；② 今日「英伟达 GTC 柏林」「英伟达商谈 Firmus」「三星电机 MLCC」均无财报语义 → 被 #3/#12 锚定词正确拦截。**不是映射失效**：旧 22 条是增量累积，full 重建只从活跃事件重算 + 锚定词生效。6 条 narrative `confidence` 全 <0.7 → `reasoning.md` 只渲染 PMI（`archive.py` 的 `high_conf` 0.7 展示门，既有口径；6 条仍在 news.json） |
+| 清理修正 | full 重建后库内仍留 **9 条旧 global_map 行**（5 条「OpenAI 拟融资 300 亿美元」顶了发布会、3 条「三星 8nm 工艺」顶了 SK 海力士财报、1 条苹果供应链）——`produced_sources` 只清「本次有产出」的来源，global=0 时跳过。**修**：`global_map`/`global_manual` 是规则/静态目录输出，产出 0=无命中而非降级，无条件参与残留清理；用本次归档 11 事件实跑 `_cleanup_stale_events` → 9 行清零，DB 仅剩 5 条 macro。否则同一交易日再跑（增量 `_load_active_events`）会把旧行原样载回 |
+| 副产品 | `node4_raw_news` 今日 391 行；`node4_events` 今日 21 行；`catalyst_refresh` 重建为 `(2026-10-21, 0)`，下次走增量 |
+
+### 宏观日历退出（2026-10-22 用户裁决）
+
+- **决定**：PMI/CPI/社融/LPR 退出催化剂日历（此前 2026-10-21 只退出评分入口）。开关 `GOT_MACRO_CALENDAR_ENABLED`（缺省 **false**）。
+- **关闭时行为**：`_generate_macro_calendar` 返回空（不再生成、不注册 P6）；`_load_active_events` 过滤存量 `macro_rule`（增量路径不复活）；`_cleanup_stale_events` 把 `macro_rule` 纳入清理（全量重建删存量）。
+- **依据**：macro 已兑现 12 条仅 1 条 |收益|>2%；PMI 两条 +0.57% / −0.50%；calibration 报告 §5.1 判定 macro n=17 样本不足。⚠️ 口径：`drift_direction_correct` 对 `binary` 的判据是 `abs(actual_return) > 2.0`，不是涨跌方向。
+- **落地**：存量 9 条 `macro_rule` 行已删；`catalyst_events` 当前 0 行（6 条 narrative 被 T2 影子 DROP 未落库）；P6 `catalyst_realizations` 历史 17 行保留。
+- **影响面与回滚粒度**：PMI / CPI-PPI / 社融-M2 / LPR **四类一并退出**（无 per-rule 开关，回滚只能整类）。LPR 虽为 ★★★，P6 实测同样无大波动（10-20 银行 −0.50%/券商 −0.27%；09-20 银行 −0.42%/券商 +0.36%）；若日后只恢复某一类，需另加 per-rule 开关。
+- **回滚**：`GOT_MACRO_CALENDAR_ENABLED=true` 恢复规则日历（评分入口仍受 `GOT_CATALYST_MACRO_AS_REGIME_REF` 控制）。
+
+
+### 已知未闭合
+
+- **被 fail-closed 的映射（3 条，有意过渡态）**：#2 美国 CPI/PCE（data）、#7 台积电/ASML 财报（earnings）、#8 礼来/诺和诺德财报及临床（earnings）——缺锚定词即不产事件；恢复方式=给对应 mapping 补 `anchor_keywords`（财报/数据语义），无需回滚开关。国内 PMI/CPI/社融/LPR 仍由 `macro_rule` 日历覆盖（#2 被砍属去重）。**#1 FOMC 例外保留**：`macro_rule` 四条不含 FOMC，砍掉即净损失，已补会议语义锚定词 `["FOMC","议息","利率决议","会议","点阵图"]` 并标 `policy`（「鲍威尔/美联储/Fed」裸提法仍被排除）。
+- **单列通道缺省空表**：`global_events_manual.MANUAL_GLOBAL_EVENTS = []`，DeepInfer 仅作注释示例；登记后才会产事件（避免把未核实新闻直接注入生产日历）。
+
+---
+
+## ‼️ 2026-10-21 补登（板块校验误伤修复：军贸行业过滤 + 实际板块名透传 + 白名单扩容）
+
+**性质**：修复即生效（用户 2026-10-21 裁决修法：① 单检索源按现状工作；②③ 按推荐方案实施）。三项改动全部落在「验证上游」与「检索词口径」，**不新增裁判权限、不放松身份护栏**（T1/T2/T3 三条件逐字未改）。
+
+| 项 | 改动 | 一处回滚方式 |
+|---|---|---|
+| backlog §7 #18 军贸漂移 | `stock_screener.py` `concept_industry_map` 补 `"军贸概念": ["军工","国防","航空","航天","兵器","船舶","雷达","导弹"]` → `_try_query` 内既有行业过滤循环由 no-op 转为生效，绿电/消费漂移票在入池前被剔 | 删该行（恢复「不过滤」旧行为） |
+| backlog §7 #19 标签错位 | 问财实际查询名 `sector_query_board`（`resolve_with_kind`/别名改写/自愈产物）随成分股 dict → universe 行 → `ScreenerStock` → Node 7 `_verify_candidate_sectors` 的检索模板与 `boards` 首位（`verify_board = sector_query_board or tagged_sector`）。**Node 6 标签保留**：`sector_intel_map` 键、FXG 剔除名单、family 归因、`sector_verify_evidence[].sector` 全按标签工作 | 代码 revert；字段缺省 `""` 时逐字节回旧行为 |
+| 检索源白名单 | `EVIDENCE_SOURCE_ALLOWLIST` 12 → 15 域（`sohu.com`/`qianzhan.com`/`southmoney.com`），`is_allowed_source` 精确/后缀判定逻辑不变 | 删三行 |
+
+### 判据（机械可核对）
+
+1. **行业过滤生效**：归档日 `candidate_pool.json` 的「军贸概念」行内不应再出现 TDX 归属光伏/电力/环保的票（601778 晶科科技 / 浙江新能 / 江苏新能 / 芯能科技）。若过滤后为空，由既有第 1.5 轮（DDE 0.5%→0.3%）与第 2 轮（不带 DDE）降级接管；仍为空则当日该板块零票，属 fail-closed 可接受结果，不加回「不过滤」分支。
+2. **检索词口径**：`portfolio_decision.json.sector_verify_evidence[].query` 应含问财实际板块名（如「液冷服务器」）而非 Node 6 标签（「液冷服务」）；`candidate_pool.json` 每行新增 `sector_query_board`，标签 vs 实名差异可离线核对（D1 事后验证样本源）。
+3. **单源假阴性**：白名单扩容**不改变**单源约束——Bocha 零结果仍判 `insufficient_evidence`。⚠️ 本页 10-20 节「白名单召回损失摊开」实测：22 条 off-list 里 21 条本就过不了身份护栏，对**当日样本**扩容零召回收益；预期收益在跨日的 F10/概念成分页，不是 10-20 那批行情页。故本条不承诺召回提升，只承诺「多进入护栏判定的样本」。
+
+### 验证读数（2026-10-21）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `test_verify_candidate_sectors.py` **16 passed**（14 + 2 新增：实名检索保标签 / 空串回落标签）；`test_sector_evidence.py` **12 passed**（11 + 1 新增：扩容正例 + `evil-sohu.com`/`sohu.com.evil.cn` 后缀伪造反例）；`test_junmao_industry_filter.py` **2 passed**（新建，打桩问财返回 5 只混合行业：绿电两票被剔、船舶/航空三票保留；`液冷服务→液冷服务器` 写回 `sector_query_board`）；`test_family_topping_suppression.py`+`test_ambush_lane_split.py` **89 passed**（候选池快照新键断言） |
+| 端到端（真实 Bocha + LLM，001400 江顺科技 × 液冷服务） | `sector_query_board="液冷服务器"` → query `江顺科技 001400 液冷服务器 概念股`、`sector_available=True`、evidence 引证券之星「1月7日江顺科技涨停:液冷服务器…」；对照组 `""` → query 回落「液冷服务」亦为 True（10-20 的 False 当日已不可复现，检索源覆盖随日变化；修复判据以 `query` 口径为准——实名出现在检索词中即成立） |
+| 预期外未闭合 | 001400 在 10-20 判 False 的根因中「Bocha 未召回」部分无法在 10-21 复位验证；若后续再出现 insufficient，按运营项（配第二检索源/自建 SearXNG）处理，与本修复判据无关 |
+
+---
 ## ‼️ 2026-10-21 补登（催化剂价值分级 #1：identity 重锚 + macro 退出评分池 — 用户裁决跳过影子）
 
 **性质**：用户 2026-10-21 裁决「全套重构、不加影子」——两件直接生效改动：① `catalyst_identities` 身份表以 `global_event` 为单位锁定首次 catalyst_date：重锚判据是**陈旧度**（`news_date - first_anchor_date >= CATALYST_WINDOW_DAYS`，即 14 日历日）而非「catalyst_date 是否仍在窗口」——增量路径 `start=today` 且只载 1 天新闻，用窗口判据会在锚定到期次日必然重锚、新 event_id 造新 P6 行（等于没修）；同一事件实例内只递增 `anchor_count`、日期永不滚动，到期实例由 `catalyst_date < start` 谓词自然落历（根治「同一 SK 海力士事件 19 行」的日期进 ID 永生问题，Tetlock 2011 陈旧新闻证据）；② `CATALYST_MACRO_AS_REGIME_REF=true` 把 PMI/CPI/社融/LPR 从聚合/选股/Phase2 三个评分入口排除（macro 实测方向正确率 1/10 + Savor-Wilson 2013 公告溢价=事件日属性，非板块方向催化剂），事件仍入 `catalyst_events` 与归档。**回滚键**：`GOT_CATALYST_MACRO_AS_REGIME_REF=false` 一键恢复旧行为（macro 重新参与评分）；identity 锚定无开关，回退 = 回退代码。
@@ -193,8 +361,8 @@
 
 | 步骤 | 内容 |
 |---|---|
-| 1. 检索 | 2 条模板 × 最多 2 个 provider 顺位（`provider_offset` 0/1），**以护栏通过为停止条件**；单票 ≤4 次逻辑查询，`days=365`（概念归属是事实型，默认 7 天会漏证）。**死顺位收敛**：offset≥1 的引擎整轮无结果 → 类级记死顺位，本进程后续票/FXG 双跑不再等它（主顺位 0 永不停用）；`available_provider_count` 只数 `is_available` 的引擎，不保证网络可达 |
-| 2. 白名单 | `is_allowed_source(url)`：`urlparse().hostname` 精确/后缀匹配 12 个财经域名（stockstar/eastmoney/10jqka/cfi/cninfo/hx168/dabanke/sina/qq/163/hexun/jrj），防营销稿与 `evil.com/?x=stockstar.com` 伪造 |
+| 1. 检索 | 2 条模板 × 最多 2 个 provider 顺位（`provider_offset` 0/1），**以护栏通过为停止条件**；单票 ≤4 次逻辑查询，`days=365`（概念归属是事实型，默认 7 天会漏证）。检索词用候选的 `sector_query_board`＝问财**实际查询**的板块名（`resolve_with_kind`/别名改写/自愈产物；2026-10-21 起，空则回落 Node 6 标签），`boards` 候选＝`[verify_board, tagged_sector, *变体, resolved]`。**死顺位收敛**：offset≥1 的引擎整轮无结果 → 类级记死顺位，本进程后续票/FXG 双跑不再等它（主顺位 0 永不停用）；`available_provider_count` 只数 `is_available` 的引擎，不保证网络可达 |
+| 2. 白名单 | `is_allowed_source(url)`：`urlparse().hostname` 精确/后缀匹配 **15** 个财经域名（stockstar/eastmoney/10jqka/cfi/cninfo/hx168/dabanke/sina/qq/163/hexun/jrj + 2026-10-21 扩容 sohu/qianzhan/southmoney），防营销稿与 `evil.com/?x=stockstar.com` 伪造 |
 | 3. 身份护栏 | `evidence_supports_membership`：T1 同段含票标识 / T2 指代词+标题绑定 / T3 指名式概念列表（`核心概念 白酒概念`，段长 ≤120、段内无他票代码） |
 | 4. LLM 判定 | 通过护栏的原文批量一次调用，`verdict ∈ {member, not_member, uncertain}`，prompt 只给「票名/代码/板块/原文」并禁止引用未给内容 |
 | 5. 落地 | `member` 保留标签；`not_member`/`uncertain`/无证据 一律清空标签（Q9-B 强制 watch），reason 分别 `llm_rejected`/`llm_uncertain`/`insufficient_evidence` |
@@ -849,9 +1017,9 @@ GATE-1（卖出可成交性投影层，`GOT_TRADABILITY_GATE`，缺省 off）在
 - **读数方式**：读当日 `data/got_daily/{date}/portfolio_decision.json` 的 `tradability_shadow` 字段与各 allocation 的 `pending_exit`/`blocked_reason`。
 - **转正门槛（建议，数值归负责人）**：影子期 ≥10 个交易日；期间 `quote_unavailable` 占比 <10%；无误拦截实证（被拦卖单次日实际可成交）。满足后经负责人批准切 enabled。
 - **性质**：本层是三态影子开关（off→shadow→enabled，存在"攒读数后转正"翻转），与 bear gate 的"闸门生效+留痕旁挂"性质不同。
-- 拦截口径（tradability.py）：跌停封板→`limit_down`（现价≤跌停价且 high 贴住→全天未开板；盘中开板视为可成交）；当日建仓→`t_plus_1`；涨停一字→`limit_up`（buy 方向）。
+- 拦截口径（tradability.py）：跌停封板→`limit_down`（现价≤跌停价且 high 贴住→全天未开板；盘中开板视为可成交）；当日建仓→`t_plus_1`；涨停封板→`limit_up`（现价≥涨停价即拦，含一字与盘中封板；buy 方向）。
 - 降级红线：行情缺失/超时/异常一律放行不拦截，仅留 `quote_unavailable` 告警标签。
-- 单测：`tests/test_gate1_tradability_wiring.py`（**26** 个用例：三态行为 + 降级红线；本行原记 17 个，2026-10-12 `--collect-only` 实测为 26）。
+- 单测：`tests/test_gate1_tradability_wiring.py`（**28** 个用例：三态行为 + 降级红线；本行原记 17 个，2026-10-12 `--collect-only` 实测为 26，2026-10-27 增 2 例“盘中开板后封板仍拦/未触板放行”）。
 - **首日读数（2026-10-12）**：`portfolio_decision.json` 的 `tradability_shadow` = `{mode: "shadow", pending_exits: []}` ⇒ 接线成功；**但账户空仓、当日无卖单 ⇒ `quote_unavailable` 占比与「误拦截」两条门槛无样本**，需等有卖单的交易日才能累。详见顶部节。
 
 ### 2.1 0911 / 0912 的降级归因（原记载有误，此处更正）

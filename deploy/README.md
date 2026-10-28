@@ -18,12 +18,19 @@
 |---|---|
 | 每工作日 13:20 跑完整 GOT（Phase 1+2）+ 写归档 | ✅ 已生效（`dsa-got.timer`，NEXT 见 `systemctl list-timers`） |
 | GOT 之外的新闻快照采集（每小时 5 个滚动新闻线，补读晚间/周末/当日已滚出条目） | ✅ 已上线（2026-10-27 14:01 起 `dsa-news-collect.timer` enabled，首跑 14:10 成功） |
-| GOT 报告推送到 IM | ✅ 已生效（ntfy 单通道）：13:20 跑完自动推送。2026-10-27 实测 journal `已配置 1 个通知渠道：ntfy` → `ntfy 消息发送成功`。正文 = 摘要块 + 当日 `reasoning.md` 全文（>3800 B 由 `NtfySender` 自动改「摘要 + 附件」，公共 ntfy.sh 附件 3 h 过期）。**2026-10-27 已同步 `main.py`/`notify_payload.py`/`ntfy_sender.py`/`archive.py` 到 ECS（md5 一致），次日 13:20 起按新正文推送**；双向收图仍未接，见下 |
-| 消息里发持仓截图自动更新持仓 | ❌ 未接：`bot/platforms/feishu_stream.py:413-415` 仍丢弃非文本消息；OCR/解析/对账三层已就绪（见下节），当前只能「给图片路径 → 拿持仓与调仓预览」 |
-| 手动给一张截图得到识别结果 | ✅ 可用（`ingest_path`，服务器实测 3 只持仓） |
+| GOT 报告推送到 IM | ✅ 已生效（ntfy 单通道）：13:20 跑完自动推送。2026-10-27 实测 journal `已配置 1 个通知渠道：ntfy` → `ntfy 消息发送成功`。正文 = 摘要块 + 当日 `reasoning.md` 全文（>3800 B 由 `NtfySender` 自动改「摘要 + 附件」，公共 ntfy.sh 附件 3 h 过期）。**2026-10-27 已同步 `main.py`/`notify_payload.py`/`ntfy_sender.py`/`archive.py` 到 ECS（md5 一致），次日 13:20 起按新正文推送** |
+| 消息里发持仓截图自动更新持仓 | ✅ 已接（ntfy 双向）：发图 → OCR/版面解析 → 调仓预览 → `/portfolio confirm` 落库。2026-10-28 实测两只持仓（天奇 2000/润建 700）一次确认写入；`dsa-bot` 常驻 |
+| 手动给一张截图得到识别结果 | ✅ 可用（`ingest_path`，默认只预览不改库） |
 
-推送通道必须选**自建应用 + 长连接**（webhook 类只能推、收不到图）；凭据到位后再装 `dsa-bot` 常驻服务。
-长连接期间掉线**不补发**：飞书只在连接存活时投递事件，进程停掉的图片不会重投——回执里会带「未收到回执请重发」。
+推送通道当前用 **ntfy**（发布/订阅/附件全通，见 `docs/bot/ntfy-channel.md`）；飞书/钉钉方案仍未接（凭据是占位）。
+ntfy 长连接期间掉线**不补发**：进程停掉的图片不会重投，回执里会带「未收到回执请重发」。
+
+### 代码一致性（2026-10-28）
+
+`/opt/dsa/code` 此前是文件级手工同步，落后 HEAD 多日（`stock_screener.py` 10-21、`tradability.py` 09-30、
+`decision_plan.py` 10-20），导致已修复的涨停闸/对账日志未生效。2026-10-28 已按归一化 md5 全量对齐
+（252 个运行时 `.py` 与工作树逐文件一致），备份 `/opt/dsa/backup/align-20261028/code-before.tar.gz`。
+后续发版以 `git diff --name-only <old>..<new>` 的运行时文件清单同步，禁止只补个别文件。
 
 ## 必须做的一步：data 软链
 
