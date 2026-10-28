@@ -31,6 +31,8 @@ ntfy 长连接期间掉线**不补发**：进程停掉的图片不会重投，�
 `decision_plan.py` 10-20），导致已修复的涨停闸/对账日志未生效。2026-10-28 已按归一化 md5 全量对齐
 （252 个运行时 `.py` 与工作树逐文件一致），备份 `/opt/dsa/backup/align-20261028/code-before.tar.gz`。
 后续发版以 `git diff --name-only <old>..<new>` 的运行时文件清单同步，禁止只补个别文件。
+2026-10-28 15:27 增量同步 `752046f`（`archive.py`/`portfolio_decision.py`，两侧 md5 一致，venv import 冒烟通过）；
+随后按下载 manifest 逐文件核对，运行时全树 **229/229 md5 一致**（`src/`+`data_provider/`+`main.py`）。
 
 ### 自动同步（本地 post-commit hook，2026-10-28 起）
 
