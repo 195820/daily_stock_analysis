@@ -14,6 +14,7 @@ efinance>=0.5.5             # Priority 0: East Money data source https://github.
 akshare>=1.12.0             # Priority 1: East Money crawler data source
 tushare>=1.4.0              # Priority 2: Tushare Pro API
 pytdx>=1.72                 # Priority 2: Tongdaxin quote servers
+mootdx>=0.11.7              # Priority 0 TDX TCP: quotes.board/stock_all + 板块K线（GOT Node 2 硬依赖，缺则板块降级）
 baostock>=0.8.0             # Priority 3: Baostock data
 yfinance>=0.2.0             # Priority 4: Yahoo Finance (Fallback)
 longbridge>=0.2.77           # Priority 5: Longbridge OpenAPI fallback for US/HK stocks; OAuth capability checked at runtime
@@ -33,8 +34,8 @@ json-repair>=0.55.1         # JSON repair
 
 # AI analysis
 # Keep the historical minimum version while excluding quarantined builds and avoiding future major breaks.
-litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0   # Unified LLM client (Gemini/Anthropic/OpenAI/DeepSeek etc.)
-tiktoken>=0.8.0,<0.12.0    # BPE tokenizer for LLM token counting (pin <0.12 to avoid plugin registration issues, #537)
+litellm>=1.80.10,!=1.82.7,!=1.82.8,<1.83   # Unified LLM client (Gemini/Anthropic/OpenAI/DeepSeek etc.); <1.83 因为 mootdx 硬钉 httpx<0.26，1.83+ 声明需 httpx>=0.28
+tiktoken>=0.8.0,<0.14,!=0.12.*  # BPE tokenizer; 0.12.0 有 #537 cl100k_base 回归，<0.12 在 Python 3.14 无 wheel（实测 0.13.0 的 get_encoding/litellm.token_counter 均正常）
 openai>=1.0.0               # OpenAI SDK (transitive dependency of litellm, kept explicit)
 PyYAML>=6.0                 # YAML parser for LITELLM_CONFIG support
 
@@ -47,7 +48,7 @@ requests>=2.31.0            # HTTP requests
 markdown2>=2.4.0            # Markdown to HTML
 imgkit>=1.2.0              # Markdown to image; requires wkhtmltopdf
 fake-useragent>=1.4.0       # Random User-Agent support
-httpx[socks]                # HTTP client with SOCKS proxy support; optional OpenAI dependency
+httpx[socks]>=0.25,<0.26    # HTTP client with SOCKS proxy support; 上限来自 mootdx 的 httpx<0.26 硬约束（litellm 1.82.x 在该区间实测可用）
 dingtalk-stream >= 0.24.3    # DingTalk Stream SDK
 # Database
 # SQLite is built into Python and does not need an extra package
@@ -60,9 +61,18 @@ PyNaCl>=1.5.0                  # Discord Interaction/Webhook Ed25519 signature v
 newspaper3k>=0.2.8          # Article extraction
 lxml_html_clean             # Fix for lxml.html.clean ImportError in newer lxml versions
 
+# 问财（THS）选股：src/services/ths_screener.py 硬依赖无头浏览器，无 HTTP 降级
+# 安装后还需 `python -m playwright install chromium` 拉取浏览器本体
+playwright>=1.40.0          # Headless Chromium driver for 同花顺问财 queries
+
 # OCR for portfolio screenshot import
-paddlepaddle>=2.5.0         # Deep learning framework for PaddleOCR
-paddleocr>=2.7.0            # Chinese OCR engine
+# PaddleOCR 走 paddlepaddle，Python 3.14 无 wheel（`pip index versions paddlepaddle` → No matching）。
+# 注意 pip **不会**自动跳过无 wheel 的行，整单会直接失败；3.14 上必须用过滤后的清单装：
+#   grep -vE '^(paddlepaddle|paddleocr|git\+)' requirements.txt > requirements-core.txt
+# 主用 rapidocr（ONNX 版 PP-OCR，模型随包，离线可跑）；paddle 装得上时优先用它。
+rapidocr-onnxruntime>=1.3.0  # ONNX PP-OCR（需系统 libgl1；中文识别包已内置）
+paddlepaddle>=2.5.0         # 仅 Python <=3.13 可装；3.14 装机清单须按上面的 grep 剔除
+paddleocr>=2.7.0            # 同上；缺失时 _load_backend() 自动退 rapidocr
 
 # Report template engine (Report Engine P0)
 jinja2>=3.1.0               # Jinja2 template engine for report rendering
