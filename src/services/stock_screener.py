@@ -1482,8 +1482,23 @@ class StockScreenerPipeline:
         return kept
 
     # =================================================================
-    # Step 2: 埋伏道四闸门（G-A1 ~ G-A4）
+    # Step 2: 埋伏道四闸门（G-A0 ~ G-A4）
     # =================================================================
+
+    @staticmethod
+    def _is_limit_up(c: dict) -> bool:
+        """当日涨停/接近涨停（主线 R0 与埋伏道 G-A0 共用口径）。
+
+        2026-10-27：原为 _filter_got_finalists 的内嵌函数，埋伏道在 R0 之前分流，
+        导致 +9.99% 的 002093 仍被买入；抽成共用方法后两条道同口径剔除。
+        """
+        pct = c.get("change_pct", 0) or 0
+        code = c.get("code", "") or ""
+        # 创业板(300xxx)/科创板(688xxx) 涨跌幅限制 20%
+        if code.startswith(("300", "688", "689")):
+            return pct >= 19.5
+        # 主板/中小板 涨跌幅限制 10%
+        return pct >= 9.5
 
     def _run_ambush_lane(
         self,
@@ -1491,7 +1506,7 @@ class StockScreenerPipeline:
         got_context: dict,
         fetcher_manager=None,
     ) -> Tuple[List[ScreenerStock], dict, dict]:
-        """执行埋伏道四闸门筛选
+        """执行埋伏道 G-A0~G-A4 筛选（G-A0=涨停剔除，G-A1~A4=原四闸门）
 
         Returns:
             (lane_finalists, lane_shadow, lane_trace)
@@ -1513,6 +1528,7 @@ class StockScreenerPipeline:
 
         lane_trace: Dict[str, int] = {
             "lane_in": len(ambush_candidates),
+            "g_a0_limit_up": 0,
             "g_a1_pass": 0,
             "g_a1_soft_pass": 0,
             "g_a1_flow_negative": 0,
@@ -1528,7 +1544,24 @@ class StockScreenerPipeline:
             "lane_error": 0,
         }
 
+        # G-A0 记录：G-A0 成功后，后续闸门 fail-open 只遍历已过滤列表，不把涨停票放回
+        limit_up_filtered: List[Dict] = []
         try:
+            # ── G-A0: 涨停过滤（与主线 R0 同口径；2026-10-27 修复埋伏道绕过 R0）──
+            _kept: List[Dict] = []
+            for c in ambush_candidates:
+                if self._is_limit_up(c):
+                    limit_up_filtered.append(c)
+                else:
+                    _kept.append(c)
+            ambush_candidates = _kept
+            lane_trace["g_a0_limit_up"] = len(limit_up_filtered)
+            if limit_up_filtered:
+                logger.info(
+                    f"埋伏道 G-A0: 剔除 {len(limit_up_filtered)} 只涨停/接近涨停票: "
+                    f"{', '.join(str(c.get('code', '')) for c in limit_up_filtered)}"
+                )
+
             # ── G-A1: 资金面闸门 ──
             capital_ctx = got_context.get("capital_context", {})
             passed_a1, a1_trace = self._ga1_gate(ambush_candidates, capital_ctx)
@@ -1599,7 +1632,20 @@ class StockScreenerPipeline:
                     }
                     for s in lane_finalists
                 ],
-                "note": f"G-A1→{len(passed_a1)} G-A2→{len(passed_a2)} G-A3→{len(passed_a3)} G-A4→{len(lane_finalists)}",
+                "limit_up_filtered": [
+                    {
+                        "code": c.get("code"),
+                        "name": c.get("name"),
+                        "sector": c.get("sector"),
+                        "change_pct": c.get("change_pct"),
+                    }
+                    for c in limit_up_filtered
+                ],
+                "note": (
+                    f"A0→{len(ambush_candidates)} G-A1→{len(passed_a1)} "
+                    f"G-A2→{len(passed_a2)} G-A3→{len(passed_a3)} "
+                    f"G-A4→{len(lane_finalists)}"
+                ),
             }
 
         except Exception as e:
@@ -1639,6 +1685,15 @@ class StockScreenerPipeline:
                 "lane_finalists": [
                     {"code": s.code, "name": s.name, "sector": s.sector_name, "ambush_rank_score": s.ambush_rank_score}
                     for s in lane_finalists
+                ],
+                "limit_up_filtered": [
+                    {
+                        "code": c.get("code"),
+                        "name": c.get("name"),
+                        "sector": c.get("sector"),
+                        "change_pct": c.get("change_pct"),
+                    }
+                    for c in limit_up_filtered
                 ],
                 "note": f"fail-open: {e}",
             }
@@ -2125,17 +2180,8 @@ class StockScreenerPipeline:
 
 
         # 轮次 0: 剔除涨停股（当日无法买入）
-        def _is_limit_up(c: dict) -> bool:
-            pct = c.get("change_pct", 0)
-            code = c.get("code", "")
-            # 创业板(300xxx)/科创板(688xxx) 涨跌幅限制 20%
-            if code.startswith(("300", "688", "689")):
-                return pct >= 19.5
-            # 主板/中小板 涨跌幅限制 10%
-            return pct >= 9.5
-
-        limit_up_count = sum(1 for c in candidates if _is_limit_up(c))
-        candidates = [c for c in candidates if not _is_limit_up(c)]
+        limit_up_count = sum(1 for c in candidates if self._is_limit_up(c))
+        candidates = [c for c in candidates if not self._is_limit_up(c)]
         logger.info(f"轮次 0: {len(candidates)} 只（剔除 {limit_up_count} 只涨停）")
         funnel_trace["r0"] = len(candidates)
 
@@ -2275,7 +2321,7 @@ class StockScreenerPipeline:
                 )
             else:
                 logger.info(
-                    "P5催化剂重排跳过: 主线池无 ambush 候选（埋伏道拆分已隔离，归埋伏道四闸门）"
+                    "P5催化剂重排跳过: 主线池无 ambush 候选（埋伏道拆分已隔离，归埋伏道 G-A0~A4）"
                 )
 
         # 轮次 5: 板块分散 Top N（每个板块最多 1 只）
@@ -2337,15 +2383,17 @@ class StockScreenerPipeline:
                 )
                 # 闸门存活链 INFO 行（2026-10-13 可观测性修复：拆分→闸门→合并断链补齐）
                 # 存活数 = 上一闸门出口 − 本闸门损失；fail-open 时 lane_error=1（见 shadow note）
+                _a0_out = lane_trace.get("lane_in", 0) - lane_trace.get("g_a0_limit_up", 0)
                 _a1_out = lane_trace.get("g_a1_pass", 0) + lane_trace.get("g_a1_soft_pass", 0)
                 _a2_out = _a1_out - lane_trace.get("g_a2_no_catalyst", 0) \
                     - lane_trace.get("g_a2_low_confidence", 0) - lane_trace.get("g_a2_position_unsafe", 0)
                 _a3_out = _a2_out - lane_trace.get("g_a3_knife", 0)
                 logger.info(
-                    "埋伏道闸门: in={lane_in} G-A1→{a1} G-A2→{a2} G-A3→{a3} G-A4→{a4} "
+                    "埋伏道闸门: in={lane_in} A0→{a0} G-A1→{a1} G-A2→{a2} G-A3→{a3} G-A4→{a4} "
                     "(soft={sp} flow_neg={fn} dde_deg={dd} no_cat={nc} low_conf={lc} "
                     "pos_unsafe={pu} pool_pass={pp} knife={kn} err={err})".format(
                         lane_in=lane_trace.get("lane_in", 0),
+                        a0=_a0_out,
                         a1=_a1_out,
                         a2=_a2_out,
                         a3=_a3_out,

@@ -6,7 +6,7 @@
 职责：对退出链（sell/reduce）与买入候选做 A 股可成交性判定——
 - 跌停封板（现价 ≤ 跌停价且当日最高价亦贴住跌停价→全天未开板）→ sell 不可成交，顺延复核
 - T+1：当日新建仓 → sell 不可成交，顺延次日（与行情无关，仅依赖建仓日）
-- 涨停一字（现价 ≥ 涨停价且当日最低价亦贴住涨停价）→ buy 不可成交
+- 涨停封板（现价 ≥ 涨停价，含一字与盘中封板）→ buy 不可成交
 
 三态开关（在消费方 portfolio_decision._allocate 读取，缺省 off 逐字节不变）：
 - GOT_TRADABILITY_GATE=shadow → 只给 allocation 打 pending_exit/blocked_reason
@@ -87,7 +87,7 @@ def check_tradability(
         action: buy / sell（reduce 由调用方折算为 sell 口径传入）
         quote_price: 现价
         pre_close: 昨收（缺失 → 放行 + quote_unavailable）
-        quote_low / quote_high: 当日最低价/最高价（一字板近似判定用，可选）
+        quote_low / quote_high: 当日最低价/最高价（跌停一字近似判定用；buy 侧 2026-10-27 起只看现价）
         limit_pct: 涨跌停幅度（limit_pct_for_code 派生）
         entry_date / today: T+1 判定输入（仅 sell 有效）
 
@@ -127,9 +127,9 @@ def check_tradability(
     if action == "buy":
         tol = pre_close * 0.001
         if quote_price >= limit_up - tol:
-            if quote_low is not None and quote_low >= limit_up - tol:
-                return TradabilityResult(executable=False, blocked_reason="limit_up")
-            return TradabilityResult(executable=True)
+            # 2026-10-27：原仅拦「一字」（要求 quote_low 也贴涨停），盘中封板的涨停票
+            # （002093 当日 low=7.57、现价=7.93）被判可买。现价触板即不可买。
+            return TradabilityResult(executable=False, blocked_reason="limit_up")
         return TradabilityResult(executable=True)
 
     # 其它 action：不适用，放行
