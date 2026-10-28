@@ -209,6 +209,7 @@ class AggregatorNode:
         *,
         replay_mode: bool = False,
         run_date: Optional[date] = None,
+        holdings=None,
     ) -> UnifiedContext:
         """执行分层 GOT 聚合
 
@@ -218,6 +219,8 @@ class AggregatorNode:
                          不产生任何持久化副作用。
             run_date: 运行日期（用于 glue 落盘目录）。默认为 date.today()。
                      回放模式时应传入回放日期。
+            holdings: H1 持仓上下文（None=无持仓诉求）。仅用于产出 `holdings_intel`
+                     （持仓专属 SectorIntel，与 confirmed_sectors 隔离）。
         """
         if self.use_mock:
             logger.info("[Node 6] 使用 mock 数据")
@@ -307,6 +310,21 @@ class AggregatorNode:
         )
         # 将埋伏通道结果回写到 SectorIntel（供 reasoning.md 和 Phase 2 消费）
         self._enrich_ambush_sector_intel(sector_intels, ambush_pool, ambush_reservoir)
+
+        # ── H1 持仓专属板块情报（2026-10-27，原则②供数）──
+        # 只覆盖 confirmed_sectors 未收录的持仓诉求板块；独立字段、独立角色 holding，
+        # 不参与 TOP-N 名额竞争、不进选股池、不改 position_limit/埋伏池。
+        holdings_intel: list[SectorIntel] = []
+        try:
+            holdings_intel = self._build_holdings_intel(sector, sector_intels, holdings)
+        except Exception as exc:  # noqa: BLE001 — 供数旁挂，失败不阻断聚合
+            logger.warning("[Node 6] holdings_intel 构建失败（已忽略）: %s", exc)
+            holdings_intel = []
+        if holdings_intel:
+            logger.info(
+                "[Node 6] 持仓专属情报 %d 个（未覆盖诉求板块）: %s",
+                len(holdings_intel), [i.sector_name for i in holdings_intel],
+            )
 
         veto_n = sum(
             1 for v in ambush_veto_log if not v.split(": ", 1)[-1].startswith("吸筹观察")
@@ -507,6 +525,7 @@ class AggregatorNode:
             llm_refinement_used=getattr(self, '_llm_refine_succeeded', False),
             ema_baseline=None,
             confirmed_sectors=sector_intels,
+            holdings_intel=holdings_intel,
             ambush_pool=ambush_pool,
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
@@ -1075,6 +1094,97 @@ class AggregatorNode:
             "[Node 6] jump 影子: jump=%s confirmed=%s（%s）",
             s_t, regime.regime, "agree" if record["agree"] else "DIVERGE",
         )
+
+    # ── H1 持仓专属情报（2026-10-27，原则②供数）───────────────
+
+    def _build_holdings_intel(
+        self,
+        sector: SectorContext,
+        confirmed: list[SectorIntel],
+        holdings,
+    ) -> list[SectorIntel]:
+        """持仓诉求板块 → 专属 SectorIntel（`sector_role="holding"`）。
+
+        刻意与 `_collect_sector_candidates` 分开（计划原文的「第 5 路」在此落成独立路径）：
+        那条链的产物是 `confirmed_sectors`，会参与 TOP-N 名额、选股池、position_limit 与
+        埋伏池——把持仓板块塞进去等于用「持仓」反向污染选股通道。持仓诉求只需要
+        lifecycle / 强度 / 过热三样事实，故独立成表并恒置 `classification="watch"`。
+
+        数据来源优先级：Node 2 `holdings_sectors`（补拉并评分）> `strength_lookup`
+        （已被候选集覆盖但未进 confirmed 的板块，只补强度）。两者皆无 → 跳过（不造数据）。
+        """
+        wishes: list[str] = []
+        for raw_wish in (getattr(holdings, "sector_wishes", None) or []):
+            wish = (raw_wish or "").strip()
+            if wish and wish not in wishes:
+                wishes.append(wish)
+        if not wishes:
+            return []
+
+        from src.got.board_aliases import normalize_sector_name
+
+        confirmed_names = {s.sector_name for s in (confirmed or []) if s.sector_name}
+        confirmed_norm = {normalize_sector_name(n) for n in confirmed_names}
+
+        detail_by_name: dict[str, SectorDetail] = {}
+        for detail in (getattr(sector, "holdings_sectors", None) or []):
+            if detail and detail.name:
+                detail_by_name[detail.name] = detail
+
+        strength_lookup = getattr(sector, "strength_lookup", None) or {}
+        results: list[SectorIntel] = []
+        for wish in wishes:
+            if wish in confirmed_names or normalize_sector_name(wish) in confirmed_norm:
+                continue  # 已由 confirmed_sectors 覆盖：不重复、不降级其分类
+            detail = detail_by_name.get(wish)
+            if detail is None:
+                # 候选集里也许有同板块但未进 confirmed（caution/exclude/非 TOP-N）→ 只保留强度
+                for name, d in detail_by_name.items():
+                    if normalize_sector_name(name) == normalize_sector_name(wish):
+                        detail = d
+                        break
+            if detail is None:
+                strength = strength_lookup.get(wish)
+                if strength is None:
+                    continue
+                results.append(SectorIntel(
+                    sector_name=wish,
+                    sector_type="concept",
+                    board_state=None,   # 无 detail：Node 2 未判定该板块状态
+                    sector_role="holding",
+                    tech_score=round(float(strength), 1),
+                    tech_detail=f"strength_lookup={float(strength):.1f}（无 detail，仅强度）",
+                    composite_score=round(float(strength), 1),
+                    confidence=0.3,
+                    classification="watch",
+                    reasoning=f"{wish}: 持仓补入（仅强度，无生命周期）",
+                ))
+                continue
+            results.append(SectorIntel(
+                sector_name=detail.name,
+                sector_code=getattr(detail, "code", "") or "",
+                sector_type="concept",
+                board_state=getattr(detail, "state", None),
+                sector_role="holding",
+                tech_score=round(float(detail.strength_score), 1),
+                tech_detail=(
+                    f"state={getattr(detail, 'state', '')}, "
+                    f"lifecycle={detail.lifecycle.phase if detail.lifecycle else 'none'}"
+                ),
+                lifecycle=detail.lifecycle if detail.lifecycle else None,
+                composite_score=round(float(detail.strength_score), 1),
+                confidence=0.3,
+                classification="watch",
+                reasoning=(
+                    f"{detail.name}: 持仓补入（不参与主线/埋伏分类），"
+                    f"strength={detail.strength_score:.1f}"
+                ),
+                overheat_severity=getattr(detail, "overheat_severity", None),
+                frame_group=getattr(detail, "frame_group", None),
+                momentum_state=getattr(detail, "momentum_state", None),
+                rs_mom_decay_2d=getattr(detail, "rs_mom_decay_2d", None),
+            ))
+        return results
 
     # =========================================================================
     # Level 1: 板块 mini GOT
@@ -2151,6 +2261,7 @@ class AggregatorNode:
             sector_name=name,
             sector_code=detail.code if detail else "",
             sector_type="concept",
+            board_state=getattr(detail, "state", None) if detail else None,
             sector_role=sector_role,
             mainline_tier=role_info.get("tier"),
             mainline_quality=role_info.get("quality"),

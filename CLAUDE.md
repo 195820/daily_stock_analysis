@@ -89,6 +89,7 @@ daily_stock_analysis/
 │   │   ├── market_theme.py      # 市场结构主题上下文（Step 2：mootdx 板块排名→MarketThemeContext，影子观测）
 │   │   ├── disagreement.py      # 分歧摘要（Phase 3b：11 类冲突分类学 + RiskOverridePlan，影子观测）
 │   │   ├── decision_plan.py     # 决策编排层（C2：allocation→trade_plans 计划装配 assemble + 昨日对账 reconcile，零新增 LLM）
+│   │   ├── holdings_context.py  # 持仓上下文供数（Phase 1 头部构建 HoldingsContext：全账户持仓+thesis 入口锚，零 LLM/零爬虫，fail-open；供 Node 2/3/6）
 │   │   ├── glue_pipeline.py     # C-P13 阶段1 事件→板块接地式召回-验证管线（L1 embedding 检索→L2 受约束生成→L3 CoVe 验证；仅 --got-replay + GLUE_PIPELINE_ENABLED，生产休眠）
 │   │   ├── family_keywords.py     # 主线家族关键词（受控词表 12+1，glue 家族归属）
 │   │   ├── board_aliases.py       # 板块别名表
@@ -314,7 +315,7 @@ run(use_mock=False)
 | **Node 4** 消息面 | 无（7 源推送采集） | `NewsContext` | `major_events[]`（含 `lifecycle_state`）, `catalyst_calendar`, `impact_score` | `node4_events`（事件生命周期）, `catalyst_events`（日历 UPSERT）, `node4_raw_news`（原始新闻跨日检测） |
 | **Node 5** 情绪面 | 无（6 源并行采集） | `SentimentContext` | `sentiment_score`, `sentiment_stage`（5 阶段）, `stage_state`, `persistence_regime`, `fear_greed_index`, `sentiment_dispersion`, `sentiment_momentum` | — |
 | **Node 6** 聚合 | 全部 5 个 context + 催化剂日历 + 跨日记忆 | `UnifiedContext` | `market_regime`(dwell_days/pinned_days/transition_events/transition_count), `cross_node_signals[]`, `confirmed_sectors[]`（`SectorIntel`）, `ambush_pool[]`, `ambush_reservoir[]`, `contradictions[]`（含T3仲裁字段）, `glue_consumed`/`glue_status`（A6 接线归档）, `conflict_summary_shadow`/`decision_path_hint`（Phase 3b 分歧摘要）, `ambush_lane_validation`（埋伏道一致性校验影子，Phase F） | `persistence.py` → `ema_baseline.json` + `previous_context_*.json` + `timeseries/` + `monitoring.json`；`agent_glue.json`（glue 产物） |
-| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测）, `ambush_lane_shadow`/`ambush_lane_trace`（埋伏道拆分产物）, `lane_budget_split_shadow`（分道预算观测，C4/D4）, `t3_routing_shadow`/`cross_node_signals_shadow`（三路路由影子，Phase E）；**埋伏道 Node 7 接线点**：action 判定抬 priority≥55（`GOT_AMBUSH_SPLIT_ACTIVE` 门控，缺省已翻 1·2026-10-20 转正）+ bear gate 豁免扩展（2026-10-13 转正·无条件，不随 ACTIVE） | `trade_plans`（计划装配+对账，decision_plan.py）+ `holding_thesis_snapshots`（四态状态机 lifecycle_state，B3）+ `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
+| **Node 7** Phase 2 | `UnifiedContext` + 全部 5 个 context | `PortfolioDecision` | `risk_assessment`（含 `raw_position_ratio` pre-clip 观测）, `unified_scoring[]`, `allocation[]`, `ambush_exit_signals[]`, `sell_source_shadow`/`risk_override_shadow`（批 4.1/3b 影子观测）, `holdings_verdict_shadow`/`holdings_history_shadow`（持仓裁决对拍/历史回查，2026-10-27 转正）, `ambush_lane_shadow`/`ambush_lane_trace`（埋伏道拆分产物）, `lane_budget_split_shadow`（分道预算观测，C4/D4）, `t3_routing_shadow`/`cross_node_signals_shadow`（三路路由影子，Phase E）；**埋伏道 Node 7 接线点**：action 判定抬 priority≥55（`GOT_AMBUSH_SPLIT_ACTIVE` 门控，缺省已翻 1·2026-10-20 转正）+ bear gate 豁免扩展（2026-10-13 转正·无条件，不随 ACTIVE） | `trade_plans`（计划装配+对账，decision_plan.py）+ `holding_thesis_snapshots`（四态状态机 lifecycle_state，B3）+ `ambush_position_snapshots`（买入/退出快照）；`shadow_t1.json` / `shadow_t1h.json`（审查影子产物） |
 
 ### 持久化层总览
 

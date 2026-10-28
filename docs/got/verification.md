@@ -3,6 +3,57 @@
 
 ---
 
+## ‼️ 2026-10-27 补登（持仓模块三原则接线 H1/H2/H3 — 供数 + 裁决归位 + 历史回查；**当日用户裁决跳过影子直接转正**）
+
+**计划**：`local://holdings-module-rewiring-plan.md`（用户三条架构原则落地：①持仓分析归决策编排层 ②前序 Node 给持仓供数 ③买入时历史决策喂当日决策）。
+
+| 阶段 | 内容 | 开关（缺省） | 决策影响 |
+|---|---|---|---|
+| **H1** 供数 | `HoldingsContext` 构建（编排器头部，零 LLM/零爬虫）→ Node 2 `holdings_sectors`+`holdings_coverage`（持仓板块兜底补拉）/ Node 3 `evidence.holdings_flow_index`（三级别名匹配）/ Node 6 `holdings_intel`（role=holding，独立字段） | 无开关（常开） | 零：`confirmed_sectors` 组成、TOP-N 名额、埋伏池、position_limit 均不变；补拉板块不进截面分母、不写 node2_sector_trends |
+| **H2** 裁决归位 | `_score_holdings` 8 分支链搬至 `decision_plan.assess_holding`（纯函数）；新增 `sector_confirmed` 守卫（选股通道 actionable + mainline/ambush，或持仓补入通道 `board_state∈{active_mainline,ambush,high_position_cooling}`；lifecycle 缺失 → hold，不再落 40/60 降温档） | `GOT_HOLDINGS_VERDICT_V2`（**enabled**，2026-10-27 转正） | 守卫生效；对拍产物照旧（`mode=enabled`）；`shadow`=只算不生效（取证态）；`off`=kill-switch |
+| **H3** 历史回查 | `decision_plan.lookup_decision_history`（thesis × catalyst_events × trade_plans × ambush snapshots，纯 SQLite 读）→ 证据进 reasoning；P4 分支扩为 snapshot ∪ thesis 催化剂锚双锚 | `GOT_HOLDINGS_HISTORY_FEED`（**enabled**，2026-10-27 转正） | 催化剂到期/失效的埋伏持仓可在 snapshot 表 0 行时退出；`shadow`=只作 evidence 不改 action；`off`=kill-switch |
+
+**唯一已知误判修正（H2）**：confirmed ambush 板块跌出候选集 → `lifecycle=None` → 40/60 降温档 `reduce`。旧链对新链对拍行 `legacy_action=reduce / v2_action=hold / reason_code_v2=sector_confirmed`。
+
+**转正裁决（2026-10-27，用户）**：纯新增能力、非修正 → 跳过影子纪律直接生效（同 D3 分道预算先例）；下列判据**降级为事后验证（转正后 ≥10 个有效交易日审阅）**，不达标用 `off` 回滚。
+
+**事后验证判据（机械可核对）**：
+
+1. `portfolio_decision.json.holdings_verdict_shadow` 逐日存在（`mode=enabled`），`holdings_seen` 与当日持仓只数一致；`applied_action == v2_action`（转正后生效路径）。
+2. 不一致行（`changed=true`）逐条可归因：reason_code_v2 ∈ {`sector_confirmed`（H2 守卫）, `p4_exit`（H3 双锚/P4 提前判定）}；出现其他原因码即视为搬家走样，须回滚。P4 相关差异在 `ambush_position_snapshots` 仍为 0 行且 `HISTORY_FEED=shadow` 时应恒为 0 条，出现即说明提前判定抢了不该抢的仓。
+3. 不一致率不以「越低越好」判定——修正目标恰是让这类行改变；判读标准是「改为 hold 后该板块次日起 N 日未跑输」。
+4. `holdings_history_shadow.rows[].catalyst_status` 与 `catalyst_events` 当日状态一致（抽样人工核对 ≥3 行）；enabled 前该字段不得影响任何 action。
+5. H1 红线：`sector.json.holdings_coverage` 与 `unified.json.holdings_intel` 同日均存在（无持仓诉求时缺省），且 `confirmed_sectors` 条数与关闭状态下逐字节一致（H1 零决策改动）。
+6. 回滚：`GOT_HOLDINGS_VERDICT_V2=off` + `GOT_HOLDINGS_HISTORY_FEED=off` → trade_plans/allocation 与接线前一致（H2/H3 全程不改分数，只改 action 判定入口）。
+7. **回归对比口径**：影子期 `reasoning` 文本会新增 H1/H3 标注（资金维 1d/3d/5d、`入场composite→当日`、`近窗计划兑现率`、`催化剂锚状态`），属预期留痕；逐字节回归只对 **action_recommendation / allocation / trade_plans** 生效，不对 reasoning 文本生效。
+
+**首批预期差异（转正即刻生效，人工抽检重点）**：① confirmed 板块（actionable 或 `board_state` 命中）但 `lifecycle=None` 的持仓 → `reduce` 变 `hold`（`reason_code=sector_confirmed`）；② thesis 催化剂锚 `elapsed/expired` 的埋伏持仓 → 可在 `ambush_position_snapshots` 0 行时 `sell`（`reason_code=p4_exit`，`p4_anchor=thesis`）；③ 带快照且真有退出信号的埋伏持仓 → `sell`（③′ 提前判定，原为死分支）。
+
+**冻结红线未动**：`GOT_SELL_SOURCE_*` / `GOT_TRAILING_STOP_*`（WI-P-7）不解冻；`.env GOT_TRADABILITY_GATE=shadow` 不动；B4-C 退出分层仍只登记判据。
+
+**影子产物**：`portfolio_decision.json.{holdings_verdict_shadow,holdings_history_shadow}`；`capital.json.evidence.holdings_flow_index`；`sector.json.{holdings_sectors,holdings_coverage}`；`unified.json.holdings_intel`；`reasoning.md`「🧪 影子模式观测」→「持仓数据供给（H1）」段。
+
+**单测**：`tests/test_holdings_rewiring.py`（34 用例：H2 分支表 18 / H1 供数 9 / H3 回查 6 + 开关缺省 1）。
+
+**P4 死分支修复（H3 附带，2026-10-27）**：原链把 P4 埋伏退出放在 `lifecycle is None` 分支之后，而埋伏板块的 `detail.lifecycle` 恒为 None（Node 2 只给 mainline/exhausted/cooling 赋 lifecycle）⇒ 退出信号永远被 40/60 降温档抢先，分支结构性不可达。改为「只在真的触发退出时抢前」（③′）：未触发则逐字节维持原顺序。`ambush_position_snapshots` 实测 0 行 ⇒ 当日零行为变化；表有数据或 thesis 催化剂到期（`GOT_HOLDINGS_HISTORY_FEED=enabled`）后才生效。
+
+**实测读数（2026-10-28 08:35–08:56 全流程 `main.py --got`，EXIT=0）**：当日组合为空（0 只持仓），故各持仓供数位按设计缺省——
+
+| 产物 | 读数 | 判读 |
+|---|---|---|
+| `orchestrator` 日志 | `[GOT] 持仓上下文: status=empty, 0 只持仓, 0 个板块诉求` | H1 构建点已接线且空组合不阻断 |
+| `portfolio_decision.json.holdings_verdict_shadow` | `{mode: shadow, holdings_seen: 0, changed_count: 0, rows: []}` | H2 对拍线在产（tombstone 证明跑过），空持仓下差异必为 0 |
+| `portfolio_decision.json.holdings_history_shadow` | `null` | H3 无持仓 → 零额外 SQLite 读 |
+| `capital.json.evidence.holdings_flow_index` | `null` | 无板块诉求 → 不产索引（缺省不等同「全未命中」） |
+| `sector.json.{holdings_coverage,holdings_sectors}` | `null / []` | Node 2 补拉零成本跳过 |
+| `unified.json.holdings_intel` | `[]` | 选股通道零污染 |
+| `reasoning.md`「持仓数据供给（H1）」 | 未渲染 | 无产物即不产段（无持仓时 reasoning.md 结构不变） |
+| `trade_plan_log` | 2 行（对账 + 装配） | 决策编排层日志照常 |
+
+> 有持仓时的端到端路径由进程内集成冒烟验证（真实 `PortfolioDecisionNode._score_holdings` + 桩 fetcher/LLM）：`shadow` → 应用 legacy `reduce` 且对拍行 `legacy=reduce / v2=hold / changed=True / reason=sector_confirmed`；`enabled` → 应用 `hold`；`off` → 应用 `reduce` 且零对拍行。
+
+---
+
 ## ‼️ 2026-10-21 补登（催化剂价值分级 #1：identity 重锚 + macro 退出评分池 — 用户裁决跳过影子）
 
 **性质**：用户 2026-10-21 裁决「全套重构、不加影子」——两件直接生效改动：① `catalyst_identities` 身份表以 `global_event` 为单位锁定首次 catalyst_date：重锚判据是**陈旧度**（`news_date - first_anchor_date >= CATALYST_WINDOW_DAYS`，即 14 日历日）而非「catalyst_date 是否仍在窗口」——增量路径 `start=today` 且只载 1 天新闻，用窗口判据会在锚定到期次日必然重锚、新 event_id 造新 P6 行（等于没修）；同一事件实例内只递增 `anchor_count`、日期永不滚动，到期实例由 `catalyst_date < start` 谓词自然落历（根治「同一 SK 海力士事件 19 行」的日期进 ID 永生问题，Tetlock 2011 陈旧新闻证据）；② `CATALYST_MACRO_AS_REGIME_REF=true` 把 PMI/CPI/社融/LPR 从聚合/选股/Phase2 三个评分入口排除（macro 实测方向正确率 1/10 + Savor-Wilson 2013 公告溢价=事件日属性，非板块方向催化剂），事件仍入 `catalyst_events` 与归档。**回滚键**：`GOT_CATALYST_MACRO_AS_REGIME_REF=false` 一键恢复旧行为（macro 重新参与评分）；identity 锚定无开关，回退 = 回退代码。

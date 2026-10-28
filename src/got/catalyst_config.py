@@ -495,6 +495,28 @@ TRAILING_DRAWDOWN_SELL = float(os.environ.get("GOT_TRAILING_DD_SELL", "0.12"))  
 LIFECYCLE_MATURE_REDUCE_DAY = int(os.environ.get("GOT_MATURE_REDUCE_DAY", "30"))
 
 # =============================================================================
+# 持仓模块三原则接线（H1 供数 / H2 verdict 归位 / H3 历史回查，2026-10-27）
+# 计划：local://holdings-module-rewiring-plan.md
+# =============================================================================
+# 三态口径（H2/H3 共用）：off / shadow / enabled；非法值回落到缺省（enabled）。
+#   enabled → 生效（H2: sector_confirmed 守卫；H3: thesis 催化剂双锚）——**当前缺省**
+#   shadow  → 新逻辑只算不生效，落对拍产物（出问题时的取证态）
+#   off     → 回滚到搬迁前行为，且不产对拍产物（kill-switch）
+# 2026-10-27 用户裁决：跳过影子纪律直接转正（同 D3 分道预算先例「纯新增能力非修正」），
+# 影子判据降级为事后验证；对拍产物照旧在产（mode=enabled），供复盘归因。
+def _holdings_mode(env_name: str, default: str = "enabled") -> str:
+    raw = (os.environ.get(env_name, default) or "").strip().lower()
+    if raw in ("off", "shadow", "enabled"):
+        return raw
+    return default
+
+
+GOT_HOLDINGS_VERDICT_V2 = _holdings_mode("GOT_HOLDINGS_VERDICT_V2", "enabled")
+GOT_HOLDINGS_HISTORY_FEED = _holdings_mode("GOT_HOLDINGS_HISTORY_FEED", "enabled")
+# H3 回查窗口（交易日；自然日窗口按 2× 覆盖周末）与最小统计样本量
+HOLDINGS_HISTORY_PLAN_WINDOW_DAYS = int(os.environ.get("GOT_HOLDINGS_HISTORY_PLAN_WINDOW", "10"))
+
+# =============================================================================
 # 埋伏道拆分（ambush-lane-split-revision v2）
 # =============================================================================
 # 开关：GOT_AMBUSH_SPLIT_ENABLED=1 启用分道逻辑（默认开）；false 回滚到 A4 单道原始逻辑
@@ -584,7 +606,13 @@ IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 # 2026-10-20.1 bump：D3 分道加权预算生效（per_stock_budget 口径变更）+ ACTIVE 转正（拦点#1 lift /
 #   #8 tech 折算生效）+ D4 合并改 union 语义（Phase 2 选股池条数上限 10 → 13）。跨此版本的前向
 #   统计不可与前序归档混池（预算口径与池规模双变）。
-SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-20.1")
+# 2026-10-27.1 bump：持仓模块三原则接线 H1（Node 2 持仓板块补拉 / Node 3 holdings_flow_index /
+#   Node 6 holdings_intel）+ H2（裁决链搬至 decision_plan，新增 sector_confirmed 守卫，缺省影子）
+#   + H3（历史回查）。
+# 2026-10-27.2 bump：H2/H3 当日转正（用户裁决跳过影子纪律，缺省 enabled）。持仓动作口径变更
+#   （confirmed 板块 lifecycle 缺失 → hold 而非 40/60 降温档；埋伏持仓催化剂锚到期可退出），
+#   跨版本前向统计须按 GOT_HOLDINGS_VERDICT_V2/HISTORY_FEED 分组，不可与前序归档混池。
+SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-27.2")
 
 # =============================================================================
 # 批次 A（竞品补强）：证据链与出处（一期只降不升，防换池）

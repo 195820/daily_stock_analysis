@@ -564,10 +564,14 @@ class SectorAnalysisNode:
             self._fetcher_manager = DataFetcherManager()
         return self._fetcher_manager
 
-    async def run(self, market_context: MarketContext) -> SectorContext:
+    async def run(self, market_context: MarketContext, holdings=None) -> SectorContext:
         """执行板块分析。
 
         流程：获取数据 → 5维强度 → 启动信号 → 过热信号 → 状态判定 → 分级 → 生命周期 → LLM reasoning
+
+        holdings: H1 持仓上下文（`src.got.holdings_context.HoldingsContext`，None=无持仓诉求）。
+        仅用于「持仓板块兜底追踪」：诉求板块若未被当日候选集覆盖，补拉 K 线单独评分，
+        结果落 `holdings_sectors`/`holdings_coverage`，**不参与**主线/埋伏分类与截面排名分母。
         """
         if self.use_mock:
             logger.info("[Node 2] 使用 mock 数据")
@@ -743,6 +747,31 @@ class SectorAnalysisNode:
 
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
+
+            # Step 3.4c（H1 持仓供数，2026-10-27）：持仓板块兜底追踪
+            # 原则②「前序节点给持仓供数」：持仓诉求板块若跌出当日候选集，其 lifecycle 会缺失，
+            # Phase 2 落 40/60 降温档（用户投诉「埋伏持仓被误判减仓」的结构根因）。
+            # 补拉只对该诉求子集（≤持仓数），排名用「原候选集 + 补拉集」的合并截面——
+            # 原 analyzed 的 ranked_indicators 仍取原排名结果，故现有板块评分逐字节不变。
+            # 供数旁挂：任何异常都不得击穿 Node 2 主链（与影子产物同一纪律）。
+            try:
+                holdings_details, holdings_coverage = await self._track_holdings_sectors(
+                    holdings=holdings,
+                    sectors_raw=sectors_raw,
+                    all_raw_metrics=all_raw_metrics,
+                    all_scores_today=all_scores_today,
+                    prev_trends=prev_trends,
+                    market_context=market_context,
+                    quality=quality,
+                    ths_hot_sectors=ths_hot_sectors,
+                    market_direction=early_direction,
+                )
+                result.holdings_sectors = holdings_details
+                result.holdings_coverage = holdings_coverage
+            except Exception as _h_exc:  # noqa: BLE001
+                logger.warning("[Node 2] 持仓板块兜底追踪失败（已忽略）: %s", _h_exc)
+                result.holdings_sectors = []
+                result.holdings_coverage = None
 
             # Step 3.5: 降级摘要 + 可信度标记（Node 2 v2）
             quality.degradation_summary = self._build_degradation_summary(quality)
@@ -1055,6 +1084,251 @@ class SectorAnalysisNode:
             f"时间线: {timeline_count})",
         )
         return matched
+
+    # =================================================================
+    # H1 持仓板块兜底追踪（2026-10-27 持仓模块三原则接线）
+    # =================================================================
+
+    async def _track_holdings_sectors(
+        self,
+        *,
+        holdings,
+        sectors_raw: list[dict[str, Any]],
+        all_raw_metrics: list[dict[str, float]],
+        all_scores_today: list[float],
+        prev_trends: dict[str, dict],
+        market_context: MarketContext,
+        quality: DataQuality,
+        ths_hot_sectors: dict[str, float],
+        market_direction: str,
+    ) -> tuple[list[SectorDetail], Optional[dict]]:
+        """持仓诉求板块兜底追踪：未被当日候选集覆盖的板块单独补拉并评分。
+
+        设计取舍（为什么不是「把诉求板块塞进候选集」）：
+        - 候选集参与截面百分位排名，塞进去会改变**所有**板块的排名分母 → 主线选择漂移。
+        - 这里改为「合并截面只取补拉行的排名」：原 analyzed 仍用原排名结果（逐字节不变），
+          补拉板块得到与本日全市场同量纲的百分位，可比。
+        - 补拉板块不写 node2_sector_trends、不进 strength_lookup/overheat_lookup，
+          因此不会影响 Node 6 的段位分类、埋伏池与 Phase 2 选股通道。
+
+        Returns:
+            (holdings_details, holdings_coverage)
+        """
+        wishes: list[str] = []
+        for raw_wish in (getattr(holdings, "sector_wishes", None) or []):
+            wish = (raw_wish or "").strip()
+            if wish and wish not in wishes:
+                wishes.append(wish)
+        if not wishes:
+            return [], None
+
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+
+        covered_names: set[str] = set()
+        for sector_info in sectors_raw:
+            name = (sector_info.get("name") or "").strip()
+            if not name:
+                continue
+            covered_names.add(name)
+            covered_names |= sector_name_variants(name)
+        covered_norm = {normalize_sector_name(n) for n in covered_names}
+
+        pending = [
+            w for w in wishes
+            if w not in covered_names and normalize_sector_name(w) not in covered_norm
+        ]
+        coverage: dict[str, Any] = {
+            "wishes": wishes,
+            "covered": [w for w in wishes if w not in pending],
+            "tracked": [],
+            "missing": [],
+            "status": "full",
+            "note": "",
+        }
+        if not pending:
+            logger.info("[Node 2] 持仓板块诉求 %d 个，全部已被当日候选集覆盖", len(wishes))
+            return [], coverage
+
+        # 板块名 → 代码解析（registry 免费先行，不足再拉全量板块列表）
+        registry_map: dict[str, str] = {
+            b["name"]: b["code"] for b in self._build_registry_boards() if b.get("name")
+        }
+        wish_codes: dict[str, str] = {}
+        unresolved: list[str] = []
+        for wish in pending:
+            code = self._match_board_code(wish, registry_map)
+            if code:
+                wish_codes[wish] = code
+            else:
+                unresolved.append(wish)
+
+        if unresolved:
+            all_boards = None
+            try:
+                all_boards = await asyncio.to_thread(self.fetcher.get_all_concept_boards)
+            except Exception as exc:  # noqa: BLE001 — 解析降级不阻断
+                logger.warning("[Node 2] 持仓板块名解析降级（全量板块列表不可用）: %s", exc)
+            full_map = dict(registry_map)
+            for board in (all_boards or []):
+                name = (board.get("name") or "").strip()
+                code = board.get("code")
+                if name and code and name not in full_map:
+                    full_map[name] = code
+            still_unresolved: list[str] = []
+            for wish in unresolved:
+                code = self._match_board_code(wish, full_map) if all_boards else None
+                if code:
+                    wish_codes[wish] = code
+                else:
+                    still_unresolved.append(wish)
+            unresolved = still_unresolved
+
+        if unresolved:
+            coverage["missing"].extend(unresolved)
+            logger.info("[Node 2] 持仓板块无法解析代码（不造数据，留痕）: %s", unresolved)
+
+        details: list[SectorDetail] = []
+        if not wish_codes:
+            coverage["status"] = "partial"
+            coverage["note"] = "诉求板块均未解析到板块代码"
+            return details, coverage
+
+        # 补拉 K 线（与原候选集同一口径：mootdx TCP + 90 日）
+        days = _KLINE_LOOKBACK_DAYS
+        semaphore = asyncio.Semaphore(_CONCURRENT_FETCHES)
+
+        async def fetch_one(wish: str, code: str) -> Optional[dict[str, Any]]:
+            async with semaphore:
+                try:
+                    kline_df = await asyncio.to_thread(
+                        self.fetcher.get_board_kline, code, "concept", days,
+                    )
+                    if kline_df is None or len(kline_df) < 5:
+                        return None
+                    change_pct = 0.0
+                    if len(kline_df) >= 2:
+                        latest_close = float(kline_df.iloc[-1]["close"])
+                        prev_close = float(kline_df.iloc[-2]["close"])
+                        if prev_close > 0:
+                            change_pct = round((latest_close - prev_close) / prev_close * 100, 2)
+                    klines = self._df_to_klines(kline_df, wish)
+                    if not klines:
+                        return None
+                    return {
+                        "code": code,
+                        "name": wish,
+                        "category": "holdings",
+                        "group": _build_frame_group(wish),
+                        "frame_group": _build_frame_group(wish),
+                        "change_pct": change_pct,
+                        "change_3d": 0.0,
+                        "change_5d": 0.0,
+                        "up_count": 0,
+                        "down_count": 0,
+                        "turnover_rate": 0.0,
+                        "klines": klines,
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("[Node 2] 持仓板块 %s(%s) K线获取失败: %s", wish, code, exc)
+                    return None
+
+        pairs = list(wish_codes.items())
+        fetched = await asyncio.gather(*(fetch_one(w, c) for w, c in pairs))
+        extras: list[dict[str, Any]] = []
+        for (wish, _code), info in zip(pairs, fetched):
+            if info is None:
+                coverage["missing"].append(wish)
+            else:
+                extras.append(info)
+
+        if not extras:
+            coverage["status"] = "partial"
+            coverage["note"] = "诉求板块 K 线均拉取失败"
+            return details, coverage
+
+        # T-0 涨跌幅（与 _fetch_sector_data 尾部同口径）
+        for info in extras:
+            klines = info.get("klines", [])
+            if len(klines) >= 2:
+                today_close = klines[-1].get("close", 0)
+                prev_close = klines[-2].get("close", 0)
+                if prev_close > 0 and today_close > 0:
+                    info["today_change"] = round((today_close - prev_close) / prev_close * 100, 2)
+
+        # 原始指标 + 合并截面排名（只消费补拉行的排名结果）
+        extra_raw: list[dict[str, float]] = []
+        for info in extras:
+            df = self._klines_to_df(info.get("klines", []))
+            if df is None or len(df) < 15:
+                extra_raw.append({})
+                continue
+            extra_raw.append(self._calculate_raw_metrics(df, info))
+
+        combined_ranked = self._apply_cross_sectional_ranking(list(all_raw_metrics) + extra_raw)
+        base_n = len(all_raw_metrics)
+        extra_scores = [
+            self._calc_strength_score(ranked_row)
+            for ranked_row in combined_ranked[base_n:]
+        ]
+        scores_for_rrg = list(all_scores_today) + extra_scores
+
+        for idx, info in enumerate(extras):
+            ranked_indicators = combined_ranked[base_n + idx] if combined_ranked[base_n + idx] else None
+            detail = self._analyze_single_sector(
+                info, market_context, quality,
+                prev_trend=prev_trends.get(info.get("code", "")),
+                ranked_indicators=ranked_indicators,
+                ths_hot_sectors=ths_hot_sectors,
+                market_direction=market_direction,
+                all_scores_today=scores_for_rrg,
+            )
+            if detail is None:
+                coverage["missing"].append(info.get("name", ""))
+                continue
+            details.append(detail)
+            coverage["tracked"].append(detail.name)
+
+        if coverage["missing"]:
+            coverage["status"] = "partial"
+            coverage["note"] = (
+                f"补拉 {len(extras)} 个持仓板块，"
+                f"{len(coverage['missing'])} 个未取到有效数据（不造数据）"
+            )
+        logger.info(
+            "[Node 2] 持仓板块兜底追踪: 诉求 %d / 已覆盖 %d / 补拉 %d / 缺失 %d",
+            len(wishes), len(coverage["covered"]), len(details), len(coverage["missing"]),
+        )
+        return details, coverage
+
+    @staticmethod
+    def _match_board_code(name: str, name_to_code: dict[str, str]) -> Optional[str]:
+        """板块名 → 板块代码：精确 → 别名变体 → 归一化 → 受控子串（≥3 字且唯一）。
+
+        与 Phase 2 `_match_sector` 同思路但更保守：子串匹配命中多个即放弃，
+        宁可留痕 missing 也不猜（持仓供数不允许造数据）。
+        """
+        if not name or not name_to_code:
+            return None
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+
+        if name in name_to_code:
+            return name_to_code[name]
+        for variant in sector_name_variants(name):
+            if variant in name_to_code:
+                return name_to_code[variant]
+        canon = normalize_sector_name(name)
+        for key, code in name_to_code.items():
+            if normalize_sector_name(key) == canon:
+                return code
+        if len(name) < 3:
+            return None
+        hits = [
+            code for key, code in name_to_code.items()
+            if (name in key or key in name)
+        ]
+        if len(hits) == 1:
+            return hits[0]
+        return None
 
     def _build_registry_boards(self) -> list[dict[str, Any]]:
         """从 TDX_BOARD_REGISTRY 构建基础板块列表。"""

@@ -1560,6 +1560,7 @@ def _render_shadow_section(
     regime_jump_shadow: "dict | None" = None,
     low_events_shadow: "dict | None" = None,
     ambush_exit_grace_shadow: "dict | None" = None,
+    holdings_supply: "dict | None" = None,
     base_dir: "Path | None" = None,
     run_date: "date | None" = None,
 ) -> list[str]:
@@ -1618,6 +1619,8 @@ def _render_shadow_section(
     lines += _prog("low_events")
     lines += _render_shadow_ambush_exit_grace(ambush_exit_grace_shadow)
     lines += _prog("ambush_exit_grace")
+    # ── H1 持仓数据供给（2026-10-27，原则②）──
+    lines += _render_shadow_holdings_supply(holdings_supply)
     lines += _render_glue_degraded_note(glue)
     lines += _render_shadow_t1(t1)
     lines += _prog("t1")
@@ -1681,6 +1684,52 @@ def _render_shadow_ambush_exit_grace(record: "dict | None") -> list[str]:
             f"mom={mom_s} strength={strength_s} 合格催化 {r.get('qualified_event_count', 0)} 条"
             f"（{td_s}）{hold}"
         )
+    lines.append("")
+    return lines
+
+
+def _render_shadow_holdings_supply(supply: "dict | None") -> list[str]:
+    """H1 持仓数据供给（原则②）：Node 2/3/6 是否为持仓产出了分析数据。
+
+    非影子线、不改决策——纯粹回答「前序节点到底给持仓喂了没有」，
+    避免再出现「持仓板块跌出名单 → lifecycle 缺失 → 40/60 降温档误判」时无从归因。
+    无产物（无持仓诉求/未跑）→ []（reasoning.md 逐字节不变）。
+    """
+    if not supply:
+        return []
+    coverage = supply.get("coverage") or {}
+    flow = supply.get("flow") or {}
+    intel = supply.get("intel") or []
+
+    lines = ["**持仓数据供给（H1，供数不改选股）**"]
+    if coverage:
+        lines.append(
+            f"- Node 2 板块诉求 {len(coverage.get('wishes') or [])}："
+            f"已覆盖 {len(coverage.get('covered') or [])} / "
+            f"补拉 {len(coverage.get('tracked') or [])} / "
+            f"缺失 {len(coverage.get('missing') or [])}"
+            f"（status=`{coverage.get('status', '')}`）"
+            + (f"，{coverage.get('note')}" if coverage.get("note") else "")
+        )
+        if coverage.get("missing"):
+            lines.append(f"  - 未取到: {'、'.join(coverage.get('missing') or [])}")
+    if flow:
+        lines.append(
+            f"- Node 3 资金流索引：命中 {flow.get('hit_count', 0)}/"
+            f"{len(flow.get('wishes') or [])} 个持仓板块"
+            + (f"；{flow.get('note')}" if flow.get("note") else "")
+        )
+    if intel:
+        rows = "、".join(
+            f"{i.get('name')}"
+            f"({i.get('lifecycle') or '无phase'}"
+            + (f"/day{i.get('day')}" if i.get("day") else "")
+            + f"/{i.get('strength')}分)"
+            for i in intel[:8]
+        )
+        lines.append(f"- Node 6 持仓专属情报 {len(intel)} 个：{rows}")
+    if len(lines) == 1:
+        lines.append("- 本次无持仓板块诉求（无持仓或全部已由选股通道覆盖）")
     lines.append("")
     return lines
 
@@ -1798,6 +1847,30 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         for s in (_unified_json.get("confirmed_sectors") or [])
         if s.get("sector_code")
     }
+    # H1 持仓数据供给留痕（2026-10-27）：Node 2 覆盖率 / Node 3 资金索引 / Node 6 专属情报
+    _holdings_supply = None
+    try:
+        _sec_json = _read_json_quiet(day_dir / "sector.json") or {}
+        _cap_json = _read_json_quiet(day_dir / "capital.json") or {}
+        _h_intel_raw = _unified_json.get("holdings_intel") or []
+        _h_flow = ((_cap_json.get("evidence") or {}).get("holdings_flow_index"))
+        _h_cov = _sec_json.get("holdings_coverage")
+        if _h_intel_raw or _h_flow or _h_cov:
+            _holdings_supply = {
+                "coverage": _h_cov,
+                "flow": _h_flow,
+                "intel": [
+                    {
+                        "name": i.get("sector_name"),
+                        "lifecycle": (i.get("lifecycle") or {}).get("phase"),
+                        "day": (i.get("lifecycle") or {}).get("days_since_launch"),
+                        "strength": i.get("tech_score"),
+                    }
+                    for i in _h_intel_raw
+                ],
+            }
+    except Exception:  # noqa: BLE001 — 留痕组装失败不得中断归档
+        _holdings_supply = None
     lines += _render_shadow_section(
         glue=_read_json_quiet(day_dir / GLUE_ARTIFACT),
         t1=_read_json_quiet(day_dir / SHADOW_T1_ARTIFACT),
@@ -1816,6 +1889,7 @@ def _append_phase2_reasoning(reasoning_path: Path, decision) -> None:
         regime_jump_shadow=_read_json_quiet(day_dir / SHADOW_REGIME_JUMP_ARTIFACT),
         low_events_shadow=_read_json_quiet(day_dir / SHADOW_LOW_EVENTS_ARTIFACT),
         ambush_exit_grace_shadow=_read_json_quiet(day_dir / SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT),
+        holdings_supply=_holdings_supply,
         base_dir=day_dir.parent,
         run_date=_shadow_run_date,
     )

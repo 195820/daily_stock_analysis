@@ -14,8 +14,9 @@ W3-pending: reconcile 对账口径当前只实现单账户（accounts[0]）口�
 """
 
 import logging
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from src.got.schemas import PortfolioDecision, UnifiedContext
 from src.storage import TradePlanRecord
@@ -405,3 +406,487 @@ def assemble_log_lines(written: list, error: Optional[str] = None) -> list[str]:
             f"{getattr(p, 'execution_status', '')}（有效至 {_valid_until or '—'}）"
         )
     return lines
+
+
+# =============================================================================
+# 持仓裁决（H2，2026-10-27 持仓模块三原则接线）
+# =============================================================================
+# 原则①：持仓的分析是决策编排的一部分。
+# `portfolio_decision._score_holdings` 的 8 分支 action 判定链搬到这里——
+# **搬家不重写**：分支顺序、阈值、宽限语义逐条对齐（原 :961-1081）。
+# Node 7 只负责「算分 + 供事实（IO/写库仍在节点内）」，判定本身是纯函数：
+# 无 IO、无副作用、可表驱动单测。
+#
+# 影子纪律（GOT_HOLDINGS_VERDICT_V2，三态）：
+#   off     → guard 关闭，不产对拍产物（回滚路径）
+#   shadow  → guard 关闭（实际 action 与 off 等价），落 `holdings_verdict_shadow` 对拍
+#   enabled → guard 生效（修正「confirmed 板块 + lifecycle 缺失 → 40/60 降温档」误判）
+# legacy 行为 = 同一函数在 guard=False 下的输出（除 guard 外无任何语义改动）。
+
+# 原因码 → 人读标签（归档/日志用；不改判定）
+HOLDING_REASON_LABELS: dict[str, str] = {
+    "no_sector": "无板块归属且无家族宽限",
+    "no_sector_grace": "无板块归属但家族强（宽限持有）",
+    "thesis_drift": "论点漂移且无宽限",
+    "thesis_drift_grace": "论点漂移但家族仍强（宽限）",
+    "lifecycle_none_weak": "板块不在追踪名单且强度<40（深破位）",
+    "lifecycle_none_cooling": "板块不在追踪名单且强度40-60（降温档减仓）",
+    "lifecycle_none_strong": "板块不在追踪名单但强度≥60（观察）",
+    "sector_confirmed": "板块已被确认为 actionable（守卫：不落降温档）",
+    "strength_lt50": "板块强度<50",
+    "cooling_hold": "高位降温板块（不强制卖出）",
+    "role_other": "非主线/埋伏角色且无宽限",
+    "role_other_grace": "非主线/埋伏角色但家族强（宽限）",
+    "p4_exit": "埋伏退出信号",
+    "p4_hold": "埋伏持有（无退出信号）",
+    "lifecycle_signal": "生命周期驱动",
+}
+
+# thesis 催化剂锚「已到期/已失效」状态（H3 enabled 时的提前退出判据）
+_CATALYST_ELAPSED_STATES = ("elapsed", "expired", "cancelled")
+
+
+@dataclass
+class HoldingAssessmentFacts:
+    """持仓裁决的输入事实（Node 7 采集，纯数据）。
+
+    设计约束：判定所需的一切都在这里；需要 IO/写库的两件事（家族宽限、
+    P4 退出信号）以「已求值结果 / 懒求值回调」传入，保证 assess_holding 本身纯净。
+    """
+    symbol: str = ""
+    # ── 板块事实 ──
+    sector_name: str = ""
+    sector_strength: float = 50.0
+    sector_role: str = ""
+    sector_confirmed: bool = False       # 见 assess_holding：选股通道 actionable 或持仓补入 board_state 证据
+    board_state: Optional[str] = None    # Node 2 状态机原始态（holding 通道的守卫证据，审计用）
+    lifecycle_phase: Optional[str] = None
+    lifecycle_day: Optional[int] = None
+    overheat_severity: Optional[float] = None
+    # ── 论点/漂移事实 ──
+    thesis_drift: bool = False
+    thesis_family: str = ""
+    all_belong_boards: list[str] = field(default_factory=list)
+    # ── 懒求值：家族宽限（Node 7 内部会写 drift_watch，故按分支调用，不预求值）──
+    grace_resolver: Optional[Callable[[str], tuple[str, bool]]] = None
+    # ── P4 埋伏退出（Node 7 用 snapshot 求得；None=无快照）──
+    ambush_exit: Optional[dict] = None    # {"signal","reason","category_tag"}
+    # ── 生命周期驱动信号（纯计算，Node 7 预算；仅在 fallback 分支消费）──
+    lifecycle_action: str = ""
+    lifecycle_reason: str = ""
+    # ── 历史回查（H3，GOT_HOLDINGS_HISTORY_FEED=enabled 时才参与分支）──
+    history: Optional[dict] = None
+    # ── 观测 ──
+    pnl_pct: float = 0.0
+    capital_data_missing: Optional[bool] = None
+
+
+@dataclass
+class HoldingVerdict:
+    """持仓裁决结果（结构化，替代散落的 action 赋值与 reasoning 拼接）。"""
+    action: str
+    reason_code: str
+    reason_text: str = ""              # 直接拼进 reasoning 的后缀（含前导 ", "）
+    grace_applied: bool = False
+    thesis_broken: bool = False        # 调用方据此 _mark_thesis_broken
+    sector_confirmed_guard: bool = False
+    evidence: dict = field(default_factory=dict)
+
+    @property
+    def reason_label(self) -> str:
+        return HOLDING_REASON_LABELS.get(self.reason_code, self.reason_code)
+
+
+def _call_grace(facts: HoldingAssessmentFacts, drift_sector: str) -> tuple[str, bool]:
+    if facts.grace_resolver is None:
+        return "sell", False
+    return facts.grace_resolver(drift_sector)
+
+
+def assess_holding(
+    facts: HoldingAssessmentFacts,
+    *,
+    guard_enabled: bool = True,
+    history_enabled: bool = False,
+) -> HoldingVerdict:
+    """持仓动作判定（单入口，8+1 分支）。
+
+    guard_enabled:
+        - True：confirmed 板块（actionable + mainline/ambush）+ lifecycle 缺失 → hold。
+        - False：与搬迁前的生产行为逐条一致（`GOT_HOLDINGS_VERDICT_V2=off/shadow`）。
+    history_enabled:
+        - True（H3 `GOT_HOLDINGS_HISTORY_FEED=enabled`）：thesis 催化剂锚已到期/失效时，
+          埋伏持仓不再要求 ambush snapshot 才判退出（双锚）。
+        - False：历史只进 evidence（影子期纪律）。
+    """
+    strength = facts.sector_strength
+    base_evidence = {
+        "sector": facts.sector_name,
+        "sector_role": facts.sector_role,
+        "sector_confirmed": facts.sector_confirmed,
+        "board_state": facts.board_state,
+        "strength": round(float(strength or 0.0), 1),
+        "lifecycle_phase": facts.lifecycle_phase,
+        "lifecycle_day": facts.lifecycle_day,
+        "thesis_drift": facts.thesis_drift,
+        "capital_data_missing": facts.capital_data_missing,
+    }
+    if facts.history:
+        # 影子期：历史只作证据（不参与任何分支判定），enabled 时 catalyst 锚另起一支
+        base_evidence["history"] = {
+            "thesis": bool((facts.history or {}).get("thesis")),
+            "catalyst_status": ((facts.history or {}).get("catalyst") or {}).get("status"),
+            "plan_executed_ratio": ((facts.history or {}).get("plan_stats") or {}).get("executed_ratio"),
+            "ambush_snap": bool((facts.history or {}).get("ambush_snap")),
+        }
+
+    # ① 无板块归属 → 家族宽限（否则卖）
+    if not facts.sector_name:
+        drift_sector = facts.all_belong_boards[0] if facts.all_belong_boards else ""
+        action, grace = _call_grace(facts, drift_sector)
+        if grace:
+            return HoldingVerdict(
+                action=action, reason_code="no_sector_grace",
+                reason_text=", [家族宽限]", grace_applied=True, evidence=base_evidence,
+            )
+        return HoldingVerdict(
+            action="sell", reason_code="no_sector", thesis_broken=True, evidence=base_evidence,
+        )
+
+    # ② 论点漂移 → 家族宽限（否则卖 + 标记论点已破）
+    if facts.thesis_drift:
+        action, grace = _call_grace(facts, facts.sector_name)
+        if grace:
+            return HoldingVerdict(
+                action=action, reason_code="thesis_drift_grace", grace_applied=True,
+                reason_text=f", [论点漂移宽限: {facts.thesis_family}]", evidence=base_evidence,
+            )
+        return HoldingVerdict(
+            action="sell", reason_code="thesis_drift", thesis_broken=True,
+            reason_text=f", [论点漂移卖出: {facts.thesis_family}→{facts.sector_name}]",
+            evidence=base_evidence,
+        )
+
+    # ③′ P4 埋伏退出「提前判定」（H3 修正已坐实的死分支，2026-10-27）
+    # 原链把 P4 放在 lifecycle=None 分支之后，而埋伏板块的 detail.lifecycle 恒为 None
+    # （Node 2 只给 mainline/exhausted/cooling 赋 lifecycle）⇒ P4 触发时永远被降温档抢先，
+    # 分支结构性不可达。这里只在「真的触发退出」时提前返回；未触发则保持原顺序落降温档，
+    # 所以对无信号的埋伏仓逐字节等价旧行为（当前 ambush_position_snapshots 实测 0 行，
+    # 生产无行为变化；表有数据/催化剂到期后才开始生效）。
+    if facts.sector_role == "ambush":
+        _p4_signal = (facts.ambush_exit or {}).get("signal") if facts.ambush_exit is not None else None
+        if _p4_signal:
+            return HoldingVerdict(
+                action="sell", reason_code="p4_exit",
+                reason_text=f", [埋伏退出:{_p4_signal}]",
+                evidence={**base_evidence, "p4_signal": _p4_signal,
+                          "p4_reason": (facts.ambush_exit or {}).get("reason") or "",
+                          "p4_anchor": "snapshot"},
+            )
+        _thesis_status = (
+            ((facts.history or {}).get("catalyst") or {}).get("status") if facts.history else None
+        )
+        if history_enabled and _thesis_status in _CATALYST_ELAPSED_STATES:
+            return HoldingVerdict(
+                action="sell", reason_code="p4_exit",
+                reason_text=f", [埋伏退出:event_elapsed(thesis锚:{_thesis_status})]",
+                evidence={**base_evidence, "p4_signal": "event_elapsed", "p4_anchor": "thesis"},
+            )
+
+    # ③ lifecycle 缺失（板块不在 confirmed/持仓补入情报里）
+    if facts.lifecycle_phase is None:
+        # H2 修正（guard）：板块已被确认为 actionable 的持仓，不因 lifecycle 缺失落降温档
+        if guard_enabled and facts.sector_confirmed:
+            return HoldingVerdict(
+                action="hold", reason_code="sector_confirmed", sector_confirmed_guard=True,
+                reason_text=", [板块确认守卫: 不落降温档]", evidence=base_evidence,
+            )
+        if strength < 40:
+            return HoldingVerdict(action="sell", reason_code="lifecycle_none_weak", evidence=base_evidence)
+        if strength < 60:
+            return HoldingVerdict(action="reduce", reason_code="lifecycle_none_cooling", evidence=base_evidence)
+        return HoldingVerdict(action="hold", reason_code="lifecycle_none_strong", evidence=base_evidence)
+
+    # ④ 强度破位
+    if strength < 50:
+        return HoldingVerdict(action="sell", reason_code="strength_lt50", evidence=base_evidence)
+
+    # ⑤ 高位降温（前主线回调未破位）：持仓者 hold，不 force-sell
+    if facts.sector_role == "cooling":
+        return HoldingVerdict(action="hold", reason_code="cooling_hold", evidence=base_evidence)
+
+    # ⑥ 非主线/埋伏角色 → 家族宽限（否则卖）
+    if facts.sector_role not in ("mainline", "ambush"):
+        drift_sector = facts.all_belong_boards[0] if facts.all_belong_boards else ""
+        action, grace = _call_grace(facts, drift_sector)
+        if grace:
+            return HoldingVerdict(
+                action=action, reason_code="role_other_grace", grace_applied=True,
+                reason_text=", [家族宽限]", evidence=base_evidence,
+            )
+        return HoldingVerdict(
+            action="sell", reason_code="role_other", thesis_broken=True, evidence=base_evidence,
+        )
+
+    # ⑦ 埋伏持仓（P4 无退出信号）→ 持有
+    # 触发退出的情形已在 ③′ 提前返回；到这里只剩「有快照但无信号」的埋伏仓保持持有。
+    if facts.sector_role == "ambush" and facts.ambush_exit is not None:
+        return HoldingVerdict(
+            action="hold", reason_code="p4_hold",
+            reason_text=f", [埋伏持有:{facts.ambush_exit.get('category_tag', '')}]",
+            evidence={**base_evidence, "p4_anchor": "snapshot"},
+        )
+
+    # ⑧ 生命周期驱动（吃鱼身 + 高切低）
+    action = facts.lifecycle_action or "hold"
+    return HoldingVerdict(
+        action=action, reason_code="lifecycle_signal",
+        evidence={**base_evidence, "lifecycle_reason": facts.lifecycle_reason},
+    )
+
+
+def build_verdict_shadow(
+    rows: list[dict],
+    *,
+    mode: str,
+    holdings_seen: int,
+) -> dict:
+    """H2 对拍产物：逐票 legacy vs v2(guard) 的 action 差异（只留痕，不参与判定）。"""
+    changed = [r for r in rows if r.get("changed")]
+    return {
+        "mode": mode,
+        "holdings_seen": holdings_seen,
+        "changed_count": len(changed),
+        "changed_symbols": [r.get("symbol") for r in changed],
+        "rows": rows,
+    }
+
+
+# =============================================================================
+# 历史决策回查（H3，2026-10-27）
+# =============================================================================
+# 原则③：买入时的历史决策数据必须为当前决策提供依据。
+# 纯 SQLite 读（thesis / catalyst_events / trade_plans / ambush_position_snapshots），
+# 零 LLM、零写副作用；失败逐表降级为空（单表坏了不拖垮其他表）。
+# 统计纪律：样本 n<3 不出比率（仓库既有「n≤2 不算统计」口径）。
+
+HISTORY_PLAN_WINDOW_DAYS = 10        # 近 N 个交易日（自然日窗口取 2N 覆盖周末）
+HISTORY_MIN_STATS_SAMPLE = 3         # 低于此样本量只出明细，不出 executed_ratio
+
+
+def _thesis_history_row(record: Any) -> dict:
+    return {
+        "sector_name": getattr(record, "sector_name", "") or "",
+        "family_name": getattr(record, "family_name", "") or "",
+        "lifecycle_state": getattr(record, "lifecycle_state", "") or "",
+        "catalyst_event_id": getattr(record, "catalyst_event_id", "") or "",
+        "entry_date": getattr(record, "entry_date", None),
+        "entry_price": getattr(record, "entry_price", None),
+        "composite_at_entry": getattr(record, "composite_at_entry", None),
+        "drift_watch_since": getattr(record, "drift_watch_since", None),
+        "source": getattr(record, "source", "") or "",
+    }
+
+
+def _catalyst_status(event_date: Optional[date], expires_at: Optional[date], as_of: date) -> str:
+    """催化剂锚状态：upcoming / today / elapsed / expired。"""
+    if expires_at is not None and expires_at < as_of:
+        return "expired"
+    if event_date is None:
+        return "unknown"
+    if event_date > as_of:
+        return "upcoming"
+    if event_date == as_of:
+        return "today"
+    return "elapsed"
+
+
+def lookup_decision_history(
+    symbols: list[str],
+    as_of: date,
+    *,
+    plan_window_days: int = HISTORY_PLAN_WINDOW_DAYS,
+    session=None,
+) -> dict[str, dict]:
+    """逐票回查买入时点痕迹，供当日裁决做证据（H3）。
+
+    返回 {symbol: {thesis, catalyst, plan_stats, ambush_snap}}：
+    - thesis：最新一条 open 论点（板块/家族/四态/催化剂锚/入场分）
+    - catalyst：join catalyst_events（事件日/等级/置信度/方向/状态）
+    - plan_stats：近 N 交易日 trade_plans 的执行明细与兑现率（n<3 时 ratio=None）
+    - ambush_snap：open 的埋伏仓位快照（有则 P4 可达）
+
+    任何表读取失败 → 该字段 None/空，不抛异常（调用方 try/except 兜底）。
+    """
+    clean_symbols = [s for s in (symbols or []) if s]
+    if not clean_symbols:
+        return {}
+
+    result: dict[str, dict] = {
+        s: {"thesis": None, "catalyst": None, "plan_stats": None, "ambush_snap": None}
+        for s in clean_symbols
+    }
+
+    own_session = session is None
+    try:
+        if own_session:
+            from src.storage import DatabaseManager
+
+            session = DatabaseManager().get_session()
+
+        # ── thesis（每票最新 open 一条）──
+        try:
+            from src.storage import HoldingThesisRecord
+
+            thesis_rows = (
+                session.query(HoldingThesisRecord)
+                .filter(
+                    HoldingThesisRecord.is_open == True,  # noqa: E712
+                    HoldingThesisRecord.symbol.in_(clean_symbols),
+                )
+                .order_by(HoldingThesisRecord.entry_date.desc())
+                .all()
+            )
+            seen: set[str] = set()
+            for row in thesis_rows:
+                if row.symbol in seen:
+                    continue
+                seen.add(row.symbol)
+                result[row.symbol]["thesis"] = _thesis_history_row(row)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[H3] thesis 回查失败（降级）: %s", exc)
+
+        # ── catalyst（join catalyst_events by event_id）──
+        try:
+            from src.storage import CatalystEventRecord
+
+            event_ids = [
+                (result[s]["thesis"] or {}).get("catalyst_event_id")
+                for s in clean_symbols
+            ]
+            event_ids = [eid for eid in event_ids if eid]
+            if event_ids:
+                events = (
+                    session.query(CatalystEventRecord)
+                    .filter(CatalystEventRecord.event_id.in_(event_ids))
+                    .all()
+                )
+                by_id = {e.event_id: e for e in events}
+                for symbol in clean_symbols:
+                    thesis = result[symbol]["thesis"] or {}
+                    eid = thesis.get("catalyst_event_id")
+                    event = by_id.get(eid) if eid else None
+                    if event is None:
+                        continue
+                    result[symbol]["catalyst"] = {
+                        "event_id": event.event_id,
+                        "event_date": event.event_date,
+                        "expires_at": getattr(event, "expires_at", None),
+                        "impact_level": getattr(event, "impact_level", None),
+                        "confidence": getattr(event, "confidence", None),
+                        "direction": getattr(event, "direction", None),
+                        "category_tag": getattr(event, "category_tag", None),
+                        "sector": getattr(event, "sector", None),
+                        "title": getattr(event, "title", None),
+                        "status": _catalyst_status(
+                            getattr(event, "event_date", None),
+                            getattr(event, "expires_at", None),
+                            as_of,
+                        ),
+                    }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[H3] catalyst 回查失败（降级）: %s", exc)
+
+        # ── trade_plans 近 N 交易日兑现明细 ──
+        try:
+            window_start = as_of - timedelta(days=max(plan_window_days, 1) * 2)
+            plans = (
+                session.query(TradePlanRecord)
+                .filter(
+                    TradePlanRecord.symbol.in_(clean_symbols),
+                    TradePlanRecord.plan_date >= window_start,
+                    TradePlanRecord.plan_date < as_of,
+                )
+                .all()
+            )
+            buckets: dict[str, dict[str, int]] = {}
+            for plan in plans:
+                bucket = buckets.setdefault(
+                    plan.symbol,
+                    {"sampled": 0, "executed": 0, "partial": 0,
+                     "expired": 0, "cancelled": 0, "pending": 0},
+                )
+                bucket["sampled"] += 1
+                status = (plan.execution_status or "pending").lower()
+                if status in bucket:
+                    bucket[status] += 1
+                else:
+                    bucket["pending"] += 1
+            for symbol, bucket in buckets.items():
+                decided = bucket["executed"] + bucket["partial"] + bucket["expired"] + bucket["cancelled"]
+                ratio = None
+                if decided >= HISTORY_MIN_STATS_SAMPLE:
+                    ratio = round((bucket["executed"] + 0.5 * bucket["partial"]) / decided, 3)
+                result[symbol]["plan_stats"] = {
+                    **bucket,
+                    "decided": decided,
+                    "executed_ratio": ratio,
+                    "note": "" if ratio is not None else f"样本 n={decided}<{HISTORY_MIN_STATS_SAMPLE}，不出比率",
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[H3] trade_plans 回查失败（降级）: %s", exc)
+
+        # ── ambush_position_snapshots（open 行）──
+        try:
+            from src.storage import AmbushPositionSnapshotRecord
+
+            snaps = (
+                session.query(AmbushPositionSnapshotRecord)
+                .filter(
+                    AmbushPositionSnapshotRecord.is_open == True,  # noqa: E712
+                    AmbushPositionSnapshotRecord.symbol.in_(clean_symbols),
+                )
+                .all()
+            )
+            for snap in snaps:
+                result[snap.symbol]["ambush_snap"] = {
+                    "category_tag": getattr(snap, "category_tag", None),
+                    "catalyst_event_id": getattr(snap, "catalyst_event_id", ""),
+                    "entry_date": getattr(snap, "entry_date", None),
+                    "entry_price": getattr(snap, "entry_price", None),
+                    "exit_signal": getattr(snap, "exit_signal", None),
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[H3] ambush snapshot 回查失败（降级）: %s", exc)
+
+        return result
+    except Exception as exc:  # noqa: BLE001 — 会话建立失败：整体降级
+        logger.warning("[H3] 历史回查整体降级: %s", exc)
+        return result
+    finally:
+        if own_session and session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def build_history_shadow(history: dict[str, dict], *, mode: str) -> dict:
+    """H3 喂入留痕（只读快照，供 reasoning 渲染与影子审阅）。"""
+    rows = []
+    for symbol, row in (history or {}).items():
+        thesis = row.get("thesis") or {}
+        catalyst = row.get("catalyst") or {}
+        stats = row.get("plan_stats") or {}
+        rows.append({
+            "symbol": symbol,
+            "thesis_present": bool(thesis),
+            "thesis_sector": thesis.get("sector_name"),
+            "thesis_state": thesis.get("lifecycle_state"),
+            "catalyst_status": catalyst.get("status"),
+            "catalyst_event_date": catalyst.get("event_date"),
+            "plans_sampled": stats.get("sampled", 0),
+            "executed_ratio": stats.get("executed_ratio"),
+            "ambush_snap": bool(row.get("ambush_snap")),
+        })
+    return {"mode": mode, "symbols": sorted(history.keys()), "rows": rows}

@@ -450,6 +450,19 @@ class SectorContext(BaseModel):
         default_factory=dict,
         description="同花顺板块热度 {板块名: 热度值}，供 Node 6 埋伏通道 G2/G3 闸门消费（替代恒空的 associated_sectors）"
     )
+    # ── H1 持仓供数（2026-10-27 持仓模块三原则接线，原则②）──
+    holdings_sectors: list[SectorDetail] = Field(
+        default_factory=list,
+        description="持仓板块兜底追踪结果（HoldingsContext.sector_wishes 中未被当日候选集覆盖的板块，"
+                    "单独补拉 K 线算强度/RRG/生命周期）。**不参与**主线/埋伏分类、不写 node2_sector_trends、"
+                    "不进 strength_lookup/overheat_lookup（截面排名分母不变），仅供 Node 6/7 取持仓板块的 "
+                    "lifecycle 与强度。空列表=无持仓诉求或全部已被候选集覆盖。",
+    )
+    holdings_coverage: Optional[dict] = Field(
+        default=None,
+        description="持仓板块追踪覆盖率留痕: {wishes, covered, tracked, missing, status: full/partial/empty, "
+                    "note}。missing=解析不到板块代码或 K 线拉取失败的诉求板块（不造数据，只留痕）。",
+    )
     # ── WI-P1-7(b) 家族 embedding 兜底留痕（【架构计划】§6，2026-10-06）──
     family_embed_shadow: Optional[dict] = Field(
         default=None,
@@ -473,6 +486,14 @@ class CapitalEvidence(BaseModel):
     northbound_realtime: Optional[dict] = None  # 北向资金分钟级实时（备用，停披后全 0 自动降级）
     dde: Optional[dict] = None                # 已废弃（缺陷③A：DDE 随东财封锁失效摘除，仅为向后兼容保留字段，不再填充）
     individual_main_force: Optional[dict] = None  # 个股主力聚流（T-1 备用）
+    holdings_flow_index: Optional[dict] = Field(
+        default=None,
+        description="持仓板块资金流索引（2026-10-27 H1，原则②供数）："
+                    "{wishes, index:{wish→{matched_key, flow, flow_3d, flow_5d}}, "
+                    "hit_count, miss, note}。"
+                    "只做「持仓板块是否拿到资金数据」的显式留痕，Phase 2 据此把资金维"
+                    "缺失降维而非静默吞 0；不改 institutional_score 计算。无持仓时 None。",
+    )
 
 
 class CapitalContext(BaseModel):
@@ -779,8 +800,18 @@ class SectorIntel(BaseModel):
     sector_name: str
     sector_code: str = ""
     sector_type: str = Field(default="concept", description="concept / industry")
+    board_state: Optional[str] = Field(
+        default=None,
+        description="Node 2 状态机原始态（active_mainline / ambush / high_position_cooling / "
+                    "exhausted_mainline / defensive_rotation / neutral）。H1 持仓补入通道据此判断"
+                    "「板块是否仍被 Node 2 认定为可持有」，避免 lifecycle 缺失时误落 40/60 降温档。",
+    )
     # ── 板块角色（主线/埋伏区分）──
-    sector_role: str = Field(default="mainline", description="mainline / ambush / independent")
+    sector_role: str = Field(
+        default="mainline",
+        description="mainline / ambush / cooling / independent / holding"
+                    "（holding=H1 持仓补入，仅存于 UnifiedContext.holdings_intel，不进选股通道）",
+    )
     mainline_tier: Optional[str] = Field(default=None, description="S / A / B（仅 mainline，来自 Node 2 MainlineGroup.tier）")
     mainline_quality: Optional[str] = Field(default=None, description="strong / weak（仅 mainline）")
     mainline_days: Optional[int] = Field(default=None, description="连续主线天数（仅 mainline）")
@@ -896,6 +927,53 @@ class AmbushPositionSnapshot(BaseModel):
     exit_date: Optional[date] = Field(default=None, description="退出日期")
     exit_price: Optional[float] = Field(default=None, description="退出价格")
     is_open: bool = Field(default=True, description="是否仍在持仓")
+
+
+class HoldingBrief(BaseModel):
+    """持仓摘要（Phase 1 供数口径，2026-10-27 持仓模块三原则接线 H1）。
+
+    与 `PortfolioService.get_portfolio_snapshot()` 的 positions 行同源，字段裁剪到
+    「前序节点需要知道的持仓事实」：身份 + 成本 + 现价 + 入口锚（thesis 板块/催化剂）。
+    不含账户结构（GOT 消费侧统一 `_all_positions` 全账户去重口径）。
+    """
+    symbol: str
+    name: str = ""
+    quantity: float = 0.0
+    avg_cost: float = 0.0
+    last_price: float = 0.0
+    market_value: float = 0.0
+    unrealized_pnl_pct: float = 0.0
+    sector_name: str = Field(default="", description="入口锚板块（holding_thesis.sector_name，无则空串）")
+    catalyst_event_id: str = Field(default="", description="入口锚催化剂事件（B2-c 埋伏买入补锚，无则空串）")
+    entry_source: str = Field(default="none", description="thesis / ambush / none（与 WI-P-2 同词表）")
+
+
+class HoldingsContext(BaseModel):
+    """持仓上下文（Phase 1 头部构建，供 Node 2/3/6 消费；2026-10-27 H1）。
+
+    定位：**数据供给**，不是决策。只读 SQLite（持仓快照 + holding_thesis_snapshots），
+    零 LLM、零新增爬虫。节点据此产出「针对持仓的分析数据」：
+    - Node 2 → `SectorContext.holdings_sectors`（持仓板块兜底追踪 + holdings_coverage）
+    - Node 3 → `CapitalEvidence.holdings_flow_index`（持仓板块资金流三级别名匹配）
+    - Node 6 → `UnifiedContext.holdings_intel`（持仓专属 SectorIntel，与选股通道隔离）
+    """
+    status: str = Field(default="normal", description="normal / empty（无持仓）/ degraded（读取失败）")
+    symbols: list[str] = Field(default_factory=list, description="全账户去重后的持仓代码")
+    positions: list[HoldingBrief] = Field(default_factory=list)
+    sector_wishes: list[str] = Field(
+        default_factory=list,
+        description="持仓板块名集合（thesis.sector_name 去重）——前序节点的追踪请求清单",
+    )
+    catalyst_ids: list[str] = Field(
+        default_factory=list,
+        description="持仓入口锚催化剂 event_id 集合（活催化剂观察名单，H3 消费）",
+    )
+    entry_source_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="{thesis, ambush, none} 计数，供归档判断入口锚覆盖率（n≤2 不出统计）",
+    )
+    error: Optional[str] = Field(default=None, description="degraded 时的失败原因（不阻断，供归档归因）")
+    generated_at: Optional[datetime] = None
 
 
 class Contradiction(BaseModel):
@@ -1017,6 +1095,16 @@ class UnifiedContext(BaseModel):
         default_factory=list,
         description="板块 mini GOT 情报（4 维交叉验证 + lifecycle + 分类），Phase 2 直接消费",
     )
+    # ── H1 持仓专属板块情报（2026-10-27 持仓模块三原则接线，原则②）──
+    holdings_intel: list[SectorIntel] = Field(
+        default_factory=list,
+        description="持仓板块专属情报（只覆盖 confirmed_sectors 未收录的持仓诉求板块，"
+                    "sector_role='holding'、classification='watch'）。"
+                    "**与选股通道隔离**：不进 confirmed_sectors、不参与 TOP-N 名额、不进选股池，"
+                    "仅供 Phase 2 取持仓板块的 lifecycle/强度/过热，消除「板块跌出名单 → lifecycle=None → "
+                    "40/60 降温档误判」。空列表=无持仓诉求或全部已被 confirmed_sectors 覆盖。",
+    )
+
 
     # ── 埋伏通道（P3 新增：Level 1 平行分支输出）──
     ambush_pool: list[AmbushCandidate] = Field(
@@ -1223,6 +1311,33 @@ class UnifiedScoringResult(BaseModel):
     sector_type: str = Field(
         default="mainline",
         description="入场分道: active_mainline/ambush（screener 内部词表，生产 passthrough 原样）；mainline 为 Schema 兜底缺省（埋伏道拆分 v2 拦点#6）",
+    )
+    # ── H1/H2/H3 持仓模块接线字段（2026-10-27）──
+    capital_data_missing: Optional[bool] = Field(
+        default=None,
+        description="（H1）持仓资金维数据是否缺失：True=板块资金流三级别名均未命中（或未尝试），"
+                    "该维度已从加权中剔除并标注，不再静默按 0 分计入；None=非持仓/未评估。",
+    )
+    action_reason_code: Optional[str] = Field(
+        default=None,
+        description="（H2）持仓裁决原因码（decision_plan.assess_holding 输出）："
+                    "no_sector / no_sector_grace / thesis_drift / thesis_drift_grace / "
+                    "lifecycle_none_weak / lifecycle_none_cooling / lifecycle_none_strong / "
+                    "sector_confirmed / strength_lt50 / cooling_hold / role_other / role_other_grace / "
+                    "p4_exit / p4_hold / lifecycle_signal；None=非持仓。",
+    )
+    sector_confirmed_guard: bool = Field(
+        default=False,
+        description="（H2）sector_confirmed 守卫是否生效（板块仍被确认——选股通道 actionable + "
+                    "role∈{mainline,ambush}，或 H1 持仓补入通道 board_state∈{active_mainline,ambush,"
+                    "high_position_cooling}——但 lifecycle 缺失 → hold 而非 40/60 降温档）。"
+                    "缺省 enabled（2026-10-27 用户裁决转正）；置 shadow 时 applied action 不变、只留提案，off 为 kill-switch。",
+    )
+    holdings_history_evidence: Optional[dict] = Field(
+        default=None,
+        description="（H3）历史决策回查证据（decision_plan.lookup_decision_history）："
+                    "{thesis, catalyst, plan_stats, ambush_snap}。影子期只入 evidence 进 reasoning，"
+                    "不改 action；GOT_HOLDINGS_HISTORY_FEED=off 时 None。",
     )
 
 
@@ -1432,6 +1547,23 @@ class PortfolioDecision(BaseModel):
         description="决策编排层（decision_plan.py）输出：run() 开头 reconcile 昨日对账回填 + "
                     "run() 末尾 assemble 当日计划装配，逐条人读行；渲染进 reasoning.md Node 7 段。"
                     "失败也记一行（不阻断）。空列表时 reasoning.md 不渲染该段。",
+    )
+    # ── H2/H3 持仓模块接线影子（2026-10-27）──
+    holdings_verdict_shadow: Optional[dict] = Field(
+        default=None,
+        description="（H2）持仓裁决搬迁对拍留痕: {mode, holdings_seen, changed_count, rows:[{symbol, name, "
+                    "sector, legacy_action, v2_action, applied_action, changed, reason_code_legacy, "
+                    "reason_code_v2, sector_confirmed_guard, capital_data_missing}]}。"
+                    "legacy=搬迁后同一逻辑在 guard 关闭下的行为（搬家不重写），v2=guard 开启。"
+                    "GOT_HOLDINGS_VERDICT_V2=off 时不产（None）。仅留痕，不参与判定。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
+    )
+    holdings_history_shadow: Optional[dict] = Field(
+        default=None,
+        description="（H3）历史决策回查喂入留痕: {mode, symbols, rows:[{symbol, thesis_present, "
+                    "catalyst_status, plans_sampled, executed_ratio, ambush_snap}], notes}。"
+                    "GOT_HOLDINGS_HISTORY_FEED=off 时不产（None）。影子期只作证据不改 action。"
+                    "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
 
 

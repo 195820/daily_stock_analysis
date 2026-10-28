@@ -362,6 +362,10 @@ class PortfolioDecisionNode:
             sector_verify_pending_count=self._sector_verify_pending_count or None,
         )
 
+        # H2：裁决对拍产物组装（import 放此处，避免节点模块顶部引入编排层依赖）
+        from src.got.catalyst_config import GOT_HOLDINGS_VERDICT_V2
+        from src.got.decision_plan import build_verdict_shadow
+
         decision = PortfolioDecision(
             status="partial" if degraded_steps else "normal",
             risk_assessment=risk_assessment,
@@ -410,6 +414,20 @@ class PortfolioDecisionNode:
             lane_budget_split_shadow=getattr(self, "_lane_budget_split_shadow", None),
             t3_routing_shadow=getattr(self, "_t3_routing_shadow", None),
             cross_node_signals_shadow=getattr(self, "_cross_node_signals_shadow", None),
+            # ── H2/H3 持仓模块接线影子（2026-10-27）──
+            # H2：裁决搬迁对拍（legacy vs v2 guard）；H3：历史回查喂入快照。
+            # 两者均只留痕；GOT_HOLDINGS_VERDICT_V2=off / HISTORY_FEED=off 时字段为 None。
+            holdings_verdict_shadow=(
+                build_verdict_shadow(
+                    getattr(self, "_holdings_verdict_rows", []) or [],
+                    mode=GOT_HOLDINGS_VERDICT_V2,
+                    holdings_seen=len([
+                        s for s in unified_scoring if getattr(s, "is_holding", False)
+                    ]),
+                )
+                if GOT_HOLDINGS_VERDICT_V2 != "off" else None
+            ),
+            holdings_history_shadow=getattr(self, "_holdings_history_shadow", None),
             data_quality=data_quality,
         )
 
@@ -755,6 +773,35 @@ class PortfolioDecisionNode:
                 "no_accounts" if not portfolio.get("accounts") else "no_holdings"
             )
 
+        # ── H2/H3 开关与历史回查（2026-10-27 持仓模块三原则接线）──
+        # 每次调用读取（支持同日实验切换）；off 时零额外 IO。
+        from src.got.catalyst_config import (
+            GOT_HOLDINGS_HISTORY_FEED,
+            GOT_HOLDINGS_VERDICT_V2,
+            HOLDINGS_HISTORY_PLAN_WINDOW_DAYS,
+        )
+        from src.got.decision_plan import HoldingAssessmentFacts, assess_holding
+        holdings_verdict_mode = GOT_HOLDINGS_VERDICT_V2
+        holdings_history_mode = GOT_HOLDINGS_HISTORY_FEED
+        self._holdings_verdict_rows: List[dict] = []
+        self._holdings_history_shadow: Optional[dict] = None
+        history_map: Dict[str, dict] = {}
+        if positions and holdings_history_mode != "off":
+            try:
+                from src.got.decision_plan import build_history_shadow, lookup_decision_history
+                history_map = lookup_decision_history(
+                    [p.get("symbol", "") for p in positions if p.get("symbol")],
+                    date.today(),
+                    plan_window_days=HOLDINGS_HISTORY_PLAN_WINDOW_DAYS,
+                ) or {}
+                self._holdings_history_shadow = build_history_shadow(
+                    history_map, mode=holdings_history_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 — 历史回查失败不阻断裁决
+                logger.warning("[Phase 2] [H3] 历史决策回查失败（降级为无证据）: %s", exc)
+                history_map = {}
+                self._holdings_history_shadow = None
+
         # 构建板块 → 强度映射（从 sector_context）
         sector_strength_map = self._build_sector_strength_map(sector_context)
         # P0-2 修复：sector_context.strength_lookup 覆盖全量板块（双保险）
@@ -793,8 +840,16 @@ class PortfolioDecisionNode:
         # 逐只日K IO（与 _batch_fetch_tech_scores 同源）；失败返回空→两观测字段 None、追踪 no-op。
         hwm_map = self._batch_fetch_hwm(positions, thesis_map, ambush_snapshot_map)
 
+        # H1（2026-10-27）：持仓板块资金流索引（Node 3 产出，三级别名匹配留痕）。
+        # None/空 → 无持仓诉求或 Node 3 未跑，持仓资金维按「无数据」降维（不吞 0 分）。
+        holdings_flow_index = (
+            getattr(getattr(capital_context, "evidence", None), "holdings_flow_index", None) or {}
+        )
+        flow_rows: dict[str, dict] = holdings_flow_index.get("index") or {}
+
         # 批量计算资金面/消息面评分（复用 screener 的方法，避免重复实现）
         holding_candidates = []
+        holding_flow_by_symbol: dict[str, Optional[dict]] = {}
         for position in positions:
             symbol = position.get("symbol", "")
             name = self._resolve_holding_name(symbol, position.get("name", symbol))
@@ -805,11 +860,27 @@ class PortfolioDecisionNode:
                 frame_group_lookup=frame_group_lookup,
             )
             sector_name = stock_sector_info.get("sector_name", "")
+            # H1：把 Node 3 已解析出的真实键喂回 screener，避免别名口径在持仓侧二次丢分
+            flow_row = self._match_holdings_flow_row(
+                [sector_name] + list(stock_sector_info.get("all_belong_boards") or []),
+                flow_rows,
+            )
+            holding_flow_by_symbol[symbol] = flow_row
             holding_candidates.append({
                 "code": symbol,
                 "name": name,
-                "sector": sector_name,
+                "sector": sector_name,          # 消息面沿用原始板块名（与 LLM 板块词表口径一致）
                 "dde_net_pct": 0,  # 持仓无 DDE 数据，仅用 sector_flow
+            })
+
+        # 资金面候选用「Node 3 已解析的真实键」重挂 sector（消除别名口径丢分）；
+        # 消息面候选保持原始板块名——两个维度各自只吃自己口径的键，互不串改。
+        capital_candidates = []
+        for cand in holding_candidates:
+            flow_row = holding_flow_by_symbol.get(cand["code"]) or {}
+            capital_candidates.append({
+                **cand,
+                "sector": flow_row.get("matched_key") or cand["sector"],
             })
 
         # 调用 screener 的批量评分方法
@@ -821,7 +892,7 @@ class PortfolioDecisionNode:
         )
         _screener = StockScreenerPipeline(get_config())
         capital_scores, capital_avail = _screener._score_capital(
-            holding_candidates, capital_context.model_dump(mode="python")
+            capital_candidates, capital_context.model_dump(mode="python")
         )
         news_scores, news_avail = _screener._score_news(
             holding_candidates, news_context.model_dump(mode="python")
@@ -872,6 +943,11 @@ class PortfolioDecisionNode:
             # 资金面/消息面：使用 screener 批量评分结果 + 可用性标记
             capital_score = capital_scores.get(symbol, 0.0)
             capital_has_data = capital_avail.get(symbol, False)
+            # H1（2026-10-27）：持仓资金维缺失须显式化——持仓无 DDE（结构性 0 分），
+            # 板块资金流是唯一可用来源；未命中即 availability=False（权重归一化已剔除该维），
+            # 这里把「没数据」与「数据为 0 分」在产物上分开，禁止静默吞 0。
+            capital_data_missing = not capital_has_data
+            _flow_row = holding_flow_by_symbol.get(symbol)
             news_score = news_scores.get(symbol, 0.0)
             news_has_data = news_avail.get(symbol, False)
 
@@ -961,123 +1037,164 @@ class PortfolioDecisionNode:
             # 动作建议：生命周期驱动 + 板块踢出检测
             sector_strength = stock_sector_info.get("strength", 50.0)
             sector_role = stock_sector_info.get("sector_role", "")
-
-            # 分层决策（方案 C：组合方案 + Invesco 2024 非对称门槛）
+            all_belong_boards = stock_sector_info.get("all_belong_boards", []) or []
             thesis_drift = stock_sector_info.get("thesis_drift", False)
-            if not sector_name:
-                # Fix 3: 漂移 sell 分支接入宽限逻辑
-                thesis = thesis_map.get(symbol)
-                all_boards = stock_sector_info.get("all_belong_boards", [])
-                action, grace_applied = self._drift_action_with_grace(
-                    symbol, sector_name, sector_strength,
-                    frame_group_lookup, family_anchor_map, thesis, date.today(),
-                    drift_sector_name=all_boards[0] if all_boards else "",
+
+            # H2（2026-10-27）：判定链已搬至决策编排层 `decision_plan.assess_holding`。
+            # 本节只负责「采集事实 + 调判定 + 落观测」，不再内嵌 8 分支 if/elif。
+            _intel_row = sector_intel_map.get(sector_name) if sector_name else None
+            # 「板块仍被确认」的两种证据（都在 intel 行里，无需新 IO）：
+            # ① 选股通道已确认（actionable + mainline/ambush）；
+            # ② H1 持仓补入通道：Node 2 状态机仍判该板块为 mainline/ambush/降温态
+            #    （role=holding，不发 actionable 以免污染选股口径，但 state 是 Node 2 的真判定）。
+            # 二者皆无 → 视为「无信息」，仍走 40/60 降温档（不做无条件庇护）。
+            sector_confirmed = bool(
+                _intel_row
+                and (
+                    (
+                        _intel_row.get("classification") == "actionable"
+                        and _intel_row.get("sector_role") in ("mainline", "ambush")
+                    )
+                    or (
+                        _intel_row.get("sector_role") == "holding"
+                        and _intel_row.get("board_state") in (
+                            "active_mainline", "ambush", "high_position_cooling",
+                        )
+                    )
                 )
-                if grace_applied:
-                    reasoning += f", [家族宽限]"
-                else:
-                    # B3 状态机：无宽限卖出 = 论点已破（家族走弱/深度破位/无家族）
-                    self._mark_thesis_broken(symbol)
-            elif thesis_drift:
-                # Fix 2: 板块漂移检测 — 论点板块与当日匹配不一致
-                thesis = thesis_map.get(symbol)
-                thesis_family = stock_sector_info.get("thesis_family", "")
-                # 用论点家族查锚点强度，走宽限逻辑
-                thesis_action, thesis_grace = self._drift_action_with_grace(
-                    symbol, sector_name, sector_strength,
-                    frame_group_lookup, family_anchor_map, thesis, date.today(),
-                    drift_sector_name=sector_name,
+            )
+
+            # P4 埋伏退出事实（纯计算；有快照才求值，与旧分支同口径）
+            ambush_fact = None
+            if symbol in ambush_snapshot_map:
+                _snapshot = ambush_snapshot_map[symbol]
+                _exit_signal, _exit_reason = self._ambush_exit_signal(
+                    _snapshot, date.today(), position.get("last_price", 0.0),
                 )
-                if thesis_grace:
-                    action = thesis_action
-                    reasoning += f", [论点漂移宽限: {thesis_family}]"
-                else:
-                    action = "sell"
-                    reasoning += f", [论点漂移卖出: {thesis_family}→{sector_name}]"
-                    # B3 状态机：论点漂移无宽限卖出 = 论点已破
-                    self._mark_thesis_broken(symbol)
-            elif lifecycle_phase is None:
-                # 板块不在 confirmed_sectors 中（可能被踢出）
-                # Invesco 2024 非对称门槛：持仓者降温期保护
-                # 进入主线门槛高（60），踢出门槛低（40）→ 防止"卖在降温，买回在上攻"whipsaw
-                if sector_strength < 40:
-                    # 深度破位 → 卖出（真正弱势，不是降温）
-                    action = "sell"
-                elif sector_strength < 60:
-                    # 轻度降温（40-60）→ 减仓但不强制卖出
-                    # （给再启动快速通道留空间：FAST 信号触发后直接回主线）
-                    action = "reduce"
-                else:
-                    # 强度尚可（>=60）→ 持有观察
-                    action = "hold"
-            elif sector_strength < 50:
-                action = "sell"
-            elif sector_role == "cooling":
-                # 高位降温（前主线回调未破位）：持仓者 hold/reduce，不 force-sell
-                # （2026-08-17 状态机校准：冷却板块不再被误标为弱势卖出）
-                action = "hold"
-            elif sector_role not in ("mainline", "ambush"):
-                # Fix 3: 漂移 sell 分支接入宽限逻辑
-                thesis = thesis_map.get(symbol)
-                all_boards = stock_sector_info.get("all_belong_boards", [])
-                action, grace_applied = self._drift_action_with_grace(
-                    symbol, sector_name, sector_strength,
-                    frame_group_lookup, family_anchor_map, thesis, date.today(),
-                    drift_sector_name=all_boards[0] if all_boards else "",
-                )
-                if grace_applied:
-                    reasoning += f", [家族宽限]"
-                else:
-                    # B3 状态机：非主线/埋伏角色 + 无宽限卖出 = 论点已破
-                    self._mark_thesis_broken(symbol)
-            elif sector_role == "ambush" and symbol in ambush_snapshot_map:
-                # P4 埋伏退出分支：催化剂驱动，替代生命周期逻辑
-                snapshot = ambush_snapshot_map[symbol]
-                last_price = position.get("last_price", 0.0)
-                exit_signal, exit_reason = self._ambush_exit_signal(
-                    snapshot, date.today(), last_price,
-                )
-                if exit_signal:
-                    action = "sell"
-                    ambush_exit_info = {
-                        "symbol": symbol,
-                        "sector": sector_name,
-                        "category_tag": snapshot.category_tag,
-                        "exit_signal": exit_signal,
-                        "reason": exit_reason,
-                    }
-                    if not hasattr(self, '_ambush_exits'):
-                        self._ambush_exits = []
-                    self._ambush_exits.append(ambush_exit_info)
-                else:
-                    action = "hold"
+                ambush_fact = {
+                    "signal": _exit_signal,
+                    "reason": _exit_reason,
+                    "category_tag": _snapshot.category_tag,
+                }
+
+            # 生命周期驱动信号（纯计算；仅 assess_holding 的 fallback 分支消费）
+            lifecycle_action, lifecycle_reason = self._lifecycle_sell_signal(
+                pnl_pct_decimal,
+                lifecycle_phase,
+                lifecycle_day,
+                overheat_severity,
+                risk_assessment.stop_loss_threshold,
+                hwm_gain_pct=_hwm_gain,
+                drawdown_from_hwm=_drawdown,
+                hwm_approx=bool(_hwm_info.get("approx")) if _hwm_info else False,
+            )
+
+            # 家族宽限：懒求值 + 记忆化（内部写 drift_watch；对拍双调用只写一次）
+            _grace_cache: Dict[str, tuple] = {}
+
+            def _grace_lookup(drift_sector: str, _symbol=symbol) -> tuple:
+                if drift_sector not in _grace_cache:
+                    _grace_cache[drift_sector] = self._drift_action_with_grace(
+                        _symbol, sector_name, sector_strength,
+                        frame_group_lookup, family_anchor_map, thesis_map.get(_symbol),
+                        date.today(), drift_sector_name=drift_sector,
+                    )
+                return _grace_cache[drift_sector]
+
+            facts = HoldingAssessmentFacts(
+                symbol=symbol,
+                sector_name=sector_name,
+                sector_strength=sector_strength,
+                sector_role=sector_role,
+                sector_confirmed=sector_confirmed,
+                board_state=(_intel_row or {}).get("board_state"),
+                lifecycle_phase=lifecycle_phase,
+                lifecycle_day=lifecycle_day,
+                overheat_severity=overheat_severity,
+                thesis_drift=thesis_drift,
+                thesis_family=stock_sector_info.get("thesis_family", ""),
+                all_belong_boards=list(all_belong_boards),
+                grace_resolver=_grace_lookup,
+                ambush_exit=ambush_fact,
+                lifecycle_action=lifecycle_action,
+                lifecycle_reason=lifecycle_reason,
+                history=history_map.get(symbol),
+                pnl_pct=pnl_pct,
+                capital_data_missing=capital_data_missing,
+            )
+            # H2 三态：
+            #   off     → 只算 legacy（= 搬迁前行为），不产对拍
+            #   shadow  → legacy 生效；另算 guard 开启的提案写对拍（否则差异永不可见）
+            #   enabled → 提案生效；legacy 仅用于对拍
+            _history_on = holdings_history_mode == "enabled"
+            legacy_verdict = assess_holding(facts, guard_enabled=False, history_enabled=_history_on)
+            if holdings_verdict_mode == "off":
+                verdict = legacy_verdict
             else:
-                # 使用生命周期驱动逻辑（吃鱼身+高切低策略）
-                # C-B1：传入 HWM 高点收益/回撤，开关开启时触发移动止盈（埋伏仓已走上方独立分支、不受影响）
-                action, _ = self._lifecycle_sell_signal(
-                    pnl_pct_decimal,
-                    lifecycle_phase,
-                    lifecycle_day,
-                    overheat_severity,
-                    risk_assessment.stop_loss_threshold,
-                    hwm_gain_pct=_hwm_gain,
-                    drawdown_from_hwm=_drawdown,
-                    hwm_approx=bool(_hwm_info.get("approx")) if _hwm_info else False,
+                proposal = assess_holding(facts, guard_enabled=True, history_enabled=_history_on)
+                verdict = proposal if holdings_verdict_mode == "enabled" else legacy_verdict
+            action = verdict.action
+            if verdict.thesis_broken:
+                # B3 状态机：无宽限卖出 = 论点已破（家族走弱/深度破位/无家族）
+                self._mark_thesis_broken(symbol)
+            if verdict.reason_text:
+                reasoning += verdict.reason_text
+            if verdict.sector_confirmed_guard:
+                logger.info(
+                    "[Phase 2] [板块确认守卫] %s 板块=%s classification=actionable，"
+                    "lifecycle 缺失不再落 40/60 降温档",
+                    symbol, sector_name,
                 )
-                # C-B2 shadow：缺省阈值 30 未命中（day≤30）、但切 14 会命中 reduce（day>14）→ 仅留痕，
-                # 供启用前盘点统计非零冲击（不参与任何判定，关闭旧路径逐字节不变）
+
+            # H2 对拍：legacy（guard 关闭）vs 提案（guard 开启）。搬家不重写 ⇒ 唯一差异是守卫。
+            if holdings_verdict_mode != "off":
+                self._holdings_verdict_rows.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "sector": sector_name,
+                    "legacy_action": legacy_verdict.action,
+                    "v2_action": proposal.action,
+                    "applied_action": verdict.action,
+                    "changed": legacy_verdict.action != proposal.action,
+                    "reason_code_legacy": legacy_verdict.reason_code,
+                    "reason_code_v2": proposal.reason_code,
+                    "sector_confirmed_guard": proposal.sector_confirmed_guard,
+                    "capital_data_missing": capital_data_missing,
+                    "evidence": proposal.evidence,
+                })
+
+            # P4 退出登记（仅 snapshot 锚；thesis 双锚无快照可关闭）
+            if (
+                verdict.reason_code == "p4_exit"
+                and ambush_fact is not None
+                and ambush_fact.get("signal")
+            ):
+                ambush_exit_info = {
+                    "symbol": symbol,
+                    "sector": sector_name,
+                    "category_tag": ambush_fact.get("category_tag"),
+                    "exit_signal": ambush_fact.get("signal"),
+                    "reason": ambush_fact.get("reason"),
+                }
+                if not hasattr(self, '_ambush_exits'):
+                    self._ambush_exits = []
+                self._ambush_exits.append(ambush_exit_info)
+
+            # C-B2 shadow：缺省阈值 30 未命中（day≤30）、但切 14 会命中 reduce（day>14）→ 仅留痕，
+            # 供启用前盘点统计非零冲击（不参与任何判定，关闭旧路径逐字节不变）
+            if verdict.reason_code == "lifecycle_signal":
                 from src.got.catalyst_config import LIFECYCLE_MATURE_REDUCE_DAY
                 if (
                     lifecycle_phase == "mature"
                     and lifecycle_day
                     and 14 < lifecycle_day <= LIFECYCLE_MATURE_REDUCE_DAY
-                    and action != "sell"  # sell 优先级更高，计入会高估 reduce 冲击
+                    and verdict.action != "sell"  # sell 优先级更高，计入会高估 reduce 冲击
                 ):
                     self._mature_reduce_shadow_hits["hits"].append({
                         "symbol": symbol,
                         "sector": sector_name,
                         "lifecycle_day": lifecycle_day,
-                        "action_kept": action,
+                        "action_kept": verdict.action,
                     })
 
             # 构建 reasoning，包含板块情报信息
@@ -1154,6 +1271,37 @@ class PortfolioDecisionNode:
                 f"{'（无数据，已跳过）' if not capital_has_data else ''}, "
                 f"动作: {action}"
             )
+            # H1：资金维数据供给留痕（缺失显式标注 / 命中给 1d-3d-5d 流向）
+            if capital_data_missing:
+                reasoning += " [资金维缺失→权重已归一化]"
+            elif _flow_row and _flow_row.get("matched_key"):
+                _f1 = _flow_row.get("flow")
+                _f3 = _flow_row.get("flow_3d")
+                _f5 = _flow_row.get("flow_5d")
+                _flow_txt = "/".join(
+                    f"{label}{value:+.1f}亿"
+                    for label, value in (("1d", _f1), ("3d", _f3), ("5d", _f5))
+                    if value is not None
+                )
+                if _flow_txt:
+                    reasoning += f" [板块资金{_flow_txt}·{_flow_row['matched_key']}]"
+            # H3：历史决策证据（只进 reasoning，不改 action；enabled 时 catalyst 双锚已在裁决内生效）
+            _h_row = history_map.get(symbol) or {}
+            _h_thesis = _h_row.get("thesis") or {}
+            _h_stats = _h_row.get("plan_stats") or {}
+            if _h_thesis.get("composite_at_entry") is not None:
+                try:
+                    reasoning += (
+                        f" [入场composite {float(_h_thesis['composite_at_entry']):.0f}"
+                        f"→当日{composite:.0f}]"
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if _h_stats.get("executed_ratio") is not None:
+                reasoning += f" [近窗计划兑现率 {_h_stats['executed_ratio']:.0%}]"
+            _h_cat = _h_row.get("catalyst") or {}
+            if _h_cat.get("status") in ("elapsed", "expired"):
+                reasoning += f" [催化剂锚{_h_cat['status']}]"
 
             # ── P4 埋伏退出字段（仅埋伏持仓有效）──
             ambush_position_type = None
@@ -1224,7 +1372,12 @@ class PortfolioDecisionNode:
                     overheat_severity=overheat_severity,
                     family_name=family_name,
                     sector_match_type=sector_match_type,
-                    sector_drift_grace=grace_applied if 'grace_applied' in locals() else False,
+                    sector_drift_grace=verdict.grace_applied,
+                    action_reason_code=verdict.reason_code,
+                    sector_confirmed_guard=verdict.sector_confirmed_guard,
+                    holdings_history_evidence=(
+                        history_map.get(symbol) if history_map else None
+                    ),
                     ambush_position_type=ambush_position_type,
                     ambush_exit_signal=ambush_exit_signal,
                     ambush_exit_reason=ambush_exit_reason,
@@ -1234,6 +1387,7 @@ class PortfolioDecisionNode:
                     hwm_approx=(bool(_hwm_info.get("approx")) if _hwm_info else None),
                     entry_source=_entry_source,
                     lifecycle_phase_source=lifecycle_phase_source,
+                    capital_data_missing=capital_data_missing,
                 )
             )
 
@@ -1260,35 +1414,75 @@ class PortfolioDecisionNode:
             }}
         """
         sector_intel_map = {}
-        if not unified.confirmed_sectors:
+        # H1（2026-10-27）：持仓专属情报先入表——只含 confirmed_sectors 未收录的持仓诉求板块
+        # （建侧已去重），故与 confirmed 无键冲突；仍然让 confirmed 后写覆盖，确保任何重叠
+        # 场景下分类口径来自选股通道而非持仓中性档。
+        for sector_intel in (getattr(unified, "holdings_intel", None) or []):
+            sector_intel_map[sector_intel.sector_name] = self._sector_intel_row(sector_intel)
+        if not unified.confirmed_sectors and not sector_intel_map:
             return sector_intel_map
 
-        for sector_intel in unified.confirmed_sectors:
-            # 提取生命周期信息
-            lifecycle_phase = None
-            lifecycle_day = None
-            if sector_intel.lifecycle:
-                lifecycle_phase = sector_intel.lifecycle.phase
-                lifecycle_day = sector_intel.lifecycle.days_since_launch
-
-            sector_intel_map[sector_intel.sector_name] = {
-                'classification': sector_intel.classification,
-                'composite_score': sector_intel.composite_score,
-                'confidence': sector_intel.confidence,
-                'capital_check': sector_intel.capital_check,
-                'news_check': sector_intel.news_check,
-                'sentiment_check': sector_intel.sentiment_check,
-                'tech_score': sector_intel.tech_score,
-                'sector_role': getattr(sector_intel, 'sector_role', 'mainline'),
-                'lifecycle_phase': lifecycle_phase,
-                'lifecycle_day': lifecycle_day,
-                'overheat_severity': getattr(sector_intel, 'overheat_severity', None),
-                'frame_group': getattr(sector_intel, 'frame_group', None),
-                'momentum_state': getattr(sector_intel, 'momentum_state', None),
-                'rs_mom_decay_2d': getattr(sector_intel, 'rs_mom_decay_2d', None),
-            }
+        for sector_intel in (unified.confirmed_sectors or []):
+            sector_intel_map[sector_intel.sector_name] = self._sector_intel_row(sector_intel)
 
         return sector_intel_map
+
+    @staticmethod
+    def _sector_intel_row(sector_intel) -> Dict[str, Any]:
+        """SectorIntel → Phase 2 情报行（_build_sector_intel_map 单行构造，两源共用）。"""
+        lifecycle_phase = None
+        lifecycle_day = None
+        if sector_intel.lifecycle:
+            lifecycle_phase = sector_intel.lifecycle.phase
+            lifecycle_day = sector_intel.lifecycle.days_since_launch
+
+        return {
+            'classification': sector_intel.classification,
+            'composite_score': sector_intel.composite_score,
+            'confidence': sector_intel.confidence,
+            'capital_check': sector_intel.capital_check,
+            'news_check': sector_intel.news_check,
+            'sentiment_check': sector_intel.sentiment_check,
+            'tech_score': sector_intel.tech_score,
+            'sector_role': getattr(sector_intel, 'sector_role', 'mainline'),
+            'board_state': getattr(sector_intel, 'board_state', None),
+            'lifecycle_phase': lifecycle_phase,
+            'lifecycle_day': lifecycle_day,
+            'overheat_severity': getattr(sector_intel, 'overheat_severity', None),
+            'frame_group': getattr(sector_intel, 'frame_group', None),
+            'momentum_state': getattr(sector_intel, 'momentum_state', None),
+            'rs_mom_decay_2d': getattr(sector_intel, 'rs_mom_decay_2d', None),
+        }
+
+    @staticmethod
+    def _match_holdings_flow_row(
+        sector_names: list, flow_rows: dict[str, dict],
+    ) -> Optional[dict]:
+        """按板块名（含所属板块列表）在 Node 3 持仓资金流索引中找命中行。
+
+        顺序：精确 → 别名变体 → 归一化，与 Node 3/Screener 同一口径（不复写第二套顺序）。
+        返回命中的 index 行（matched=True）或 None。
+        """
+        if not flow_rows:
+            return None
+        from src.got.board_aliases import normalize_sector_name, sector_name_variants
+
+        names = [n for n in (sector_names or []) if n]
+        for name in names:
+            row = flow_rows.get(name)
+            if row and row.get("matched"):
+                return row
+        for name in names:
+            for variant in sector_name_variants(name):
+                row = flow_rows.get(variant)
+                if row and row.get("matched"):
+                    return row
+        norm_rows = {normalize_sector_name(k): v for k, v in flow_rows.items()}
+        for name in names:
+            row = norm_rows.get(normalize_sector_name(name))
+            if row and row.get("matched"):
+                return row
+        return None
 
     def _compute_fxg_exclusions(
         self,
@@ -1389,7 +1583,13 @@ class PortfolioDecisionNode:
                 if best:
                     lifecycle_map[group.group_name] = self._extract_lifecycle_from_detail(best)
 
-        for detail_list_attr in ('cooling_down', 'exhausted_mainline', 'ambush', 'defensive_rotation', 'top_by_score'):
+        for detail_list_attr in (
+            'cooling_down', 'exhausted_mainline', 'ambush', 'defensive_rotation',
+            'top_by_score',
+            # H1（2026-10-27）：Node 2 持仓板块兜底追踪结果——Node 6 holdings_intel 缺失时
+            # （如 Node 6 侧异常）仍能从 Node 2 取到 lifecycle，避免落 40/60 降温档。
+            'holdings_sectors',
+        ):
             for detail in (getattr(sector_context, detail_list_attr, None) or []):
                 if detail.name and detail.name not in lifecycle_map:
                     lifecycle_map[detail.name] = self._extract_lifecycle_from_detail(detail)
@@ -1433,6 +1633,11 @@ class PortfolioDecisionNode:
             return base_score
 
         intel = sector_intel_map[sector_name]
+        # H1（2026-10-27）：role=holding 只承载 lifecycle/强度事实（glue 未覆盖该板块，
+        # capital/news/sentiment 恒为未验证值）。对未验证维度加减分等于凭空造证据，
+        # 故持仓补入板块不做情报加减分；过热/拥挤降权仍由 _compute_overheat_penalty 施加。
+        if intel.get('sector_role') == 'holding':
+            return base_score
         adjustment = 0.0
 
         # classification 调整（区分主线/埋伏，conviction-weighted）

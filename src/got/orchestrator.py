@@ -150,8 +150,25 @@ class GOTOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[GOT] 网络预检失败（已忽略）: %s", exc)
 
+        # H1（持仓模块三原则接线，2026-10-27）：Phase 1 头部构建一次持仓上下文，
+        # 供 Node 2/3/6 产出「针对持仓的分析数据」。纯 SQLite + 快照读，零 LLM/零爬虫；
+        # 失败 fail-open（degraded → 下游按无持仓处理），绝不阻断 GOT 主流程。
+        holdings_ctx = None
+        if not self.use_mock:
+            try:
+                from src.got.holdings_context import build_holdings_context
+                holdings_ctx = await asyncio.to_thread(build_holdings_context, target_date)
+                logger.info(
+                    "[GOT] 持仓上下文: status=%s, %d 只持仓, %d 个板块诉求",
+                    holdings_ctx.status, len(holdings_ctx.positions),
+                    len(holdings_ctx.sector_wishes),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[GOT] 持仓上下文构建失败（已忽略，按无持仓运行）: %s", exc)
+                holdings_ctx = None
+
         # Step 2: 并行执行两路
-        tech_path_task = self._run_tech_path()
+        tech_path_task = self._run_tech_path(holdings_ctx)
         data_path_task = self._run_data_path(bar_complete)
 
         tech_result, data_result = await asyncio.gather(
@@ -191,6 +208,14 @@ class GOTOrchestrator:
             capital=capital_ctx,
             news=news_ctx,
             sentiment=sentiment_ctx,
+            # H1：持仓上下文 → Node 6 产出 holdings_intel（持仓专属 SectorIntel，与选股通道隔离）
+            holdings=holdings_ctx,
+            # 业务日必须与归档/Phase 2 同源（2026-10-23 补）：不传则 Node 6 回退
+            # date.today()，跨日上下文（previous_context_YYYYMMDD）、埋伏 entered_date、
+            # 催化剂 proximity、relations before 全按真实今天算，而归档目录与 Phase 2
+            # as_of 按 target_date —— 补跑历史日会写错跨日基线并污染 regime 状态机。
+            # 生产（target_date=today）逐字节不变。
+            run_date=target_date,
         )
 
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -407,14 +432,18 @@ class GOTOrchestrator:
 
         return unified
 
-    async def _run_tech_path(self) -> tuple:
-        """技术分析路：串行依赖（大盘 → 板块 → 资金面）"""
+    async def _run_tech_path(self, holdings=None) -> tuple:
+        """技术分析路：串行依赖（大盘 → 板块 → 资金面）
+
+        holdings: H1 持仓上下文（None=mock/构建失败 → 节点按无持仓诉求运行）。
+        Node 1（大盘）与持仓无关，保持不传。
+        """
         logger.info("[GOT] 技术分析路：开始")
 
         market_ctx = await self.market_node.run()
         logger.info(f"[GOT]   Node 1 完成 — 科技成长: {market_ctx.tech_growth.trend}")
 
-        sector_ctx = await self.sector_node.run(market_context=market_ctx)
+        sector_ctx = await self.sector_node.run(market_context=market_ctx, holdings=holdings)
         if sector_ctx.status in ("degraded", "failed"):
             raise RuntimeError(
                 f"[GOT] Node 2 板块分析失败（status={sector_ctx.status}），"
@@ -425,6 +454,7 @@ class GOTOrchestrator:
         capital_ctx = await self.capital_node.run(
             market_context=market_ctx,
             sector_context=sector_ctx,
+            holdings=holdings,
         )
         logger.info(f"[GOT]   Node 3 完成 — 机构态度: {capital_ctx.institutional_attitude}")
 

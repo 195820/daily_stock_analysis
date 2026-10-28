@@ -94,10 +94,14 @@ class CapitalAnalysisNode:
         self,
         market_context: MarketContext,
         sector_context: SectorContext,
+        holdings=None,
     ) -> CapitalContext:
         """执行资金面分析。
 
         流程：并发获取 3 维度数据 → 逐维度评分 → 加权聚合 → LLM reasoning
+
+        holdings: H1 持仓上下文（None=无持仓诉求）。仅用于产出 `holdings_flow_index`
+        （持仓板块资金流三级别名匹配留痕），**不改** institutional_score 计算。
         """
         if self.use_mock:
             logger.info("[Node 3] 使用 mock 数据")
@@ -113,6 +117,16 @@ class CapitalAnalysisNode:
 
             # Step 2: 逐维度评分 + 加权聚合
             result = self._calculate_institutional_score(raw_data, quality, sector_context)
+
+            # Step 2.5（H1 持仓供数）：持仓板块资金流索引留痕。
+            # 持仓股无 DDE（非问财候选），板块资金流是唯一可用资金维；此处把「哪些持仓板块
+            # 拿到了资金数据、用哪个别名键命中」显式记下，Phase 2 据此把缺失维降维而非静默吞 0。
+            try:
+                result.evidence.holdings_flow_index = self._build_holdings_flow_index(
+                    result.evidence.sector_flow, holdings,
+                )
+            except Exception as exc:  # noqa: BLE001 — 供数留痕失败不阻断 Node 3
+                logger.warning("[Node 3] holdings_flow_index 构建失败（已忽略）: %s", exc)
 
             # Step 3: 判定失败
             if result.status == "failed":
@@ -297,6 +311,65 @@ class CapitalAnalysisNode:
     # =================================================================
     # 单维度评分函数
     # =================================================================
+
+    @staticmethod
+    def _build_holdings_flow_index(
+        sector_flow_evidence: Optional[dict],
+        holdings,
+    ) -> Optional[dict]:
+        """持仓板块资金流索引（H1，2026-10-27）。
+
+        对每个 `holdings.sector_wishes` 板块做「精确 → 别名变体 → 归一化」三级匹配，
+        记下命中的真实键与 1d/3d/5d 净流入。用途：
+        1. Phase 2 把匹配到的键喂回 `_score_capital`（消除别名口径丢分）；
+        2. 未命中的板块显式标 `capital_data_missing`（缺失≠零分，仓库纪律）。
+
+        无持仓诉求 → None（与「有持仓但全未命中」区分开，后者是有效读数）。
+        """
+        wishes: list[str] = []
+        for raw_wish in (getattr(holdings, "sector_wishes", None) or []):
+            wish = (raw_wish or "").strip()
+            if wish and wish not in wishes:
+                wishes.append(wish)
+        if not wishes:
+            return None
+
+        evidence = sector_flow_evidence or {}
+        flow_map: dict[str, float] = evidence.get("sector_flow_all") or {}
+        flow_3d: dict[str, float] = evidence.get("sector_flow_all_3d") or {}
+        flow_5d: dict[str, float] = evidence.get("sector_flow_all_5d") or {}
+
+        index: dict[str, dict] = {}
+        hit_count = 0
+        misses: list[str] = []
+        for wish in wishes:
+            matched_key = _resolve_sector_flow_key(wish, flow_map)
+            row = {
+                "matched": bool(matched_key),
+                "matched_key": matched_key or "",
+                "flow": flow_map.get(matched_key) if matched_key else None,
+                "flow_3d": flow_3d.get(matched_key) if matched_key else None,
+                "flow_5d": flow_5d.get(matched_key) if matched_key else None,
+            }
+            index[wish] = row
+            if matched_key:
+                hit_count += 1
+            else:
+                misses.append(wish)
+
+        note = ""
+        if not flow_map:
+            note = "sector_flow_all 不可用（Node 3 降级），全部持仓板块资金维缺失"
+        elif misses:
+            note = f"{len(misses)} 个持仓板块在 sector_flow_all 三级别名匹配后仍未命中"
+
+        return {
+            "wishes": wishes,
+            "index": index,
+            "hit_count": hit_count,
+            "miss": misses,
+            "note": note,
+        }
 
     @staticmethod
     def _score_sector_flow(
@@ -688,4 +761,26 @@ def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
         for candidate in candidates:
             if candidate in col_text:
                 return col
+    return None
+
+
+def _resolve_sector_flow_key(name: str, flow_map: dict[str, float]) -> Optional[str]:
+    """板块名 → sector_flow_all 真实键：精确 → 别名变体 → 归一化（与 screener 同口径）。
+
+    screener `_score_capital` 用同样三级顺序匹配；本函数只返回「命中的键」，
+    供 Node 3 留痕 / Phase 2 回喂，避免两处各写一套顺序。
+    """
+    if not name or not flow_map:
+        return None
+    from src.got.board_aliases import normalize_sector_name, sector_name_variants
+
+    if name in flow_map:
+        return name
+    for variant in sector_name_variants(name):
+        if variant in flow_map:
+            return variant
+    canon = normalize_sector_name(name)
+    for key in flow_map:
+        if normalize_sector_name(key) == canon:
+            return key
     return None
