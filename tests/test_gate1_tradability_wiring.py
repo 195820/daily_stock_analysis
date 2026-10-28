@@ -2,7 +2,7 @@
 """GATE-1 可成交性投影层 + WI-P1-9 真实交易日历 + WI-P1-7(a) 词表重叠自检。
 
 对应实施报告 docs/got/plans/architecture_optimization_implementation_20260929.md：
-- GATE-1 验收：跌停一字/T+1/涨停一字三态用例 + 行情不可用不拦截不抛异常 +
+- GATE-1 验收：跌停一字/T+1/涨停封板（含一字与盘中封板）三态用例 + 行情不可用不拦截不抛异常 +
   开关全关逐字节不变红线
 - WI-P1-9 验收：节假日计数正确；日历异常降级 weekend-only 不崩
 - WI-P1-7(a) 验收：去重后词表无跨族重叠
@@ -85,6 +85,24 @@ def test_buy_blocked_at_limit_up_one_word() -> None:
         quote_low=11.00, quote_high=11.00, limit_pct=10.0,
     )
     assert not res.executable and res.blocked_reason == "limit_up"
+
+
+def test_buy_blocked_when_limit_up_after_intraday_open() -> None:
+    """现价触板但盘中曾开板（low < 涨停）→ 仍不可买（2026-10-27 002093 实盘）"""
+    res = check_tradability(
+        action="buy", quote_price=11.00, pre_close=10.0,
+        quote_low=10.50, quote_high=11.00, limit_pct=10.0,
+    )
+    assert not res.executable and res.blocked_reason == "limit_up"
+
+
+def test_buy_allowed_below_limit_up() -> None:
+    """现价未触板 → 放行（不误拦开板后回落的票）"""
+    res = check_tradability(
+        action="buy", quote_price=10.90, pre_close=10.0,
+        quote_low=10.50, quote_high=11.00, limit_pct=10.0,
+    )
+    assert res.executable and res.blocked_reason is None
 
 
 def test_missing_quote_never_blocks() -> None:
@@ -214,7 +232,7 @@ def test_quote_unavailable_never_blocks_enabled(node, monkeypatch) -> None:
 
 
 def test_enabled_blocks_limit_up_buy(node, monkeypatch) -> None:
-    """enabled：涨停一字买入候选禁入成交集合"""
+    """enabled：涨停封板买入候选禁入成交集合"""
     monkeypatch.setenv("GOT_TRADABILITY_GATE", "enabled")
     _patch_quote(node, monkeypatch, {"002040": _LIMIT_UP_Q})
     allocations, _ = node._allocate([_buy_candidate()], _risk(), {
