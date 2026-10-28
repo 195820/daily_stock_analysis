@@ -29,10 +29,24 @@ from src.got.catalyst_config import (
     CATALYST_TIER_DEFAULT,
     GOT_MACRO_FANOUT_ENABLED,
     MACRO_FANOUT_LEGACY_BOARDS,
+    GOT_MACRO_CALENDAR_ENABLED,
+    GOT_NARRATIVE_FERMENTING_INPUT,
+    FERMENTING_INPUT_MAX,
+    FERMENTING_RECENCY_DAYS,
+    FERMENTING_MIN_TITLE_LEN,
 )
 from src.got.board_aliases import normalize_sector_name as _normalize_sector_name
+from src.got.global_events_manual import active_manual_events
 
 logger = logging.getLogger(__name__)
+
+# 日期确定型事件类型（2026-10-22）：这类映射必须有 anchor_keywords（财报/会议/数据语义），
+# 否则公司名/实体裸命中会伪造事件日期（实测：三星 8nm 工艺新闻被映射成 SK 海力士财报，
+# source_news 是工艺新闻、标题却是「财报及 HBM 指引」）。产物/大宗/地缘型事件本身即突发，
+# 无确定日期可伪造，允许无锚定词。
+_ANCHOR_REQUIRED_EVENT_TYPES = ("earnings", "policy", "data", "macro")
+# fail-closed 跳过只提示一次（静态配置，进程内不重复刷日志）
+_WARNED_UNANCHORED_MAPS: Set[int] = set()
 
 
 # =============================================================================
@@ -440,6 +454,7 @@ class CatalystCalendarBuilder:
         news_events = self._load_recent_news_events(days=7)
 
         global_events = self._map_global_events(news_events, start, end)
+        global_events.extend(self._manual_global_events(start, end))
         all_events.extend(global_events)
 
         narrative = await self._llm_extract_narrative_catalysts(news_events, start, end)
@@ -455,8 +470,10 @@ class CatalystCalendarBuilder:
         all_events = [e for e in all_events if e.source == "macro_rule"] + self._deduplicate(dedup_pool)
 
         logger.info(
-            "[CatalystCalendar] 全量构建: macro=%d global=%d narrative=%d → 去重后 %d（个股级不入历）",
-            len(macro_raw), len(global_events), len(narrative), len(all_events),
+            "[CatalystCalendar] 全量构建: macro=%d%s global=%d narrative=%d → 去重后 %d（个股级不入历）",
+            len(macro_raw),
+            "" if GOT_MACRO_CALENDAR_ENABLED else "(已退出)",
+            len(global_events), len(narrative), len(all_events),
         )
         return all_events
 
@@ -475,6 +492,7 @@ class CatalystCalendarBuilder:
         # 全球映射增量（近 1 天新闻）
         news_events = self._load_recent_news_events(days=1)
         global_events = self._map_global_events(news_events, start, end)
+        global_events.extend(self._manual_global_events(start, end))
         for e in global_events:
             if e.event_id not in existing_ids:
                 new_events.append(e)
@@ -502,7 +520,14 @@ class CatalystCalendarBuilder:
         return all_events
 
     def _generate_macro_calendar(self, start: date, end: date) -> List[Dict]:
-        """宏观日历：规则内置（PMI/CPI/社融/LPR）"""
+        """宏观日历：规则内置（PMI/CPI/社融/LPR）
+
+        2026-10-22 用户裁决：例行宏观无事件日波动（macro 已兑现 12 条仅 1 条
+        |收益|>2%，PMI 两条 ±0.5%），退出催化剂日历。开关
+        `GOT_MACRO_CALENDAR_ENABLED`（缺省 false）关闭生成；回滚置 true 恢复。
+        """
+        if not GOT_MACRO_CALENDAR_ENABLED:
+            return []
         results = []
 
         # 遍历窗口内的每个月
@@ -565,7 +590,30 @@ class CatalystCalendarBuilder:
         身份锚定（2026-10-21）— 同一 global_event 身份在首次锚定后 CATALYST_WINDOW_DAYS
         个日历日内不重锚；增量路径（start=today, days=1）因此不会每日滚动；到期实例
         由窗口谓词淘汰，超窗再现才视为新事件实例。
+
+        事件目录治理（2026-10-22）— 日期确定型映射（earnings/policy/data/macro）缺
+        `anchor_keywords` 时 fail-closed 跳过：这类事件有确定日期，实体裸命中会把工艺/
+        行情/合作新闻伪造成财报/数据事件。产物/大宗/地缘型（product/commodity/geo）允许
+        无锚定词（事件本身即突发）。新增锚定词即可恢复某条映射，无需回滚开关。
         """
+        active_mappings: List[Dict[str, Any]] = []
+        for mapping in GLOBAL_TO_A_SHARE_MAP:
+            if (
+                not mapping.get("anchor_keywords")
+                and mapping.get("event_type_fixed") in _ANCHOR_REQUIRED_EVENT_TYPES
+            ):
+                map_id = mapping.get("id")
+                if map_id not in _WARNED_UNANCHORED_MAPS:
+                    _WARNED_UNANCHORED_MAPS.add(map_id)
+                    logger.warning(
+                        "[CatalystCalendar] 映射 #%s「%s」缺 anchor_keywords"
+                        "（event_type_fixed=%s），fail-closed 跳过（补锚定词后恢复）",
+                        map_id, mapping.get("global_event"),
+                        mapping.get("event_type_fixed"),
+                    )
+                continue
+            active_mappings.append(mapping)
+
         # 聚合命中：key = global_event 名 → (mapping, 最早新闻日期, 锚定新闻标题)
         hits: Dict[str, Tuple[Dict[str, Any], date, str]] = {}
         for news in news_events:
@@ -576,7 +624,7 @@ class CatalystCalendarBuilder:
                 )
                 continue
             title_lower = news.title.lower()
-            for mapping in GLOBAL_TO_A_SHARE_MAP:
+            for mapping in active_mappings:
                 keywords = mapping["global_keywords"]
                 if not any(kw.lower() in title_lower for kw in keywords):
                     continue
@@ -677,6 +725,43 @@ class CatalystCalendarBuilder:
 
         return results
 
+    def _manual_global_events(self, start: date, end: date) -> List[CatalystEvent]:
+        """人工单列大事件 → CatalystEvent（`src/got/global_events_manual.py` 登记）。
+
+        与关键词映射的分工：map 只收固定事件目录，一次性大事件单列一条登记，避免
+        「蹭名称的旁支新闻」把无关条目顶成事件（2026-10-22 治理）。字段逐项取人工
+        登记值（impact_level/confidence/title/source_news 不回退 map 缺省），有效期
+        以 `start`（=target_date）判定：过期即不产事件；存量行由全量重建的残留清理
+        （produced_sources 含 global_manual）与 `expires_at` 到期兜底，不留永久残留。
+        板块名仍需命中 CONCEPT_UNIVERSE（未命中不产事件，不猜）。
+        """
+        results: List[CatalystEvent] = []
+        for entry in active_manual_events(start):
+            catalyst_date = min(_trade_days_offset(entry["occurred_date"], 1), end)
+            if catalyst_date < start:
+                # 事件日已过（catalyst_date 落在窗口前）→ 与 global_map 同口径落历
+                continue
+            for sector_hint in entry["sectors"]:
+                for sector in self._match_sector_hint(sector_hint):
+                    results.append(CatalystEvent(
+                        event_id=_make_event_id(
+                            "global_manual", "global", sector, catalyst_date,
+                        ),
+                        event_date=catalyst_date,
+                        event_type="global",
+                        title=entry["title"],
+                        sector=sector,
+                        impact_level=entry["impact_level"],
+                        direction=entry["direction"],
+                        confidence=entry["confidence"],
+                        consensus_expectation=entry["a_share_linkage"],
+                        source="global_manual",
+                        category_tag=entry["category_tag"],
+                        is_global=True,
+                        source_news=entry["source_news"],
+                    ))
+        return results
+
     def _match_sector_hint(self, sector_hint: str) -> List[str]:
         """板块关键词 → CONCEPT_UNIVERSE 中匹配的板块名"""
         # 精确匹配
@@ -690,6 +775,80 @@ class CatalystCalendarBuilder:
     # =================================================================
     # LLM 叙事型催化剂提取
     # =================================================================
+
+    def _format_fermenting_section(self, today: Optional[date] = None) -> str:
+        """跨日发酵原始新闻段（2026-10-22）：`_detect_fermenting_events` 的首个调用方。
+
+        背景：`NewsAnalysisNode._detect_fermenting_events()`（appearance_count>=3 且
+        跨日>=2 天）是全仓唯一直接实现「跨日发酵」信号的机制，此前零调用、从未进入
+        任何 prompt。厄尔尼诺×农业反例正属此类：8-24 起 37 条原始新闻反复出现
+        （"超强厄尔尼诺持续发酵"9-01 出现 3 次），但 Node 4 只抽出 3 条二手转述事件。
+
+        **不新写第二套检测**：直接复用该方法；本函数只负责过滤、排序（appearance_count
+        降序）、截断（FERMENTING_INPUT_MAX）与 prompt 渲染。输出侧不变——仍走
+        `_parse_llm_narrative` 的 D1–D4 守卫与窗口/周末校验（新来源一视同仁）。
+
+        调用侧边界（2026-10-22 真库核查，见 catalyst_config 注释）：
+        - 时效：`last_seen_date ∈ [today-N, today]`（N=FERMENTING_RECENCY_DAYS）——
+          检测器无时效上界且 `node4_raw_news.lifecycle_state` 恒 active，不加则注入
+          8 月以来的陈旧论坛长文；上界 `<= today` 同时守住回放前视。
+        - 形态：标题长度 < FERMENTING_MIN_TITLE_LEN 的裸实体（「中际旭创」「宁德时代」）
+          不含事件信息，不构成发酵信号。
+
+        开关 GOT_NARRATIVE_FERMENTING_INPUT=false → 返回 ""（prompt 逐字节回现状）。
+        """
+        if not GOT_NARRATIVE_FERMENTING_INPUT:
+            return ""
+        try:
+            from src.got.nodes.news_analysis import NewsAnalysisNode
+            rows = NewsAnalysisNode()._detect_fermenting_events()
+        except Exception as exc:  # noqa: BLE001 — 旁挂输入，失败只丢该段
+            logger.warning("[CatalystCalendar] 发酵原始新闻读取失败（跳过该段）: %s", exc)
+            return ""
+
+        anchor = today or date.today()
+        cutoff = anchor - timedelta(days=FERMENTING_RECENCY_DAYS)
+        kept = []
+        for r in (rows or []):
+            title = (getattr(r, "title_original", "") or "").strip()
+            if len(title) < FERMENTING_MIN_TITLE_LEN:
+                continue
+            last_seen = getattr(r, "last_seen_date", None)
+            if not isinstance(last_seen, date) or not (cutoff <= last_seen <= anchor):
+                continue
+            kept.append(r)
+
+        stale_dropped = len(rows or []) - len(kept)
+        kept.sort(key=lambda r: int(getattr(r, "appearance_count", 0) or 0), reverse=True)
+        kept = kept[:FERMENTING_INPUT_MAX]
+        if not kept:
+            if stale_dropped:
+                logger.info(
+                    "[CatalystCalendar] 发酵原始新闻 %d 条全部超出时效/形态边界（跳过该段）",
+                    stale_dropped,
+                )
+            return ""
+
+        lines: List[str] = []
+        for r in kept:
+            try:
+                span = (r.last_seen_date - r.first_seen_date).days + 1
+            except (TypeError, AttributeError):
+                span = 1
+            lines.append(
+                f"- {r.title_original.strip()}"
+                f"（出现 {int(getattr(r, 'appearance_count', 0) or 0)} 次，跨 {span} 天）"
+            )
+        logger.info(
+            "[CatalystCalendar] 发酵原始新闻入 prompt: %d 条（原始 %d 条，过滤 %d）",
+            len(lines), len(rows or []), stale_dropped,
+        )
+        return (
+            "\n## 跨日发酵信号（原始新闻，非事件）\n"
+            + "\n".join(lines)
+            + "\n以上条目是**尚未被抽成事件**的原始新闻，若其中已有明确未来节点"
+              "（政策落地/发布/招标/披露），可同样输出为催化剂；没有则忽略。\n"
+        )
 
     async def _llm_extract_narrative_catalysts(
         self, news_events: List[NewsEvent], start: date, end: date
@@ -720,7 +879,9 @@ class CatalystCalendarBuilder:
             and _anchor_ok(e)
         ]
 
-        if not candidates:
+        # 时效锚定 start（=target_date，回放即回放日），非 date.today()：守前视纪律
+        fermenting_section = self._format_fermenting_section(start)
+        if not candidates and not fermenting_section:
             return []
 
         # 构建 prompt
@@ -729,7 +890,7 @@ class CatalystCalendarBuilder:
             f"- [{e.lifecycle_state}] {e.title} (影响={e.impact_level}, "
             f"情感={e.sentiment}, 首次={e.first_seen}, 提及={e.mention_count})"
             for e in candidates[:30]  # 限制输入量
-        )
+        ) or "（今日无已抽事件候选）"
 
         today = start  # start 即 target_date（今日）
         prompt = f"""你是一个 A 股市场催化剂分析师。你的任务是识别未来 {CATALYST_WINDOW_DAYS} 天内**尚未发生**的催化剂事件。
@@ -738,7 +899,7 @@ class CatalystCalendarBuilder:
 
 ## 候选新闻事件
 {events_summary}
-
+{fermenting_section}
 ## 合法板块列表（只允许映射到以下板块）
 {json.dumps(concept_list, ensure_ascii=False)}
 
@@ -1480,7 +1641,12 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
         来源降级护栏（2026-08-31）：某来源本次产出为 0 可能是降级（如 LLM 模块缺失）
         而非"无事件"，此时删除该来源存量会误伤有效日历；只清理本次有产出的来源。
-        结构化/宏观事件（akshare_*/macro_rule）event_id 幂等，不在此主动删除。
+        例外（2026-10-21 实测）：`global_map` 是纯规则映射、`global_manual` 是静态人工
+        目录，产出 0 = 当日无命中而非降级——两者无条件参与残留清理，否则全量重建后
+        旧行仍留在库中，同一交易日再跑（增量 `_load_active_events`）会把它们原样载回。
+        结构化事件（akshare_*）event_id 幂等，不在此主动删除；`macro_rule` 仅在
+        宏观日历退出（`GOT_MACRO_CALENDAR_ENABLED=false`）时纳入清理（P6 兑现记录
+        在 catalyst_realizations 另一张表，不受影响）。
         """
         from src.storage import DatabaseManager, CatalystEventRecord
         db = DatabaseManager()
@@ -1488,8 +1654,19 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
         # 本次有产出的非结构化来源（未产出来源的存量跳过清理）
         produced_sources = sorted({
-            e.source for e in events if e.source in ("global_map", "llm_narrative")
+            e.source for e in events
+            if e.source in ("global_map", "global_manual", "llm_narrative")
         })
+        # 确定性来源无条件纳入（见 docstring 例外说明）
+        # node4_event（2026-10-22，伏通道补登 P6）：与 global_map/global_manual 同属确定性来源
+        # ——Node 4 事件不进本表（日历由 Node 4 侧构建），纳入只为「当日零 node4 产出」时
+        # 不会因未产出而跳过该来源的残留清理口径。
+        produced_sources = sorted(
+            set(produced_sources) | {"global_map", "global_manual", "node4_event"}
+        )
+        # 宏观日历退出是配置级动作：即使当轮日历零产出（下面 skip_stale_cleanup
+        # 护栏会跳常规残留清理），存量 macro_rule 也必须清掉，不能等下一次有产出。
+        macro_disabled = not GOT_MACRO_CALENDAR_ENABLED
 
         # R4 护栏：重建结果为空（数据源全面降级）时不清理残留，
         # 否则 ~event_id.in_(空集) 恒真，会把全部 global_map/llm_narrative 删光；
@@ -1505,6 +1682,12 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 CatalystEventRecord.expires_at < target_date
             ).delete(synchronize_session=False)
 
+            macro_disabled_count = 0
+            if macro_disabled:
+                macro_disabled_count = session.query(CatalystEventRecord).filter(
+                    CatalystEventRecord.source == "macro_rule"
+                ).delete(synchronize_session=False)
+
             if skip_stale_cleanup or not produced_sources:
                 stale_count = 0
             else:
@@ -1515,8 +1698,8 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
             session.commit()
 
         logger.info(
-            "[CatalystCalendar] 全量重建清理: 过期=%d, 残留=%d",
-            expired_count, stale_count,
+            "[CatalystCalendar] 全量重建清理: 过期=%d, 残留=%d, 宏观退出=%d",
+            expired_count, stale_count, macro_disabled_count,
         )
 
     def _load_active_events(self, target_date: date) -> List[CatalystEvent]:
@@ -1545,6 +1728,14 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 "[CatalystCalendar] 前瞻窗口剔除已过事件日记录: %d/%d（target=%s）",
                 dropped, len(rows), target_date,
             )
+        if not GOT_MACRO_CALENDAR_ENABLED:
+            kept = [r for r in records if getattr(r, "source", "") != "macro_rule"]
+            if len(kept) != len(records):
+                logger.debug(
+                    "[CatalystCalendar] 宏观日历已退出，增量加载跳过 %d 条 macro_rule",
+                    len(records) - len(kept),
+                )
+            records = kept
 
         return [
             CatalystEvent(
@@ -1604,7 +1795,9 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 lifecycle_state=r.lifecycle_state,
                 mention_count=r.mention_count,
                 first_seen=str(r.first_seen) if r.first_seen else None,
-                source_count=len(r.get_sources_seen()),
+                # NewsEvent.source_count 有 ge=1 约束；历史行 sources_seen 为空时不得让整条
+                # 加载失败（否则 global_map/Node 4 昨日补读会被一行 legacy 数据静默禁用）
+                source_count=max(1, len(r.get_sources_seen())),
             )
             for r in records
         ]

@@ -149,6 +149,40 @@ class TestAmbushLaneSplit(unittest.TestCase):
             # 断言 lane_shadow 含模式信息
             self.assertIn("mode", lane_shadow)
 
+    def test_g_a0_filters_limit_up(self):
+        """G-A0：埋伏道在 G-A1 前剔除涨停票（2026-10-27 002093 实盘 +9.99%）"""
+        s = _screener()
+        candidates = [
+            _ticket("002093", "数据中心", change_pct=9.99),
+            _ticket("600002", "数据中心", change_pct=1.00),
+        ]
+        lane_finalists, lane_shadow, lane_trace = s._run_ambush_lane(
+            candidates,
+            {"capital_context": _capital_ctx(), "news_context": _news_ctx()},
+            fetcher_manager=None,
+        )
+        self.assertEqual(lane_trace["lane_in"], 2)
+        self.assertEqual(lane_trace["g_a0_limit_up"], 1)
+        self.assertEqual(lane_shadow["limit_up_filtered"][0]["code"], "002093")
+        self.assertNotIn("002093", [stock.code for stock in lane_finalists])
+
+    def test_g_a0_fail_open_does_not_reintroduce_limit_up(self):
+        """G-A0 成功后 G-A4 异常 fail-open → 只放回已过滤列表，涨停票不得回流"""
+        s = _screener()
+        candidates = [
+            _ticket("002093", "数据中心", change_pct=9.99),
+            _ticket("600002", "数据中心", change_pct=1.00),
+        ]
+        with patch.object(s, "_ga4_rank", side_effect=RuntimeError("mock error")):
+            lane_finalists, lane_shadow, lane_trace = s._run_ambush_lane(
+                candidates,
+                {"capital_context": _capital_ctx(), "news_context": _news_ctx()},
+                fetcher_manager=None,
+            )
+        self.assertEqual(lane_trace["g_a0_limit_up"], 1)
+        self.assertEqual([stock.code for stock in lane_finalists], ["600002"])
+        self.assertEqual(lane_shadow["limit_up_filtered"][0]["code"], "002093")
+
     def test_p5_shadowing_repro_full_funnel(self):
         """回归：P5 块变量遮蔽致埋伏道永不执行（2026-10-13 生产事故）。
 

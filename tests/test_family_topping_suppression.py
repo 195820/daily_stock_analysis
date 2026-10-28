@@ -745,7 +745,8 @@ class TestFxgShadowArtifact(unittest.TestCase):
         node = PortfolioDecisionNode(use_mock=True)
         finalist = _make_stock(code="600513", name="联环药业", sector_name="创新药")
         universe_dict = {"code": "600513", "name": "联环药业", "sector": "创新药",
-                         "sector_type": "active_mainline", "sector_score": 90}
+                         "sector_type": "active_mainline", "sector_score": 90,
+                         "sector_query_board": "创新药概念"}
         other_dict = {"code": "000001", "name": "平安银行", "sector": "银行",
                       "sector_type": "ambush", "sector_score": 60}
         old = os.getcwd()
@@ -768,6 +769,8 @@ class TestFxgShadowArtifact(unittest.TestCase):
         self.assertEqual(row0["sector_name"], "创新药")
         self.assertEqual(row0["family"], "医药")
         self.assertEqual(row0["sector_score"], 90)
+        # §7 #19：Node6 标签 vs 问财实际查询名的差异样本可离线核对
+        self.assertEqual(row0["sector_query_board"], "创新药概念")
         self.assertTrue(row0["is_finalist"])
         # 非 finalist 行：真实 code 不在 finalist 集合（F-1 缺陷时恒 False）
         self.assertEqual(row1["symbol"], "000001")

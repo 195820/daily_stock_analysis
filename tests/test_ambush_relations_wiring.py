@@ -26,6 +26,7 @@ from src.got.nodes.aggregator import AggregatorNode
 from src.got.schemas import (
     SectorContext, CapitalContext, CapitalEvidence, NewsContext, SentimentContext,
     SectorDetail, CatalystEvent, CatalystCalendar, AmbushReservoirEntry, GlueRelation,
+    DataQuality,
 )
 
 
@@ -373,6 +374,117 @@ class TestPromotionBranch(unittest.TestCase):
         self.assertEqual(1, len(promoted))
         self.assertEqual(name, promoted[0].sector_name)
         self.assertIn("蓄水池升格", promoted[0].gate_notes)
+
+
+class TestPromotionGateAligned(unittest.TestCase):
+    """2026-10-23：升格门与准入闸对齐到 0.6（回测三档无统计差异）。"""
+
+    def setUp(self):
+        self.node = AggregatorNode.__new__(AggregatorNode)
+        self.node._replay_mode = False
+        self.node._rel_idx_cache = {}
+        self.tmp_archive_root = Path(tempfile.mkdtemp(prefix="glue_arch_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_archive_root, ignore_errors=True)
+
+    def test_062_event_promotes_after_alignment(self):
+        name = "稀土"
+        ev = _make_event(name, confidence=0.62, event_id="ev062")
+        entry = AmbushReservoirEntry(
+            sector_name=name, sector_code="880301", reason="no_catalyst",
+            entered_date=date.today() - timedelta(days=3),
+            days_in_reservoir=3, entered_strength=45.0,
+        )
+        sector = SectorContext(active_mainline=[], strength_lookup={name: 55.0})
+
+        with patch("src.got.persistence.load_capital_flow_series",
+                   return_value=({}, [])), \
+             patch.object(AggregatorNode, "_load_capital_flow_aliases", return_value={}):
+            promoted, _ = self.node._check_reservoir_promotion(
+                [entry], sector, _make_news([ev]),
+                _make_capital({name: 2.0}), _make_sentiment(), date.today(),
+            )
+
+        self.assertEqual([name], [c.sector_name for c in promoted],
+                         "0.62 事件在 0.6 升格门下应能升格")
+
+    def test_058_event_still_blocked(self):
+        name = "稀土"
+        ev = _make_event(name, confidence=0.58, event_id="ev058")
+        entry = AmbushReservoirEntry(
+            sector_name=name, sector_code="880301", reason="no_catalyst",
+            entered_date=date.today() - timedelta(days=3),
+            days_in_reservoir=3, entered_strength=45.0,
+        )
+        sector = SectorContext(active_mainline=[], strength_lookup={name: 55.0})
+
+        with patch("src.got.persistence.load_capital_flow_series",
+                   return_value=({}, [])), \
+             patch.object(AggregatorNode, "_load_capital_flow_aliases", return_value={}):
+            promoted, remaining = self.node._check_reservoir_promotion(
+                [entry], sector, _make_news([ev]),
+                _make_capital({name: 2.0}), _make_sentiment(), date.today(),
+            )
+
+        self.assertEqual([], promoted, "0.58 仍低于 0.6 准入闸")
+        self.assertEqual(1, len(remaining))
+
+
+class TestNode4GlueIndex(unittest.TestCase):
+    """Node 4 事件×glue：major_events 合成 id → relations 按 board_code 归属。"""
+
+    def setUp(self):
+        self.node = AggregatorNode.__new__(AggregatorNode)
+
+    @staticmethod
+    def _news(major_events):
+        return NewsContext(
+            overall_impact="neutral", major_events=major_events,
+            concept_suggestions=[], impact_score=0.0, reasoning=None,
+            data_quality=DataQuality(),
+        )
+
+    def test_major_event_id_stable_and_distinct(self):
+        from src.got.schemas import NewsEvent
+        a = NewsEvent(event_type="policy", title="国办印发AI促就业意见", summary="",
+                      impact_level="high", sentiment="positive")
+        a2 = NewsEvent(event_type="policy", title="国办印发AI促就业意见", summary="",
+                       impact_level="medium", sentiment="neutral")
+        b = NewsEvent(event_type="policy", title="另一条事件", summary="",
+                      impact_level="high", sentiment="positive")
+        self.assertEqual(AggregatorNode._major_event_id(a), AggregatorNode._major_event_id(a2))
+        self.assertNotEqual(AggregatorNode._major_event_id(a), AggregatorNode._major_event_id(b))
+        self.assertTrue(AggregatorNode._major_event_id(a).startswith("major_"))
+
+    def test_relations_map_by_board_code(self):
+        from src.got.schemas import NewsEvent, SemanticGlueResult, GlueRelation
+        me = NewsEvent(event_type="policy", title="国办印发AI促就业意见", summary="",
+                       impact_level="high", sentiment="positive",
+                       affected_sectors=["AI手机/PC"])
+        glue = SemanticGlueResult(relations=[GlueRelation(
+            event_id=AggregatorNode._major_event_id(me), board_code="880541",
+            strength=0.5, direction="positive", propagation_path=[], confidence=0.6,
+        )])
+        index = self.node._build_node4_glue_index(glue, self._news([me]))
+        self.assertEqual([me], index.get("880541"))
+
+    def test_negative_relation_and_unknown_id_filtered(self):
+        from src.got.schemas import NewsEvent, SemanticGlueResult, GlueRelation
+        me = NewsEvent(event_type="policy", title="某利空事件", summary="",
+                       impact_level="high", sentiment="negative")
+        me2 = NewsEvent(event_type="policy", title="正常事件", summary="",
+                        impact_level="high", sentiment="positive")
+        glue = SemanticGlueResult(relations=[
+            GlueRelation(event_id=AggregatorNode._major_event_id(me), board_code="880001",
+                         strength=0.5, direction="positive", propagation_path=[], confidence=0.6),
+            GlueRelation(event_id="major_unknown", board_code="880002",
+                         strength=0.5, direction="positive", propagation_path=[], confidence=0.6),
+            GlueRelation(event_id=AggregatorNode._major_event_id(me2), board_code="880003",
+                         strength=0.5, direction="negative", propagation_path=[], confidence=0.6),
+        ])
+        index = self.node._build_node4_glue_index(glue, self._news([me, me2]))
+        self.assertEqual({}, index)
 
 
 if __name__ == "__main__":

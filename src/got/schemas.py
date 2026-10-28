@@ -539,6 +539,17 @@ class NewsEvent(BaseModel):
     # ⚠ source_url 的生产端回填（news_analysis 三步确定性回连 + news_feeds 透传）为后续子项。
     source_url: Optional[str] = Field(default=None, description="新闻出处链接（采集层透传）")
     evidence_tier: Optional[str] = Field(default=None, description="证据档：confirmed/reported/rumor")
+    # 埋伏通道专用（2026-10-22 架构修正，方案 local://node4-ambush-events-plan.md）：
+    # 不新增 confidence —— 刻意避开与 CalendarEvent.confidence 同语义，防下游把
+    # 「排序权重」误当「概率/准入闸」混用（Ordinal Gates 文献：LLM 自报置信度只适合排序）。
+    catalyst_weight: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="伏通道专用权重（非概率）：impact_level×sentiment 映射，供 ambush 准入与 B 公式",
+    )
+    catalyst_onset_days: Optional[int] = Field(
+        default=None,
+        description="LLM 估计的事件生效滞后期（交易日）；None=未知，按中位默认",
+    )
 
 
 class CatalystEvent(BaseModel):
@@ -552,7 +563,7 @@ class CatalystEvent(BaseModel):
     direction: str = Field(default="positive", description="价格方向：positive / negative / binary（二元事件）。与 category_tag（事件类型 drift/fade/binary）正交，不得填 drift/fade")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="< 0.7 不入评分")
     consensus_expectation: str = Field(default="", description="共识预期（必填）")
-    source: str = Field(..., description="akshare_earnings / akshare_lockup / macro_rule / llm_narrative / global_map")
+    source: str = Field(..., description="akshare_earnings / akshare_lockup / macro_rule / llm_narrative / global_map / global_manual / node4_event")
     category_tag: str = Field(default="", description="drift / fade / binary（退出策略分型依据）")
     is_global: bool = Field(default=False, description="是否来自全球事件映射")
     source_news: Optional[str] = Field(default=None, description="来源新闻标题（LLM 叙事事件用于回声检测）")
@@ -1500,13 +1511,14 @@ class PortfolioDecision(BaseModel):
     # ── 埋伏道拆分 v2 拦点#5：screener 侧埋伏道产物透传 ──
     ambush_lane_shadow: Optional[dict] = Field(
         default=None,
-        description="埋伏道拆分 v2 产物: {mode, lane_finalists, note}（screener 侧埋伏道过闸名单）。"
+        description="埋伏道拆分 v2 产物: {mode, lane_finalists, limit_up_filtered, note}"
+                    "（screener 侧埋伏道过闸名单 + G-A0 涨停剔除留痕）。"
                     "纯观测，不参与判定。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
     ambush_lane_trace: Optional[dict] = Field(
         default=None,
-        description="埋伏道拆分 v2 拦点追踪: {g_a1_pass, g_a1_soft_pass, g_a1_flow_negative, "
+        description="埋伏道拆分 v2 拦点追踪: {g_a0_limit_up, g_a1_pass, g_a1_soft_pass, g_a1_flow_negative, "
                     "g_a1_dde_degraded, g_a2_pool_pass, g_a2_no_catalyst, g_a2_low_confidence, "
                     "g_a2_position_unsafe, "
                     "g_a3_knife, g_a4_selected, cross_lane_collision, lane_overflow_n, lane_error, "

@@ -771,7 +771,8 @@ class TestCollectPipelineEvents(unittest.TestCase):
         events = node._collect_pipeline_events(news)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["event_id"], "ev1")
-        self.assertTrue(events[1]["event_id"].startswith("major_0_"))
+        self.assertEqual(events[1]["event_id"], AggregatorNode._major_event_id(news.major_events[0]))
+        self.assertTrue(events[1]["event_id"].startswith("major_"))
         self.assertEqual(events[1]["affected_sectors"], ["石油加工"])
 
     def test_none_news_safe(self):

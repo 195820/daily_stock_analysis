@@ -417,7 +417,16 @@ def _write_reasoning_md(
         # 2026-10-21：用 run_date 而非 date.today()——重渲染历史归档时，今日/未来分界
         # 必须锚定该归档日，否则隔天重跑会把旧归档的「未来事件」错判成过去。
         today = run_date
-        high_conf = [e for e in cal.events if e.confidence >= 0.7]
+        # 2026-10-23 修：不再按 0.7 二次截断。`CATALYST_CONFIDENCE_GATE` 的既定口径是
+        # 「低于 0.7 只进日历展示、标参考、退出评分」，此前这里硬筛 0.7 + 10-22 起低置信
+        # 事件重新入历（narrative conf 0.50~0.60），导致标题写着 N 个事件、正文一条不渲染。
+        from src.got.catalyst_config import CATALYST_CONFIDENCE_GATE
+
+        render_events = list(cal.events)
+
+        def _ref_tag(e) -> str:
+            return " ·参考" if e.confidence < CATALYST_CONFIDENCE_GATE else ""
+
         three_star = [e for e in cal.events if e.impact_level == 3]
 
         lines.append(f"## 📅 催化剂日历（{len(cal.events)} 事件，{len(three_star)} 个 ★★★）— {cal.refresh_mode}")
@@ -428,7 +437,7 @@ def _write_reasoning_md(
         # 延续至生效，非今日发生）」——与日期无关：10-20 新闻 → 10-21 次日反应的
         # SK 海力士事件 event_date=今天、就是今日催化，却被标成「历史事件传导」。
         # 日历已按 event_date >= today 过滤（_load_active_events），事件日=今天即今日事件。
-        today_events = [e for e in high_conf if e.event_date == today]
+        today_events = [e for e in render_events if e.event_date == today]
         if today_events:
             arrow_map = {"positive": "📈", "negative": "📉", "binary": "⚖️", "drift": "🌀"}
 
@@ -436,7 +445,7 @@ def _write_reasoning_md(
                 stars = "★" * e.impact_level
                 arrow = arrow_map.get(e.direction, "•")
                 tag = f" `{e.category_tag}`" if e.category_tag else ""
-                return f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%})"
+                return f"- {arrow} {stars} **{e.sector}**: {e.title}{tag} (置信{e.confidence:.0%}{_ref_tag(e)})"
 
             lines.append(f"**今日（{today}）{len(today_events)} 个事件:**")
             for e in sorted(today_events, key=lambda x: (-x.impact_level, -x.confidence))[:8]:
@@ -444,7 +453,7 @@ def _write_reasoning_md(
             lines.append("")
 
         # ── 未来 2 周按日期展示（每日 Top 事件）──
-        future_events = [e for e in high_conf if e.event_date > today]
+        future_events = [e for e in render_events if e.event_date > today]
         if future_events:
             # 按日期分组，每日取 impact_level 最高的 2 个
             from collections import defaultdict
@@ -459,7 +468,7 @@ def _write_reasoning_md(
                 stars = "★" * top.impact_level
                 arrow = {"positive": "📈", "negative": "📉", "binary": "⚖️", "drift": "🌀"}.get(top.direction, "•")
                 extra = f" +{len(day_events)-1}个" if len(day_events) > 1 else ""
-                lines.append(f"- {d} {arrow} {stars} **{top.sector}**: {top.title}{extra}")
+                lines.append(f"- {d} {arrow} {stars} **{top.sector}**: {top.title}{extra} (置信{top.confidence:.0%}{_ref_tag(top)})")
             lines.append("")
 
         # ── 按板块聚合：哪些板块有 upcoming catalyst ──

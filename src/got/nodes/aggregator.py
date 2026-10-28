@@ -13,6 +13,7 @@ Node 6: 聚合节点（v3 — 分层 GOT 架构）
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ from src.got.catalyst_config import (
     ANTICIPATION_THRESHOLD_DAYS,
     CATALYST_MAX_POOL_SIZE,
     CATALYST_CONFIDENCE_GATE,
+    CATALYST_CONFIDENCE_GATE_LOW,
+    GOT_NODE4_AMBUSH_EVENTS_ENABLED,
     RESERVOIR_EXPIRY_DAYS,
     RESERVOIR_PROMOTION_MIN_DAYS,
     REFINE_TOP_N,
@@ -86,7 +89,7 @@ from src.got.catalyst_config import (
     CATALYST_MACRO_AS_REGIME_REF,
 )
 from src.got import glue_pipeline as _glue_pipeline_mod
-from src.got.catalyst_calendar import _count_trade_days
+from src.got.catalyst_calendar import _count_trade_days, _make_event_id
 from src.got.persistence import (
     load_previous_context,
     save_current_context,
@@ -292,10 +295,14 @@ class AggregatorNode:
         # relations 补挂索引（当日优先）：写入缓存供 _build_ambush_channel 及其内部
         # 升格分支消费；degraded/no_candidates 时索引为空→补挂恒 no-op
         self._rel_idx_cache = self._build_relations_index(glue)
+        # Node 4 事件×glue（2026-10-23）：major_events 带合成 id 进 glue prompt，
+        # relations 命中即按 board_code 归属，名称扇出降级为兜底。
+        self._node4_glue_index = self._build_node4_glue_index(glue, news)
 
         # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
         ambush_pool, ambush_reservoir, ambush_veto_log = await self._build_ambush_channel(
             sector, capital, news, sentiment, regime=regime,
+            node4_glue_index=self._node4_glue_index,
         )
 
         # ── Level 1: 板块 mini GOT（主线/降温走 TOP-N，埋伏按通道结果拆分消费）──
@@ -1355,6 +1362,9 @@ class AggregatorNode:
         major_events = []
         for me in (getattr(news, "major_events", None) or []):
             major_events.append({
+                # 2026-10-23：给 Node 4 事件稳定 id，让 relations 能按 id 回连（原先无 id，
+                # 事件→板块只能走 affected_sectors 名称扇出）
+                "event_id": AggregatorNode._major_event_id(me),
                 "event_type": getattr(me, "event_type", ""),
                 "title": getattr(me, "title", ""),
                 "impact_level": getattr(me, "impact_level", ""),
@@ -1435,6 +1445,9 @@ class AggregatorNode:
 
 ## 重大事件（{len(major_events)} 条）
 {json.dumps(major_events, ensure_ascii=False, default=str)}
+
+> 归属口径（任务3）：**催化事件与重大事件都可以归属**，relations.event_id 必须原样引用
+> 上方给出的 event_id；重大事件的 id 以 `major_` 开头，未给出 id 的条目不得编造归属。
 
 ## 资金流 3d 日均（单位：亿元，全量 {len(flow_3d)} 板块）
 {json.dumps(flow_3d, ensure_ascii=False, default=str)}
@@ -1634,9 +1647,10 @@ class AggregatorNode:
         cal = getattr(news, "catalyst_calendar", None)
         if cal and cal.events:
             events.extend(self._glue_strip_event(ev) for ev in cal.events)
-        for i, me in enumerate(getattr(news, "major_events", None) or []):
+        for me in (getattr(news, "major_events", None) or []):
             events.append({
-                "event_id": f"major_{i}_{getattr(me, 'event_type', '') or 'evt'}",
+                # 与 _build_glue_prompt / _build_node4_glue_index 共用同一稳定 id
+                "event_id": self._major_event_id(me),
                 "event_type": getattr(me, "event_type", ""),
                 "title": getattr(me, "title", ""),
                 "impact_level": getattr(me, "impact_level", ""),
@@ -2510,8 +2524,11 @@ class AggregatorNode:
         """确定性提升兜底规则（LLM 概率上调之外的硬规则保障）
 
         对象：sector_role == "ambush" 且 classification == "caution" 的 SectorIntel
-        条件 A（合格催化）：命中事件 confidence >= CATALYST_CONFIDENCE_GATE(0.7)
+        条件 A（合格催化）：命中事件 confidence >= CATALYST_CONFIDENCE_GATE_LOW(0.6)
                            且 direction != "negative" 且 impact_level >= 2
+                           （2026-10-23 与升格门/准入闸对齐：10-22 回测 0.6/0.65/0.7 三档
+                           已兑现方向正确率 0.40/0.42/0.40、平均收益 +0.10/+0.15/+0.24%，
+                           Wilson95 全重叠 → 保留 0.7 无统计依据）
         条件 B（证据，二选一）：
           - 该板块在 ambush_pool 中且 accum_strength ∈ {strong, medium, weak} 或 nominated=True
           - 不在池中时 capital_check == "aligned"
@@ -2533,7 +2550,7 @@ class AggregatorNode:
             events = self._lookup_sector_events(s.sector_name, events_by_sector)
             qualified_events = [
                 e for e in events
-                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                if e.confidence >= CATALYST_CONFIDENCE_GATE_LOW
                 and e.direction != "negative"
                 and e.impact_level >= 2
             ]
@@ -2888,24 +2905,15 @@ class AggregatorNode:
             sector_events = self._supplement_from_relations(
                 sector_events, entry.sector_code, rel_index, all_events, _DISCARD_STATS,
             )
+            # 2026-10-23：升格门与准入闸对齐到 GATE_LOW(0.6)——10-22 回测三档
+            # （0.6/0.65/0.7）已兑现收益无统计差异，0.7 硬门只砍量不筛质。
+            # 原「晋升影子（0.60 会放行吗）」区块在两档相等后恒空，随之删除。
             qualified_events = [
                 e for e in sector_events
-                if e.confidence >= CATALYST_CONFIDENCE_GATE
+                if e.confidence >= CATALYST_CONFIDENCE_GATE_LOW
                 and e.direction != "negative"
             ]
             if not qualified_events:
-                # A3 影子评估：若门槛降至 0.60 会放行吗？
-                shadow = [
-                    e for e in sector_events
-                    if 0.6 <= e.confidence < CATALYST_CONFIDENCE_GATE
-                    and e.direction != "negative"
-                ]
-                if shadow:
-                    logger.info(
-                        f"[Node 6 晋升影子] {name}: 门槛 0.60 会放行 "
-                        f"{len(shadow)} 个事件 (置信度 "
-                        f"{shadow[0].confidence:.2f})"
-                    )
                 remaining.append(entry)
                 continue
 
@@ -3202,6 +3210,7 @@ class AggregatorNode:
         news: NewsContext,
         sentiment: SentimentContext,
         regime: Optional[MarketRegime] = None,
+        node4_glue_index: Optional[dict] = None,
     ) -> tuple[list[AmbushCandidate], list[AmbushReservoirEntry], list[str]]:
         """埋伏通道（P3+P1-2）：独立于主线 composite 的平行分支
 
@@ -3230,6 +3239,9 @@ class AggregatorNode:
         all_events = calendar.events if calendar else []
         all_events = self._exclude_macro_regime_ref(all_events)
         events_by_sector = self._group_events_by_sector(all_events)
+        # 第二支路（2026-10-22）：Node 4 当日事件也进埋伏通道（此前只读日历，
+        # 10-21 实测 11 个产业级事件对埋伏零贡献）。开关关闭 → 空索引 → 逐字节回现状。
+        node4_index = self._build_node4_event_index(news)
         # 与今日候选支路同形（L217）：锚定 _run_date，回放时 today=回放日
         today = getattr(self, "_run_date", None) or date.today()
 
@@ -3312,6 +3324,11 @@ class AggregatorNode:
                 sector_events = self._supplement_from_relations(
                     sector_events, detail.code, rel_index, all_events, rel_supplement_stats,
                 )
+                # Node 4 事件（第二支路）：优先 glue board_code 归属（2026-10-23），
+                # 未覆盖时回退 affected_sectors 名称扇出（保持旧口径兜底）。
+                node4_events = list((node4_glue_index or {}).get(detail.code) or [])
+                if not node4_events and node4_index:
+                    node4_events = self._lookup_sector_events(name, node4_index)
 
                 # D-P2: 闸门漏斗追踪（每个候选都评估 G1）
                 gate_funnel["G1_利空"]["evaluated"] += 1
@@ -3412,22 +3429,27 @@ class AggregatorNode:
                     continue
 
                 # 闸门通过 → 催化剂排序
+                # 2026-10-22：准入降到低档闸（CATALYST_CONFIDENCE_GATE_LOW，缺省 0.6）——
+                # 三档阈值（0.6/0.65/0.7）的已兑现方向正确率 0.40/0.42/0.40 Wilson 区间全重叠，
+                # 硬闸无区分度只拦截量；质量由 B 公式里的 confidence 乘数保证（0.6 事件自然
+                # 排 0.8 之后）。提升/升格 2026-10-23 起同样对齐到 GATE_LOW=0.6。
                 qualified_events = [
                     e for e in sector_events
-                    if e.confidence >= CATALYST_CONFIDENCE_GATE
+                    if e.confidence >= CATALYST_CONFIDENCE_GATE_LOW
                     and e.direction != "negative"
                 ]
 
-                if not qualified_events:
-                    # A3 影子评估
+                if not qualified_events and not node4_events:
+                    # A3 影子评估（低档闸与正式闸之间的残余带；两档相等时恒空）
                     shadow = [
                         e for e in sector_events
-                        if 0.6 <= e.confidence < CATALYST_CONFIDENCE_GATE
+                        if CATALYST_CONFIDENCE_GATE_LOW <= e.confidence < CATALYST_CONFIDENCE_GATE
                         and e.direction != "negative"
                     ]
                     if shadow:
                         logger.info(
-                            f"[Node 6 闸门影子] {name}: 门槛 0.60 会放行 "
+                            f"[Node 6 闸门影子] {name}: 门槛 "
+                            f"{CATALYST_CONFIDENCE_GATE_LOW:.2f} 会放行 "
                             f"{len(shadow)} 个事件"
                         )
                     # 无催化分支 → 蓄水池
@@ -3442,12 +3464,42 @@ class AggregatorNode:
                     ))
                     continue
 
-                score, top_event, category_tag, event_titles = self._compute_catalyst_score(
-                    qualified_events, today,
-                )
-
                 # v2.1: 吸筹档位乘数（共用模块级常量 AMBUSH_ACCUM_MULTIPLIER，防与另一处各写各的）
                 accum_multiplier = AMBUSH_ACCUM_MULTIPLIER.get(accum_strength, 1.0)
+
+                if qualified_events:
+                    score, top_event, category_tag, event_titles = self._compute_catalyst_score(
+                        qualified_events, today,
+                    )
+                    top_event_date = top_event.event_date if top_event else None
+                    top_event_level = top_event.impact_level if top_event else 1
+                    gate_note = (
+                        f"G4冻结放行({accum_strength}×{accum_multiplier})"
+                        if accum_strength == "missing"
+                        else f"闸门全通过({accum_strength}×{accum_multiplier})"
+                    )
+                    if node4_events:
+                        # 日历胜出（有日期前瞻，信息更全）：Node 4 事件只补留痕，
+                        # 不改分、不重复登记 P6（同一现实事件由日历侧 llm_narrative 负责）
+                        gate_note += f"；{self._format_node4_note(node4_events)}"
+                    node4_primary = False
+                else:
+                    # 日历零合格事件 → Node 4 当日事件作主催化（无 event_date，固定 proximity）
+                    score, category_tag, event_titles, top_event_level = (
+                        self._compute_node4_catalyst_score(node4_events)
+                    )
+                    # top_event_date 取 today（不是 None）：P4 退出分支按
+                    # `category_tag=="fade" and today > event_date` 判「事件日次日卖」，
+                    # 留 None 会让 fade 标签的持仓永远走不到该分支（只剩 -7% 止损），
+                    # 且与 P6 登记（event_date=today）不一致。代价：次日即触发 fade_sell，
+                    # 与「当日事件=已兑现、不追持有」的 fade 语义自洽。
+                    top_event_date = today
+                    gate_note = (
+                        f"{self._format_node4_note(node4_events)}；闸门全通过"
+                        f"({accum_strength}×{accum_multiplier})"
+                    )
+                    node4_primary = True
+
                 adjusted_score = round(score * accum_multiplier, 3)
 
                 pool.append(AmbushCandidate(
@@ -3456,16 +3508,17 @@ class AggregatorNode:
                     catalyst_score=adjusted_score,
                     category_tag=category_tag,
                     events=event_titles[:3],
-                    top_event_date=top_event.event_date if top_event else None,
-                    top_event_level=top_event.impact_level if top_event else 1,
+                    top_event_date=top_event_date,
+                    top_event_level=top_event_level,
                     accumulation_detail=accum_detail,
-                    gate_notes=(
-                        f"G4冻结放行({accum_strength}×{accum_multiplier})"
-                        if accum_strength == "missing"
-                        else f"闸门全通过({accum_strength}×{accum_multiplier})"
-                    ),
+                    gate_notes=gate_note,
                     accum_strength=accum_strength,
                 ))
+
+                # P6 兑现登记（第 4 步）：仅 Node 4 事件单独作主催化时登记——
+                # 日历胜出场景由日历侧负责，避免同一现实事件双登记污染兑现统计。
+                if node4_primary:
+                    self._register_node4_realization(name, node4_events, today)
 
         # ── 决策 21: Agent 催化剂先行提名（单次批量调用，仅候选非空时触发）──
         if nomination_queue:
@@ -3710,12 +3763,160 @@ class AggregatorNode:
         return grouped
 
     @staticmethod
+    def _major_event_id(me) -> str:
+        """Node 4 事件的稳定合成 id（标题哈希，与跨日/列表顺序无关）。
+
+        日历事件有 `_make_event_id` 造的 event_id，major_events 没有；glue 的 relations
+        只认 event_id，所以这里补一个确定性 id，供 glue prompt 与回连共用。
+        """
+        title = str(getattr(me, "title", "") or "").strip()
+        return f"major_{hashlib.md5(title.encode('utf-8')).hexdigest()[:12]}"
+
+    def _build_node4_glue_index(self, glue, news: "NewsContext") -> dict[str, list]:
+        """glue.relations → {board_code: [major_event]}（2026-10-23）。
+
+        取代 Node 4 支路的名称扇出：relations 直接给 board_code，无需别名/归一化。
+        过滤口径与 `_build_node4_event_index` 一致（impact ∈ high/medium 且非负面）。
+        开关 `GOT_NODE4_AMBUSH_EVENTS_ENABLED=false` → 空索引（回退名称扇出）。
+        """
+        if not GOT_NODE4_AMBUSH_EVENTS_ENABLED or not glue:
+            return {}
+        relations = getattr(glue, "relations", None) or []
+        if not relations:
+            return {}
+        by_id = {
+            self._major_event_id(me): me
+            for me in (getattr(news, "major_events", None) or [])
+        }
+        if not by_id:
+            return {}
+        index: dict[str, list] = {}
+        seen: set[tuple[str, str]] = set()
+        for rel in relations:
+            eid = str(getattr(rel, "event_id", "") or "")
+            me = by_id.get(eid)
+            if me is None:
+                continue
+            if str(getattr(rel, "direction", "")).lower() == "negative":
+                continue
+            if str(getattr(me, "impact_level", "")).lower() not in ("high", "medium"):
+                continue
+            if str(getattr(me, "sentiment", "")).lower() == "negative":
+                continue
+            code = str(getattr(rel, "board_code", "") or "")
+            if not code or (code, eid) in seen:
+                continue
+            seen.add((code, eid))
+            index.setdefault(code, []).append(me)
+        if index:
+            logger.info(
+                "[Node 6] Node 4×glue 归属: %d 条 relations → %d 个板块",
+                len(relations), len(index),
+            )
+        return index
+
+    @staticmethod
+    def _build_node4_event_index(news: "NewsContext") -> dict[str, list]:
+        """Node 4 当日事件按 affected_sectors 归一化分桶（2026-10-22，埋伏通道第二支路）。
+
+        背景（10-21 实测）：当日 11 个产业级事件（稀土出口管制/厄尔尼诺/MLCC 交期 52 周/
+        液氩涨价）对埋伏通道零贡献——`_build_ambush_channel` 只读 `catalyst_calendar.events`。
+        59 个归档日中正式池 >0 仅 16 天（27%），均值 0.47 个/日。
+
+        与 `_group_events_by_sector` 同形（normalize_sector_name + affected_sectors 扇出）：
+        - 不做日期窗口过滤：当日事件即"正在发生"，没有 event_date；
+        - 准入条件改为 impact_level ∈ {high, medium} 且 sentiment != negative
+          （日历侧用 confidence 硬闸，Node 4 侧用确定性映射权重，见
+          `NewsAnalysisNode._derive_catalyst_weight`）；
+        - 宏观例行数据不排除（Node 4 事件非 macro_rule 来源，`_exclude_macro_regime_ref`
+          只作用于日历）。
+
+        开关 GOT_NODE4_AMBUSH_EVENTS_ENABLED=false → 空索引（逐字节回现状）。
+        """
+        if not GOT_NODE4_AMBUSH_EVENTS_ENABLED:
+            return {}
+        from src.got.board_aliases import normalize_sector_name
+
+        index: dict[str, list] = {}
+        for event in (getattr(news, "major_events", None) or []):
+            if str(getattr(event, "impact_level", "")).lower() not in ("high", "medium"):
+                continue
+            if str(getattr(event, "sentiment", "")).lower() == "negative":
+                continue
+            seen_keys: set[str] = set()
+            for raw_sector in (getattr(event, "affected_sectors", None) or []):
+                key = normalize_sector_name(raw_sector)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                index.setdefault(key, []).append(event)
+        if index:
+            logger.info(
+                "[Node 6] Node 4 事件索引: %d 条事件 → %d 个板块桶",
+                len(getattr(news, "major_events", []) or []), len(index),
+            )
+        return index
+
+    def _register_node4_realization(
+        self, sector_name: str, events: list, today: date
+    ) -> None:
+        """Node 4 事件入埋伏池后补登 P6 兑现追踪（2026-10-22，第 4 步）。
+
+        目的：不断样本链——`catalyst_realizations` 是唯一可校准的「预期 vs 实际」数据源，
+        新准入路径若不登记，后续无法回答「Node 4 事件入池的 3 日超额是多少」。
+
+        纪律：
+        - 只在 Node 4 事件**单独**作主催化时调用（日历胜出的场景由日历侧 llm_narrative 登记，
+          同一现实事件不双登记）；
+        - event_id 用 `_make_event_id(source, type, sector, date)`（与日历同一确定性 MD5）
+          → 同日重跑 UPSERT 幂等；
+        - `register_event` 收的是 `CatalystEvent`（不是散字段）；
+        - replay 模式零持久化副作用 → 跳过；异常只 warn 不阻断主流程。
+        """
+        if not events or getattr(self, "_replay_mode", False):
+            return
+        try:
+            top = max(
+                events,
+                key=lambda e: (
+                    self._NODE4_IMPACT_MULT.get(str(getattr(e, "impact_level", "")).lower(), 1.0),
+                    float(getattr(e, "catalyst_weight", 0.0) or 0.0),
+                ),
+            )
+            tracker = getattr(self, "_p6_tracker", None)
+            if tracker is None:
+                from src.got.catalyst_realization import CatalystRealizationTracker
+                tracker = CatalystRealizationTracker()
+                self._p6_tracker = tracker
+            title = (getattr(top, "title", "") or "")[:80]
+            tracker.register_event(CatalystEvent(
+                event_id=_make_event_id("node4_event", "narrative", sector_name, today),
+                event_date=today,
+                event_type="narrative",
+                title=f"[Node4] {title}",
+                sector=sector_name,
+                impact_level=3 if str(getattr(top, "impact_level", "")).lower() == "high" else 2,
+                direction="positive",
+                confidence=float(getattr(top, "catalyst_weight", 0.0) or 0.0),
+                consensus_expectation="Node 4 当日事件，埋伏通道准入",
+                source="node4_event",
+                category_tag="fade",
+                is_global=False,
+                source_news=title,
+            ))
+        except Exception as exc:  # noqa: BLE001 — P6 旁挂，失败不阻断埋伏通道
+            logger.warning("[Node 6] Node 4 事件 P6 登记失败（不阻断）: %s", exc)
+
+    @staticmethod
     def _lookup_sector_events(
-        name: str, events_by_sector: dict[str, list[CatalystEvent]]
-    ) -> list[CatalystEvent]:
+        name: str, events_by_sector: dict[str, list]
+    ) -> list:
         """归一化板块名查找事件（A2：精确 → 别名变体 → 空）
 
         解决晋升路径/P5 中板块名与事件 sector 命名不一致导致的事件饥荒。
+
+        2026-10-22：入参泛化为 `list`（元素可 CatalystEvent 或 NewsEvent），供埋伏通道
+        的 Node 4 事件支路复用同一套 L1/L2 查找——纯字典取值，不新写第二套查找。
         """
         # L1: 精确匹配
         result = events_by_sector.get(name)
@@ -4157,6 +4358,66 @@ class AggregatorNode:
 
         return total_score, top_event, category_tag, event_titles
 
+    # Node 4 事件支路的固定临近系数（2026-10-22）：NewsEvent 无 event_date，
+    # B 公式的 proximity 无输入。0.5 等价"中等临近"（介于 ANTICIPATION_DECAY_NEAR=0.6 与
+    # 已过事件 0 之间）。若后续回测显示固定值扭曲排序，再接入
+    # NewsEvent.catalyst_onset_days（字段已预留，本次不接）。
+    NODE4_PROXIMITY_FIXED = 0.5
+    _NODE4_IMPACT_MULT = {"high": 2.0, "medium": 1.0}
+
+    @classmethod
+    def _compute_node4_catalyst_score(
+        cls, events: list
+    ) -> tuple[float, str, list[str], int]:
+        """Node 4 当日事件的主催化分（日历落空时的替代路径）。
+
+        主催化分 = 影响权重(high=2.0 / medium=1.0) × 0.5(固定临近) × mean(catalyst_weight)。
+        与 `_compute_catalyst_score` 同量纲（日历档 0.18~1.0），使两路候选可在同一
+        `catalyst_score` 排序中混排。
+
+        Returns:
+            (score, category_tag, event_titles, top_impact_level)
+            category_tag 固定 "fade"（当日事件=软叙事，事件日即退）；
+            top_impact_level 折算 1/2（同日历档位口径），供 AmbushCandidate 落盘。
+        """
+        if not events:
+            return 0.0, "", [], 1
+
+        ranked = sorted(
+            events,
+            key=lambda e: (
+                -cls._NODE4_IMPACT_MULT.get(str(getattr(e, "impact_level", "")).lower(), 1.0),
+                -float(getattr(e, "catalyst_weight", 0.0) or 0.0),
+            ),
+        )
+        top = ranked[0]
+        impact_weight = cls._NODE4_IMPACT_MULT.get(
+            str(getattr(top, "impact_level", "")).lower(), 1.0
+        )
+        weights = [float(getattr(e, "catalyst_weight", 0.0) or 0.0) for e in ranked]
+        mean_weight = sum(weights) / len(weights)
+        score = round(impact_weight * cls.NODE4_PROXIMITY_FIXED * mean_weight, 3)
+        top_level = 2 if str(getattr(top, "impact_level", "")).lower() == "high" else 1
+        return score, "fade", [getattr(e, "title", "") for e in ranked[:3]], top_level
+
+    @staticmethod
+    def _format_node4_note(events: list) -> str:
+        """Node 4 事件留痕（gate_notes 用）：`Node4事件(high×2, w=0.80): 标题 / 标题`"""
+        if not events:
+            return ""
+        top = max(
+            events,
+            key=lambda e: (
+                AggregatorNode._NODE4_IMPACT_MULT.get(str(getattr(e, "impact_level", "")).lower(), 1.0),
+                float(getattr(e, "catalyst_weight", 0.0) or 0.0),
+            ),
+        )
+        titles = " / ".join((getattr(e, "title", "") or "")[:24] for e in events[:2])
+        return (
+            f"Node4事件({getattr(top, 'impact_level', '?')}×{len(events)}, "
+            f"w={float(getattr(top, 'catalyst_weight', 0.0) or 0.0):.2f}): {titles}"
+        )
+
     @staticmethod
     def _enrich_ambush_sector_intel(
         sector_intels: list[SectorIntel],
@@ -4177,7 +4438,10 @@ class AggregatorNode:
                 intel.ambush_category_tag = candidate.category_tag
                 intel.ambush_events = candidate.events
             elif name in reservoir_map:
-                intel.ambush_gate_fail = "no_catalyst"
+                # 2026-10-23 修：原先一律写 "no_catalyst"，把 near_miss:score_below_floor
+                # 也误标成「无事件支撑」（10-23 15 条蓄水池里 9 条其实是分数 0.28~0.29<0.30）。
+                # 蓄水池条目的 reason 才是真实失败原因，原样回写。
+                intel.ambush_gate_fail = reservoir_map[name].reason or "no_catalyst"
 
     # =========================================================================
     # Level 2: 组合决策

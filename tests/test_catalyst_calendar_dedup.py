@@ -262,10 +262,11 @@ class TestCleanupStaleEvents(unittest.TestCase):
         fake_db = MagicMock()
         fake_db.get_session.return_value.__enter__.return_value = fake_session
 
-        with patch("src.storage.DatabaseManager", return_value=fake_db):
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", True):
             builder._cleanup_stale_events([kept], date(2026, 8, 28))
 
-        # 一次过期清理 + 一次残留清理
+        # 一次过期清理 + 一次残留清理（宏观退出分支由 TestMacroCalendarSwitch 覆盖）
         self.assertEqual(fake_session.query.call_count, 2)
         self.assertEqual(fake_session.commit.call_count, 1)
 
@@ -364,7 +365,8 @@ class TestForwardWindowLoad(unittest.TestCase):
         fake_db = MagicMock()
         fake_db.get_session.return_value.__enter__.return_value = fake_session
 
-        with patch("src.storage.DatabaseManager", return_value=fake_db):
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", True):
             events = CatalystCalendarBuilder()._load_active_events(target)
 
         self.assertEqual(
@@ -445,6 +447,174 @@ class TestGlobalMapHbmAnchorGuard(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].impact_level, 3)
         self.assertEqual(events[0].event_date, date(2026, 10, 21))
+
+
+class TestGlobalMapGovernanceFields(unittest.TestCase):
+    """2026-10-22 事件目录治理：日期确定型映射（earnings/policy/data/macro）缺
+    anchor_keywords → fail-closed 不产事件；补锚定词即恢复。"""
+
+    @staticmethod
+    def _mapping(**overrides):
+        mapping = {
+            "id": 99,
+            "global_event": "测试台积电财报",
+            "global_keywords": ["台积电"],
+            "event_type_fixed": "earnings",
+            "a_share_sectors": ["半导体设备"],
+            "base_impact_level": 2,
+            "direction": "positive",
+            "category_tag": "drift",
+            "review_note": "2026-10-22 测试用",
+        }
+        mapping.update(overrides)
+        return mapping
+
+    def test_earnings_mapping_without_anchor_is_skipped(self):
+        builder = _builder({"半导体设备"})
+        with patch(
+            "src.got.catalyst_calendar.GLOBAL_TO_A_SHARE_MAP",
+            [self._mapping()],
+        ):
+            events = builder._map_global_events(
+                [_news("台积电3nm产能利用率提升", "2026-10-20")],
+                date(2026, 10, 20), date(2026, 11, 3),
+            )
+        self.assertEqual(events, [], "无锚定词的财报映射必须 fail-closed，不得伪造成财报事件")
+
+    def test_anchored_earnings_mapping_still_maps(self):
+        builder = _builder({"半导体设备"})
+        with patch(
+            "src.got.catalyst_calendar.GLOBAL_TO_A_SHARE_MAP",
+            [self._mapping(anchor_keywords=["财报", "业绩", "指引"])],
+        ):
+            events = builder._map_global_events(
+                [_news("台积电Q3财报超预期，上调全年指引", "2026-10-20")],
+                date(2026, 10, 20), date(2026, 11, 3),
+            )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].sector, "半导体设备")
+        self.assertEqual(events[0].source, "global_map")
+
+    def test_product_mapping_without_anchor_is_allowed(self):
+        builder = _builder({"半导体设备"})
+        with patch(
+            "src.got.catalyst_calendar.GLOBAL_TO_A_SHARE_MAP",
+            [self._mapping(event_type_fixed="product")],
+        ):
+            events = builder._map_global_events(
+                [_news("台积电3nm产能利用率提升", "2026-10-20")],
+                date(2026, 10, 20), date(2026, 11, 3),
+            )
+        self.assertEqual(len(events), 1, "产物型事件本身即突发，不要求锚定词")
+
+
+    def test_fomc_mapping_kept_with_event_anchors(self):
+        """FOMC 无 macro_rule 兜底，必须靠会议语义锚定词保留（2026-10-22）。"""
+        from src.got.catalyst_config import GLOBAL_TO_A_SHARE_MAP
+
+        mapping = next(m for m in GLOBAL_TO_A_SHARE_MAP if m["id"] == 1)
+        self.assertEqual(mapping["event_type_fixed"], "policy")
+        self.assertTrue(mapping.get("anchor_keywords"))
+
+        builder = _builder({"券商"})
+        events = builder._map_global_events(
+            [_news("美联储将于本周召开议息会议，市场预期降息", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertTrue(events, "FOMC 会议新闻应映射为催化事件")
+
+        bare = builder._map_global_events(
+            [_news("鲍威尔称将关注就业市场", "2026-10-20")],
+            date(2026, 10, 20), date(2026, 11, 3),
+        )
+        self.assertEqual(bare, [], "无会议语义的裸提法不得伪造 FOMC 事件")
+
+
+
+class TestMacroCalendarSwitch(unittest.TestCase):
+    """2026-10-22 用户裁决：例行宏观（PMI/CPI/社融/LPR）退出催化剂日历。
+
+    依据：catalyst_realizations 已兑现 macro 12 条仅 1 条 |收益|>2%（PMI 两条 ±0.5%），
+    且 calibration 报告 §5.1 判定 macro 样本不足。
+    """
+
+    def test_macro_calendar_disabled_by_default(self):
+        builder = _builder({"券商"})
+        with patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", False):
+            self.assertEqual(
+                builder._generate_macro_calendar(date(2026, 10, 1), date(2026, 11, 4)), []
+            )
+
+    def test_macro_calendar_enabled_restores_rules(self):
+        builder = _builder({"券商"})
+        with patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", True):
+            rows = builder._generate_macro_calendar(date(2026, 10, 1), date(2026, 11, 4))
+        titles = {r["title"] for r in rows}
+        self.assertIn("官方制造业PMI", titles)
+        pmi = next(r for r in rows if r["title"] == "官方制造业PMI")
+        self.assertEqual(pmi["event_date"], date(2026, 10, 31))
+
+    def test_loader_filters_legacy_macro_rows_when_disabled(self):
+        from types import SimpleNamespace
+
+        def _row(event_id, source):
+            return SimpleNamespace(
+                event_id=event_id, event_date=date(2026, 10, 31), event_type="macro",
+                title="t", sector="券商", impact_level=2, direction="binary",
+                confidence=1.0, consensus_expectation="", source=source,
+                category_tag="binary", evidence_tier="reported", source_url=None,
+                is_global=False, source_news=None, affected_sectors="[]",
+            )
+
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.all.return_value = [
+            _row("m1", "macro_rule"), _row("n1", "llm_narrative"),
+        ]
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+        builder = _builder({"券商"})
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", False):
+            events = builder._load_active_events(date(2026, 10, 21))
+        self.assertEqual([e.event_id for e in events], ["n1"],
+                         "宏观日历退出后，增量加载不得把存量 macro_rule 载回")
+
+    def test_cleanup_removes_macro_rule_when_disabled(self):
+        from src.got.schemas import CatalystEvent
+
+        builder = _builder({"券商"})
+        narrative = CatalystEvent(
+            event_id="n1", event_date=date(2026, 10, 23), event_type="narrative",
+            title="测试", sector="券商", source="llm_narrative",
+        )
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.delete.return_value = 0
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", False):
+            builder._cleanup_stale_events([narrative], date(2026, 10, 21))
+        expressions = " ".join(
+            str(call.args[0].compile(compile_kwargs={"literal_binds": True}))
+            for call in fake_session.query.return_value.filter.call_args_list
+        )
+        self.assertIn("macro_rule", expressions)
+
+    def test_cleanup_macro_even_when_calendar_empty(self):
+        """当日历零产出（skip_stale_cleanup 护栏生效）时，宏观退出仍须清存量。"""
+        builder = _builder({"券商"})
+        fake_session = MagicMock()
+        fake_session.query.return_value.filter.return_value.delete.return_value = 0
+        fake_db = MagicMock()
+        fake_db.get_session.return_value.__enter__.return_value = fake_session
+        with patch("src.storage.DatabaseManager", return_value=fake_db), \
+             patch("src.got.catalyst_calendar.GOT_MACRO_CALENDAR_ENABLED", False):
+            builder._cleanup_stale_events([], date(2026, 10, 21))
+        expressions = " ".join(
+            str(call.args[0].compile(compile_kwargs={"literal_binds": True}))
+            for call in fake_session.query.return_value.filter.call_args_list
+        )
+        self.assertIn("macro_rule", expressions)
 
 
 if __name__ == "__main__":

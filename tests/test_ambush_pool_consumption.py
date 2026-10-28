@@ -297,5 +297,47 @@ class TestResolvePoolSectorDetail(unittest.TestCase):
         self.assertIsNone(self.resolve(sector, _make_pool_candidate("半导体")))
 
 
+class TestAmbushGateFailReason(unittest.TestCase):
+    """蓄水池条目的真实失败原因必须原样回写，不能一律标 no_catalyst（10-23 修）。"""
+
+    def setUp(self):
+        from src.got.nodes.aggregator import AggregatorNode
+        self.node = AggregatorNode(use_mock=True)
+
+    def _reservoir(self, name, reason):
+        from datetime import date
+        from src.got.schemas import AmbushReservoirEntry
+        return AmbushReservoirEntry(
+            sector_name=name,
+            sector_code="880507",
+            reason=reason,
+            entered_date=date(2026, 10, 23),
+            weeks_without_catalyst=0,
+            days_in_reservoir=0,
+            entered_strength=52.9,
+        )
+
+    def _build(self, name, reservoir):
+        sector = _make_sector_ctx(ambush=[_make_detail(name, 52.9, state="ambush")])
+        intels = self.node._build_sector_intel(
+            sector, _make_capital(), _make_news(), _make_sentiment(),
+            ambush_pool=[], ambush_reservoir=reservoir,
+        )
+        self.node._enrich_ambush_sector_intel(intels, [], reservoir)
+        return {i.sector_name: i for i in intels}[name]
+
+    def test_score_below_floor_reason_is_preserved(self):
+        intel = self._build("存储芯片", [self._reservoir(
+            "存储芯片", "near_miss:score_below_floor(0.28<0.30)")])
+        self.assertEqual(
+            intel.ambush_gate_fail, "near_miss:score_below_floor(0.28<0.30)",
+            "分数未达标不得被误标成 no_catalyst",
+        )
+
+    def test_no_catalyst_reason_still_reported(self):
+        intel = self._build("特高压", [self._reservoir("特高压", "no_catalyst")])
+        self.assertEqual(intel.ambush_gate_fail, "no_catalyst")
+
+
 if __name__ == "__main__":
     unittest.main()

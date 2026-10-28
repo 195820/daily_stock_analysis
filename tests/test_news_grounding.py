@@ -93,16 +93,18 @@ def _example_json(rendered: str) -> str:
     return rendered[rendered.index('{"events"'):]
 
 
-def test_event_prompt_off_state_formats_and_matches_pre_batch():
-    """缺省态（GOT_NEWS_EVIDENCE_GATING=false）必须能 format，且渲染逐字同改造前。"""
+def test_event_prompt_off_state_formats_without_source_index():
+    """缺省态（GOT_NEWS_EVIDENCE_GATING=false）：模板可 format，示例 JSON 可解析且不含 source_index。
+
+    2026-10-22：示例不再逐字快照（新增 `onset_days` 是**无条件**字段契约，不随证据接地开关），
+    改为结构断言——只钉「接地字段不泄露」+「示例可解析且覆盖 onset_days」两条真实契约。
+    """
     rendered = EVENT_EXTRACTION_PROMPT.format(src_index_req="", src_index_example="", **_PROMPT_BASE)
     assert "source_index" not in rendered
-    assert _example_json(rendered) == (
-        '{"events": [{"title": "...", "summary": "...", "event_type": "...", '
-        '"impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], '
-        '"affected_stocks": ["..."], "source_type": "professional"}]}'
-    )
-    json.loads(_example_json(rendered))  # 示例 JSON 自身可解析，不是残缺串
+    example = json.loads(_example_json(rendered))["events"][0]
+    assert "source_index" not in example
+    assert example["source_type"] == "professional"
+    assert "onset_days" in example, "onset_days 是事件提取的必答字段"
 
 
 def test_event_prompt_on_state_formats_and_keeps_valid_json():
