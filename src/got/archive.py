@@ -2021,8 +2021,9 @@ def archive_phase2(
         else:
             f.write(f"当前无持仓\n\n")
 
-        f.write(f"## 候选股评分 Top 5\n\n")
+        # 标题按实际条数渲染：持仓行不进候选表，"Top 5" 是上限不是承诺
         candidates = [s for s in decision.unified_scoring if not s.is_holding][:5]
+        f.write(f"## 候选股评分 Top {len(candidates)}\n\n")
         for i, score in enumerate(candidates, 1):
             f.write(f"### {i}. {score.name} ({score.symbol})\n\n")
             f.write(f"- **综合评分:** {score.composite_score:.1f}/100\n")

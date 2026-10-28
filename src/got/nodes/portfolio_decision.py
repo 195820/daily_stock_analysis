@@ -4776,7 +4776,15 @@ verdict 含义：
 
             # Q9 连带修复（audit_20260922）：板块维度被剔除时同步重写分数行，
             # 消除 screener 旧分（69.0）与 Phase 2 重算分（67.2）双轨透传
-            base_reasoning = stock.ai_reasoning or f"综合评分 {adjusted_composite:.1f}"
+            # 兜底文案必须带板块名：埋伏道票在 screener 侧不生成 ai_reasoning
+            # （_run_ambush_lane 不做 5 维打分），否则归档/终端只见「综合评分 X」，
+            # 无从判断是哪只板块的票（2026-10-28 天奇股份 002009 实测）。
+            _sector_tag = ""
+            if stock_sector:
+                _sector_tag = f", 板块[{stock_sector}]"
+                if _stock_sector_type == "ambush":
+                    _sector_tag += "（埋伏道）"
+            base_reasoning = stock.ai_reasoning or f"综合评分 {adjusted_composite:.1f}{_sector_tag}"
             if not getattr(stock, "sector_available", True):
                 base_reasoning = re.sub(
                     r"\*\*综合评分\*\*:\s*[\d.]+/100",
