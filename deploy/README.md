@@ -32,6 +32,33 @@ ntfy 长连接期间掉线**不补发**：进程停掉的图片不会重投，�
 （252 个运行时 `.py` 与工作树逐文件一致），备份 `/opt/dsa/backup/align-20261028/code-before.tar.gz`。
 后续发版以 `git diff --name-only <old>..<new>` 的运行时文件清单同步，禁止只补个别文件。
 
+### 自动同步（本地 post-commit hook，2026-10-28 起）
+
+2026-10-28 用户裁决「服务器侧依据本地 git 同步」：`/opt/dsa/code` **不是 git 仓库**（服务器到 github.com 不通），
+同步以本地 git 为准，用 `git diff` 文件清单经 Workbench 传输。
+
+- 脚本：`scripts/sync_server.py` —— `workbench upload` 逐文件（OSS 中转）→ 远端 `md5sum` 与本地逐文件比对 → `chown dsa:dsa` + 清受影响 `__pycache__` + 远端 `py_compile`
+- 清单：`git diff --name-status <base>..HEAD`，只同步运行时文件（`main.py`、`src/**/*.py`、`data_provider/**/*.py`）；删除项同步为远端 `rm`
+- 基准：`.git/dsa_sync_state.json`（上次**成功**同步的 commit；失败不推进，下次提交自动重试，重复上传幂等）
+- 日志：`.git/dsa_sync.log`
+- hook：`.git/hooks/post-commit` **不入库**，每台克隆机需装一次（`chmod +x` 可选，Git for Windows 不查位）：
+
+```sh
+#!/bin/sh
+TOP=$(git rev-parse --show-toplevel) || exit 0
+cd "$TOP" || exit 0
+GITDIR=$(git rev-parse --git-dir) || exit 0
+PY=".venv/Scripts/python.exe"
+[ -x "$PY" ] || PY=$(command -v python 2>/dev/null || true)
+[ -z "$PY" ] && exit 0
+"$PY" scripts/sync_server.py --auto >>"$GITDIR/dsa_sync.log" 2>&1 || true
+```
+
+- 首次/换机：确认服务器已与 HEAD 一致后执行 `python scripts/sync_server.py --init` 钉基准；日常 `--check` 只预览清单。
+- 环境变量：`DSA_ECS_INSTANCE_ID`（缺省 `i-uf6bi5wzzb9lqh27mkgf`）、`DSA_ECS_CODE_DIR`（缺省 `/opt/dsa/code`）、`DSA_ECS_PYTHON`（缺省 `/opt/dsa/venv/bin/python`）。
+- 边界：只同步 Python 运行时；`deploy/`、`tests/`、docs、`scripts/`、配置文件不进服务器，`.env` 从不覆盖。
+
+
 ## 必须做的一步：data 软链
 
 GOT 归档/跨日记忆/时序目录在代码里是**相对路径**（`data/got_daily`、`data/aggregator_contexts`、
