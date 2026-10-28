@@ -3,6 +3,22 @@
 
 ---
 
+## 2026-10-28 补登（Node 4 消息面补强 — 三条影子线）
+
+计划：`local://node4-news-hardening-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。
+
+| 影子线 | 开关（缺省） | 产物 | 决策影响 | 转正判据（归负责人） |
+|---|---|---|---|---|
+| attention 观测（P0-1） | `GOT_ATTENTION_SHADOW`（true） | `shadow_attention.json` | 零：不写 `source_count`、不进 prompt、不进 `_detect_fermenting_events` | ≥10 交易日 `platform_count` 分布稳定 + 多平台同题人工抽检无系统性误聚 |
+| 正文精读（P0-2） | `GOT_NEWS_FULLTEXT_ENABLED`（**false**） | 无独立产物（prompt 素材行） | true 后细读输入变长（≤`GOT_NEWS_FULLTEXT_MAX_CHARS`=1200 字/条 + 正文补抓） | 对照跑：`affected_stocks` 非空事件数 ≥ 基线、LLM 输出 token 用量无异常 |
+| 短名单类目配额（P1-3） | `GOT_NEWS_SHORTLIST_QUOTA`（false） | `shadow_shortlist_quota.json` | true 时同类目超额部分整组裁掉（按 LLM 顺序，空位不回填） | `category_dist` 实测单一类目常态 ≤6 → 可直接放弃转正并删开关 |
+
+**已直接生效（无决策面改动）**：P1-1 URL 指纹去重（`url_canonical` 列）、P0-1 热榜元数据落库（`platform/platforms/rank/heat/snapshot_count` 列）、P1-2 权威 RSS 源注册、`has_partial_failure` 判定修复。
+
+**两条实现边界（勿回退）**：① `MAX_MERGED_NEWS=150` 的 weight 截断会把**无发布时间的热榜条目整源丢弃**（实测 2026-10-28：newsnow 203 + ths_hot 15 → merged 0 条）→ `_persist_raw_news` 改吃 `fetch_all_news_pool` 的未截断池，LLM 输入仍是 150 条口径；② 热榜源 `published_at`=采集时刻，按 desc 会占满 `list_items(limit=100)` → 权威 RSS 走独立取片（`source_id_prefix="rss-"` + `RSS_LOOKBACK_DAYS=7`）。
+
+---
+
 ## ‼️ 2026-10-27 补登（持仓模块三原则接线 H1/H2/H3 — 供数 + 裁决归位 + 历史回查；**当日用户裁决跳过影子直接转正**）
 
 **计划**：`local://holdings-module-rewiring-plan.md`（用户三条架构原则落地：①持仓分析归决策编排层 ②前序 Node 给持仓供数 ③买入时历史决策喂当日决策）。

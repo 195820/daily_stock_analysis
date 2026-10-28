@@ -280,6 +280,25 @@ GOT_NEWS_CARRY_DAYS = int(os.environ.get("GOT_NEWS_CARRY_DAYS", "3"))
 GOT_NEWS_CARRY_MAX = int(os.environ.get("GOT_NEWS_CARRY_MAX", "1500"))
 
 # =============================================================================
+# Node 4 消息面补强（2026-10-28）：热榜 attention 观测 / 正文精读 / 短名单类目配额
+# =============================================================================
+# P0-1 attention 影子：聚合当日 node4_raw_news 的 platform/rank/snapshot_count，
+# 落 shadow_attention.json（纯观测，不写 source_count、不进 prompt、不进发酵检测）。
+# 缺省 true（同 GOT_MARKET_THEME_SHADOW 先例）；false 时缺文件。
+GOT_ATTENTION_SHADOW = os.environ.get("GOT_ATTENTION_SHADOW", "true").lower() == "true"
+
+# P0-2 正文级精读（影子，缺省关）：阶段 2 细读的素材行把 snippet 从 150 字放到
+# GOT_NEWS_FULLTEXT_MAX_CHARS（超长按头/中/尾采样，Horizon 策略），并对 snippet 短、
+# url 非空的条目抓单页正文补齐。缺省 false → prompt 逐字节同现状（可一键回滚）。
+GOT_NEWS_FULLTEXT_ENABLED = os.environ.get("GOT_NEWS_FULLTEXT_ENABLED", "false").lower() == "true"
+GOT_NEWS_FULLTEXT_MAX_CHARS = int(os.environ.get("GOT_NEWS_FULLTEXT_MAX_CHARS", "1200"))
+
+# P1-3 短名单类目配额（影子，缺省关）：12 条短名单是单池，单一类目可挤占全部名额。
+# true → prompt 追加分散要求 + 代码侧把同一粗类目超过 6 条的部分裁掉（空位不回填，宁少不凑数），
+# 并落 shadow_shortlist_quota.json；false → prompt 与行为逐字节同现状。
+GOT_NEWS_SHORTLIST_QUOTA = os.environ.get("GOT_NEWS_SHORTLIST_QUOTA", "false").lower() == "true"
+
+# =============================================================================
 # 催化剂日历架构修正（2026-10-22，docs/got/verification.md「2026-10-22 架构修正」）
 # 三条独立开关，可分别回退；全 false 时逐字节回现状。
 # =============================================================================

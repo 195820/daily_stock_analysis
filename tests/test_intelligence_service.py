@@ -394,27 +394,86 @@ class TestConvenienceFunctions:
         assert "datetime" not in item
 
     @patch("src.got.intelligence_service.get_intelligence_service")
+    def test_fetch_intelligence_items_includes_rss_slice(self, mock_get_service):
+        """P1-2：权威 RSS 条目走独立取片，不被热榜条（published_at=采集时刻）挤掉。"""
+        from src.got.intelligence_service import fetch_intelligence_items, RSS_LOOKBACK_DAYS
+
+        mock_service = MagicMock()
+        mock_service.fetch_enabled_sources.return_value = {"rss-x": 1}
+
+        calls = {}
+
+        def _list_items(**kw):
+            calls.setdefault("calls", []).append(kw)
+            if kw.get("source_id_prefix") == "rss-":
+                return {"items": [{
+                    "item_id": "r1", "title": "全国规模以上工业企业利润增长",
+                    "summary": "统计发布", "url": "https://stats/a",
+                    "source_id": "rss-x", "published_at": "2026-10-27T09:30:00",
+                }], "total": 1}
+            return {"items": [{
+                "item_id": "n1", "title": "微博热搜某话题", "summary": "热榜",
+                "url": "https://weibo/a", "source_id": "newsnow-weibo",
+                "published_at": "2026-10-28T08:00:00",
+            }], "total": 1}
+
+        mock_service.list_items.side_effect = _list_items
+        mock_get_service.return_value = mock_service
+
+        items = fetch_intelligence_items(days=1)
+
+        assert {i["source"] for i in items} == {
+            "intelligence_newsnow-weibo", "intelligence_rss-x",
+        }
+        rss_call = [c for c in calls["calls"] if c.get("source_id_prefix") == "rss-"][0]
+        assert rss_call["days"] == max(1, RSS_LOOKBACK_DAYS)
+
+    @patch("src.got.intelligence_service.get_intelligence_service")
     def test_initialize_builtin_sources_registers_missing(self, mock_get_service):
-        """W1：无既有源时注册全部内建模板"""
-        from src.got.intelligence_service import initialize_builtin_sources, NEWSNOW_TEMPLATES
+        """W1：无既有源时注册全部内建模板 + P1-2 权威 RSS 源"""
+        from src.got.intelligence_service import (
+            initialize_builtin_sources, NEWSNOW_TEMPLATES, RSS_BUILTIN_SOURCES,
+        )
         mock_service = MagicMock()
         mock_service.list_sources.return_value = {"sources": [], "total": 0}
         mock_get_service.return_value = mock_service
         registered = initialize_builtin_sources()
         assert mock_service.register_newsnow_source.call_count == len(NEWSNOW_TEMPLATES)
-        assert registered == len(NEWSNOW_TEMPLATES)
+        assert mock_service.register_rss_source.call_count == len(RSS_BUILTIN_SOURCES)
+        assert registered == len(NEWSNOW_TEMPLATES) + len(RSS_BUILTIN_SOURCES)
 
     @patch("src.got.intelligence_service.get_intelligence_service")
     def test_initialize_builtin_sources_skips_existing(self, mock_get_service):
         """W1：已存在的源被跳过，不重新注册（保留用户 enabled 设置，不被强制启用）"""
-        from src.got.intelligence_service import initialize_builtin_sources, NEWSNOW_TEMPLATES
+        import hashlib
+
+        from src.got.intelligence_service import (
+            initialize_builtin_sources, NEWSNOW_TEMPLATES, RSS_BUILTIN_SOURCES,
+        )
         mock_service = MagicMock()
         existing = [{"source_id": f"newsnow-{tid}"} for tid in NEWSNOW_TEMPLATES]
+        existing += [
+            {"source_id": f"rss-{hashlib.md5(src['url'].encode()).hexdigest()[:12]}"}
+            for src in RSS_BUILTIN_SOURCES
+        ]
         mock_service.list_sources.return_value = {"sources": existing, "total": len(existing)}
         mock_get_service.return_value = mock_service
         registered = initialize_builtin_sources()
         assert mock_service.register_newsnow_source.call_count == 0
+        assert mock_service.register_rss_source.call_count == 0
         assert registered == 0
+
+    def test_rss_builtin_source_ids_match_register_derivation(self):
+        """P1-2：initialize_builtin_sources 的 source_id 推导必须与 register_rss_source 一致
+        （rss- + md5(url)[:12]），否则幂等判定永远不命中，每次运行重复注册。"""
+        import hashlib
+
+        from src.got.intelligence_service import RSS_BUILTIN_SOURCES
+        assert RSS_BUILTIN_SOURCES, "至少注册一个实测存活的权威 RSS 源"
+        for src in RSS_BUILTIN_SOURCES:
+            assert src["url"].startswith("http")
+            assert src["name"]
+            assert len(f"rss-{hashlib.md5(src['url'].encode()).hexdigest()[:12]}") <= 32
 
 
 # =============================================================================

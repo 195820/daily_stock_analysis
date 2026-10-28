@@ -27,12 +27,17 @@ from src.got.schemas import (
     NewsEvent,
     DataQuality,
 )
-from src.got.news_feeds import fetch_all_news
+from src.got.news_feeds import fetch_all_news_pool
+from src.got.news_url import canonicalize_url
 from src.got.catalyst_config import (
     GOT_NEWS_EVIDENCE_GATING,
+    GOT_ATTENTION_SHADOW,
+    GOT_NEWS_FULLTEXT_ENABLED,
+    GOT_NEWS_FULLTEXT_MAX_CHARS,
     GOT_LOW_SECTOR_RESCUE,
     GOT_NEWS_TITLE_SHORTLIST_ENABLED,
     GOT_NEWS_TITLE_SHORTLIST_SIZE,
+    GOT_NEWS_SHORTLIST_QUOTA,
     GOT_NEWS_CARRY_PREV_TITLES,
     GOT_NEWS_CARRY_DAYS,
     GOT_NEWS_CARRY_MAX,
@@ -73,6 +78,9 @@ TITLE_SHORTLIST_TEMPERATURE = 0.2
 TITLE_SHORTLIST_MAX_TOKENS = 1500
 # 回滚路径（GOT_NEWS_TITLE_SHORTLIST_ENABLED=false）沿用的旧截断条数
 LEGACY_PROMPT_MAX_ITEMS = 50
+# 类目配额（P1-3）：同一粗类目在短名单中的上限（12 条上限的 50%，拍板值非数据标定；
+# 影子期收 category_dist 实际分布后再调）
+SHORTLIST_CATEGORY_QUOTA = 6
 
 
 # =============================================================================
@@ -89,7 +97,7 @@ TITLE_SHORTLIST_PROMPT = """你是 A 股消息面筛选员。下面是今日全�
 - 不挑：单纯行情播报（"XX涨超X%""多股涨停"）、论坛口水、无主体的评论转载、软文、与 A 股无关的境外社会新闻、标题无法判断主体的条目。
 - 关键区分：一条"某小公司三季报"若只影响自身，影响低于"改变全行业供需/政策的产业级事件"；反之若该公司是产业链关键环节，则影响深远。
 - [今日早前]/[昨日]/[N日前] 前缀的是此前已出现但未分析的条目（数字为距今天的自然日数；跨周末/假日时其市场时效以重新开盘计，不按日龄折减），若具实质影响同样要挑。
-- 每条标题最多被挑一次；挑中的要给一句话理由（引用标题里的实体与影响链条）。
+- 每条标题最多被挑一次；挑中的要给一句话理由（引用标题里的实体与影响链条）。{quota_req}
 输出 JSON：{{"selected":[{{"index":3,"reason":"..."}}]}}
 index 必须是上面出现过的编号。只输出 JSON。"""
 
@@ -213,6 +221,24 @@ LOW_RESCUE_PROMPT = """你是 A 股板块研究员。以下事件被一审判为
 只输出 JSON。index 对应候选事件列表的 0-based 序号。宁严勿松：拿不准 high 还是 medium 时给 medium。"""
 
 
+def _sample_long_text(text: str, limit: int) -> str:
+    """超长正文头/中/尾采样（Horizon 策略）：头 50% + 中 25% + 尾 25%。
+
+    ≤limit 原样返回。头/中/尾采样优于纯截断：政策文件的关键结论常在末尾（"自X日起施行"），
+    纯头截断会把它切掉。
+    """
+    text = (text or "").strip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head_len = int(limit * 0.5)
+    mid_len = int(limit * 0.25)
+    tail_len = limit - head_len - mid_len
+    mid_start = max(head_len, (len(text) - mid_len) // 2)
+    mid = text[mid_start:mid_start + mid_len]
+    tail = text[-tail_len:] if tail_len > 0 else ""
+    return f"{text[:head_len]}\n…（中略）\n{mid}\n…（中略）\n{tail}"
+
+
 def _carry_age_prefix(item: Dict) -> str:
     """补读条目的自然日龄前缀（0=当日更早时点 / 1=昨日 / n=n 自然日前）。
 
@@ -253,10 +279,11 @@ class NewsAnalysisNode:
             logger.warning("[Node 4] Intelligence 初始化失败（降级跳过）: %s", e)
 
         # Step 1: 并发采集新闻
-        raw_news, data_quality = await self._fetch_news()
+        raw_news, raw_pool, data_quality = await self._fetch_news()
 
         # Step 1.5: 原始新闻持久化（P1-1: 跨日发酵检测基础）
-        self._persist_raw_news(raw_news)
+        # 落库用**未截断**的全量池：热榜条目（无发布时间）排在 weight 尾部，不会进 merged
+        self._persist_raw_news(raw_pool)
 
         if not raw_news:
             logger.warning("[Node 4] 未获取到任何新闻数据")
@@ -268,9 +295,15 @@ class NewsAnalysisNode:
                 data_quality=data_quality,
             )
 
+        # 部分失败判定：`_fetch_news` 只填 available/missing_fields（fetch_failed_fields 恒空，
+        # 旧检查里的 cls_telegraph/akshare_news/search_news 已不起作用）→ status 永不 degraded。
+        # 只对高价值 4 线降级：sina_feed/intelligence 缺失不降级（滚动线外部源多，
+        # 单线缺失不等于分析能力受损；全源为空的 failed 分支已在上方处理）。
+        partial_failure_fields = (
+            "cls_telegraph", "wallstreetcn", "eastmoney_kuaixun", "newsnow_hot",
+        )
         has_partial_failure = any(
-            f in data_quality.fetch_failed_fields
-            for f in ["cls_telegraph", "akshare_news", "search_news"]
+            f in data_quality.missing_fields for f in partial_failure_fields
         )
 
         logger.info("[Node 4] 采集到 %d 条原始新闻", len(raw_news))
@@ -331,11 +364,29 @@ class NewsAnalysisNode:
         except Exception as exc:
             logger.warning("[Node 4] 催化剂日历构建失败（已降级）: %s", exc)
 
+        # ── P0-1 attention 影子（纯观测，缺省开） ──
+        self._write_attention_shadow()
+
         logger.info(
             "[Node 4] 完成 — status=%s, impact=%s(%.2f), events=%d",
             status, overall_impact, impact_score, len(events),
         )
         return result
+
+    @staticmethod
+    def _write_attention_shadow() -> None:
+        """P0-1 attention 影子（缺省开）：聚合当日热榜平台扩散 → shadow_attention.json。
+
+        纯观测：不写 `source_count`、不进 prompt、不进 `_detect_fermenting_events`。
+        开关 `GOT_ATTENTION_SHADOW=false` → 缺文件不回现状（零产物）。
+        """
+        if not GOT_ATTENTION_SHADOW:
+            return
+        try:
+            from src.got.attention_shadow import build_attention_shadow
+            build_attention_shadow(Path("data/got_daily") / date.today().strftime("%Y%m%d"))
+        except Exception as exc:  # noqa: BLE001 — 影子旁挂，失败不阻断主流程
+            logger.warning("[Node 4] attention 影子落盘失败（已忽略）: %s", exc)
 
     # =================================================================
     # Step 1: 新闻采集
@@ -345,20 +396,27 @@ class NewsAnalysisNode:
         self,
         skip_sources: Iterable[str] = (),
         include_intelligence: bool = True,
-    ) -> Tuple[List[Dict[str, Any]], DataQuality]:
-        """7 源串行采集（新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）+ Intelligence 合并，返回 DataQuality。
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], DataQuality]:
+        """7 源串行采集（新浪/CLS/华尔街见闻/东财/NewsNow/NGA/同花顺）+ Intelligence 合并。
+
+        Returns:
+            (merged_news, raw_pool, data_quality)
+            - merged_news：截断到 MAX_MERGED_NEWS 的 LLM 输入口径（`run` 的分析素材）
+            - raw_pool：截断前的去重全量池（`_persist_raw_news` 落库口径）——热榜条目
+              （NewsNow/同花顺，无发布时间）结构性地排在 weight 尾部队列，只会出现在这里
 
         `skip_sources` / `include_intelligence` 供定时快照采集降载：跳过论坛/热榜/情报热榜，
         只留滚动新闻线（CLS 1–3h、东财/见闻/NewsNow 数小时，必须高频采才不会整段丢失）；
         NGA/同花顺热榜/情报热榜非时效源，仍由每日 GOT 全量采集。
         """
-        merged, stats = await asyncio.to_thread(fetch_all_news, skip_sources)
+        merged, raw_pool, stats = await asyncio.to_thread(fetch_all_news_pool, skip_sources)
 
         # §6 Intelligence 通道：与 5 源并行，合并去重后送 LLM
         intelligence_items = await self._fetch_intelligence() if include_intelligence else []
         if intelligence_items:
             # 去重合并（基于标题相似度）
             merged = self._merge_with_intelligence(merged, intelligence_items)
+            raw_pool = self._merge_with_intelligence(raw_pool, intelligence_items)
             stats["intelligence"] = len(intelligence_items)
 
         # 构建 DataQuality
@@ -390,7 +448,7 @@ class NewsAnalysisNode:
             stats.get("newsnow", 0), stats.get("intelligence", 0),
             len(merged),
         )
-        return merged, data_quality
+        return merged, raw_pool, data_quality
 
     async def _fetch_intelligence(self) -> List[Dict[str, Any]]:
         """§6 Intelligence 情报采集（独立通道）"""
@@ -439,7 +497,9 @@ class NewsAnalysisNode:
     # Step 2: 4 次串行 LLM 分析（标题粗筛 → 事件提取 → 概念发现 → 风险总结）
     # =================================================================
 
-    def _shortlist_titles(self, raw_news: List[Dict]) -> List[Dict]:
+    def _shortlist_titles(
+        self, raw_news: List[Dict], quota_out: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict]:
         """把当日**全部**候选标题一次性交 LLM 初筛，返回选中条目（输入不设条数上限）。
 
         事件价值判定交给 LLM：weight 只度量「媒体多热」，不度量「对 A 股的影响深度」
@@ -447,6 +507,9 @@ class NewsAnalysisNode:
         证伪（同 Node 6 A6 阶段 2 「规则价值判断不可靠」教训）。粗筛只读标题不带摘要：
         成本低于细读，且覆盖全量不受长上下文位置偏差影响（Lost in the Middle,
         arXiv:2307.03172）。
+
+        `quota_out`：`GOT_NEWS_SHORTLIST_QUOTA=true` 时的影子记录出口（picked/dropped/
+        category_dist），开关关闭不动它。
 
         失效契约（**不降级到规则排序**）：LLM 空响应 / JSON 解析失败 / 有效 index 为 0
         → 返回 []，当日不产事件。用 weight 兜底等于 LLM 失效时主动选择错误事件——
@@ -464,6 +527,11 @@ class NewsAnalysisNode:
             total=len(ordered),
             limit=GOT_NEWS_TITLE_SHORTLIST_SIZE,
             titles="\n".join(lines),
+            quota_req=(
+                "\n- 挑选时保持类目分散：同一宏观政策/同一产业主题的条目合计不超过"
+                f" {SHORTLIST_CATEGORY_QUOTA} 条（{GOT_NEWS_TITLE_SHORTLIST_SIZE} 条上限内"
+                "至少 3 个不同主题方向），除非当日确实只有单一主线。"
+            ) if GOT_NEWS_SHORTLIST_QUOTA else "",
         )
 
         raw_result = self._call_llm(
@@ -511,7 +579,70 @@ class NewsAnalysisNode:
                 "[Node 4] 标题粗筛失败，当日不产事件（不降级到规则排序）: 有效 index 为 0"
             )
             return []
+        if GOT_NEWS_SHORTLIST_QUOTA:
+            picked, quota_record = self._apply_category_quota(picked)
+            if quota_out is not None:
+                quota_out.update(quota_record)
+            if quota_record["dropped_by_quota"]:
+                logger.info(
+                    "[Node 4] 类目配额裁剪: 保留 %d 条，裁掉 %d 条（%s）",
+                    len(picked), len(quota_record["dropped_by_quota"]),
+                    quota_record["category_dist"],
+                )
         return picked
+
+    @classmethod
+    def _apply_category_quota(cls, picked: List[Dict]) -> Tuple[List[Dict], Dict[str, Any]]:
+        """同一粗类目超过 `SHORTLIST_CATEGORY_QUOTA` 的部分整组裁掉（空位不回填）。
+
+        粗类目 = 标题命中的首个 `INDUSTRY_RECALL_KEYWORDS["industry_entity"]` 词，未命中记
+        「其他」。词表只做形态归类（与产业召回同一口径），**不做价值判断**：裁谁留谁完全
+        按 LLM 给出的顺序，只限制单类目占比。返回 (裁剪后条目, 影子记录)。
+        """
+        entities = INDUSTRY_RECALL_KEYWORDS["industry_entity"]
+
+        def _category(title: str) -> str:
+            for kw in entities:
+                if kw in title:
+                    return kw
+            return "其他"
+
+        buckets: Dict[str, List[Dict]] = {}
+        for item in picked:
+            buckets.setdefault(_category(item.get("title", "")), []).append(item)
+
+        kept_ids = set()
+        dropped: List[str] = []
+        for items in buckets.values():
+            for item in items[:SHORTLIST_CATEGORY_QUOTA]:
+                kept_ids.add(id(item))
+            dropped.extend(it.get("title", "") for it in items[SHORTLIST_CATEGORY_QUOTA:])
+
+        kept = [it for it in picked if id(it) in kept_ids]
+        return kept, {
+            "picked": [it.get("title", "") for it in kept],
+            "dropped_by_quota": dropped,
+            "category_dist": {cat: len(items) for cat, items in buckets.items()},
+        }
+
+    @staticmethod
+    def _write_shortlist_quota_shadow(record: Dict[str, Any]) -> None:
+        """落 shadow_shortlist_quota.json（tmp+replace 原子写，影子产物同款惯例）。"""
+        try:
+            day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            out = day_dir / "shadow_shortlist_quota.json"
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(out)
+            logger.info(
+                "[Node 4] 短名单配额影子落盘: picked=%d dropped=%d",
+                len(record.get("picked", [])), len(record.get("dropped_by_quota", [])),
+            )
+        except OSError as exc:
+            logger.warning(
+                "[Node 4] shadow_shortlist_quota.json 落盘失败（已忽略）: %s", exc,
+            )
 
     def _recall_industry_candidates(
         self, raw_news: List[Dict], exclude: Optional[List[Dict]] = None,
@@ -696,7 +827,10 @@ class NewsAnalysisNode:
                         if self._normalize_title(c.get("title", "")) not in today_norms
                     ]
                 pool_for_shortlist = raw_news + carried
-            shortlist = self._shortlist_titles(pool_for_shortlist)
+            quota_record: Dict[str, Any] = {}
+            shortlist = self._shortlist_titles(pool_for_shortlist, quota_out=quota_record)
+            if quota_record:
+                self._write_shortlist_quota_shadow(quota_record)
             # 产业级召回（2026-10-22）：短名单之外按「供给侧动作×产业实体」补召回，
             # 与短名单合并去重后一起进阶段 2 细读（DeepInfer 类单源产业发布不再缺席）
             recalled = self._recall_industry_candidates(raw_news, exclude=shortlist)
@@ -705,10 +839,15 @@ class NewsAnalysisNode:
                 "[Node 4] 标题粗筛: %d → %d 条（含补读 %d、产业召回 %d）",
                 len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
             )
-            news_text, ordered_items = self._format_news_for_prompt(extraction_pool, gated=gated)
             # 概念发现/风险总结仍读全量 raw_news（标题+摘要）：概念发现依赖跨条目的
-            # 重复主题，喂 12 条短名单会让它失效。
+            # 重复主题，喂 12 条短名单会让它失效。**先**格式化全量文本再给短名单补正文，
+            # 保证概念/风险输入不受 GOT_NEWS_FULLTEXT_ENABLED 影响（开关只作用于细读）。
             all_news_text, _ = self._format_news_for_prompt(raw_news, gated=gated)
+            if GOT_NEWS_FULLTEXT_ENABLED:
+                extraction_pool = await self._enrich_fulltext(extraction_pool)
+            news_text, ordered_items = self._format_news_for_prompt(
+                extraction_pool, gated=gated, fulltext=GOT_NEWS_FULLTEXT_ENABLED,
+            )
         else:
             news_text, ordered_items = self._format_news_for_prompt(
                 raw_news, max_items=LEGACY_PROMPT_MAX_ITEMS, gated=gated,
@@ -787,7 +926,42 @@ class NewsAnalysisNode:
     _RESERVED_SOURCE_TYPES = ("nga_forum", "intelligence")
 
     @staticmethod
-    def _format_news_for_prompt(news_items: List[Dict], max_items: Optional[int] = None, *, gated: bool = False) -> Tuple[str, List[Dict]]:
+    async def _enrich_fulltext(items: List[Dict]) -> List[Dict]:
+        """短名单正文补全（P0-2，`GOT_NEWS_FULLTEXT_ENABLED` 门控）。
+
+        只对 **url 非空且 snippet < 200 字** 的条目抓单页正文（CLS 快讯 url 恒空但
+        snippet 已是全文，跳过）。抓取失败/正文为空 → 保持原 snippet；成功时原 snippet
+        留存在 `snippet_raw`（影子对照用）。并发 5，单页超时 10s，最坏 ~20s。
+        """
+        from src.got.news_fulltext import fetch_article_text
+
+        targets = [
+            it for it in items
+            if (it.get("url") or "").strip() and len((it.get("snippet") or "").strip()) < 200
+        ]
+        if not targets:
+            return items
+
+        sem = asyncio.Semaphore(5)
+
+        async def _fill(item: Dict) -> None:
+            async with sem:
+                text = await asyncio.to_thread(fetch_article_text, item["url"])
+            if text:
+                item["snippet_raw"] = item.get("snippet", "")
+                item["snippet"] = text
+
+        await asyncio.gather(*(_fill(it) for it in targets))
+        filled = sum(1 for it in targets if it.get("snippet_raw"))
+        logger.info(
+            "[Node 4] 正文补全: %d/%d 条目标补齐（短名单共 %d 条）",
+            filled, len(targets), len(items),
+        )
+        return items
+
+    @staticmethod
+    def _format_news_for_prompt(news_items: List[Dict], max_items: Optional[int] = None, *, gated: bool = False,
+                                fulltext: bool = False) -> Tuple[str, List[Dict]]:
         """将新闻列表格式化为 LLM prompt 文本（含来源类型标注 + NGA/Intelligence 保底）。
 
         返回 (文本, 有序条目列表)：有序列表与文本中序号 1..N 严格对齐，供 `_parse_events`
@@ -796,6 +970,8 @@ class NewsAnalysisNode:
         辅助调用都走这条）；只保留旧的 50 条截断作为回滚路径的显式传参
         （`LEGACY_PROMPT_MAX_ITEMS`）。
         gated=False（缺省）：素材行逐字同改造前，仅返回列表供回连（实际无 source_index 则回连 None）。
+        fulltext=False（缺省）：snippet 截 150 字（逐字节同改造前）；True（`GOT_NEWS_FULLTEXT_ENABLED`）
+        → 上限放到 `GOT_NEWS_FULLTEXT_MAX_CHARS` 且超长按头/中/尾采样。
         """
         top_items = list(news_items) if max_items is None else list(news_items[:max_items])
 
@@ -829,7 +1005,11 @@ class NewsAnalysisNode:
             source = item.get("source", "未知")
             source_type = item.get("source_type", "")
             title = item.get("title", "")
-            snippet = item.get("snippet", "")[:150]
+            raw_snippet = item.get("snippet", "") or ""
+            if fulltext:
+                snippet = _sample_long_text(raw_snippet, GOT_NEWS_FULLTEXT_MAX_CHARS)
+            else:
+                snippet = raw_snippet[:150]
             level = item.get("level", "")
 
             # 来源标注：[财联社-A] / [东财] / [央视] / [搜索]
@@ -1436,6 +1616,28 @@ class NewsAnalysisNode:
         union = bigrams_a | bigrams_b
         return len(intersection) / len(union)
 
+    @staticmethod
+    def _attention_meta(item: Dict) -> Dict[str, Any]:
+        """采集条目的热榜元数据（P0-1）：单值 platform + 合并 platforms 集 + rank/heat 规整。
+
+        `platforms` 是 `_deduplicate` 合并同题多平台后的集合（微博/百度/知乎同题只留一条
+        新闻，但平台扩散要可观测）；单值 `platform` 保留首个平台，`platforms` 记录全集。
+        """
+        platform = item.get("platform") or None
+        platforms = {p for p in (item.get("platforms") or []) if p}
+        if platform:
+            platforms.add(platform)
+        rank = item.get("rank")
+        rank = int(rank) if isinstance(rank, (int, float)) and rank > 0 else None
+        heat = item.get("heat")
+        heat = float(heat) if isinstance(heat, (int, float)) and heat else None
+        return {
+            "platform": platform,
+            "platforms": ",".join(sorted(platforms))[:200] or None,
+            "rank": rank,
+            "heat": heat,
+        }
+
     def _persist_raw_news(self, raw_news: List[Dict]) -> Tuple[int, int]:
         """原始新闻持久化（P1-1）：精确匹配 + 相似度兜底去重。
 
@@ -1462,14 +1664,25 @@ class NewsAnalysisNode:
                         continue
                     url = (item.get("url") or "").strip() or None
                     published_at = (item.get("published_date") or "").strip() or None
+                    url_canonical = canonicalize_url(url or "") or None
+                    meta = self._attention_meta(item)
 
                     title_norm = self._normalize_title(title)
 
+                    # Step 0: URL 指纹匹配（同源同链接 → 同一条，换标题也算）
+                    existing = None
+                    if url_canonical:
+                        existing = session.query(Node4RawNewsRecord).filter(
+                            Node4RawNewsRecord.url_canonical == url_canonical,
+                            Node4RawNewsRecord.source == source,
+                        ).first()
+
                     # Step 1: 精确匹配（同标题 + 同来源）
-                    existing = session.query(Node4RawNewsRecord).filter(
-                        Node4RawNewsRecord.title_normalized == title_norm,
-                        Node4RawNewsRecord.source == source,
-                    ).first()
+                    if not existing:
+                        existing = session.query(Node4RawNewsRecord).filter(
+                            Node4RawNewsRecord.title_normalized == title_norm,
+                            Node4RawNewsRecord.source == source,
+                        ).first()
 
                     # Step 2: 精确未命中 → 同源近 3 日记录做相似度兜底
                     if not existing:
@@ -1496,6 +1709,8 @@ class NewsAnalysisNode:
 
                         # 影子字段：每次运行+1（旧口径，用于对比）
                         existing.appearance_count_run_based = (existing.appearance_count_run_based or 0) + 1
+                        # P0-1：快照/运行命中次数（小时快照 × 在榜时长 → 盘中热度轨迹，纯观测）
+                        existing.snapshot_count = (existing.snapshot_count or 0) + 1
 
                         existing.last_seen_date = today
                         # A1 出处回填：旧行无 url/发布时间而本次采到则补齐（不覆盖已有值）
@@ -1503,6 +1718,23 @@ class NewsAnalysisNode:
                             existing.url = url
                         if published_at and not getattr(existing, "published_at", None):
                             existing.published_at = published_at
+                        if url_canonical and not getattr(existing, "url_canonical", None):
+                            existing.url_canonical = url_canonical
+                        # P0-1 热榜元数据：platform 补空不覆盖、名次取更靠前、热度补空
+                        if meta["platform"] and not getattr(existing, "platform", None):
+                            existing.platform = meta["platform"]
+                        if meta["platforms"]:
+                            merged_platforms = {
+                                p for p in (getattr(existing, "platforms", None) or "").split(",") if p
+                            } | set(meta["platforms"].split(","))
+                            existing.platforms = ",".join(sorted(merged_platforms))[:200]
+                        if meta["rank"] and (
+                            getattr(existing, "rank", None) is None
+                            or meta["rank"] < existing.rank
+                        ):
+                            existing.rank = meta["rank"]
+                        if meta["heat"] and not getattr(existing, "heat", None):
+                            existing.heat = meta["heat"]
                         updated += 1
                     else:
                         session.add(Node4RawNewsRecord(
@@ -1516,6 +1748,12 @@ class NewsAnalysisNode:
                             lifecycle_state='active',
                             url=url,
                             published_at=published_at,
+                            url_canonical=url_canonical,
+                            platform=meta["platform"],
+                            platforms=meta["platforms"],
+                            rank=meta["rank"],
+                            heat=meta["heat"],
+                            snapshot_count=1,
                         ))
                         persisted += 1
 

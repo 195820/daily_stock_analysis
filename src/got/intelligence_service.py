@@ -57,6 +57,10 @@ NEWSNOW_TIMEOUT = 10
 # RSS 解析
 RSS_TIMEOUT = 12
 RSS_MAX_ITEMS = 30
+# 权威 RSS 源的独立查询窗口/条数（P1-2）：政策/统计线周级节奏，且 published_at 比热榜源旧，
+# 混在全局 limit 里会被热榜条挤掉
+RSS_LOOKBACK_DAYS = 7
+RSS_MAX_ITEMS_PER_QUERY = 40
 
 # 通用
 DEFAULT_TIMEOUT = 10
@@ -86,6 +90,24 @@ NEWSNOW_TEMPLATES = {
     "weibo": {"name": "微博热搜", "scope_type": "market", "scope_value": "cn"},
     "baidu": {"name": "百度热搜", "scope_type": "market", "scope_value": "cn"},
 }
+
+# 权威 RSS 源（P1-2）：政策/统计官方发布线，走既有 `_fetch_rss` + `register_rss_source`，
+# 不新增管线、不新增权重映射（条目以 source_type="intelligence" 合并进 raw_news，
+# 价值交 LLM 初筛判，同 2026-10-22 契约）。
+#
+# 2026-10-28 逐个实测存活（都是 RSS 2.0 且 `<item` 非空、内容当日/近日）：
+#   国家统计局「数据发布」 200 / 500 items（PMI/CPI/工业利润等宏观数据）
+#   中国政府网「原创推荐」 200 / 60 items（国务院文件与政策解读）
+# 实测剔除（勿再加回，会静默产出 0 条）：
+#   https://www.gov.cn/gongbao/rss.xml            404 HTML
+#   http://www.ndrc.gov.cn/xxgk/zcfb/rss.xml     200 但 RSS 骨架 **0 items**（空频道）
+#   https://www.miit.gov.cn/rss/index.xml        404 HTML
+RSS_BUILTIN_SOURCES = [
+    {"url": "https://www.stats.gov.cn/sj/zxfb/rss.xml", "name": "国家统计局数据发布",
+     "scope_type": "market", "scope_value": "cn"},
+    {"url": "https://www.gov.cn/pushinfo/v150203/rss.xml", "name": "中国政府网原创推荐",
+     "scope_type": "market", "scope_value": "cn"},
+]
 
 
 # =============================================================================
@@ -664,6 +686,7 @@ class IntelligenceService:
         query: Optional[str] = None,
         days: int = 1,
         limit: int = 50,
+        source_id_prefix: Optional[str] = None,
     ) -> Dict[str, Any]:
         """查询情报条目
 
@@ -674,6 +697,8 @@ class IntelligenceService:
             query: 关键词搜索（标题/摘要）
             days: 时间范围（天）
             limit: 返回条数上限
+            source_id_prefix: 按 source_id 前缀过滤（如 "rss-"）——热榜源按
+                `published_at desc` 会占满全局 limit，权威 RSS 源需要独立取片
 
         Returns:
             {"items": [...], "total": int}
@@ -685,6 +710,11 @@ class IntelligenceService:
             q = session.query(IntelligenceItemRecord).filter(
                 IntelligenceItemRecord.published_at >= cutoff
             )
+
+            if source_id_prefix:
+                q = q.filter(
+                    IntelligenceItemRecord.source_id.like(f"{source_id_prefix}%")
+                )
 
             if scope_type:
                 q = q.filter(IntelligenceItemRecord.scope_type == scope_type)
@@ -783,7 +813,23 @@ def fetch_intelligence_items(
 
     # W9：按 market/scope 过滤查询
     result = service.list_items(days=days, market=market, scope_type=scope_type, limit=100)
-    items = result.get("items", [])
+    items = list(result.get("items", []))
+
+    # P1-2：权威 RSS 源单独取片。热榜源（newsnow-*）的 published_at 是采集时刻，
+    # 按 desc 排序会占满全局 limit，政策源的 feed pubDate（往往 1–3 天前）永远被饿死。
+    # 政策/统计线发布节奏是周级，故 RSS 片段用独立窗口（RSS_LOOKBACK_DAYS）。
+    try:
+        rss_result = service.list_items(
+            days=max(days, RSS_LOOKBACK_DAYS), market=market, scope_type=scope_type,
+            limit=RSS_MAX_ITEMS_PER_QUERY, source_id_prefix="rss-",
+        )
+        seen_ids = {it.get("item_id") for it in items}
+        for it in rss_result.get("items", []):
+            if it.get("item_id") in seen_ids:
+                continue
+            items.append(it)
+    except Exception as e:  # noqa: BLE001 — RSS 取片失败不阻断热榜通道
+        logger.warning("[Intelligence] RSS 条目查询失败（降级跳过）: %s", e)
 
     # 转换为 news_feeds 兼容格式
     merged: List[Dict[str, Any]] = []
@@ -807,6 +853,8 @@ def initialize_builtin_sources() -> int:
 
     W1：仅创建**缺失**的源，不覆盖已存在源的 enabled 状态
         （避免用户手动禁用后被每次 Node 4 运行重新启用）。
+    P1-2：`NEWSNOW_TEMPLATES` 之外追加 `RSS_BUILTIN_SOURCES`（政策/统计权威线，
+        source_id 由 URL md5 派生，与 register_rss_source 口径一致）。
 
     Returns:
         本次新注册的源数量。
@@ -830,6 +878,20 @@ def initialize_builtin_sources() -> int:
             registered += 1
         except Exception as e:
             logger.warning("[Intelligence] 注册 %s 失败: %s", template_id, e)
+
+    # P1-2 权威 RSS 源（幂等：source_id 由 URL md5 派生，已存在则跳过）
+    for src in RSS_BUILTIN_SOURCES:
+        source_id = f"rss-{hashlib.md5(src['url'].encode()).hexdigest()[:12]}"
+        if source_id in existing_ids:
+            continue
+        try:
+            service.register_rss_source(
+                src["url"], src["name"],
+                scope_type=src.get("scope_type"), scope_value=src.get("scope_value"),
+            )
+            registered += 1
+        except Exception as e:
+            logger.warning("[Intelligence] 注册 RSS %s 失败: %s", src["name"], e)
 
     if registered:
         logger.info(

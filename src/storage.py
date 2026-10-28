@@ -1371,7 +1371,7 @@ class CatalystRealizationRecord(Base):
     # 事件标识
     event_id = Column(String(64), nullable=False, index=True, unique=True)
     event_type = Column(String(20), nullable=False)          # earnings/lockup/narrative/global/macro
-    source = Column(String(30), nullable=False)              # akshare_earnings / llm_narrative / global_map
+    source = Column(String(30), nullable=False)              # akshare_earnings / llm_narrative / global_map / global_manual
     source_type = Column(String(20), nullable=False, default='forward')  # forward / reverse_discovery / veto / reservoir
     # 事件信息
     sector = Column(String(64), nullable=False, index=True)
@@ -1447,6 +1447,15 @@ class Node4RawNewsRecord(Base):
     # A1（批次 A）出处链：来源链接与发布时间（采集层透传，旧行 NULL→回读容错）
     url = Column(String(500), nullable=True)
     published_at = Column(String(32), nullable=True)
+    # P1-1 URL 指纹（归一化去重键；旧行 NULL = 未采集，消费端跳过该判据）
+    url_canonical = Column(String(500), nullable=True, index=True)
+    # P0-1 热榜元数据（NewsNow 平台名次 / THS 热度；旧行 NULL = 未采集）
+    platform = Column(String(32), nullable=True)
+    platforms = Column(String(200), nullable=True)  # 去重合并后的平台集合（逗号分隔，观测用）
+    rank = Column(Integer, nullable=True)
+    heat = Column(Float, nullable=True)
+    # 当日快照/运行命中次数（小时快照 × 在榜时长 → 盘中热度轨迹；非热榜行同样计数，纯观测列）
+    snapshot_count = Column(Integer, default=0)
     # 时间戳
     created_at = Column(DateTime, default=utc_naive_now)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
@@ -1962,6 +1971,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         新增列：
         - node4_events.mention_count_run_based (INTEGER DEFAULT 0)
         - node4_raw_news.appearance_count_run_based (INTEGER DEFAULT 0)
+        - node4_raw_news.url / published_at (A1 出处链)
+        - node4_raw_news.url_canonical (P1-1 URL 指纹去重键)
+        - node4_raw_news.platform / platforms / rank / heat / snapshot_count (P0-1 热榜元数据)
 
         幂等：已存在的列跳过；失败不阻塞启动。
         """
@@ -1976,6 +1988,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 # A1（批次 A）出处链：采集层透传 url / 发布时间（nullable，旧行 NULL 回读容错）
                 "url": "VARCHAR(500)",
                 "published_at": "VARCHAR(32)",
+                # P1-1 URL 指纹（归一化去重键，旧行 NULL 跳过该判据）
+                "url_canonical": "VARCHAR(500)",
+                # P0-1 热榜元数据（旧行 NULL = 未采集，消费端 None 判断）
+                "platform": "VARCHAR(32)",
+                "platforms": "VARCHAR(200)",
+                "rank": "INTEGER",
+                "heat": "FLOAT",
+                "snapshot_count": "INTEGER DEFAULT 0",
             },
         }
         try:

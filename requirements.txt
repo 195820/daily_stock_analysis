@@ -71,3 +71,7 @@ jinja2>=3.1.0               # Jinja2 template engine for report rendering
 fastapi>=0.109.0            # Modern Python Web framework
 uvicorn[standard]>=0.27.0   # ASGI server
 python-multipart>=0.0.6     # FastAPI File/Form upload support
+
+# 正文抽取（Node 4 短名单全文精读，可选依赖）
+# 缺失时 src/got/news_fulltext.py 自动降级为 requests + 标签剥离：功能不损，抽取质量降一档
+trafilatura>=1.6.0

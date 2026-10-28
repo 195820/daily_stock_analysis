@@ -38,6 +38,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from src.got.news_url import canonicalize_url
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -298,7 +300,8 @@ def fetch_cls_telegraph(limit: int = 60) -> List[Dict[str, Any]]:
 
             all_items.append({
                 "title": title,
-                "snippet": content[:150] if content else title[:150],
+                # P0-2：正文不截断（CLS API 本就返回全文；旧版截 150 字让细读只见摘要尾巴）
+                "snippet": content if content else title[:150],
                 "source": "cls",
                 "source_type": "cls",
                 "url": "",
@@ -354,7 +357,8 @@ def fetch_wallstreetcn_news(limit: int = 30) -> List[Dict[str, Any]]:
 
         results.append({
             "title": text[:100],
-            "snippet": text[:150],
+            # P0-2：正文不截断（快讯流无标题字段，title 本就是截断产物；snippet 保留全文）
+            "snippet": text,
             "source": "wallstreetcn",
             "source_type": "wallstreetcn",
             "url": f"https://wallstreetcn.com/articles/{uri}" if uri else "",
@@ -451,7 +455,7 @@ def fetch_newsnow_hot() -> List[Dict[str, Any]]:
             data = resp.json()
             items = data.get("items", [])
 
-            for item in items:
+            for idx, item in enumerate(items, 1):
                 title = (item.get("title") or "").strip()
                 if not title:
                     continue
@@ -465,6 +469,9 @@ def fetch_newsnow_hot() -> List[Dict[str, Any]]:
                     "url": url,
                     "published_date": "",
                     "platform": pid,
+                    # P0-1：API item 无 rank 字段（实测只有 id/title/url/mobileUrl/extra），
+                    # 响应数组顺序即榜单顺序 → 序号补名次
+                    "rank": idx,
                 })
         except Exception as exc:
             logger.warning("[news_feeds] NewsNow %s 失败: %s", name, exc)
@@ -478,24 +485,74 @@ def fetch_newsnow_hot() -> List[Dict[str, Any]]:
 # =============================================================================
 
 
+def _platform_set(item: Dict) -> set:
+    """条目已知平台集合：合并列表 `platforms` 优先，回退单值 `platform`。"""
+    merged = item.get("platforms")
+    if merged:
+        return set(merged)
+    single = item.get("platform")
+    return {single} if single else set()
+
+
+def _merge_attention_meta(keep: Dict, drop: Dict) -> None:
+    """被去重吞掉的条目，把热榜元数据（platform/rank/heat）并入保留条目。
+
+    P0-1：平台扩散（微博/百度/知乎同题）此前在 `_deduplicate` 里被整条丢弃，
+    `platform` 只在首条保留。这里只做**观测聚合**：不写 `source_count`（平台扩散
+    ≠ 独立媒体确认，`source_count` 口径由 `_count_cross_source` 独有）。
+    """
+    platforms = _platform_set(keep) | _platform_set(drop)
+    if platforms:
+        keep["platforms"] = sorted(platforms)
+
+    ranks = [
+        r for r in (keep.get("rank"), drop.get("rank"))
+        if isinstance(r, int) and r > 0
+    ]
+    if ranks:
+        keep["rank"] = min(ranks)  # 数值更小 = 榜单更靠前
+
+    heats = [
+        h for h in (keep.get("heat"), drop.get("heat"))
+        if isinstance(h, (int, float)) and h
+    ]
+    if heats:
+        keep["heat"] = max(heats)
+
+
 def _deduplicate(news_items: List[Dict]) -> List[Dict]:
-    """按 title 相似度去重。"""
+    """按 URL 指纹 + title 相似度去重（P1-1：URL 先判，换标题同链接不再重复入库）。"""
     if not news_items:
         return []
 
     unique: List[Dict] = []
+    seen_urls: dict[str, Dict] = {}
     for item in news_items:
         title = item.get("title", "")
         if not title:
             continue
+        cand = canonicalize_url(item.get("url", "") or "")
+        if cand:
+            owner = seen_urls.get(cand)
+            if owner is not None:
+                _merge_attention_meta(owner, item)
+                continue
         is_dup = False
         for existing in unique:
             ratio = SequenceMatcher(None, title, existing["title"]).ratio()
             if ratio >= TITLE_SIMILARITY_THRESHOLD:
                 is_dup = True
+                _merge_attention_meta(existing, item)
+                # 本条被标题判重吞掉，但它携带的 URL 归属保留条目：
+                # 否则同一 URL 换标题再来一条时 URL 判据看不到 owner，会重复入库
+                if cand:
+                    seen_urls.setdefault(cand, existing)
                 break
-        if not is_dup:
-            unique.append(item)
+        if is_dup:
+            continue
+        unique.append(item)
+        if cand:
+            seen_urls[cand] = item
 
     if len(unique) < len(news_items):
         logger.info(
@@ -536,7 +593,7 @@ def _count_cross_source(
         item["source_count"] = max(1, len(matched))
 
 
-def merge_news(
+def _merge_all(
     sina: List[Dict],
     cls_news: List[Dict],
     wallstreetcn: List[Dict],
@@ -544,13 +601,20 @@ def merge_news(
     newsnow: List[Dict],
     nga_forum: Optional[List[Dict]] = None,
     ths_hot: Optional[List[Dict]] = None,
-) -> List[Dict]:
-    """7 源合并 + 去重 + 跨源标记 + 权重排序。"""
+) -> Tuple[List[Dict], List[Dict]]:
+    """合并核心：返回 (截断后的 LLM 输入, 截断前的去重全量池)。
+
+    `MAX_MERGED_NEWS` 的 weight 截断只服务 LLM 输入预算。热榜条目（NewsNow/同花顺）
+    没有发布时间 → `_calculate_weight` 的时效项取默认中值，结构性地排在有时间戳的
+    滚动新闻之后，多数交易日在截断线外被整源丢弃（实测 2026-10-28：newsnow 203 条、
+    ths_hot 15 条，merged 150 条中 0 条）。**落库/观测必须用未截断的池**，
+    否则 platform/rank/snapshot_count 永远到不了 node4_raw_news。
+    """
     nga_forum = nga_forum or []
     ths_hot = ths_hot or []
     all_news = sina + cls_news + wallstreetcn + eastmoney + newsnow + nga_forum + ths_hot
     if not all_news:
-        return []
+        return [], []
 
     deduped = _deduplicate(all_news)
     _count_cross_source(deduped, sina, wallstreetcn, cls_news, eastmoney, newsnow, nga_forum, ths_hot)
@@ -559,6 +623,7 @@ def merge_news(
     for item in deduped:
         item["weight"] = _calculate_weight(item)
     deduped.sort(key=lambda x: x.get("weight", 0), reverse=True)
+    pool = deduped
 
     # NGA 保底：确保至少 5 条论坛帖子进入合并结果（散户视角不应被专业媒体完全淹没）
     NGA_MIN_ITEMS = 5
@@ -585,28 +650,35 @@ def merge_news(
 
     active = sum(1 for s in [sina, cls_news, wallstreetcn, eastmoney, newsnow, nga_forum] if s)
     logger.info(
-        "[news_feeds] 合并: %d 条（%d 源活跃），权重 %.0f~%.0f",
+        "[news_feeds] 合并: %d 条（%d 源活跃），权重 %.0f~%.0f；未截断池 %d 条",
         len(deduped), active,
         deduped[-1].get("weight", 0) if deduped else 0,
         deduped[0].get("weight", 0) if deduped else 0,
+        len(pool),
     )
-    return deduped
+    return deduped, pool
 
 
-def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[str, int]]:
-    """
-    串行采集 7 源新闻，返回合并结果 + 各源统计。
+def merge_news(
+    sina: List[Dict],
+    cls_news: List[Dict],
+    wallstreetcn: List[Dict],
+    eastmoney: List[Dict],
+    newsnow: List[Dict],
+    nga_forum: Optional[List[Dict]] = None,
+    ths_hot: Optional[List[Dict]] = None,
+) -> List[Dict]:
+    """7 源合并 + 去重 + 跨源标记 + 权重排序（截断到 MAX_MERGED_NEWS，LLM 输入口径）。"""
+    merged, _ = _merge_all(
+        sina, cls_news, wallstreetcn, eastmoney, newsnow, nga_forum, ths_hot,
+    )
+    return merged
 
-    Args:
-        skip_sources: 跳过的源名（`sina`/`cls`/`wallstreetcn`/`eastmoney`/`newsnow`/
-            `nga_forum`/`ths_hot`）。快照采集按小时跑，跳过论坛/热榜这类非时效源，
-            避免高频抓取触发反爬（它们仍由每日 GOT 采集）。
 
-    Returns:
-        (merged_news, source_stats)
-        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N, "nga_forum": N, "ths_hot": N}
-        （被跳过的源不出现在 stats 中，与「该源返回空」区分开）
-    """
+def _collect_all_sources(
+    skip_sources: Iterable[str] = (),
+) -> Tuple[Dict[str, List[Dict]], Dict[str, int]]:
+    """串行采集 7 源（避免并发触发反爬），返回 {源名: 条目} 与各源条数。"""
     sources = {
         "sina": fetch_sina_news,
         "cls": lambda: fetch_cls_telegraph(120),
@@ -626,7 +698,6 @@ def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[s
     results: Dict[str, List[Dict]] = {}
     stats: Dict[str, int] = {}
 
-    # 串行采集（避免并发触发反爬）
     for name, fetcher in sources.items():
         try:
             items = fetcher()
@@ -637,7 +708,22 @@ def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[s
             results[name] = []
             stats[name] = 0
 
-    merged = merge_news(
+    return results, stats
+
+
+def fetch_all_news_pool(
+    skip_sources: Iterable[str] = (),
+) -> Tuple[List[Dict], List[Dict], Dict[str, int]]:
+    """同 `fetch_all_news`，额外返回**截断前**的去重全量池（落库/观测口径）。
+
+    Returns:
+        (merged_news, raw_pool, source_stats)
+        - merged_news：截断到 MAX_MERGED_NEWS 的 LLM 输入（与 `fetch_all_news` 逐字节一致）
+        - raw_pool：去重 + 权重排序后的全量池（不截断），供 `_persist_raw_news` 落库；
+          热榜条目（无发布时间）只会出现在这里，不在 merged_news 里
+    """
+    results, stats = _collect_all_sources(skip_sources)
+    merged, pool = _merge_all(
         results.get("sina", []),
         results.get("cls", []),
         results.get("wallstreetcn", []),
@@ -646,7 +732,26 @@ def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[s
         results.get("nga_forum", []),
         results.get("ths_hot", []),
     )
+    return merged, pool, stats
+
+
+def fetch_all_news(skip_sources: Iterable[str] = ()) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    串行采集 7 源新闻，返回合并结果 + 各源统计。
+
+    Args:
+        skip_sources: 跳过的源名（`sina`/`cls`/`wallstreetcn`/`eastmoney`/`newsnow`/
+            `nga_forum`/`ths_hot`）。快照采集按小时跑，跳过论坛/热榜这类非时效源，
+            避免高频抓取触发反爬（它们仍由每日 GOT 采集）。
+
+    Returns:
+        (merged_news, source_stats)
+        source_stats = {"sina": N, "cls": N, "wallstreetcn": N, "eastmoney": N, "newsnow": N, "nga_forum": N, "ths_hot": N}
+        （被跳过的源不出现在 stats 中，与「该源返回空」区分开）
+    """
+    merged, _, stats = fetch_all_news_pool(skip_sources)
     return merged, stats
+
 
 
 # =============================================================================
@@ -735,6 +840,11 @@ def fetch_ths_hot_topics() -> List[Dict[str, Any]]:
             if not title:
                 continue
 
+            try:
+                rank = int(topic.get("order", 0) or 0)
+            except (TypeError, ValueError):
+                rank = 0
+
             # 构建描述（包含相关股票信息）
             description = topic.get("description", "")
             related_stocks = topic.get("related_stocks", [])
@@ -757,6 +867,9 @@ def fetch_ths_hot_topics() -> List[Dict[str, Any]]:
                 "published_date": "",  # 热榜无明确时间戳
                 "heat": topic.get("heat", 0),
                 "related_stocks": related_stocks,
+                # P0-1：热榜名次（API `order` 字段，0=未知）+ 平台标记供落库/attention 观测
+                "platform": "ths",
+                "rank": rank or None,
             })
 
         logger.info("[news_feeds] S7 同花顺热榜: %d 条", len(items))
