@@ -1825,12 +1825,13 @@ class PortfolioDecisionNode:
            `sector_query_board`（问财**实际查询**的板块名；2026-10-20 修 §7 #19：
            Node 6 标签「液冷服务」被别名表改写为 THS 实名「液冷服务器」后，
            用原标签检索与真实板块名错位 → 001400/002076 误拦），空则回落标签。
-        2. 结果先过来源白名单 `is_allowed_source`，再用 `evidence_supports_membership`
-           做同段身份护栏（防"别的票的军贸新闻"被当成本票证据）
-        3. 通过护栏的原文批量交 LLM 判 `member` / `not_member` / `uncertain`
+        2. **不做检索后裁剪**（2026-10-23 用户裁决）：原先的白名单 + 同段共现护栏全删，
+           检索原文（标题+摘要+URL）整段交 LLM——冷门板块名（软件服务/化工机械/财税数字）
+           在公开文本里几乎不同句共现，规则层只会系统性误杀；串票识别交给 LLM。
+        3. LLM 一次性判定 `member` / `not_member` / `uncertain`（是否蹭概念）
 
-        落地：`member` 保留标签；`not_member` / `uncertain` / 无证据 一律清空标签
-        （sector 维度剔除 + Q9-B 强制 watch）。
+        落地：`member` 保留标签；`not_member` 清空标签（sector 维度剔除）；
+        `uncertain` / 无检索结果 → **保留标签**只留痕（证据不足 ≠ 蹭概念）。
 
         fail-closed：响应级 LLM 失败（异常/空/无 JSON/非数组）、全部查询无任何结果 →
         `raise SectorVerifyUnavailable`，由 orchestrator Phase 2 失败分支落
@@ -1842,11 +1843,7 @@ class PortfolioDecisionNode:
         if not finalists or len(finalists) > 15:
             return finalists
 
-        from src.got.board_aliases import sector_name_variants
-        from src.got.sector_evidence import evidence_supports_membership, is_allowed_source
         from src.search_service import get_search_service
-        from src.services.board_name_resolver import get_board_name_resolver
-        from urllib.parse import urlparse
 
         # 待验证票：有板块标签且标签在 Node 6 板块情报表内（沿用旧跳过分支口径）
         targets: List[tuple] = []
@@ -1872,10 +1869,7 @@ class PortfolioDecisionNode:
         if cached_count:
             logger.info("[板块验证] 复用本进程已校验决策 %d 票，跳过重复检索", cached_count)
         searcher = get_search_service()
-        resolver = get_board_name_resolver()
         sem = asyncio.Semaphore(4)
-        skipped_offlist = 0
-        skipped_hosts: Counter = Counter()
         raw_results_seen = False
         queries_made = 0
         # 只遍历「实际可用引擎」的顺位：未配置第二家时 offset=1 是纯等超时
@@ -1890,7 +1884,7 @@ class PortfolioDecisionNode:
         offsets_saw_results = {o: False for o in provider_offsets}
 
         async def _search_evidence(stock, tagged_sector: str) -> Optional[Dict[str, Any]]:
-            nonlocal skipped_offlist, raw_results_seen, queries_made
+            nonlocal raw_results_seen, queries_made
             # 检索词用问财**实际查询**的板块名（screener 侧 resolve_with_kind / 别名改写产物），
             # Node 6 标签仍是归档/审计字段（sector_intel_map 键、FXG 剔除名单、family 归因
             # 全部按标签工作），不在这里改写。空串（旧调用方/缓存行未带该键）→ 回落标签，
@@ -1901,15 +1895,6 @@ class PortfolioDecisionNode:
                     "[板块验证] %s 检索用实际板块名 %r（Node6 标签 %r）",
                     getattr(stock, "code", ""), verify_board, tagged_sector,
                 )
-            boards = [verify_board, tagged_sector, *sector_name_variants(tagged_sector)]
-            try:
-                resolved, _kind = resolver.resolve_with_kind(tagged_sector)
-                if resolved:
-                    boards.append(resolved)
-            except Exception as exc:  # 仅用于扩展候选板块名，失败不影响主流程
-                logger.debug("[板块验证] resolver 解析失败（忽略）: %s", exc)
-            boards = [b for b in dict.fromkeys(b.strip() for b in boards) if b]
-
             stock_name = getattr(stock, "name", "") or ""
             clean_code = (
                 (getattr(stock, "code", "") or "")
@@ -1919,6 +1904,8 @@ class PortfolioDecisionNode:
                 f"{stock_name} {clean_code} {verify_board} 概念股",
                 f"{stock_name} {clean_code} 核心概念 所属板块",
             )
+            items: List[Dict[str, str]] = []
+            provider_seen = ""
             for template in templates:
                 for offset in provider_offsets:
                     async with sem:
@@ -1930,26 +1917,23 @@ class PortfolioDecisionNode:
                         )
                     if response.results:
                         raw_results_seen = True
+                        provider_seen = getattr(response, "provider", "") or provider_seen
                         if offset in offsets_saw_results:
                             offsets_saw_results[offset] = True
                     for item in response.results:
-                        item_url = getattr(item, "url", "") or ""
-                        if not is_allowed_source(item_url):
-                            skipped_offlist += 1
-                            skipped_hosts[urlparse(item_url).hostname or "?"] += 1
-                            continue
-                        quote = evidence_supports_membership(
-                            title=getattr(item, "title", "") or "",
-                            text=getattr(item, "snippet", "") or "",
-                            stock_name=stock_name, code=clean_code, boards=boards,
-                        )
-                        if quote:
-                            return {
-                                "symbol": stock.code, "sector": tagged_sector,
-                                "quote": quote, "provider": response.provider,
-                                "query": template,
-                            }
-            return None
+                        items.append({
+                            "title": (getattr(item, "title", "") or "")[:200],
+                            "snippet": (getattr(item, "snippet", "") or "")[:300],
+                            "url": getattr(item, "url", "") or "",
+                        })
+            if not items:
+                return None
+            # 2026-10-23：检索后不再做白名单/同段共现裁剪——原文整段交 LLM 判是否蹭概念
+            return {
+                "symbol": stock.code, "sector": tagged_sector,
+                "query_board": verify_board, "items": items[:12],
+                "provider": provider_seen, "query": templates[0],
+            }
 
         evidence_hits: List[Dict[str, Any]] = []
         if fresh_targets:
@@ -1969,13 +1953,6 @@ class PortfolioDecisionNode:
             self._sector_verify_degraded = True
             self._sector_verify_pending_count = len(fresh_targets)
             raise SectorVerifyUnavailable("板块身份检索不可用：所有 provider 均未返回结果")
-
-        if skipped_offlist:
-            logger.info(
-                "[板块验证] 非白名单来源略过 %d 条（host 分布 top5: %s）",
-                skipped_offlist,
-                ", ".join(f"{host}×{n}" for host, n in skipped_hosts.most_common(5)) or "-",
-            )
 
         # 通过护栏的证据批量交 LLM 判定（1 次调用）；响应级失败 → fail-closed
         verdicts: Dict[str, str] = {}
@@ -2005,13 +1982,19 @@ class PortfolioDecisionNode:
                 elif verdict == "not_member":
                     decisions[stock.code] = {"sector": tagged_sector, "reason": "llm_rejected"}
                 else:
-                    decisions[stock.code] = {"sector": tagged_sector, "reason": "llm_uncertain"}
+                    # 2026-10-23：检索裁剪移除后，LLM 判 uncertain = 证据不足（冷门板块名常见），
+                    # 不再当作蹭概念清空；保留维度并留痕，人工可抽检。
+                    decisions[stock.code] = {
+                        "sector": tagged_sector, "reason": "llm_uncertain_kept", "evidence": hit,
+                    }
             decision_cache[cache_key] = decisions[stock.code]
 
         verified: List[Any] = []
         unverified: List[Dict[str, Any]] = []
+        kept_uncertain: List[Dict[str, Any]] = []
         evidence_log: List[Dict[str, Any]] = []
-        counts = {"member": 0, "insufficient_evidence": 0, "llm_rejected": 0, "llm_uncertain": 0}
+        counts = {"member": 0, "insufficient_evidence": 0, "llm_rejected": 0,
+                  "llm_uncertain": 0, "llm_uncertain_kept": 0}
 
         for stock in finalists:
             decision = decisions.get(getattr(stock, "code", ""))
@@ -2021,11 +2004,27 @@ class PortfolioDecisionNode:
             sector = decision["sector"]
             reason = decision["reason"]
             if reason is None:
-                evidence_log.append(decision["evidence"])
+                hit = decision.get("evidence") or {}
+                top = (hit.get("items") or [{}])[0]
+                evidence_log.append({
+                    "symbol": stock.code, "sector": sector,
+                    "quote": (top.get("title", "") + " | " + top.get("snippet", ""))[:140],
+                    "provider": hit.get("provider", ""), "query": hit.get("query", ""),
+                })
                 counts["member"] += 1
                 logger.info(
-                    f"[板块验证] {stock.code} {stock.name}: ✓ 检索证据支持 '{sector}'"
-                    f"（{decision['evidence']['provider']}）: {decision['evidence']['quote'][:60]}"
+                    f"[板块验证] {stock.code} {stock.name}: ✓ LLM 判定属于 '{sector}'"
+                    f"（{hit.get('provider', '')}）"
+                )
+                verified.append(stock)
+                continue
+
+            if reason == "llm_uncertain_kept":
+                # 证据不足但不足以判蹭概念 → 保留维度，只留痕
+                counts["llm_uncertain_kept"] += 1
+                kept_uncertain.append({"symbol": stock.code, "sector": sector, "reason": reason})
+                logger.info(
+                    f"[板块验证] {stock.code} {stock.name}: ？ '{sector}' 证据不足，保留标签（待人工抽检）"
                 )
                 verified.append(stock)
                 continue
@@ -2050,12 +2049,13 @@ class PortfolioDecisionNode:
             verified.append(stock)
 
         self._sector_verify_unverified = unverified or None
+        self._sector_verify_kept_uncertain = kept_uncertain or None
         self._sector_verify_evidence = evidence_log or None
         logger.info(
             "[板块验证] 检索 %d 票/%d 次查询（可用引擎 %d）: member=%d insufficient=%d "
-            "llm_rejected=%d llm_uncertain=%d",
+            "llm_rejected=%d llm_uncertain(保留)=%d",
             len(targets), queries_made, provider_count, counts["member"],
-            counts["insufficient_evidence"], counts["llm_rejected"], counts["llm_uncertain"],
+            counts["insufficient_evidence"], counts["llm_rejected"], counts["llm_uncertain_kept"],
         )
 
         return verified
@@ -2084,21 +2084,28 @@ class PortfolioDecisionNode:
 
         lines = []
         for i, case in enumerate(evidence_cases):
+            docs = "\n".join(
+                f'   [{j}] {it.get("title", "")} | {it.get("snippet", "")} | {it.get("url", "")}'
+                for j, it in enumerate(case.get("items") or [])
+            )
             lines.append(
                 f'{i}. 股票: {case.get("symbol", "")} | 板块: {case.get("sector", "")} '
-                f'| 原文: {case.get("quote", "")}'
+                f'| 检索口径: {case.get("query_board", "")}\n{docs}'
             )
         cases_text = "\n".join(lines)
 
-        prompt = f"""你是 A 股板块归属审核员。下面每个案例给出「股票」「板块」「一段已通过身份护栏的检索原文」。
-只依据给出的原文判断该股票是否属于该板块。
+        prompt = f"""你是 A 股板块归属审核员。下面每个案例给出「股票」「板块」以及该股票与板块的检索结果原文（标题+摘要，可能夹杂行情页、股吧、研报等无关内容，也可能提到别的股票）。
+
+任务：判断这只股票**是否真的属于该板块**，还是只是蹭概念（例如原文把该板块归给别的公司、或原文与该板块无关）。
 
 ## 案例
 {cases_text}
 
 ## 输出
 只输出 JSON 数组：{{"index": 案例号, "verdict": "member" | "not_member" | "uncertain"}}
-（原文没有明确支持该归属时填 uncertain，不要为了给结论硬填 not_member）"""
+- member：有原文明确支持该股票属于该板块
+- not_member：原文显示该板块其实归属别的公司，或候选股与该板块无关
+- uncertain：信息不足/无法判断（不要为了给结论硬填 not_member）"""
 
         try:
             adapter = LLMToolAdapter()
@@ -5645,7 +5652,7 @@ verdict 含义：
                     logger.warning(f"[Phase 2] 无法获取 {score.symbol} 价格，跳过")
                     continue
 
-                # GATE-1: 涨停一字买入拦截（enabled 不进成交集合；shadow 仅留痕）
+                # GATE-1: 涨停封板买入拦截（现价触板即拦，含一字与盘中封板；enabled 不进成交集合，shadow 仅留痕）
                 _tg_buy_flag = _tg_buy_reason = None
                 if _tg_active:
                     _tres_b = _tradability_check(score.symbol, score.name, "buy")

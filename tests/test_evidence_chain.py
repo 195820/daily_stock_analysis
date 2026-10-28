@@ -22,7 +22,7 @@ from src.got.catalyst_calendar import resolve_macro_fanout_sectors
 from src.got.nodes.aggregator import AggregatorNode
 
 # schemas.CatalystEvent.source 声明的完整枚举（与字段 description 逐字对齐）
-DECLARED_SOURCES = {"akshare_earnings", "akshare_lockup", "macro_rule", "llm_narrative", "global_map"}
+DECLARED_SOURCES = {"akshare_earnings", "akshare_lockup", "macro_rule", "llm_narrative", "global_map", "global_manual", "node4_event"}
 
 
 def _ev(source: str, tier: str, *, impact: int = 3, conf: float = 1.0) -> CatalystEvent:
