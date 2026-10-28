@@ -34,7 +34,7 @@ class TestTwoRowLayout(unittest.TestCase):
     def setUp(self):
         self.svc = PortfolioOcrImportService()
         # 名称→代码走网络，测试固定为已知结果
-        self.svc._resolve_symbol = lambda name: {"润建股份": "002929"}.get(name)
+        self.svc._resolve_symbol = lambda name: {"润建股份": "002929", "天奇股份": "002009"}.get(name)
 
     def test_number_variants_handle_dot_thousands_and_three_decimals(self):
         variants = PortfolioOcrImportService._number_variants
@@ -61,6 +61,24 @@ class TestTwoRowLayout(unittest.TestCase):
         self.assertAlmostEqual(item.cost_price, 54.945, places=3)
         self.assertAlmostEqual(item.current_price, 52.68, places=3)
         self.assertEqual(item.symbol, "002929")
+
+    def test_two_row_layout_without_duplicated_quantity(self):
+        """T+1 买入当日「可用」为空 → 下行缺数量列，仍须按市值兜底解析。"""
+        boxes = _boxes([
+            ["市值", "盈亏", "持仓/可用←", "成本/现价←"],
+            ["天奇股份", "-72.63", "2000", "17.816"],
+            ["35,560.00", "-0.200%", "17.780"],
+        ])
+
+        holdings = self.svc.parse_holdings_from_boxes(boxes)
+
+        self.assertEqual(len(holdings), 1)
+        item = holdings[0]
+        self.assertEqual(item.name, "天奇股份")
+        self.assertEqual(item.symbol, "002009")
+        self.assertEqual(item.quantity, 2000)
+        self.assertAlmostEqual(item.cost_price, 17.816, places=3)
+        self.assertAlmostEqual(item.current_price, 17.78, places=3)
 
     def test_inconsistent_numbers_are_rejected(self):
         boxes = _boxes([

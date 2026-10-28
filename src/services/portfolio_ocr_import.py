@@ -460,11 +460,20 @@ class PortfolioOcrImportService:
                 for qty in qty_variants:
                     if qty <= 0 or qty != int(qty) or qty > 100_000_000:
                         continue
-                    if not any(qty in variants for variants in lower):
-                        continue
+                    # 数量通常上下两行重复；但 T+1 买入当日「可用」为空，
+                    # 下行会缺数量列（2026-10-28 天奇股份 2000 股实测）。
+                    # 此时用下行市值 ≈ 数量×现价 兜底校验，避免整行丢失。
+                    qty_in_lower = any(qty in variants for variants in lower)
+                    lower_values = [v for variants in lower for v in variants]
                     for cost in [v for variants in upper for v in variants if v != qty]:
                         for price in [v for variants in lower for v in variants if v != qty]:
                             if cost <= 0 or price <= 0:
+                                continue
+                            mkt_hit = any(
+                                m > 0 and abs(qty * price - m) / max(m, 1.0) <= 0.02
+                                for m in lower_values
+                            )
+                            if not (qty_in_lower or mkt_hit):
                                 continue
                             for pnl in [v for variants in upper for v in variants
                                         if v not in (qty, cost)]:
