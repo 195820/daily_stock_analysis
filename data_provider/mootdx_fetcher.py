@@ -41,6 +41,12 @@ from .base import (
     normalize_stock_code,
     _is_hk_market,
 )
+from .tdx_protocol import apply_tdx_protocol_patch
+
+# 2026-09 通达信新版行情协议：必须在建立任何 mootdx 会话之前打补丁，
+# 否则服务器只认握手不认行情命令（K线/报价静默回空）。
+apply_tdx_protocol_patch()
+
 import os
 import re
 
