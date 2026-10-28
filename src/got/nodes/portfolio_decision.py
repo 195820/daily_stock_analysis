@@ -930,6 +930,7 @@ class PortfolioDecisionNode:
                 sector_strength_map=sector_strength_map,
                 strength_lookup=strength_lookup,
                 frame_group_lookup=frame_group_lookup,
+                allow_override=True,
             )
             # Fix 2: 消费论点快照（fallback 路径）
             stock_sector_info = self._find_stock_sector_with_thesis(
@@ -1342,6 +1343,8 @@ class PortfolioDecisionNode:
                 sector_match_type = "thesis"
             elif is_relay:
                 sector_match_type = "relay"
+            elif stock_sector_info.get("is_override"):
+                sector_match_type = "override"
             elif stock_sector_info.get("is_fallback", False):
                 sector_match_type = "fallback"
             elif sector_name and sector_name in sector_intel_map:
@@ -2271,12 +2274,16 @@ class PortfolioDecisionNode:
         sector_strength_map: Dict[str, float] = None,
         strength_lookup: Dict[str, float] = None,
         frame_group_lookup: Dict[str, str] = None,  # Fix 1: 家族中继匹配
+        allow_override: bool = False,  # 仅持仓评分启用人工主板块覆盖
     ) -> Dict[str, Any]:
         """查找股票所属板块及其强度
 
         优先从正向映射缓存查找，未命中则用反向查询（get_belong_boards）。
         匹配 Node 6 聚合后的 confirmed_sectors（SectorIntel），非 Node 2 原始追踪列表。
         使用多成员关系加权（multiple membership scoring）计算加权平均分数。
+
+        allow_override=True 时先查 `holding_sector_overrides`：人工确认主板块优先于
+        「confirmed 交集」（2026-10-28 润建股份被光伏顶替的修复），只作用于持仓。
 
         学术参考：
         - "A framework for stock selection via concept-oriented attention
@@ -2288,6 +2295,36 @@ class PortfolioDecisionNode:
 
         # 标准化 symbol（去除市场前缀如 "SH600961" → "600961"）
         clean_symbol = symbol.replace("SH", "").replace("SZ", "").replace("BJ", "")
+
+        if allow_override:
+            from src.got.holding_sector_overrides import get_holding_sector_override
+
+            override_name = get_holding_sector_override(clean_symbol)
+            if override_name:
+                _strength = (strength_lookup or {}).get(override_name)
+                if _strength is None:
+                    _strength = (sector_strength_map or {}).get(override_name, 50.0)
+                logger.info(
+                    f"[持仓板块覆盖] {clean_symbol} → {override_name}"
+                    f"（强度 {float(_strength):.1f}，跳过 confirmed 交集匹配）"
+                )
+                return {
+                    "sector_name": override_name,
+                    "sector_type": "concept",
+                    "strength": float(_strength),
+                    "weight": 1.0,
+                    "sector_role": "holding_override",
+                    "all_sectors": [{
+                        "sector_name": override_name,
+                        "sector_type": "concept",
+                        "strength": float(_strength),
+                        "weight": 1.0,
+                        "sector_role": "holding_override",
+                    }],
+                    "all_belong_boards": [override_name],
+                    "is_fallback": False,
+                    "is_override": True,
+                }
 
         sectors_list = self._stock_sector_map.get(clean_symbol, [])
 
@@ -3525,6 +3562,10 @@ class PortfolioDecisionNode:
         """
         is_fallback = stock_sector_info.get("is_fallback", False)
         sector_name = stock_sector_info.get("sector_name", "")
+
+        # 人工主板块覆盖：不再用 thesis 判漂移（覆盖本身就是人工裁决）
+        if stock_sector_info.get("is_override"):
+            return stock_sector_info
 
         # 查论点快照
         thesis = thesis_map.get(symbol)
