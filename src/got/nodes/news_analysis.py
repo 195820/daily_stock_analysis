@@ -27,14 +27,21 @@ from src.got.schemas import (
     NewsEvent,
     DataQuality,
 )
-from src.got.news_feeds import fetch_all_news_pool
+from src.got.news_feeds import fetch_all_news_pool, filter_carried_pool
 from src.got.news_url import canonicalize_url
+from src.got.news_retrieval import (
+    news_category,
+    normalize_title,
+    read_news,
+    title_similarity,
+)
 from src.got.catalyst_config import (
     GOT_NEWS_EVIDENCE_GATING,
     GOT_ATTENTION_SHADOW,
     GOT_NEWS_FULLTEXT_ENABLED,
     GOT_NEWS_FULLTEXT_MAX_CHARS,
     GOT_LOW_SECTOR_RESCUE,
+    GOT_NEWS_READING_ARCH,
     GOT_NEWS_TITLE_SHORTLIST_ENABLED,
     GOT_NEWS_TITLE_SHORTLIST_SIZE,
     GOT_NEWS_SHORTLIST_QUOTA,
@@ -596,20 +603,13 @@ class NewsAnalysisNode:
         """同一粗类目超过 `SHORTLIST_CATEGORY_QUOTA` 的部分整组裁掉（空位不回填）。
 
         粗类目 = 标题命中的首个 `INDUSTRY_RECALL_KEYWORDS["industry_entity"]` 词，未命中记
-        「其他」。词表只做形态归类（与产业召回同一口径），**不做价值判断**：裁谁留谁完全
-        按 LLM 给出的顺序，只限制单类目占比。返回 (裁剪后条目, 影子记录)。
+        「其他」。词表只做形态归类（与产业召回同一口径，实现见 `news_retrieval.news_category`），
+        **不做价值判断**：裁谁留谁完全按 LLM 给出的顺序，只限制单类目占比。
+        返回 (裁剪后条目, 影子记录)。
         """
-        entities = INDUSTRY_RECALL_KEYWORDS["industry_entity"]
-
-        def _category(title: str) -> str:
-            for kw in entities:
-                if kw in title:
-                    return kw
-            return "其他"
-
         buckets: Dict[str, List[Dict]] = {}
         for item in picked:
-            buckets.setdefault(_category(item.get("title", "")), []).append(item)
+            buckets.setdefault(news_category(item.get("title", "")), []).append(item)
 
         kept_ids = set()
         dropped: List[str] = []
@@ -814,7 +814,6 @@ class NewsAnalysisNode:
         # 两段式：阶段 1 全量标题初筛，阶段 2 只对选中条目细读抽事件。
         # GOT_NEWS_TITLE_SHORTLIST_ENABLED=false 回滚到旧口径（weight 前 50 条直接喂细读）。
         if GOT_NEWS_TITLE_SHORTLIST_ENABLED:
-            pool_for_shortlist = list(raw_news)
             carried: List[Dict] = []
             if GOT_NEWS_CARRY_PREV_TITLES:
                 carried = self._load_unabsorbed_titles()
@@ -826,19 +825,46 @@ class NewsAnalysisNode:
                         c for c in carried
                         if self._normalize_title(c.get("title", "")) not in today_norms
                     ]
-                pool_for_shortlist = raw_news + carried
-            quota_record: Dict[str, Any] = {}
-            shortlist = self._shortlist_titles(pool_for_shortlist, quota_out=quota_record)
-            if quota_record:
-                self._write_shortlist_quota_shadow(quota_record)
-            # 产业级召回（2026-10-22）：短名单之外按「供给侧动作×产业实体」补召回，
-            # 与短名单合并去重后一起进阶段 2 细读（DeepInfer 类单源产业发布不再缺席）
-            recalled = self._recall_industry_candidates(raw_news, exclude=shortlist)
-            extraction_pool = shortlist + recalled
-            logger.info(
-                "[Node 4] 标题粗筛: %d → %d 条（含补读 %d、产业召回 %d）",
-                len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
-            )
+            # 粗筛池降噪（2026-10-29）：娱乐/社会热榜只从 LLM 粗筛入口剔除，
+            # `raw_news` 与 DB 行不动（概念发现/风险总结/attention 观测口径不变）。
+            pool_for_shortlist = filter_carried_pool(list(raw_news) + carried)
+
+            if GOT_NEWS_READING_ARCH == "cluster":
+                shortlist, retrieval_trace = await read_news(self, pool_for_shortlist)
+                # 产业召回：exclude 增加簇成员标题，防同簇另一说法再进细读
+                exclude_items: List[Dict] = list(shortlist)
+                for item in shortlist:
+                    exclude_items.extend(
+                        {"title": title} for title in item.get("member_titles") or []
+                    )
+                recalled = self._recall_industry_candidates(
+                    pool_for_shortlist, exclude=exclude_items,
+                )
+                extraction_pool = shortlist + recalled
+                logger.info(
+                    "[Node 4] 分层粗筛(cluster): 池 %d → 细读 %d 条"
+                    "（补读 %d、产业召回 %d；簇 %d / 片 %d / 终审池 %d / %s）",
+                    len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
+                    retrieval_trace.get("cluster_count", 0),
+                    retrieval_trace.get("shard_count", 0),
+                    retrieval_trace.get("finalist_count", 0),
+                    retrieval_trace.get("review_status"),
+                )
+            else:
+                quota_record: Dict[str, Any] = {}
+                shortlist = self._shortlist_titles(
+                    pool_for_shortlist, quota_out=quota_record,
+                )
+                if quota_record:
+                    self._write_shortlist_quota_shadow(quota_record)
+                # 产业级召回（2026-10-22）：短名单之外按「供给侧动作×产业实体」补召回，
+                # 与短名单合并去重后一起进阶段 2 细读（DeepInfer 类单源产业发布不再缺席）
+                recalled = self._recall_industry_candidates(raw_news, exclude=shortlist)
+                extraction_pool = shortlist + recalled
+                logger.info(
+                    "[Node 4] 标题粗筛: %d → %d 条（含补读 %d、产业召回 %d）",
+                    len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
+                )
             # 概念发现/风险总结仍读全量 raw_news（标题+摘要）：概念发现依赖跨条目的
             # 重复主题，喂 12 条短名单会让它失效。**先**格式化全量文本再给短名单补正文，
             # 保证概念/风险输入不受 GOT_NEWS_FULLTEXT_ENABLED 影响（开关只作用于细读）。
@@ -1594,27 +1620,13 @@ class NewsAnalysisNode:
 
     @staticmethod
     def _normalize_title(title: str) -> str:
-        """标题归一化：去标点/统一小写/压缩空白，用于精确匹配去重。"""
-        import re
-        t = title.strip().lower()
-        t = re.sub(r'[^\w一-鿿]', '', t)  # 保留中文+字母数字
-        t = re.sub(r'\s+', '', t)
-        return t[:200]  # 截断到 200 字符
+        """标题归一化：去标点/统一小写/压缩空白（实现见 news_retrieval，全仓唯一口径）。"""
+        return normalize_title(title)
 
     @staticmethod
     def _title_similarity(a: str, b: str) -> float:
         """标题相似度（Jaccard on character bigrams）。0~1。"""
-        if not a or not b:
-            return 0.0
-        if a == b:
-            return 1.0
-        bigrams_a = {a[i:i+2] for i in range(len(a)-1)}
-        bigrams_b = {b[i:i+2] for i in range(len(b)-1)}
-        if not bigrams_a or not bigrams_b:
-            return 0.0
-        intersection = bigrams_a & bigrams_b
-        union = bigrams_a | bigrams_b
-        return len(intersection) / len(union)
+        return title_similarity(a, b)
 
     @staticmethod
     def _attention_meta(item: Dict) -> Dict[str, Any]:
@@ -1638,11 +1650,65 @@ class NewsAnalysisNode:
             "heat": heat,
         }
 
-    def _persist_raw_news(self, raw_news: List[Dict]) -> Tuple[int, int]:
-        """原始新闻持久化（P1-1）：精确匹配 + 相似度兜底去重。
+    @classmethod
+    def _merge_same_title_rows(cls, raw_news: List[Dict]) -> List[Dict]:
+        """本次入参按 `_normalize_title()` 同题归并后再落库（跨源转载不重复写行）。
 
-        每次 _fetch_news() 后调用，将全量原始数据写入 node4_raw_news 表。
+        主行=首个条目（保留其 source/url/发布时间，URL 指纹与 title 精确匹配都用主行）；
+        其余行的热榜元数据（platform/platforms/rank/heat）并入主行。`source_count`
+        不参与（平台扩散 ≠ 独立媒体确认，口径由 `_count_cross_source` 独有）。
+        只作用于写入路径，不改调用方对象、不改历史行。
+        """
+        merged: Dict[str, Dict] = {}
+        order: List[str] = []
+        for item in raw_news:
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
+            norm = cls._normalize_title(title)
+            if not norm:
+                continue
+            main = merged.get(norm)
+            if main is None:
+                copy = dict(item)
+                platforms = {p for p in (copy.get("platforms") or []) if p}
+                if copy.get("platform"):
+                    platforms.add(copy["platform"])
+                if platforms:
+                    copy["platforms"] = sorted(platforms)
+                merged[norm] = copy
+                order.append(norm)
+                continue
+
+            platforms = {p for p in (main.get("platforms") or []) if p}
+            platforms |= {p for p in (item.get("platforms") or []) if p}
+            if item.get("platform"):
+                platforms.add(item["platform"])
+            if platforms:
+                main["platforms"] = sorted(platforms)
+            if not main.get("platform") and item.get("platform"):
+                main["platform"] = item["platform"]
+            ranks = [
+                r for r in (main.get("rank"), item.get("rank"))
+                if isinstance(r, int) and not isinstance(r, bool) and r > 0
+            ]
+            if ranks:
+                main["rank"] = min(ranks)  # 数值更小 = 榜单更靠前
+            heats = [
+                h for h in (main.get("heat"), item.get("heat"))
+                if isinstance(h, (int, float)) and not isinstance(h, bool) and h
+            ]
+            if heats:
+                main["heat"] = max(heats)
+        return [merged[norm] for norm in order]
+
+    def _persist_raw_news(self, raw_news: List[Dict]) -> Tuple[int, int]:
+        """原始新闻持久化（P1-1）：同题归并 + 精确匹配 + 相似度兜底去重。
+
+        每次 `_fetch_news()` 后调用，将全量原始数据写入 node4_raw_news 表。
         同一新闻跨日重复出现时：appearance_count += 1, last_seen_date 更新。
+        本次入参先按 `_normalize_title()` 同题归并（`_merge_same_title_rows`）：
+        `intelligence_newsnow-*` 与热榜源的同一新闻只落一行，URL/title 匹配都用主行。
 
         Returns:
             (persisted, updated)：本次新增行数 / 命中去重后刷新的行数；
@@ -1650,6 +1716,7 @@ class NewsAnalysisNode:
         """
         if not raw_news:
             return 0, 0
+        raw_news = self._merge_same_title_rows(raw_news)
 
         today = date.today()
         persisted = 0

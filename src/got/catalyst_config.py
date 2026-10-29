@@ -5,7 +5,19 @@
 映射表中 a_share_sectors 为关键词列表，运行时与 CONCEPT_UNIVERSE 模糊匹配。
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
+
+
+def _bounded_int(name: str, value: int, low: int, high: int) -> int:
+    """环境变量整型钳制：越界钳到 [low, high] 并 warning（不隐式抛新异常）。"""
+    if value < low or value > high:
+        clamped = max(low, min(high, value))
+        logger.warning("[config] %s=%s 越界 [%d, %d]，钳制为 %d", name, value, low, high, clamped)
+        return clamped
+    return value
 
 
 # =============================================================================
@@ -297,6 +309,42 @@ GOT_NEWS_FULLTEXT_MAX_CHARS = int(os.environ.get("GOT_NEWS_FULLTEXT_MAX_CHARS", 
 # true → prompt 追加分散要求 + 代码侧把同一粗类目超过 6 条的部分裁掉（空位不回填，宁少不凑数），
 # 并落 shadow_shortlist_quota.json；false → prompt 与行为逐字节同现状。
 GOT_NEWS_SHORTLIST_QUOTA = os.environ.get("GOT_NEWS_SHORTLIST_QUOTA", "false").lower() == "true"
+
+# =============================================================================
+# Node 4 分层粗筛（2026-10-29）：事件簇索引 → 分片泛读 → 全局去重/MMR → 终审
+# =============================================================================
+# 背景：小时快照让单日新增达到数千条，`_shortlist_titles` 把「实时池 + 近 3 日补读」
+# 一次性交给 LLM 只选 12 条；补读行还没有 snippet，「扩大上下文」不是可靠召回方案。
+# 依据：
+# - Lost in the Middle（arXiv:2307.03172）：长 prompt 存在位置偏差 → 分片而非塞满；
+# - RAPTOR（arXiv:2401.18059）/ LLM×MapReduce（ACL 2025）：分片/分层阅读替代单次泛读，
+#   这里只取「分而治之」，不搬递归摘要树/向量库；
+# - MMR（Carbonell & Goldstein, 1998）：终审候选按「价值 − 冗余」保留不同主题。
+# 默认 flat = 现状（`_shortlist_titles` 单次粗筛）；审核通过后生产显式设 cluster。
+# 回滚仍以 GOT_NEWS_TITLE_SHORTLIST_ENABLED=false（weight 前 50 旧路径）为最高优先级。
+GOT_NEWS_READING_ARCH = os.environ.get("GOT_NEWS_READING_ARCH", "flat").strip().lower()
+if GOT_NEWS_READING_ARCH not in ("flat", "cluster"):
+    logger.warning(
+        "[config] GOT_NEWS_READING_ARCH=%s 非法（仅 flat|cluster），回退 flat",
+        GOT_NEWS_READING_ARCH,
+    )
+    GOT_NEWS_READING_ARCH = "flat"
+# 单片刻度（簇数）：60 ≈ 一个产业形态桶的典型规模；范围 20–80 防单片过长/过碎
+GOT_NEWS_READ_SHARD_SIZE = _bounded_int(
+    "GOT_NEWS_READ_SHARD_SIZE", int(os.environ.get("GOT_NEWS_READ_SHARD_SIZE", "60")), 20, 80,
+)
+# 分片 LLM 并发上限（同步 _call_llm 走 to_thread）
+GOT_NEWS_SHARD_CONCURRENCY = _bounded_int(
+    "GOT_NEWS_SHARD_CONCURRENCY", int(os.environ.get("GOT_NEWS_SHARD_CONCURRENCY", "3")), 1, 8,
+)
+# 全局终审候选池（MMR 后）上限：36 = 12 条细读 × 3 个主题备选
+GOT_NEWS_FINALIST_LIMIT = _bounded_int(
+    "GOT_NEWS_FINALIST_LIMIT", int(os.environ.get("GOT_NEWS_FINALIST_LIMIT", "36")), 12, 100,
+)
+# 标题向量按日缓存根目录（复用 glue_pipeline 的 sha1(model+text) 结构）
+GOT_NEWS_EMBED_CACHE_ROOT = os.environ.get("GOT_NEWS_EMBED_CACHE_ROOT", "data/got_daily/_cache")
+# trace 根目录：回放脚本重定向到临时目录，生产缺省写 got_daily/YYYYMMDD/
+GOT_NEWS_TRACE_ROOT = os.environ.get("GOT_NEWS_TRACE_ROOT", "data/got_daily")
 
 # =============================================================================
 # 催化剂日历架构修正（2026-10-22，docs/got/verification.md「2026-10-22 架构修正」）

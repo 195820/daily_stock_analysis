@@ -675,6 +675,48 @@ def merge_news(
     return merged
 
 
+# =============================================================================
+# 粗筛池降噪：娱乐/社会热榜不进 LLM 泛读（2026-10-29）
+# =============================================================================
+# 微博/百度/头条/抖音/B站/知乎热榜与 A 股基本面无关，却因小时快照与多次在榜获得
+# 高 appearance_count/rank（旧 weight 路径的结构性误判）。本过滤器只作用于 **LLM
+# 粗筛入口与补读分析**：`_persist_raw_news(raw_pool)` 照旧落库（attention 轨迹与
+# 概念发现/风险总结的 `raw_news` 均不改），DB 行不删不改。
+# 保留：同花顺热榜（投资者关注）、财联社热门、澎湃新闻、财经媒体与 `intelligence_rss-*`。
+_CARRIED_POOL_EXCLUDED_SOURCES = frozenset({
+    "微博", "百度热搜", "今日头条", "抖音", "B站热搜", "知乎",
+})
+_CARRIED_POOL_EXCLUDED_INTEL_SOURCES = frozenset({
+    "intelligence_newsnow-baidu",
+    "intelligence_newsnow-weibo",
+    "intelligence_newsnow-toutiao",
+    "intelligence_newsnow-douyin",
+    "intelligence_newsnow-bilibili-hot-search",
+    "intelligence_newsnow-zhihu",
+})
+
+
+def filter_carried_pool(items: List[Dict]) -> List[Dict]:
+    """返回剔除娱乐/社会热榜后的**新列表**（不改条目字段、不删除 DB 行）。
+
+    只按 `source` 精确匹配（NewsNow 平台名与 Intelligence `intelligence_newsnow-<platform>`
+    源名），不做标题语义判断：规则是「哪些平台不该参与粗筛」，不是价值判断。
+    """
+    kept: List[Dict] = []
+    dropped = 0
+    for item in items:
+        source = (item.get("source") or "").strip()
+        if source in _CARRIED_POOL_EXCLUDED_SOURCES or source in _CARRIED_POOL_EXCLUDED_INTEL_SOURCES:
+            dropped += 1
+            continue
+        kept.append(item)
+    if dropped:
+        logger.info(
+            "[news_feeds] 粗筛池降噪: 剔除娱乐热榜 %d 条（保留 %d 条）", dropped, len(kept),
+        )
+    return kept
+
+
 def _collect_all_sources(
     skip_sources: Iterable[str] = (),
 ) -> Tuple[Dict[str, List[Dict]], Dict[str, int]]:

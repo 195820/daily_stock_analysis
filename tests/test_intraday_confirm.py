@@ -311,6 +311,28 @@ def test_archive_preserves_intraday_dir(tmp_path, monkeypatch):
     assert (d / "market.json").exists()
 
 
+def test_archive_preserves_news_retrieval_trace(tmp_path):
+    """日频归档原子替换不得抹掉 Node 4 分层粗筛 trace（与 intraday 同坑搬运）。"""
+    import src.got.archive as arch
+
+    base = tmp_path / "got_daily"
+    d = base / "20261015"
+    d.mkdir(parents=True)
+    (d / "news_retrieval_trace.json").write_text(
+        '{"cluster_count": 3, "index_mode": "embedding"}', encoding="utf-8",
+    )
+
+    ctxs = {k: _FakeCtx(k) for k in ("market", "sector", "capital", "news", "sentiment", "unified")}
+    arch.archive_daily_run(
+        market_ctx=ctxs["market"], sector_ctx=ctxs["sector"], capital_ctx=ctxs["capital"],
+        news_ctx=ctxs["news"], sentiment_ctx=ctxs["sentiment"], unified_ctx=ctxs["unified"],
+        run_date=date(2026, 10, 15), base_dir=base, use_mock=True,
+    )
+    payload = json.loads((d / "news_retrieval_trace.json").read_text(encoding="utf-8"))
+    assert payload["cluster_count"] == 3
+    assert (d / "market.json").exists()
+
+
 def test_load_intraday_shadow_record_roundtrip(tmp_path, monkeypatch):
     import src.got.archive as arch
     from src.got.schemas import IntradayShadowRecord, IntradayVerdict

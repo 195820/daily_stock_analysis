@@ -133,7 +133,11 @@ def archive_daily_run(
         # Q1/埋伏宽限影子旁路（2026-10-16）：news_analysis._rescue_low_events 与
         # aggregator._compute_ambush_exit_grace_shadow 在归档前直写当日目录，同 glue
         # 语义（当日影子结论末版为准），必须随本轮搬运否则被原子替换删除。
-        for _shadow_name in (SHADOW_LOW_EVENTS_ARTIFACT, SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT):
+        for _shadow_name in (
+            SHADOW_LOW_EVENTS_ARTIFACT,
+            SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
+            NEWS_RETRIEVAL_TRACE_ARTIFACT,
+        ):
             _shadow_src = archive_dir / _shadow_name
             if _shadow_src.exists():
                 shutil.move(str(_shadow_src), str(tmp_dir / _shadow_name))
@@ -823,6 +827,9 @@ SHADOW_FTS_ARTIFACT = "shadow_fts.json"
 SHADOW_BEAR_GATE_ARTIFACT = "shadow_bear_gate.json"
 SHADOW_LOW_EVENTS_ARTIFACT = "shadow_low_events.json"
 SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT = "shadow_ambush_exit_grace.json"
+# Node 4 分层粗筛 trace（2026-10-29）：news_retrieval.read_news 在归档前直写当日目录，
+# 不搬进 tmp 会被 archive_daily_run 的原子替换删除（与 glue/low-events 同语义）。
+NEWS_RETRIEVAL_TRACE_ARTIFACT = "news_retrieval_trace.json"
 
 
 def _shadow_display_name(name: str, symbol: str) -> str:

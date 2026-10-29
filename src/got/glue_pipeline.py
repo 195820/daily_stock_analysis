@@ -133,6 +133,10 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                     input=chunk,
                     api_base=GLUE_EMBEDDING_BASE_URL,
                     api_key=GLUE_EMBEDDING_API_KEY,
+                    # DashScope compatible-mode 要求显式 float；litellm 1.82（ECS venv）缺省值
+                    # 会被 400 拒绝（"'encoding_format' only support with [float, base64]"），
+                    # 1.98 缺省可用。显式传参两版一致（2026-10-29 Node 4 回放实测）。
+                    encoding_format="float",
                 )
                 vectors.extend([list(d["embedding"]) for d in resp.data])
                 last_exc = None
