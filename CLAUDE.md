@@ -77,7 +77,7 @@ daily_stock_analysis/
 │   │   │   ├── market_analysis.py    # Node 1: 大盘（4维技术评分/多时间框架/跨指数一致性/波动率仓位）
 │   │   │   ├── sector_analysis.py    # Node 2: 板块（4维百分位/RRG状态机/主线家族/6维埋伏评分）
 │   │   │   ├── capital_analysis.py   # Node 3: 资金面（3维：板块流/DDE/北向永久豁免/降级机制）
-│   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/4次LLM/事件持久化/原始新闻跨日检测）
+│   │   │   ├── news_analysis.py      # Node 4: 消息面（7源推送/两段式粗筛flat|cluster/事件持久化/原始新闻跨日检测）
 │   │   │   ├── sentiment_analysis.py # Node 5: 情绪面（6维置信度加权/反身性/恐贪指数/时序动量）
 │   │   │   ├── aggregator.py         # Node 6: 聚合（A6 glue 直读·规则评分模式已退役/regime 状态机迟滞豁免/T3仲裁/埋伏通道/跨节点共振/分歧摘要影子/埋伏道一致性校验影子 GOT_AMBUSH_VALIDATION_SHADOW）
 │   │   │   └── portfolio_decision.py # Node 7: 统一决策（Phase 2，5步流水线+Step 1.5超限强制减仓+埋伏退出+T1-H持仓审查+thesis四态状态机+_all_positions全账户聚合）

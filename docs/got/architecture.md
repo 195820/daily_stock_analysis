@@ -360,7 +360,7 @@ S≥5, A≥3, B<3
 
 **文件**: `src/got/nodes/news_analysis.py` (1072 行)
 
-**职责**: 7 源推送型采集 + 4 次 LLM 调用 + 事件生命周期追踪
+**职责**: 7 源推送型采集 + 两段式粗筛（flat / cluster）+ 事件提取/概念/风险 + 事件生命周期追踪
 
 **输入**: 无（并行采集）  
 **输出**: `NewsContext`
@@ -416,6 +416,29 @@ emerging → fermenting → peak → fading → archived
 ### 5.6 DataQuality
 
 追踪 7 源采集成功率，缺失源权重归一化
+
+### 5.7 分层粗筛 cluster（2026-10-29 生产启用）
+
+**文件**: `src/got/news_retrieval.py`（`news_analysis.py` 只替换粗筛入口，四阶段主链不变）
+
+**动机**: 小时快照使单日候选达 1500+ 条，flat 单次粗筛把全部标题塞进一次 prompt（实测 1650 条 / 76.8k 字符），存在位置偏差且同题转载占满 12 条名额（10-28 flat：SK海力士×3、工业利润×2）。
+
+**流程**（`read_news()`）:
+
+1. `normalize_title` 完全同题归并（主行 URL > snippet > 时间较新 > 原顺序），附 `member_titles/sources/member_count`；
+2. 标题 embedding（DashScope，复用 `glue_pipeline.embed_texts`，按日缓存 `data/got_daily/_cache/news_title_embed_YYYYMMDD.json`）cosine ≥0.78 连通分量；候选对用 normalized title 的 **character bigram 倒排**（实体 token×日龄桶实测漏 77% 高相似对）；
+3. 日龄（今日/昨日/更早）×产业实体形态桶连续切片，`GOT_NEWS_READ_SHARD_SIZE=60`，不跨日龄；
+4. 每片一次 LLM（≤20 候选，`importance 1-3 / freshness 0-2 / evidence_index`），并发 `GOT_NEWS_SHARD_CONCURRENCY=3`；
+5. `merge_shard_candidates` 同簇/同主题去重 → MMR（`0.55×importance/3 + 0.25×freshness/2 + 0.20×source_quality − 0.60×主题相似度`，同 topic ≤3、同簇 ≤1）至 `GOT_NEWS_FINALIST_LIMIT=36`；
+6. 终审一次 LLM（≤12，`merge_with` 仅接受同类目）→ 代表条目原始 dict + `news_cluster_id/member_titles/sources`。
+
+**降级契约**: embedding 不可用 → bigram Jaccard 连通分量（`index_mode=jaccard_fallback`）；单片 LLM 失败 → 跳过该片（连续 3 片失败停止后续调用）；终审空响应/JSON 失败/全非法 ID → MMR 前 12；终审合法空数组 → 当日不产事件（不伪造结论）；归档失败不阻断。
+
+**接入边界**: cluster 路径的 `extraction_pool = 终审 12 + 产业召回 ≤8`；概念发现/风险总结/`all_news_text`/`_apply_source_count`/`_save_events_to_db` 仍吃原始 `raw_news`。`GOT_NEWS_TITLE_SHORTLIST_ENABLED=false` 仍为最高优先级回滚（weight 前 50）。
+
+**产物**: `news_retrieval_trace.json`（簇/片/候选/终审池/入选/失败/降级/耗时；`archive_daily_run` 原子替换白名单已搬运）。**开关**: `GOT_NEWS_READING_ARCH=flat|cluster`（代码缺省 flat，ECS 生产 `.env` 已设 cluster）；回滚设 flat。
+
+**10-28 真库回放（同池 1650）**: flat 12 条/9 主题/3 冗余/4 次 LLM/18.6s；cluster 1199 簇/34 片/392 候选/36 终审/12 入选/12 主题/38 次 LLM/90.6s，归档 11 条事件 11/11 可回连。**10-29 生产**: 池 1089 → 861 簇/31 片/308 候选/36 终审/12 入选，Node 4 82.1s，`llm_failures=0`。
 
 ---
 

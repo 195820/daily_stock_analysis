@@ -3,6 +3,25 @@
 
 ---
 
+## 2026-10-29 补登（Node 4 分层粗筛 — 生产直接启用 + 事后验证）
+
+计划：`local://node4-news-retrieval-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。
+**非影子线**：ECS `/opt/dsa/code/.env` 已设 `GOT_NEWS_READING_ARCH=cluster`（备份 `.env.bak.20261029`）；代码缺省仍 `flat`，回滚一行改回。达标判定归项目负责人。
+
+| 判据 | 口径/产物 | 当前读数 | 不达标动作 |
+|---|---|---|---|
+| 索引模式 | `news_retrieval_trace.json.index_mode` | 10-28 回放 / 10-29 生产均为 `embedding`；ECS litellm 1.82 需 `encoding_format=float`（已修） | 持续 `jaccard_fallback` 先查 embedding key/model |
+| 归档事件回连 | 10-28 `news.json` 11 条 `major_events` → 原始标题/`node4_events` 历史 | **11/11**（flat 亦 11/11） | 回滚 flat 并审计 carry 窗口 |
+| 短名单唯一性 | 12 条 `news_cluster_id` 去重 | 12/12 唯一；`review_stats.invalid=0, duplicate=0` | 查 `review_candidates` 校验 |
+| 主题覆盖 | 存储/AI 政策/固态电池/上海智能制造/OpenAI 谷歌芯片 | 前 3 项直系；上海智能制造由「物理AI」覆盖；OpenAI 谷歌芯片在终审池未入 12（flat 回放同样未入，原稿来自归档历史事件） | 人工复核后决定是否调 prompt/终审池 |
+| 资源预算 | Node 4 调用数/字符/耗时 | 同池 1650：4→38 次、276.6k→324.4k 字符、18.6→90.6s；生产 1089：33 次、分片 88.6k、82–103s、0 失败片 | 超 5 min 或失败片 ≥3 查分片并发/超时 |
+| 单片 prompt | 最大 shard `input_chars` | 10-29 生产最大 6,035（flat 单次 76,780） | >15k 降 `GOT_NEWS_READ_SHARD_SIZE` |
+| 重复事件 | `_save_events_to_db` 新增/更新 | 10-29 生产 10–12 条事件，无激增 | 查同题归并与 `source_count` 口径 |
+
+**已知取舍（记录，不作缺陷）**：终审 12 条是 LLM 判断，未入选主题仍保留在终审池/原始池/历史上下文；flat 同日 12 条含 3 个重复位（SK海力士×3、工业利润×2），cluster 0 冗余但会换掉 flat 的广电/卫星/绿电/电力市场等主题。
+
+---
+
 ## 2026-10-28 补登（Node 4 消息面补强 — 三条影子线）
 
 计划：`local://node4-news-hardening-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。
