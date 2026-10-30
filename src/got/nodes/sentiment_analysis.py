@@ -118,8 +118,9 @@ CAPITULATION_SCORE_THRESHOLD = -0.5
 class SentimentAnalysisNode:
     """情绪面分析节点"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         self._fetcher_manager: Optional[DataFetcherManager] = None
 
     @property
@@ -184,12 +185,13 @@ class SentimentAnalysisNode:
             stage_state = self._apply_stage_state_machine(stage)
             persistence_regime = self._compute_ar1_persistence()
 
-        # Step 9: LLM reasoning + hot_topics
-        reasoning, hot_topics = await self._generate_reasoning(
+        # Step 9: reasoning（纯文本；hot_topics 由 Node 6 A6 共享产物回填）
+        reasoning = await self._generate_reasoning(
             overall, sentiment_score, stage, forum_mood,
             hot_stocks, breadth_data, search_data, nga_data,
             dispersion_info=dispersion_info,
         )
+        hot_topics: List[str] = []
 
         # 情绪评分 → 恐贪指数（0=极度恐惧, 1=极度贪婪）
         fear_greed = (sentiment_score + 1) / 2  # [-1,1] → [0,1]
@@ -1286,8 +1288,8 @@ class SentimentAnalysisNode:
         search: Dict,
         nga: Dict,
         dispersion_info: Optional[Dict] = None,
-    ) -> Tuple[str, List[str]]:
-        """LLM 生成 reasoning + hot_topics，失败时规则降级。"""
+    ) -> str:
+        """LLM 生成 reasoning，失败时规则降级。hot_topics 已移出本调用（A6 回填）。"""
         # 构建摘要
         top_stocks_text = "、".join(
             f"{s.stock_name}({s.sentiment[0].upper()},{self._format_mention_display(s)})"
@@ -1346,10 +1348,8 @@ class SentimentAnalysisNode:
             f"舆情搜索：{search_text or '无数据'}\n"
             f"NGA论坛：{nga_text or '无数据'}\n\n"
             "请输出：\n"
-            "1. 一段150字以内的情绪分析文本（注意分歧度和反向信号）\n"
-            "2. 2-3个热门话题关键词（用JSON格式返回）\n\n"
-            "输出格式（不要 markdown 代码块）：\n"
-            '{"reasoning": "分析文本...", "hot_topics": ["话题1", "话题2"]}'
+            "1. 一段150字以内的情绪分析文本（注意分歧度和反向信号）\n\n"
+            "输出格式：纯文本（不要 JSON）"
         )
 
         try:
@@ -1357,47 +1357,38 @@ class SentimentAnalysisNode:
                 self._call_llm, prompt, temperature=0.3, max_tokens=600,
             )
             if result:
-                import json
-                import re
-                cleaned = re.sub(r"```(?:json)?\s*", "", result).strip()
-                try:
-                    data = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-                    if match:
-                        try:
-                            data = json.loads(match.group())
-                        except json.JSONDecodeError:
-                            data = None
-                    else:
-                        data = None
-
-                if data:
-                    reasoning = data.get("reasoning", result)
-                    hot_topics = data.get("hot_topics", [])
-                    return reasoning, hot_topics
+                return result.strip()
         except Exception as exc:
             logger.warning("[Node 5] reasoning LLM 失败: %s", exc)
 
         # 规则降级
-        return self._fallback_reasoning(overall, score, stage, mood, hot_stocks, breadth), []
+        return self._fallback_reasoning(overall, score, stage, mood, hot_stocks, breadth)
 
-    @staticmethod
-    def _call_llm(prompt: str, *, temperature: float, max_tokens: int, max_retries: int = 3) -> str:
-        """同步 LLM 调用，含空响应重试。"""
-        from src.agent.llm_adapter import LLMToolAdapter
+    def _call_llm(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+        max_retries: int = 3,
+        task_id: str = "node5.reasoning",
+    ) -> str:
+        """同步 LLM 调用（worker 线程内执行），统一走 run 级 runtime。"""
+        from src.got.agent_runtime import ensure_runtime
 
-        adapter = LLMToolAdapter()
-        messages = [{"role": "user", "content": prompt}]
-
-        for attempt in range(max_retries + 1):
-            response = adapter.call_text(
-                messages, temperature=temperature, max_tokens=max_tokens,
-            )
-            if response and response.content and response.content.strip():
-                return response.content.strip()
-            if attempt < max_retries:
-                logger.debug("[Node 5] LLM 空响应，重试 %d/%d", attempt + 1, max_retries)
+        runtime = ensure_runtime(self, date.today())
+        step = runtime.call_text_sync(
+            task_id=task_id,
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            timeout=60.0,
+        )
+        if step.status == "ok" and isinstance(step.output, str):
+            return step.output.strip()
+        if step.status == "failed":
+            logger.warning("[Node 5] LLM 调用未成功（%s）: %s", task_id, step.error)
         return ""
 
     @staticmethod

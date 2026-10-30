@@ -79,8 +79,9 @@ from src.got.data_freshness import check_data_freshness as _validate_data_freshn
 class CapitalAnalysisNode:
     """资金面分析节点（GOT Node 3，实时版）"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         self._fetcher_manager: Optional[DataFetcherManager] = None
 
     @property
@@ -134,9 +135,7 @@ class CapitalAnalysisNode:
                 return result
 
             # Step 4: LLM 生成 reasoning
-            result.reasoning = await self._generate_reasoning(
-                result, market_context, sector_context,
-            )
+            result.reasoning = self._fallback_reasoning(result)
 
             logger.info(
                 f"[Node 3] 完成 — "
@@ -608,99 +607,7 @@ class CapitalAnalysisNode:
     # LLM Reasoning
     # =================================================================
 
-    async def _generate_reasoning(
-        self,
-        ctx: CapitalContext,
-        market_context: MarketContext,
-        sector_context: SectorContext,
-    ) -> Optional[str]:
-        """调用 LLM 生成资金面分析 reasoning 文本。"""
-        try:
-            from src.agent.llm_adapter import LLMToolAdapter
-        except ImportError:
-            logger.warning("LLMToolAdapter 不可用，跳过 reasoning 生成")
-            return self._fallback_reasoning(ctx)
-
-        # 构建证据摘要
-        evidence_parts = []
-        if ctx.evidence.sector_flow:
-            sf = ctx.evidence.sector_flow
-            concepts = "、".join(sf.get("top_concepts", [])[:5]) or "无"
-            industries = "、".join(sf.get("top_industries", [])[:3]) or "无"
-            evidence_parts.append(
-                f"- 板块资金流（实时）：净流入概念 Top5: {concepts}；"
-                f"行业 Top3: {industries}"
-            )
-            if sf.get("mainline_bonus"):
-                evidence_parts.append("  → 主线板块资金确认（额外加分）")
-        if ctx.evidence.northbound_realtime:
-            nb = ctx.evidence.northbound_realtime
-            evidence_parts.append(
-                f"- 北向资金(实时)：累计 {nb['cumulative_inflow']}亿，"
-                f"近30分钟趋势：{nb['recent_30m_trend']}"
-            )
-
-        evidence_text = "\n".join(evidence_parts) if evidence_parts else "无可用数据"
-
-        trend = getattr(market_context.tech_growth, "trend", "未知")
-        mainline_count = len(sector_context.active_mainline)
-        mainline_names = "、".join(
-            g.group_name for g in sector_context.active_mainline[:3]
-        ) or "无"
-
-        # 时序感知：交易时段 vs 收盘后
-        now_hour = datetime.now().hour
-        is_trading_hours = 9 <= now_hour < 15
-        if is_trading_hours:
-            time_context = "盘中实时（T+0）"
-            action_hint = "盘中资金整体态度"
-            timing_note = ""
-        else:
-            time_context = "收盘后（当日最终数据）"
-            action_hint = "当日资金整体态度"
-            timing_note = "请基于当日全天数据分析，不要使用午后等盘中时态。"
-
-        # 有效维度说明（盘中单维模式 / 数据降级时注入，限制 LLM 过度自信）
-        # 2026-10-14：原「置信度 {confidence_multiplier:.0%}。若置信度≤50%…」随字段删除移除——
-        # 走到此处时该值恒为 100%（sector_flow 不可用已在 status=failed 分支提前返回），
-        # 「若置信度≤50%」结构性不可达，留着等于给 LLM 一条永不触发的假约束。
-        dim_note = ""
-        if ctx.missing_dimensions:
-            dim_note = (
-                f"有效维度缺失：{'、'.join(ctx.missing_dimensions)}，"
-                "证据维度有限，请在结论中明确提示“结论基于单一资金维度、证据强度有限”，"
-                "严禁使用“强烈看多”“坚决做多”等强绝对化措辞，改用“资金维度强流入”等限定表述。"
-            )
-        else:
-            dim_note = "资金面基于板块资金流单维口径（DDE 数据源已随东财封锁失效摘除、北向官方停披豁免），证据维度有限，请注意结论强度。"
-
-        prompt = (
-            f"你是一个专业的资金流分析师。根据以下{time_context}资金数据，撰写简洁分析报告。\n\n"
-            f"机构态度评分：{ctx.institutional_score}（{ctx.institutional_attitude}）\n\n"
-            f"有效维度：{dim_note}\n\n"
-            f"支撑证据：\n{evidence_text}\n\n"
-            f"大盘背景：科技成长趋势={trend}\n"
-            f"板块背景：活跃主线={mainline_names}（{mainline_count}个）\n\n"
-            f"注意：以上数据为{time_context}数据。{timing_note}\n\n"
-            "请输出：\n"
-            f"1. 一段150字以内的分析文本，解释{action_hint}\n"
-            "2. 重点说明资金是否流向主线板块\n"
-            "3. 提示风险信号（如有）\n\n"
-            "输出格式：纯文本（不要JSON）"
-        )
-
-        try:
-            adapter = LLMToolAdapter()
-            messages = [{"role": "user", "content": prompt}]
-            response = await asyncio.to_thread(
-                adapter.call_text, messages, temperature=0.3, max_tokens=300,
-            )
-            if response and response.content:
-                return response.content.strip()
-        except Exception as e:
-            logger.warning(f"LLM reasoning 生成失败: {e}")
-
-        return self._fallback_reasoning(ctx)
+    
 
     @staticmethod
     def _fallback_reasoning(ctx: CapitalContext) -> str:

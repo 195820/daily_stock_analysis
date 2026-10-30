@@ -137,6 +137,12 @@ def archive_daily_run(
             SHADOW_LOW_EVENTS_ARTIFACT,
             SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
             NEWS_RETRIEVAL_TRACE_ARTIFACT,
+            # 2026-10-30 运行时收敛：run trace 与叙事上下文同样在归档前写入当日目录，
+            # 必须随原子替换搬运，避免被删除。
+            "agent_run.json",
+            "agent_steps.jsonl",
+            "narrative_context.json",
+            "run_card.json",
         ):
             _shadow_src = archive_dir / _shadow_name
             if _shadow_src.exists():
@@ -614,6 +620,7 @@ def _write_reasoning_md(
         glue_consumed=bool(getattr(_a6_uc, "glue_consumed", False)) if _a6_uc else False,
         glue_status=(getattr(_a6_uc, "glue_status", None) or "unknown") if _a6_uc else "unknown",
         code_to_name=_a6_code_to_name,
+        event_titles=_event_title_map(contexts.get("news")),
     )
 
     for key in NODE_ORDER:
@@ -842,12 +849,32 @@ def _shadow_display_name(name: str, symbol: str) -> str:
     return f"{text}（{symbol}）" if text and text != symbol else (symbol or text)
 
 
+def _event_title_map(news_ctx) -> dict:
+    """event_id → 标题（Node 4 major_events + 催化剂日历）。"""
+    import hashlib
+
+    mapping: dict = {}
+    for ev in (getattr(news_ctx, "catalyst_calendar", None).events
+               if getattr(news_ctx, "catalyst_calendar", None) else []):
+        event_id = getattr(ev, "event_id", None)
+        if event_id:
+            mapping[event_id] = getattr(ev, "title", "") or ""
+    for me in (getattr(news_ctx, "major_events", None) or []):
+        event_id = getattr(me, "event_id", None)
+        if not event_id:
+            title = str(getattr(me, "title", "") or "")
+            event_id = f"major_{hashlib.md5(title.encode('utf-8')).hexdigest()[:12]}"
+        mapping[event_id] = getattr(me, "title", "") or ""
+    return mapping
+
+
 def _render_a6_glue_formal(
     glue: "dict | None",
     *,
     glue_consumed: bool,
     glue_status: str,
     code_to_name: dict,
+    event_titles: "dict | None" = None,
 ) -> list[str]:
     """A6 glue（已转正）：Node 6 正文固定子块——叙述 + 全量语义表。
 
@@ -896,6 +923,80 @@ def _render_a6_glue_formal(
                 f"| {item.get('capital_read')} | {item.get('sentiment_read')} "
                 f"| {' → '.join(path) if path else '—'} |"
             )
+        lines.append("")
+    event_titles = event_titles or {}
+
+    # ── 事件→板块关系（含证据闭包）──
+    if relations:
+        lines += [
+            "### 🔗 A6 事件→板块关系（可回溯证据）",
+            "",
+            "| 事件 | 板块 | 方向 | 强度 | 置信度 | 证据数 | 传导路径 |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for rel in relations:
+            code = rel.get("board_code") or ""
+            event_id = rel.get("event_id") or ""
+            title = event_titles.get(event_id) or event_id[:18] or "?"
+            path = " → ".join(rel.get("propagation_path") or []) or "—"
+            lines.append(
+                f"| {title} | {code_to_name.get(code) or code or '?'} "
+                f"| {rel.get('direction') or 'positive'} | {rel.get('strength')} "
+                f"| {rel.get('confidence')} | {len(rel.get('evidence_ids') or [])} | {path} |"
+            )
+        lines.append("")
+        with_evidence = sum(1 for r in relations if r.get("evidence_ids"))
+        unique_evidence = {
+            eid for r in relations for eid in (r.get("evidence_ids") or []) if eid
+        }
+        lines.append(
+            f"**证据闭包**：{with_evidence}/{len(relations)} 条 relation 带 evidence_ids，"
+            f"唯一证据 {len(unique_evidence)} 个；伪造/未知引用在结构化校验阶段失败。"
+        )
+        lines.append("")
+
+    # ── A6 共享语义产物（Node 4/5 回填源）──
+    shared_any = any(
+        glue.get(key) for key in (
+            "narrative", "concept_suggestions", "key_risks",
+            "cross_sector_risks", "hot_topics",
+        )
+    )
+    if shared_any:
+        lines += ["### 🧠 A6 共享语义产物（回填 Node 4/5）", ""]
+        narrative = (glue.get("narrative") or "").strip()
+        if narrative:
+            lines += [f"- **narrative**：{narrative}"]
+        concepts = glue.get("concept_suggestions") or []
+        if concepts:
+            rendered = []
+            for c in concepts[:8]:
+                name = c.get("concept_name") or ""
+                if not name:
+                    continue
+                evidence = (c.get("evidence") or "").strip()
+                freq = c.get("mention_frequency")
+                rendered.append(
+                    f"{name}（{evidence or '无证据'}；提及 {freq if freq is not None else '?'}）"
+                )
+            if rendered:
+                lines += ["- **concept_suggestions**（已回填 Node 4）："]
+                lines += [f"  - {item}" for item in rendered]
+        key_risks = glue.get("key_risks") or []
+        if key_risks:
+            lines.append("- **key_risks**（已回填 Node 4）：" + "；".join(key_risks))
+        cross_risks = glue.get("cross_sector_risks") or []
+        if cross_risks:
+            lines.append("- **cross_sector_risks**（并入 UnifiedContext.key_risks）：" + "；".join(cross_risks))
+        hot_topics = glue.get("hot_topics") or []
+        if hot_topics:
+            lines.append("- **hot_topics**（已回填 Node 5）：" + "、".join(hot_topics))
+        lines.append("")
+        lines.append(
+            "> 以上为 A6 一次合成的共享语义，Node 4 concepts/key_risks 与 Node 5 hot_topics "
+            "不再各自调用模型；完整 prompt/raw response 与逐次证据见 "
+            "`agent_steps.jsonl`，原始证据表见 `agent_glue.json`。"
+        )
         lines.append("")
     return lines
 

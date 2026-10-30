@@ -134,8 +134,8 @@ class TestArchivePhase2Atomic(unittest.TestCase):
 class TestPartialDegradation(unittest.IsolatedAsyncioTestCase):
 
     async def test_step_failures_produce_partial_decision(self):
-        """Step2.5/Step3/LLM 精炼全失败 → 正常 return，status=partial、
-        allocation 空、unified_scoring 保留、warnings 透出降级步骤"""
+        """Step2.5/Step3 全失败 → 正常 return，status=partial、
+        allocation 空、unified_scoring 保留、warnings 透出降级步骤（零 LLM）"""
         from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
         node = PortfolioDecisionNode()
@@ -166,8 +166,6 @@ class TestPartialDegradation(unittest.IsolatedAsyncioTestCase):
              patch.object(node, "_write_ambush_buy_snapshots", return_value=([], [])), \
              patch.object(node, "_close_thesis_snapshots"), \
              patch.object(node, "_close_ambush_snapshots"), \
-             patch.object(node, "_llm_refinement",
-                          AsyncMock(side_effect=RuntimeError("llm boom"))), \
              patch.object(node, "_generate_summary", return_value="降级总结"), \
              patch.object(node, "_generate_warnings", return_value=[]), \
              patch.object(node, "_save_shadow_records"):
@@ -184,7 +182,6 @@ class TestPartialDegradation(unittest.IsolatedAsyncioTestCase):
         joined = "\n".join(decision.warnings)
         self.assertIn("Step2.5", joined)
         self.assertIn("Step3", joined)
-        self.assertIn("LLM 精炼", joined)
         # 产物可 JSON 序列化（archive 必然可执行）
         json.dumps(decision.model_dump(mode="json"), ensure_ascii=False, allow_nan=False)
 

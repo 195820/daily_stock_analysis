@@ -235,8 +235,8 @@ AMBUSH_POOL_TARGET_RANGE = (2, 6)    # 正式池水位目标区间（实测 12 �
 # 影子模式开关（Track B agent 增强）
 # =============================================================================
 
-SECTOR_ALIGN_SHADOW = os.environ.get("SECTOR_ALIGN_SHADOW", "false").lower() == "true"   # T5: 事件→板块对齐层（2026-09-01 转正；影子观察已验证无异常，回滚设 SECTOR_ALIGN_SHADOW=true）
-# 项一②b（外网对标 2026-10-11）：macro_rule 事件是否也走 T5 语义对齐（扇出感知当日埋伏候选/蓄水池）。
+# 项一②b（外网对标 2026-10-11）：macro_rule 事件确定性扇出的开关（T5 LLM 对齐已于 2026-10-30 退役，
+# 叙事/global_map 的扇出改由 A6 relations 在 Node 6 内共享回填）。
 # 【2026-10-15 负责人拍板翻 true】与 GOT_MACRO_FANOUT_ENABLED 同日开启开始影子读数；转正判据见
 # verification.md 2026-10-15 节（题材类零事件率<30% + still_missed 降≥50%，连续≥10 交易日）。
 # 回滚：GOT_MACRO_SECTOR_ALIGN_ENABLED=false。
@@ -446,13 +446,39 @@ GLUE_MAX_TOKENS = int(os.environ.get("GLUE_MAX_TOKENS", "16000"))
 GOT_A6_ENABLED = os.environ.get("GOT_A6_ENABLED", "true").lower() == "true"
 
 # =============================================================================
-# 竞品经验补强（计划 2026-10-06）批次 D：持仓异动归因通道（news_pulse，一期纯观测）
+# 2026-10-30 语义运行时 / 窄 Agent / 只读复盘
 # =============================================================================
-# 默认关：先手动跑一周验证输出质量（计划 §D 纪律）。转正（推送接线）另立子项。
-# 回滚：GOT_NEWS_PULSE_ENABLED=0。
-GOT_NEWS_PULSE_ENABLED = os.environ.get("GOT_NEWS_PULSE_ENABLED", "0") == "1"
-GOT_NEWS_PULSE_THRESHOLD = float(os.environ.get("GOT_NEWS_PULSE_THRESHOLD", "7.0"))  # 触发幅度（|当日涨跌%|）
-GOT_NEWS_PULSE_MAX_STOCKS = int(os.environ.get("GOT_NEWS_PULSE_MAX_STOCKS", "3"))    # 单次运行硬上限（LLM 成本）
+# 窄语义 Agent（身份 + 涨跌归因）总开关；关闭时 NarrativeContext.status="disabled"。
+GOT_NARRATIVE_AGENTS_ENABLED = os.environ.get("GOT_NARRATIVE_AGENTS_ENABLED", "true").lower() == "true"
+GOT_NARRATIVE_MAX_SYMBOLS = _bounded_int(
+    "GOT_NARRATIVE_MAX_SYMBOLS", int(os.environ.get("GOT_NARRATIVE_MAX_SYMBOLS", "20")), 1, 200,
+)
+GOT_NARRATIVE_TIMEOUT_S = float(os.environ.get("GOT_NARRATIVE_TIMEOUT_S", "60"))
+# 成分股查询（THS/问财）可能极慢：默认 20s 超时后仅用持仓，不让窄 Agent 卡住 GOT 主链
+GOT_NARRATIVE_CONSTITUENTS_ENABLED = os.environ.get(
+    "GOT_NARRATIVE_CONSTITUENTS_ENABLED", "true",
+).lower() == "true"
+GOT_NARRATIVE_CONSTITUENTS_TIMEOUT_S = float(
+    os.environ.get("GOT_NARRATIVE_CONSTITUENTS_TIMEOUT_S", "10")
+)
+# 原始 trace 文件开关（只控制 prompt/raw_response 落盘；调用、usage、内存证据闭包不受影响）
+GOT_LLM_TRACE_ENABLED = os.environ.get("GOT_LLM_TRACE_ENABLED", "true").lower() == "true"
+
+# 只读决策复盘：shadow=只落产物/日志；0=完全关闭；enabled=保留给人工转正（不影响主流程）
+GOT_AUDIT_ENABLED = os.environ.get("GOT_AUDIT_ENABLED", "shadow").strip().lower()
+GOT_AUDIT_MAX_HYPOTHESES = _bounded_int(
+    "GOT_AUDIT_MAX_HYPOTHESES", int(os.environ.get("GOT_AUDIT_MAX_HYPOTHESES", "3")), 1, 10,
+)
+GOT_AUDIT_MAX_GRILL_ROUNDS = _bounded_int(
+    "GOT_AUDIT_MAX_GRILL_ROUNDS", int(os.environ.get("GOT_AUDIT_MAX_GRILL_ROUNDS", "2")), 0, 5,
+)
+GOT_AUDIT_MAX_SYMBOLIC_TOOLS = _bounded_int(
+    "GOT_AUDIT_MAX_SYMBOLIC_TOOLS", int(os.environ.get("GOT_AUDIT_MAX_SYMBOLIC_TOOLS", "8")), 1, 64,
+)
+GOT_AUDIT_MAX_LLM_CALLS = _bounded_int(
+    "GOT_AUDIT_MAX_LLM_CALLS", int(os.environ.get("GOT_AUDIT_MAX_LLM_CALLS", "8")), 1, 64,
+)
+GOT_AUDIT_TIMEOUT_S = float(os.environ.get("GOT_AUDIT_TIMEOUT_S", "180"))
 
 # =============================================================================
 # 批次 G：产出前运行时自查 gate（output_review，一期只 warn 不阻断）
@@ -679,7 +705,7 @@ IMPACT_WEIGHT = {1: 0.3, 2: 0.6, 3: 1.0}
 # 2026-10-27.2 bump：H2/H3 当日转正（用户裁决跳过影子纪律，缺省 enabled）。持仓动作口径变更
 #   （confirmed 板块 lifecycle 缺失 → hold 而非 40/60 降温档；埋伏持仓催化剂锚到期可退出），
 #   跨版本前向统计须按 GOT_HOLDINGS_VERDICT_V2/HISTORY_FEED 分组，不可与前序归档混池。
-SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-27.2")
+SCORING_FORMULA_VERSION = os.environ.get("GOT_SCORING_FORMULA_VERSION", "2026-10-30.1-agent-runtime-v1")
 
 # =============================================================================
 # 批次 A（竞品补强）：证据链与出处（一期只降不升，防换池）

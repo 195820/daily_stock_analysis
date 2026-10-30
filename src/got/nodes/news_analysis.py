@@ -73,12 +73,6 @@ SOURCE_MULTIPLIER_BONUS = 1.5
 # LLM 参数
 EVENT_EXTRACTION_TEMPERATURE = 0.2
 EVENT_EXTRACTION_MAX_TOKENS = 4000
-CONCEPT_DISCOVERY_TEMPERATURE = 0.5
-CONCEPT_DISCOVERY_MAX_TOKENS = 800
-RISK_SUMMARY_TEMPERATURE = 0.3
-RISK_SUMMARY_MAX_TOKENS = 300
-REASONING_TEMPERATURE = 0.3
-REASONING_MAX_TOKENS = 400
 
 # 标题粗筛（阶段 1）：输出上限依据 ≤12 条 × ~40 token/条
 TITLE_SHORTLIST_TEMPERATURE = 0.2
@@ -136,54 +130,6 @@ EVENT_EXTRACTION_PROMPT = """你是严谨的新闻编辑。从以下新闻中提
 
 输出 JSON 格式（不要 markdown 代码块）：
 {{"events": [{{"title": "...", "summary": "...", "event_type": "...", "impact_level": "...", "sentiment": "...", "affected_sectors": ["..."], "affected_stocks": ["..."], "source_type": "professional", "onset_days": 3{src_index_example}}}]}}"""
-
-CONCEPT_DISCOVERY_PROMPT = """你是敏锐的市场分析师，善于发现新兴投资概念。
-
-当前已有的概念列表：{current_concepts}
-
-{historical_context}
-
-最新新闻：
-{news_data}
-
-要求：
-1. 从新闻中发现新闻中反复出现的、尚未在概念列表中的新投资概念/主题
-2. 每个概念需提供：concept_name（概念名）、evidence（证据，1-2句）、mention_frequency（新闻中被提及的次数估计）
-3. 只输出真正有价值的新概念，不要凑数
-4. 如果没有新概念，返回空列表
-5. 如果某个概念在历史事件中已经连续多天出现（fermenting 或 peak 状态），请特别关注并标注"持续发酵中"
-
-输出 JSON 格式（不要 markdown 代码块）：
-{{"concepts": [{{"concept_name": "...", "evidence": "...", "mention_frequency": 3}}]}}"""
-
-RISK_SUMMARY_PROMPT = """你是专业的市场研究员。请阅读以下新闻摘要，列出 3-5 个投资者需要关注的不确定性因素。
-
-新闻摘要：
-{news_data}
-
-要求：
-1. 每个因素用一句话概括
-2. 重点关注：政策变化、外部环境、行业竞争格局等方面
-3. 语言客观中立
-
-输出 JSON 格式（不要 markdown 代码块）：
-{{"risks": ["因素1", "因素2", "因素3"]}}"""
-
-REASONING_PROMPT = """你是资深市场策略师。根据以下消息面分析结果，撰写一段简洁的分析报告。
-
-消息面分析结果：
-- 整体影响：{overall_impact}（评分：{impact_score:.2f}）
-- 重要事件（{event_count}条）：
-{events_text}
-- 新概念建议：{concepts_text}
-- 关键风险：{risks_text}
-
-请输出：
-1. 一段200字以内的分析文本，解释当前消息面的整体格局
-2. 重点说明哪些事件对市场影响最大
-3. 提示需要关注的风险和机会
-
-输出格式：纯文本（不要JSON）"""
 
 LOW_RESCUE_PROMPT = """你是 A 股板块研究员。以下事件被一审判为对大盘「low（轻微影响）」——大盘口径没错，但其中部分事件对**特定板块**可能是「high（重大影响）」。你的任务是逐条判定每个事件**对其映射板块**的影响等级。
 
@@ -263,15 +209,19 @@ def _carry_age_prefix(item: Dict) -> str:
 class NewsAnalysisNode:
     """消息面分析节点"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
 
-    async def run(self, bar_complete: bool = True) -> NewsContext:
+    async def run(self, bar_complete: bool = True, as_of: Optional[date] = None) -> NewsContext:
         """执行消息面分析
-        
+
         Args:
             bar_complete: 数据完整性标记（True=收盘后数据, False=盘中快照）
+            as_of: 业务日（回放/补跑必须与归档/Phase 2 同源）；缺省=当日
         """
+        business_date = as_of or date.today()
+        self._as_of = business_date
         if self.use_mock:
             logger.info("[Node 4] 使用 mock 数据")
             return self._mock_output()
@@ -290,7 +240,7 @@ class NewsAnalysisNode:
 
         # Step 1.5: 原始新闻持久化（P1-1: 跨日发酵检测基础）
         # 落库用**未截断**的全量池：热榜条目（无发布时间）排在 weight 尾部，不会进 merged
-        self._persist_raw_news(raw_pool)
+        self._persist_raw_news(raw_pool, as_of=business_date)
 
         if not raw_news:
             logger.warning("[Node 4] 未获取到任何新闻数据")
@@ -321,6 +271,11 @@ class NewsAnalysisNode:
         # Step 3: 多源确认
         events = self._apply_source_count(events, raw_news)
 
+        # Step 3.0: 稳定事件身份（normalize_title + 首次来源 + 业务日）
+        # 必须在 low rescue 之前生成，救援/升级不改变身份；_save_events_to_db 命中
+        # 历史相似事件时复用历史 event_id（禁止用本次运行日重写历史身份）。
+        self._assign_stable_event_ids(events, business_date)
+
         # Step 3.1: low 事件板块级救援（Q1 修复，GOT_LOW_SECTOR_RESCUE=1 缺省直连，用户裁决 2026-10-16）：
         # LLM 按三维判定标准复审 low 事件的板块级影响，sector_impact=high 的事件升级 medium
         # 进链路（DB/NewsContext/impact_score/日历候选池自然吃到），终结 low 无痕蒸发。
@@ -334,14 +289,14 @@ class NewsAnalysisNode:
             events = [e for e in events if e.impact_level != "low"]
 
         # Step 3.5: 事件持久化（跨日记忆）
-        self._save_events_to_db(events, raw_news)
+        self._save_events_to_db(events, raw_news, as_of=business_date)
 
         # Step 4: 评分计算
         impact_score = self._calculate_impact_score(events)
         overall_impact = self._score_to_impact(impact_score)
 
-        # Step 5: reasoning 生成
-        reasoning = await self._generate_reasoning(
+        # Step 5: reasoning 生成（纯规则；A6 回填 concepts/risks 后重算，见 Node 6）
+        reasoning = self._fallback_reasoning(
             overall_impact, impact_score, events, concepts, risks,
         )
 
@@ -361,7 +316,7 @@ class NewsAnalysisNode:
         # ── 催化剂日历（P1） ──
         try:
             from src.got.catalyst_calendar import CatalystCalendarBuilder
-            builder = CatalystCalendarBuilder()
+            builder = CatalystCalendarBuilder(got_runtime=getattr(self, "got_runtime", None))
             calendar = await builder.build_calendar(bar_complete=bar_complete)
             result.catalyst_calendar = calendar
             logger.info(
@@ -545,6 +500,7 @@ class NewsAnalysisNode:
             prompt,
             temperature=TITLE_SHORTLIST_TEMPERATURE,
             max_tokens=TITLE_SHORTLIST_MAX_TOKENS,
+            task_id="node4.title_shortlist",
         )
         if not raw_result:
             logger.warning(
@@ -852,7 +808,8 @@ class NewsAnalysisNode:
                 )
             else:
                 quota_record: Dict[str, Any] = {}
-                shortlist = self._shortlist_titles(
+                shortlist = await asyncio.to_thread(
+                    self._shortlist_titles,
                     pool_for_shortlist, quota_out=quota_record,
                 )
                 if quota_record:
@@ -865,10 +822,8 @@ class NewsAnalysisNode:
                     "[Node 4] 标题粗筛: %d → %d 条（含补读 %d、产业召回 %d）",
                     len(pool_for_shortlist), len(extraction_pool), len(carried), len(recalled),
                 )
-            # 概念发现/风险总结仍读全量 raw_news（标题+摘要）：概念发现依赖跨条目的
-            # 重复主题，喂 12 条短名单会让它失效。**先**格式化全量文本再给短名单补正文，
-            # 保证概念/风险输入不受 GOT_NEWS_FULLTEXT_ENABLED 影响（开关只作用于细读）。
-            all_news_text, _ = self._format_news_for_prompt(raw_news, gated=gated)
+            # 概念/风险不再单独调用 LLM（2026-10-30 运行时收敛）：概念由 Node 6 A6
+            # 共享语义产物回填，风险先按负面事件规则兜底、A6 成功后回填。
             if GOT_NEWS_FULLTEXT_ENABLED:
                 extraction_pool = await self._enrich_fulltext(extraction_pool)
             news_text, ordered_items = self._format_news_for_prompt(
@@ -878,7 +833,6 @@ class NewsAnalysisNode:
             news_text, ordered_items = self._format_news_for_prompt(
                 raw_news, max_items=LEGACY_PROMPT_MAX_ITEMS, gated=gated,
             )
-            all_news_text = news_text
         # A-2 (2026-10-11)：概念列表不再硬编码"科技成长"，改为从 CONCEPT_UNIVERSE
         # 子类标签派生（含周期/资源/消费/机械/医药扩展），使事件提取的
         # affected_sectors 不再只偏科技（glue 埋伏支路的上游事件供给）。
@@ -907,39 +861,17 @@ class NewsAnalysisNode:
                 ),
                 temperature=EVENT_EXTRACTION_TEMPERATURE,
                 max_tokens=EVENT_EXTRACTION_MAX_TOKENS,
+                task_id="node4.event_extraction",
             )
         else:
             logger.warning("[Node 4] 素材为空（粗筛无选中）→ 跳过事件提取，当日不产事件")
         events = self._parse_events(events_result, ordered_items)
 
-        # 概念发现（注入历史上下文）
-        concepts_result = await asyncio.to_thread(
-            self._call_llm,
-            CONCEPT_DISCOVERY_PROMPT.format(
-                current_concepts=concept_list_str,
-                news_data=all_news_text,
-                historical_context=historical_context,
-            ),
-            temperature=CONCEPT_DISCOVERY_TEMPERATURE,
-            max_tokens=CONCEPT_DISCOVERY_MAX_TOKENS,
-        )
-        concepts = self._parse_concepts(concepts_result)
-
-        # 风险总结（可从事件中规则兜底）
-        risks_result = await asyncio.to_thread(
-            self._call_llm,
-            RISK_SUMMARY_PROMPT.format(news_data=all_news_text),
-            temperature=RISK_SUMMARY_TEMPERATURE,
-            max_tokens=RISK_SUMMARY_MAX_TOKENS,
-        )
-        risks = self._parse_risks(risks_result, events)
-
-        for name, result in zip(
-            ["事件提取", "概念发现", "风险总结"],
-            [events_result, concepts_result, risks_result],
-        ):
-            if not result:
-                logger.warning("[Node 4] LLM %s 返回空", name)
+        # 概念发现 / 风险总结（2026-10-30 运行时收敛）：独立 LLM 调用已删除。
+        # concepts 由 Node 6 A6 共享语义产物回填；risks 先用负面事件规则兜底，
+        # A6 成功后同样回填（不伪造 LLM 输出）。
+        concepts: List[Dict] = []
+        risks = self._parse_risks("", events)
 
         return events, concepts, risks
 
@@ -1069,22 +1001,33 @@ class NewsAnalysisNode:
                 lines.append(f"{i}. [{tag}] {prefix}{title}\n   {snippet}")
         return "\n".join(lines), top_items
 
-    @staticmethod
-    def _call_llm(prompt: str, *, temperature: float, max_tokens: int, max_retries: int = 3) -> str:
-        """同步 LLM 调用（在 asyncio.to_thread 中执行），含空响应重试。"""
-        from src.agent.llm_adapter import LLMToolAdapter
+    
 
-        adapter = LLMToolAdapter()
-        messages = [{"role": "user", "content": prompt}]
+    def _call_llm(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+        max_retries: int = 3,
+        task_id: str = "node4.llm",
+    ) -> str:
+        """同步 LLM 调用（worker 线程内执行），统一走 run 级 runtime。"""
+        from src.got.agent_runtime import ensure_runtime
 
-        for attempt in range(max_retries + 1):
-            response = adapter.call_text(
-                messages, temperature=temperature, max_tokens=max_tokens,
-            )
-            if response and response.content and response.content.strip():
-                return response.content.strip()
-            if attempt < max_retries:
-                logger.debug("[Node 4] LLM 空响应，重试 %d/%d", attempt + 1, max_retries)
+        runtime = ensure_runtime(self, getattr(self, "_as_of", None))
+        step = runtime.call_text_sync(
+            task_id=task_id,
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            timeout=60.0,
+        )
+        if step.status == "ok" and isinstance(step.output, str):
+            return step.output.strip()
+        if step.status == "failed":
+            logger.warning("[Node 4] LLM 调用未成功（%s）: %s", task_id, step.error)
         return ""
 
     @staticmethod
@@ -1412,6 +1355,7 @@ class NewsAnalysisNode:
                 ),
                 temperature=LOW_RESCUE_TEMPERATURE,
                 max_tokens=LOW_RESCUE_MAX_TOKENS,
+                task_id="node4.low_rescue",
             )
             verdicts = self._parse_low_rescue_verdicts(raw)
         except Exception as exc:  # noqa: BLE001 — LLM 失败/解析失败：降级不升级，仍落影子（T4/T5 契约）
@@ -1534,64 +1478,72 @@ class NewsAnalysisNode:
     # Step 3.5: 事件持久化（跨日记忆）
     # =================================================================
 
-    def _save_events_to_db(self, events: List[NewsEvent], raw_news: List[Dict]) -> None:
+    def _save_events_to_db(self, events: List[NewsEvent], raw_news: List[Dict], *, as_of: Optional[date] = None) -> None:
         """保存事件到 SQLite，支持跨日累积。
 
         去重策略：标题相似度 ≥0.6 视为同一事件，复用 _deduplicate_news() 逻辑。
         同一事件多次出现时：mention_count += 1，更新 last_seen，追加 sources_seen。
+        as_of：业务日（回放/补跑不读墙钟日）；命中历史相似事件时复用其 event_id/first_seen。
         """
         if not events:
             return
 
         try:
             db = DatabaseManager()
-            today = date.today()
+            today = as_of or date.today()
 
             with db.get_session() as session:
-                # 加载最近 7 天的历史事件用于去重
-                historical_events = self._load_historical_events_from_db(session, days=7)
+                # 加载最近 7 天的历史事件用于去重（以业务日为上界）
+                historical_events = self._load_historical_events_from_db(session, days=7, as_of=today)
 
                 for event in events:
                     # 在历史事件中查找相似事件
                     matched_event_id = None
+                    db_event = None
                     for hist_event in historical_events:
                         similarity = SequenceMatcher(None, event.title, hist_event.title).ratio()
                         if similarity >= 0.6:
                             matched_event_id = hist_event.event_id
+                            db_event = hist_event
                             break
 
                     if matched_event_id:
-                        # 更新已有事件
-                        db_event = session.query(Node4EventRecord).filter_by(event_id=matched_event_id).first()
-                        if db_event:
-                            # A-P0-7: mention_count 改为跨日才增（按日去重）
-                            last_seen_date = db_event.last_seen
-                            if isinstance(last_seen_date, datetime):
-                                last_seen_date = last_seen_date.date()
-                            elif not isinstance(last_seen_date, date):
-                                last_seen_date = date.today()
-                            if last_seen_date < today:
-                                db_event.mention_count = (db_event.mention_count or 0) + 1
-                            # else: 同日重复只刷新 last_seen/来源/轨迹，不增 mention_count
+                        # 复用历史身份：本次运行日不得重写 event_id/first_seen
+                        event.event_id = matched_event_id
+                        if getattr(db_event, "first_seen", None):
+                            event.first_seen = str(db_event.first_seen)
+                        # A-P0-7: mention_count 改为跨日才增（按日去重）
+                        last_seen_date = db_event.last_seen
+                        if isinstance(last_seen_date, datetime):
+                            last_seen_date = last_seen_date.date()
+                        elif not isinstance(last_seen_date, date):
+                            last_seen_date = today
+                        if last_seen_date < today:
+                            db_event.mention_count = (db_event.mention_count or 0) + 1
+                        # else: 同日重复只刷新 last_seen/来源/轨迹，不增 mention_count
 
-                            # 影子字段：每次运行+1（旧口径，用于对比）
-                            db_event.mention_count_run_based = (db_event.mention_count_run_based or 0) + 1
+                        # 影子字段：每次运行+1（旧口径，用于对比）
+                        db_event.mention_count_run_based = (db_event.mention_count_run_based or 0) + 1
 
-                            db_event.last_seen = today
-                            # 追加新来源
-                            existing_sources = db_event.get_sources_seen()
-                            if event.source_type and event.source_type not in existing_sources:
-                                existing_sources.append(event.source_type)
-                                db_event.set_sources_seen(existing_sources)
-                            # 追加情感值到轨迹
-                            sentiment_value = self._sentiment_to_float(event.sentiment)
-                            trajectory = db_event.get_sentiment_trajectory()
-                            trajectory.append(sentiment_value)
-                            db_event.set_sentiment_trajectory(trajectory[-7:])  # 保留最近 7 天
-                            db_event.updated_at = datetime.utcnow()
+                        db_event.last_seen = today
+                        # 追加新来源
+                        existing_sources = db_event.get_sources_seen()
+                        if event.source_type and event.source_type not in existing_sources:
+                            existing_sources.append(event.source_type)
+                            db_event.set_sources_seen(existing_sources)
+                        # 追加情感值到轨迹
+                        sentiment_value = self._sentiment_to_float(event.sentiment)
+                        trajectory = db_event.get_sentiment_trajectory()
+                        trajectory.append(sentiment_value)
+                        db_event.set_sentiment_trajectory(trajectory[-7:])  # 保留最近 7 天
+                        db_event.updated_at = datetime.utcnow()
                     else:
-                        # 创建新事件
-                        event_id = self._generate_event_id(event.title, today)
+                        # 创建新事件（稳定 ID 已在 Step 3.0 生成，缺失时按业务日补）
+                        event_id = event.event_id or self._generate_event_id(
+                            event.title, event.source_type or "unknown", today,
+                        )
+                        event.event_id = event_id
+                        event.first_seen = event.first_seen or today.isoformat()
                         db_event = Node4EventRecord(
                             event_id=event_id,
                             title=event.title,
@@ -1702,7 +1654,7 @@ class NewsAnalysisNode:
                 main["heat"] = max(heats)
         return [merged[norm] for norm in order]
 
-    def _persist_raw_news(self, raw_news: List[Dict]) -> Tuple[int, int]:
+    def _persist_raw_news(self, raw_news: List[Dict], *, as_of: Optional[date] = None) -> Tuple[int, int]:
         """原始新闻持久化（P1-1）：同题归并 + 精确匹配 + 相似度兜底去重。
 
         每次 `_fetch_news()` 后调用，将全量原始数据写入 node4_raw_news 表。
@@ -1718,7 +1670,7 @@ class NewsAnalysisNode:
             return 0, 0
         raw_news = self._merge_same_title_rows(raw_news)
 
-        today = date.today()
+        today = as_of or date.today()
         persisted = 0
         updated = 0
         try:
@@ -1769,7 +1721,7 @@ class NewsAnalysisNode:
                         if isinstance(last_seen_date, datetime):
                             last_seen_date = last_seen_date.date()
                         elif not isinstance(last_seen_date, date):
-                            last_seen_date = date.today()
+                            last_seen_date = today
                         if last_seen_date < today:
                             existing.appearance_count = (existing.appearance_count or 0) + 1
                         # else: 同日重复只刷新 last_seen_date，不增 appearance_count
@@ -1853,9 +1805,9 @@ class NewsAnalysisNode:
             logger.warning(f"[Node 4] 发酵检测失败: {e}")
             return []
 
-    def _load_historical_events_from_db(self, session, days: int = 7) -> List[Node4EventRecord]:
+    def _load_historical_events_from_db(self, session, days: int = 7, as_of: Optional[date] = None) -> List[Node4EventRecord]:
         """从 SQLite 加载最近 N 天的事件（用于去重和 LLM prompt 注入）。"""
-        cutoff_date = date.today() - timedelta(days=days)
+        cutoff_date = (as_of or date.today()) - timedelta(days=days)
         return session.query(Node4EventRecord).filter(
             Node4EventRecord.last_seen >= cutoff_date
         ).order_by(Node4EventRecord.mention_count.desc()).all()
@@ -1916,10 +1868,19 @@ class NewsAnalysisNode:
             elif event.last_seen < today:
                 event.lifecycle_state = "fading"
 
-    def _generate_event_id(self, title: str, today: date) -> str:
-        """生成事件 ID（基于标题和日期的哈希）。"""
-        content = f"{title}|{today.isoformat()}"
+    def _generate_event_id(self, title: str, source: str, as_of: date) -> str:
+        """稳定事件 ID：normalize_title + 首次来源 + 业务日（跨日相似匹配合并后复用）。"""
+        content = f"{self._normalize_title(title)}|{source or 'unknown'}|{as_of.isoformat()}"
         return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+    def _assign_stable_event_ids(self, events: List[NewsEvent], as_of: date) -> None:
+        """为抽取完成的事件生成稳定身份（low rescue 前调用，救援不改身份）。"""
+        for event in events:
+            if getattr(event, "event_id", None):
+                continue
+            event.event_id = self._generate_event_id(
+                event.title, event.source_type or "unknown", as_of,
+            )
 
     @staticmethod
     def _build_concept_list_str() -> str:
@@ -2041,48 +2002,7 @@ class NewsAnalysisNode:
     # Step 5: reasoning 生成
     # =================================================================
 
-    async def _generate_reasoning(
-        self,
-        overall_impact: str,
-        impact_score: float,
-        events: List[NewsEvent],
-        concepts: List[Dict],
-        risks: List[str],
-    ) -> str:
-        """LLM 生成 reasoning 文本，失败时降级为规则拼接。"""
-        events_text = "\n".join(
-            f"  - [{e.impact_level}/{e.sentiment}] {e.title}"
-            for e in events[:8]
-        ) or "  无"
-        concepts_text = "、".join(
-            c.get("concept_name", "") for c in concepts[:5]
-        ) or "无"
-        risks_text = "；".join(risks[:5]) if risks else "无"
-
-        prompt = REASONING_PROMPT.format(
-            overall_impact=overall_impact,
-            impact_score=impact_score,
-            event_count=len(events),
-            events_text=events_text,
-            concepts_text=concepts_text,
-            risks_text=risks_text,
-        )
-
-        try:
-            result = await asyncio.to_thread(
-                self._call_llm,
-                prompt,
-                temperature=REASONING_TEMPERATURE,
-                max_tokens=REASONING_MAX_TOKENS,
-            )
-            if result:
-                return result
-        except Exception as exc:
-            logger.warning("[Node 4] reasoning LLM 生成失败: %s", exc)
-
-        return self._fallback_reasoning(
-            overall_impact, impact_score, events, concepts, risks,
-        )
+    
 
     @staticmethod
     def _fallback_reasoning(

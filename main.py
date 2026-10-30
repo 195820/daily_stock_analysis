@@ -395,6 +395,22 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--got-audit',
+        nargs='?',
+        const='today',
+        default=None,
+        metavar='YYYYMMDD',
+        help='只读复盘指定日（缺省当日）的 GOT 归档，产物写 data/got_audit/'
+    )
+
+    parser.add_argument(
+        '--audit-date',
+        metavar='YYYYMMDD',
+        default=None,
+        help='--got 完成后限定复盘的业务日（缺省=当日）'
+    )
+
+    parser.add_argument(
         '--intraday-time',
         choices=['0926', '1125', '1445'],
         default=None,
@@ -1406,6 +1422,26 @@ def main() -> int:
                 logger.exception(f"[选股] 执行失败: {e}")
                 return 1
 
+        # 模式1.4b: 只读决策复盘（独立于 --got 主链）
+        if args.got_audit:
+            try:
+                from datetime import date as _date
+                from src.got.audit_agent import run_audit_sync
+
+                if args.got_audit == 'today':
+                    _audit_day = date.today()
+                else:
+                    _audit_day = datetime.strptime(args.got_audit, "%Y%m%d").date()
+                result = run_audit_sync(_audit_day)
+                print(f"\n[GOT Audit] status={result.get('status')} date={_audit_day}")
+                for err in result.get("errors") or []:
+                    print(f"  [!] {err}")
+                print(f"  产物目录: data/got_audit/{_audit_day.strftime('%Y%m%d')}/")
+                return 0
+            except Exception as e:
+                logger.exception(f"[GOT Audit] 执行失败: {e}")
+                return 1
+
         # 模式1.5a: 盘中 0→1 确认闸门（Phase 6-1，影子模式旁挂节点）
         if args.got_intraday:
             if not args.intraday_time:
@@ -1596,6 +1632,24 @@ def main() -> int:
                 # orchestrator 已落 status="failed" 占位产物（用于区分"没跑"与"跑崩"），
                 # 但"占位产物存在"≠"运行成功"——出口不失败的话，调度器/终端看到的仍是成功，
                 # 静默清空只是换成了静默无决策。
+                # 只读决策复盘（Phase 2 归档 + P6 后、通知前；失败不影响主流程）
+                try:
+                    from src.got.audit_agent import run_audit_sync
+
+                    _audit_day = (
+                        datetime.strptime(args.audit_date, "%Y%m%d").date()
+                        if getattr(args, "audit_date", None)
+                        else date.today()
+                    )
+                    _audit_result = run_audit_sync(_audit_day)
+                    logger.info(
+                        "[GOT Audit] status=%s date=%s errors=%s",
+                        _audit_result.get("status"), _audit_day,
+                        len(_audit_result.get("errors") or []),
+                    )
+                except Exception as _audit_exc:  # noqa: BLE001
+                    logger.warning("[GOT] 只读复盘失败（已忽略）: %s", _audit_exc)
+
                 if decision and getattr(decision, "status", "") != "failed":
                     print("\n" + "=" * 60)
                     print("Phase 2: 交易建议")
@@ -1670,6 +1724,7 @@ def main() -> int:
                             print(f"  [!] {warning}")
 
                     print(f"\n推理总结:\n{decision.reasoning}")
+
                     # ── GOT 通知 hook（C3）──
                     if os.environ.get("GOT_NOTIFY_ENABLED", "1") == "1":
                         try:

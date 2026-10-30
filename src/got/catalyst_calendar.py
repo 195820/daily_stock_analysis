@@ -280,9 +280,10 @@ class CatalystCalendarBuilder:
         calendar = await builder.build_calendar(target_date=date.today())
     """
 
-    def __init__(self):
+    def __init__(self, got_runtime=None):
+        self.got_runtime = got_runtime
+        self._run_date: Optional[date] = None
         self._concept_set: Optional[Set[str]] = None
-        self._llm = None
         # T2 批判者判 DROP 的 event_id 集合（影子模式下 events 仍原样返回上层，
         # 但 _save_events 落库/注册 P6 前必须过滤——audit_20260922 Q6-C①：
         # Run 3 孤儿行成因正是「影子 DROP 后仍写盘」）
@@ -297,12 +298,41 @@ class CatalystCalendarBuilder:
             self._concept_set = _flatten_concept_universe()
         return self._concept_set
 
-    @property
-    def llm(self):
-        if self._llm is None:
-            from src.agent.llm_adapter import LLMToolAdapter
-            self._llm = LLMToolAdapter()
-        return self._llm
+    async def _call_llm_async(
+        self, prompt: str, *, system: str, temperature: float, max_tokens: int,
+        task_id: str,
+    ) -> str:
+        """Run-scoped semantic call (no independent adapter)."""
+        runtime = getattr(self, "got_runtime", None)
+        legacy = getattr(self, "_llm", None)
+        if runtime is None and legacy is not None:
+            resp = await asyncio.to_thread(
+                legacy.call_text,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return (getattr(resp, "content", "") or "").strip()
+        from src.got.agent_runtime import ensure_runtime
+
+        runtime = ensure_runtime(self, getattr(self, "_run_date", None))
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+        step = await runtime.call_text(
+            task_id=task_id,
+            prompt=full_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=2,
+            timeout=90.0,
+        )
+        if step.status == "ok" and isinstance(step.output, str):
+            return step.output.strip()
+        if step.status == "failed":
+            logger.warning("[CatalystCalendar] LLM 调用未成功（%s）: %s", task_id, step.error)
+        return ""
 
     # =================================================================
     # 主入口
@@ -317,6 +347,7 @@ class CatalystCalendarBuilder:
         bar_complete: 数据完整性标记（True=收盘后数据, False=盘中快照）
         """
         target_date = target_date or date.today()
+        self._run_date = target_date
         end_date = target_date + timedelta(days=CATALYST_WINDOW_DAYS)
 
         try:
@@ -327,6 +358,11 @@ class CatalystCalendarBuilder:
                 events = await self._full_build(target_date, end_date)
             else:
                 events = await self._incremental_update(target_date, end_date)
+
+            # 逻辑事件去重（只做 llm_narrative，±3 日、同 source_news+同板块）：
+            # event_id 仍按 (sector,event_date) 独立，P6 外键不合并；重复只丢新入行，
+            # 保留最早 event_date / 同日最高 confidence。global_map 合法多板块扇出不动。
+            events = self._dedupe_logical_narrative_events(events, target_date)
 
             # 按日期排序
             events.sort(key=lambda e: e.event_date)
@@ -460,9 +496,8 @@ class CatalystCalendarBuilder:
         narrative = await self._llm_extract_narrative_catalysts(news_events, start, end)
         all_events.extend(narrative)
 
-        # T5: 事件→板块语义对齐层（为叙事/全球事件补充多板块扇出）
-        # 候选域 = CONCEPT_UNIVERSE + 蓄水池板块（A2 最想喂饱的对象）
-        all_events = await self._align_events_to_sectors(all_events, self._build_sector_universe())
+        # 宏观扇出：仅 macro_rule 走确定性规则映射（T5 LLM 对齐已删除）。
+        all_events = self._align_macro_rule_events(all_events, self.concept_set)
 
         # 去重：叙事/全球事件（同 sector+date 保留最高 impact）；宏观事件不参与
         # （原结构化白名单分支随财报/解禁入历路径一并退役，akshare_* 已无生成入口）
@@ -503,11 +538,8 @@ class CatalystCalendarBuilder:
             if e.event_id not in existing_ids:
                 new_events.append(e)
 
-        # T5: 增量路径同样跑语义对齐（只处理 affected_sectors 为空的新事件；
-        # 存量事件从 DB 加载时已回填，不会重复对齐）——否则扇出一周仅全量日生效
-        new_events = await self._align_events_to_sectors(
-            new_events, self._build_sector_universe()
-        )
+        # 宏观扇出：仅 macro_rule 走确定性规则映射（T5 LLM 对齐已删除）。
+        new_events = self._align_macro_rule_events(new_events, self.concept_set)
 
         # 合并
         all_events = existing + new_events
@@ -981,21 +1013,18 @@ class CatalystCalendarBuilder:
 8. 只输出 JSON，不要其他文字"""
 
         try:
-            response = await asyncio.to_thread(
-                self.llm.call_text,
-                messages=[
-                    {"role": "system", "content": "你是 A 股催化剂分析师，只输出 JSON。"},
-                    {"role": "user", "content": prompt},
-                ],
+            content = await self._call_llm_async(
+                prompt,
+                system="你是 A 股催化剂分析师，只输出 JSON。",
                 temperature=0.3,
                 max_tokens=3000,
+                task_id="catalyst.narrative_extract",
             )
-
-            if not response or not response.content:
+            if not content:
                 logger.warning("[CatalystCalendar] LLM 叙事提取返回空")
                 return []
 
-            events = self._parse_llm_narrative(response.content, start, end)
+            events = self._parse_llm_narrative(content, start, end)
 
             # T2: 叙事校验者（D1/D2 结构守卫之后，语义层校验）
             events = await self._critic_verify_narrative(events, news_events)
@@ -1115,195 +1144,33 @@ class CatalystCalendarBuilder:
         return results
 
     # =================================================================
-    # T5: 事件→板块语义对齐层
+    # 确定性宏观扇出（T5 LLM 对齐已退役）
     # =================================================================
 
-    _SECTOR_ALIGN_PROMPT = """你是 A 股板块映射专家。给定一条催化剂事件和候选板块列表，判断该事件影响哪些板块。
-
-## 规则
-1. 只从候选列表中选择，不编造板块名
-2. 每个事件可选 0-N 个板块（0 表示无明确板块影响）
-3. 输出 JSON 数组，每个元素: {{"event_id": "...", "affected_sectors": ["板块1", "板块2"]}}
-4. 若事件无明确板块影响，affected_sectors 留空数组
-
-## 事件列表
-{events_json}
-
-## 候选板块（只从中选择）
-{sector_list}
-
-只输出 JSON，不要其他文字。"""
-
-    def _build_sector_universe(self) -> Set[str]:
-        """T5 候选域：CONCEPT_UNIVERSE 白名单 + 蓄水池板块（计划要求：蓄水池+主线+白名单）
-
-        蓄水池是 A2 晋升最想喂饱的对象，必须在候选域内，否则 T5 无法把事件对齐到蓄水池名字。
-        """
-        universe = set(self.concept_set)
-        universe.update(self._load_reservoir_sector_names())
-        return universe
-
-    @staticmethod
-    def _load_reservoir_sector_names() -> Set[str]:
-        """从最新 GOT 归档加载蓄水池板块名（失败降级空集，不阻塞）"""
-        from pathlib import Path
-        names: Set[str] = set()
-        try:
-            # A-P0-1 统一入口，排除当天
-            from src.got.archive import list_archive_dirs
-            date_dirs = list_archive_dirs(reverse=True, before=date.today())
-            for d in date_dirs:
-                unified_path = d / "unified.json"
-                if not unified_path.exists():
-                    continue
-                with open(unified_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                for e in data.get("ambush_reservoir", []):
-                    if e.get("sector_name"):
-                        names.add(e["sector_name"])
-                break  # 只取最近一份归档
-        except Exception as exc:
-            logger.debug("[T5对齐] 蓄水池板块加载失败，降级: %s", exc)
-        return names
-
-    async def _align_events_to_sectors(
-        self, events: List[CatalystEvent], sector_universe: Set[str]
+    def _align_macro_rule_events(
+        self, events: List[CatalystEvent], concept_set: Set[str],
     ) -> List[CatalystEvent]:
-        """T5: LLM 语义对齐 — 为叙事/全球事件补充 affected_sectors 多板块扇出
+        """只对 macro_rule 执行既有规则扇出；不解释叙事/全球事件（A6 负责）。
 
-        一次批量调用：逐事件输出 affected_sectors（0-N 个）。
-        影子模式（SECTOR_ALIGN_SHADOW=true）：只记录对比日志，不修改事件。
-
-        仅处理 source in (llm_narrative, global_map) 的事件。
-        结构化/宏观事件走既有规则映射，不受影响。
-
-        【P2-1 长期口径（裁决 #8，2026-09-28）】对齐 prompt 不要求区分正/负面
-        （只输出板块名列表，无方向字段）——已明示接受为长期口径，见 schemas.CatalystEvent.affected_sectors。
+        叙事/global_map 的 affected_sectors 由 A6 relations 在 Node 6 内共享回填
+        （apply_glue_relations），此处不得再用 LLM 二次解释同一事件。
         """
-        from src.got.catalyst_config import SECTOR_ALIGN_SHADOW, GOT_MACRO_SECTOR_ALIGN_ENABLED
+        from src.got.catalyst_config import (
+            GOT_MACRO_FANOUT_ENABLED,
+            GOT_MACRO_SECTOR_ALIGN_ENABLED,
+        )
 
-        # 筛选需要对齐的事件：
-        # - 叙事 + 全球：仅 affected_sectors 为空时对齐（存量已回填不重复）
-        # - 项一②b：macro_rule 事件（现恒带 [sector]）在开关开启时也纳入，扇出感知当日候选/蓄水池
-        def _is_align_target(e: CatalystEvent) -> bool:
-            if e.source in ("llm_narrative", "global_map"):
-                return not e.affected_sectors
-            if e.source == "macro_rule" and GOT_MACRO_SECTOR_ALIGN_ENABLED:
-                return True
-            return False
-
-        targets = [e for e in events if _is_align_target(e)]
-        if not targets:
+        if not GOT_MACRO_SECTOR_ALIGN_ENABLED:
             return events
-
-        # 构建板块列表（限制 150 个，防 prompt 过长）。
-        # 蓄水池板块优先保留（它们是晋升路径最想对齐的目标），其余按字典序补齐；
-        # prompt 与输出校验使用同一份列表，避免"校验允许的名字 LLM 看不到"的自相矛盾。
-        reservoir = self._load_reservoir_sector_names()
-        prioritized = sorted(n for n in sector_universe if n in reservoir)
-        rest = sorted(n for n in sector_universe if n not in reservoir)
-        sector_list = (prioritized + rest)[:150]
-        allowed_sectors = set(sector_list)
-
-        # 构建事件摘要（只传关键信息）
-        events_json = json.dumps(
-            [
-                {
-                    "event_id": e.event_id,
-                    "title": e.title[:80],
-                    "sector": e.sector,
-                    "event_type": e.event_type,
-                }
-                for e in targets[:30]  # 最多 30 个事件一批
-            ],
-            ensure_ascii=False,
-        )
-
-        prompt = self._SECTOR_ALIGN_PROMPT.format(
-            events_json=events_json,
-            sector_list=", ".join(sector_list),
-        )
-
-        # R5: 串行 + 空响应重试（与 T1/T3 对齐）
-        response = None
-        for attempt in range(3):
-            try:
-                response = await asyncio.to_thread(
-                    self.llm.call_text,
-                    messages=[
-                        {"role": "system", "content": "你是板块映射专家，只输出 JSON。"},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                    max_tokens=2000,
-                )
-                if response and response.content:
-                    break
-            except Exception as exc:
-                logger.debug("[T5对齐] 第 %d 次调用失败: %s", attempt + 1, exc)
-                response = None
-        try:
-            if not response or not response.content:
-                logger.warning("[T5对齐] LLM 返回空（已重试 3 次），降级跳过")
-                return events
-
-            # 解析 LLM 输出
-            cleaned = response.content.strip()
-            if cleaned.startswith("```"):
-                lines = cleaned.split("\n")
-                cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-            mappings = json.loads(cleaned)
-
-            if not isinstance(mappings, list):
-                logger.warning("[T5对齐] LLM 输出非数组，降级跳过")
-                return events
-
-            # 建立 event_id → affected_sectors 映射
-            id_to_sectors: Dict[str, List[str]] = {}
-            for m in mappings:
-                eid = m.get("event_id", "")
-                sectors = m.get("affected_sectors", [])
-                if eid and isinstance(sectors, list):
-                    # 只保留在候选列表中的板块（与 prompt 同源，不产生幻觉名）
-                    id_to_sectors[eid] = [s for s in sectors if s in allowed_sectors]
-
-            # 应用对齐结果（或影子模式只记日志）
-            aligned_count = 0
-            multi_sector_count = 0
-            for event in targets:
-                new_sectors = id_to_sectors.get(event.event_id, [])
-                if not new_sectors:
-                    continue
-                aligned_count += 1
-                if len(new_sectors) > 1:
-                    multi_sector_count += 1
-
-                if SECTOR_ALIGN_SHADOW:
-                    # 影子模式：只记日志
-                    if new_sectors != [event.sector]:
-                        logger.info(
-                            "[T5影子] %s: 原 sector=%s → 对齐后 %s",
-                            event.event_id[:16], event.sector, new_sectors
-                        )
-                else:
-                    # 正式模式：写入 affected_sectors
-                    # macro 事件保留自身名义板块（[sector] ∪ 对齐结果，去重），避免对齐后丢失本桶；
-                    # 叙事/全球仍直接取对齐结果。
-                    if event.source == "macro_rule":
-                        event.affected_sectors = list(
-                            dict.fromkeys([event.sector] + new_sectors)
-                        )
-                    else:
-                        event.affected_sectors = new_sectors
-
-            logger.info(
-                "[T5对齐] %d 个事件对齐，%d 个多板块扇出（影子=%s）",
-                aligned_count, multi_sector_count, SECTOR_ALIGN_SHADOW,
+        for event in events:
+            if event.source != "macro_rule":
+                continue
+            fanout = resolve_macro_fanout_sectors(
+                list(event.affected_sectors or [event.sector]),
+                concept_set,
+                fanout_enabled=GOT_MACRO_FANOUT_ENABLED,
             )
-
-        except Exception as exc:
-            logger.warning("[T5对齐] LLM 调用失败，降级跳过: %s", exc)
-
+            event.affected_sectors = list(dict.fromkeys([event.sector] + fanout))
         return events
 
     # =================================================================
@@ -1374,30 +1241,20 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
             events_json=events_json,
         )
 
-        # R5: 串行 + 空响应重试（与 T1/T3/T5 对齐）
-        response = None
-        for attempt in range(3):
-            try:
-                response = await asyncio.to_thread(
-                    self.llm.call_text,
-                    messages=[
-                        {"role": "system", "content": "你是批判性审查员，只输出 JSON。"},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                    max_tokens=2000,
-                )
-                if response and response.content:
-                    break
-            except Exception as exc:
-                logger.debug("[T2校验] 第 %d 次调用失败: %s", attempt + 1, exc)
-                response = None
+        # R5: 串行 + 空响应重试（runtime 内统一重试/usage/trace）
+        content = await self._call_llm_async(
+            prompt,
+            system="你是批判性审查员，只输出 JSON。",
+            temperature=0.2,
+            max_tokens=2000,
+            task_id="catalyst.t2_critic",
+        )
         try:
-            if not response or not response.content:
-                logger.warning("[T2校验] LLM 返回空（已重试 3 次），降级保留全部事件")
+            if not content:
+                logger.warning("[T2校验] LLM 返回空（已重试），降级保留全部事件")
                 return events
 
-            cleaned = response.content.strip()
+            cleaned = content.strip()
             if cleaned.startswith("```"):
                 lines = cleaned.split("\n")
                 cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
@@ -1520,6 +1377,79 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
     # =================================================================
     # 持久化
     # =================================================================
+
+    def _dedupe_logical_narrative_events(
+        self, events: List[CatalystEvent], target_date: date,
+    ) -> List[CatalystEvent]:
+        """同一叙事逻辑事件在 ±3 日内只保留一行（llm_narrative only）。
+
+        key = source + normalize_title(source_news or title)，再叠加 canonical sector。
+        与 DB 活动行冲突→丢弃本次新入行（历史身份/event_date 不动）；
+        本次批内冲突→最早 event_date 优先，同日取最高 confidence。
+        """
+        from src.got.board_aliases import normalize_sector_name
+        from src.storage import CatalystEventRecord, DatabaseManager
+
+        def key_of(ev: CatalystEvent) -> tuple[str, str]:
+            logical = f"{ev.source}:{normalize_sector_name(ev.source_news or ev.title)}"
+            return (normalize_sector_name(ev.sector), logical)
+
+        def in_window(a: date, b: date) -> bool:
+            return abs((a - b).days) <= 3
+
+        # DB 活动行（同 source，窗口覆盖 target_date ± 3）
+        active: dict[tuple[str, str], date] = {}
+        try:
+            db = DatabaseManager()
+            with db.get_session() as session:
+                rows = (
+                    session.query(CatalystEventRecord)
+                    .filter(
+                        CatalystEventRecord.source == "llm_narrative",
+                        CatalystEventRecord.event_date >= target_date - timedelta(days=3),
+                        CatalystEventRecord.event_date <= target_date + timedelta(days=CATALYST_WINDOW_DAYS),
+                    )
+                    .all()
+                )
+            for row in rows:
+                active.setdefault(
+                    (normalize_sector_name(row.sector), f"llm_narrative:{normalize_sector_name(row.source_news or row.title)}"),
+                    row.event_date,
+                )
+        except Exception as exc:  # noqa: BLE001 — 读失败时退化为仅批内去重
+            logger.warning("[CatalystCalendar] 逻辑事件读取失败（仅批内去重）: %s", exc)
+
+        kept: list[CatalystEvent] = []
+        batch: dict[tuple[str, str], CatalystEvent] = {}
+        dropped = 0
+        for ev in events:
+            if ev.source != "llm_narrative":
+                kept.append(ev)
+                continue
+            key = key_of(ev)
+            existing_date = active.get(key)
+            if existing_date is not None and in_window(existing_date, ev.event_date):
+                dropped += 1
+                continue
+            prior = batch.get(key)
+            if prior is not None and in_window(prior.event_date, ev.event_date):
+                if ev.event_date < prior.event_date:
+                    batch[key] = ev
+                elif ev.event_date == prior.event_date and ev.confidence > prior.confidence:
+                    batch[key] = ev
+                dropped += 1
+                continue
+            batch[key] = ev
+            kept.append(ev)
+
+        if dropped:
+            logger.info("[CatalystCalendar] 逻辑事件去重: 丢弃 %d 条 llm_narrative 重复行", dropped)
+        # 批内替换：kept 中保留最后一次选中的对象
+        kept_ids = {id(ev) for ev in batch.values()}
+        return [
+            ev for ev in kept
+            if ev.source != "llm_narrative" or id(ev) in kept_ids
+        ]
 
     def _save_events(self, events: List[CatalystEvent], target_date: date, bar_complete: bool = True) -> None:
         """UPSERT 事件到 catalyst_events 表
@@ -1792,6 +1722,7 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
                 summary=r.title,
                 impact_level="high" if (r.significance_score or 0) > 0.5 else "medium",
                 sentiment="neutral",
+                event_id=r.event_id,
                 lifecycle_state=r.lifecycle_state,
                 mention_count=r.mention_count,
                 first_seen=str(r.first_seen) if r.first_seen else None,

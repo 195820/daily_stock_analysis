@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from src.got.family_keywords import CONTROLLED_FAMILIES  # noqa: E402
 # Phase 4b：市场结构上下文模型（market_theme 不反向依赖 schemas，无循环）
 from src.got.market_theme import MarketThemeContext  # noqa: E402
+# 2026-10-30 窄语义 Agent：身份/归因上下文（agent_runtime 无 schemas 依赖，无循环）
+from src.got.narrative_agents import NarrativeContext  # noqa: E402
 
 
 # =============================================================================
@@ -529,6 +531,9 @@ class NewsEvent(BaseModel):
     affected_sectors: list[str] = Field(default_factory=list)
     affected_stocks: list[str] = Field(default_factory=list, description="事件中明确提到的个股名称或代码")
     timestamp: Optional[str] = None
+    # 稳定事件身份（2026-10-30）：normalize_title+source+as_of 生成；跨日相似匹配合并时
+    # 复用历史 event_id，禁止用本次运行日重写历史身份。旧归档缺该字段仍可回读。
+    event_id: Optional[str] = Field(default=None, description="Node 4 稳定事件 ID（跨日复用）")
     source_count: int = Field(default=1, ge=1)
     source_type: str = Field(default="search", description="事件级：professional/retail_forum（LLM 提取）；采集源级：sina/cls/wallstreetcn/eastmoney/newsnow/nga_forum/ths_hot（E3 死枚举对齐，原记载 cctv/caixin/search 无生产者）")
     # 生命周期追踪字段（跨日记忆）
@@ -1115,6 +1120,11 @@ class UnifiedContext(BaseModel):
                     "仅供 Phase 2 取持仓板块的 lifecycle/强度/过热，消除「板块跌出名单 → lifecycle=None → "
                     "40/60 降温档误判」。空列表=无持仓诉求或全部已被 confirmed_sectors 覆盖。",
     )
+    # ── 2026-10-30 窄语义 Agent 产物（只读证据，不改交易规则）──
+    narrative_context: Optional[NarrativeContext] = Field(
+        default=None,
+        description="身份/涨跌归因上下文（A6 只当证据；不得改 sector_role/classification/仓位）",
+    )
 
 
     # ── 埋伏通道（P3 新增：Level 1 平行分支输出）──
@@ -1597,6 +1607,7 @@ class GlueRelation(BaseModel):
     direction: str = Field(default="positive")
     propagation_path: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence_ids: list[str] = Field(default_factory=list, description="该归属引用的输入证据 ID（A6 闭包校验）")
 
 
 class GlueStrength(BaseModel):
@@ -1608,6 +1619,7 @@ class GlueStrength(BaseModel):
     capital_read: str = Field(default="unknown")
     news_read: str = Field(default="unknown")
     sentiment_read: str = Field(default="unknown")
+    evidence_ids: list[str] = Field(default_factory=list, description="该强度判断引用的输入证据 ID（A6 闭包校验）")
     # C-P9: 口径声明（strength 替代的是综合评分 composite_score，0-100 百分制）
     basis: str = Field(
         default="composite",
@@ -1630,6 +1642,14 @@ class SemanticGlueResult(BaseModel):
     relations: list[GlueRelation] = Field(default_factory=list)
     strengths: list[GlueStrength] = Field(default_factory=list)
     families: list[GlueFamily] = Field(default_factory=list)
+    # A6 一次合成的共享语义产物（2026-10-30 运行时收敛）：
+    # Node 4 concepts/risks 与 Node 5 hot_topics 不再各自调用 LLM，由 A6 回填。
+    evidence_ids: list[str] = Field(default_factory=list)
+    concept_suggestions: list[dict] = Field(default_factory=list)
+    key_risks: list[str] = Field(default_factory=list)
+    hot_topics: list[str] = Field(default_factory=list)
+    narrative: str = Field(default="")
+    cross_sector_risks: list[str] = Field(default_factory=list)
     degraded: bool = Field(default=False)
     degraded_sectors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

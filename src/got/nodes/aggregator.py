@@ -199,8 +199,9 @@ class AggregatorNode:
         "陆股通", "融资余额", "融券余额", "两融",
     })
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
 
     async def run(
         self,
@@ -213,6 +214,7 @@ class AggregatorNode:
         replay_mode: bool = False,
         run_date: Optional[date] = None,
         holdings=None,
+        narrative_context=None,
     ) -> UnifiedContext:
         """执行分层 GOT 聚合
 
@@ -230,6 +232,7 @@ class AggregatorNode:
             return self._mock_output()
 
         self._replay_mode = replay_mode
+        self._narrative_context = narrative_context
         # C-P2: 运行日期（用于 _save_glue_result 落盘目录）
         self._run_date = run_date or date.today()
         logger.info("[Node 6] 开始 v3 分层 GOT 聚合" + ("（replay_mode）" if replay_mode else ""))
@@ -292,12 +295,27 @@ class AggregatorNode:
             if getattr(glue, "degraded", False):
                 raise RuntimeError(f"[Node 6] glue 已降级，不允许继续: {getattr(glue, 'warnings', [])}")
         self._a6_glue_active = bool(not is_replay and getattr(glue, "status", None) == "ok" and not getattr(glue, "degraded", False))
+        self._last_glue = glue
         # relations 补挂索引（当日优先）：写入缓存供 _build_ambush_channel 及其内部
         # 升格分支消费；degraded/no_candidates 时索引为空→补挂恒 no-op
         self._rel_idx_cache = self._build_relations_index(glue)
         # Node 4 事件×glue（2026-10-23）：major_events 带合成 id 进 glue prompt，
         # relations 命中即按 board_code 归属，名称扇出降级为兜底。
         self._node4_glue_index = self._build_node4_glue_index(glue, news)
+
+        # A6 relations 共享回填（2026-10-30）：
+        # 1) llm_narrative/global_map 的 affected_sectors 用同一 relation 改写并 UPSERT；
+        # 2) concepts/key_risks/hot_topics/narrative 由 A6 一次合成回填 Node 4/5。
+        self._apply_glue_relations_to_calendar(news, glue, candidates_for_glue, replay=is_replay)
+        self._backfill_semantic_aggregates(news, sentiment, glue)
+        # 内存 relations（板块名→信号）供 Phase 2 选股消息面直接消费，避免二次 LLM 解释
+        try:
+            from src.got.glue_relations import relation_signal_map
+
+            self._semantic_relations = relation_signal_map(glue.relations, candidates_for_glue)
+        except Exception as exc:  # noqa: BLE001 — 供数旁挂，失败时下游走 relation_missing
+            logger.warning("[Node 6] semantic_relations 构建失败（已忽略）: %s", exc)
+            self._semantic_relations = {}
 
         # ── Level 1 平行分支: 埋伏通道（P3，先于 mini GOT 分类，供拆分消费）──
         ambush_pool, ambush_reservoir, ambush_veto_log = await self._build_ambush_channel(
@@ -347,7 +365,10 @@ class AggregatorNode:
             f"蓄水池={len(ambush_reservoir)}, 否决={veto_n} 观察={observe_n}"
         )
 
-        # LLM 精炼板块情报（决策 20：视野扩围 + 注入催化事件，让 Agent 看见带催化的埋伏候选）
+        # A6 语义粘合已是唯一决策语义入口（2026-10-30 运行时收敛）：
+        # 原 _llm_refine_sectors（narrative/cross_sector_risks）删除，narrative 由 A6 产出，
+        # cross_sector_risks 并入 UnifiedContext.key_risks（_collect_key_risks）。
+        # 确定性提升兜底保留（硬规则保障）。
         refine_calendar = getattr(news, "catalyst_calendar", None)
         # A6 接线：构建 board_code→sector_name 反查表，供 _glue_aware_events_map 使用。
         # candidates_for_glue 已在上方收集，此处重新取一次以取到 detail.code。
@@ -361,9 +382,6 @@ class AggregatorNode:
             refine_calendar.events if refine_calendar else [],
             glue=glue,
             code_to_name=code_to_name,
-        )
-        sector_intels = await self._llm_refine_sectors(
-            sector_intels, regime, catalyst_events_by_sector=refine_events_map,
         )
 
         # ── 确定性提升兜底（LLM 概率上调之外的硬规则保障）──
@@ -439,7 +457,10 @@ class AggregatorNode:
                 decision_path_hint=_decision_path_hint,
             )
 
-        key_risks = self._collect_key_risks(news, sentiment, temporal)
+        key_risks = self._collect_key_risks(
+            news, sentiment, temporal,
+            extra_risks=getattr(glue, "cross_sector_risks", None),
+        )
         key_opportunities = self._collect_key_opportunities(sector_intels)
 
         # ── 主线续航评估（v3.5 S4：对 active_mainline 家族逐一生成）──
@@ -526,13 +547,17 @@ class AggregatorNode:
             key_risks=key_risks,
             key_opportunities=key_opportunities,
             concept_suggestions=news.concept_suggestions,
-            reasoning=self._build_reasoning(regime, sector_intels, contradictions),
+            reasoning=self._build_reasoning(
+                regime, sector_intels, contradictions,
+                narrative=getattr(glue, "narrative", ""),
+            ),
             data_quality=data_quality,
             market_regime=regime,
-            llm_refinement_used=getattr(self, '_llm_refine_succeeded', False),
+            llm_refinement_used=False,
             ema_baseline=None,
             confirmed_sectors=sector_intels,
             holdings_intel=holdings_intel,
+            narrative_context=getattr(self, "_narrative_context", None),
             ambush_pool=ambush_pool,
             ambush_reservoir=ambush_reservoir,
             ambush_veto_log=ambush_veto_log,
@@ -1312,9 +1337,12 @@ class AggregatorNode:
 
     @staticmethod
     def _glue_strip_event(ev: CatalystEvent) -> dict:
-        """事件去冗余（§5.2）：剥除 4 个可由其他字段派生的字段。"""
+        """事件去冗余（§5.2）：剥除 4 个可由其他字段派生的字段；附逻辑事件键。"""
+        from src.got.board_aliases import normalize_sector_name
+
         return {
             "event_id": ev.event_id,
+            "logical_event_key": f"{ev.source}:{normalize_sector_name(ev.source_news or ev.title)}",
             "event_date": str(ev.event_date),
             "event_type": ev.event_type,
             "title": ev.title,
@@ -1334,6 +1362,7 @@ class AggregatorNode:
         capital: CapitalContext,
         sentiment: SentimentContext,
         variant: str = "",
+        evidence: Optional[list] = None,
     ) -> str:
         """组装 Agent 输入 prompt（§5.2：只喂候选 + 去冗余事件 + 3d 资金流 + 瘦身情绪）
 
@@ -1400,6 +1429,13 @@ class AggregatorNode:
             "hot_topics": list(getattr(sentiment, "hot_topics", None) or [])[:20],
         } if sentiment else {}
 
+        # ── 证据索引（运行时注册的 EvidenceRef；输出必须引用这些 ID）──
+        evidence_lines = []
+        for ref in (evidence or []):
+            label = (ref.quote or ref.locator or "")[:140]
+            evidence_lines.append(f"- {ref.evidence_id} | {ref.kind} | {ref.locator} | {label}")
+        _evidence_text = "\n".join(evidence_lines)
+
         # ── C-P12 变体文案区块（只替换任务1 的 unknown 行与任务3 整块，其余两版共用）──
         if variant == "b":
             t1_unknown_line = (
@@ -1430,6 +1466,7 @@ class AggregatorNode:
 - propagation_path 是传导链，每跳是一个实体（公司/产品/技术），终点必须是候选板块
 - strength: 事件对该板块的影响强度 (0-1)
 - confidence: 你对这个归属判断的置信度 (0-1)
+- evidence_ids: 支撑该归属的输入证据 ID 列表（只能引用证据索引中的 ID；无证据时 confidence 必须 ≤0.5）
 - 没把握的事件不要输出（不要编造）""" + (
                 "——宁缺毋滥，省略不是错误" if variant == "a" else ""
             ) + """
@@ -1458,6 +1495,11 @@ class AggregatorNode:
 ## 情绪热榜（{len(hot_list)} 只）
 {json.dumps(hot_list[:50], ensure_ascii=False)}
 
+## 证据索引（输出 evidence_ids 只能引用这些 ID）
+{_evidence_text or "（无）"}
+> 规则：relations/strengths 的 evidence_ids 必须来自上方证据索引；没有证据支撑的判断
+> 不得给高 confidence。引用不存在的 ID 会让整次结构化输出判为失败。
+
 ## 任务
 
 ### 任务1: strengths — 板块强度评估
@@ -1468,6 +1510,7 @@ class AggregatorNode:
 - sentiment_read: 情绪面判据 ("high"/"medium"/"low"/"unknown")
 - confidence: 你对这个评估的置信度 (0-1)
 - evidence: 一句话说明判断依据
+- evidence_ids: 支撑该判断的输入证据 ID 列表（只能引用证据索引中的 ID）
 {t1_unknown_line}
 
 ### 任务2: families — 家族归属（仅对落「其他」的板块）
@@ -1477,18 +1520,31 @@ class AggregatorNode:
 
 {t3_block}
 
+### 任务4: 共享语义产物（供 Node 4/5 回填，不改变任何评分）
+- narrative: 一段话总结板块格局（50 字内）
+- concept_suggestions: 从事件/新闻中发现的新概念（最多 5 条），每条 {{"concept_name","evidence","mention_frequency"}}
+- key_risks: 消息面关键风险（最多 5 条，纯文本）
+- hot_topics: 2-3 个热门话题关键词
+- cross_sector_risks: 跨板块风险（最多 5 条，纯文本）
+
 ## 输出格式（严格 JSON）
 ```json
 {{
+  "evidence_ids": ["ev_..."],
   "strengths": [
-    {{"board_code": "...", "strength": 0.7, "confidence": 0.8, "evidence": "...", "capital_read": "medium", "news_read": "high", "sentiment_read": "low"}}
+    {{"board_code": "...", "strength": 0.7, "confidence": 0.8, "evidence": "...", "capital_read": "medium", "news_read": "high", "sentiment_read": "low", "evidence_ids": ["ev_..."]}}
   ],
   "families": [
     {{"board_code": "...", "family": "AI软件"}}
   ],
   "relations": [
-    {{"event_id": "...", "board_code": "...", "strength": 0.8, "direction": "positive", "propagation_path": ["实体A", "实体B"], "confidence": 0.9}}
-  ]
+    {{"event_id": "...", "board_code": "...", "strength": 0.8, "direction": "positive", "propagation_path": ["实体A", "实体B"], "confidence": 0.9, "evidence_ids": ["ev_..."]}}
+  ],
+  "concept_suggestions": [{{"concept_name": "...", "evidence": "...", "mention_frequency": 3}}],
+  "key_risks": ["..."],
+  "hot_topics": ["..."],
+  "cross_sector_risks": ["..."],
+  "narrative": "..."
 }}
 ```
 只输出 JSON，不要其他内容。"""
@@ -1534,18 +1590,20 @@ class AggregatorNode:
             raise ValueError("无 JSON 对象")
         return json.loads(m.group())
 
+    
+
     def _validate_glue(
         self,
         parsed: dict,
         candidates: list[tuple[str, Optional[SectorDetail], dict]],
+        allowed_evidence_ids: Optional[set[str]] = None,
     ) -> SemanticGlueResult:
-        """校验 Agent 输出并构造 SemanticGlueResult（§7.2 S3-S5）。"""
+        """校验 Agent 输出并构造 SemanticGlueResult（§7.2 S3-S5 + 证据闭包）。"""
         code_to_name = {}
         for name, detail, role_info in candidates:
             code = getattr(detail, "code", "") or ""
-            code_to_name[code] = name
-        # 注：§5.3.3「仅对落『其他』的板块要家族」的范围约束由 prompt 任务3 交给 Agent
-        # 自行判定（非家族则返回「无归属」），此处不再预计算 unknown_family_sectors。
+            if code:
+                code_to_name[code] = name
 
         warnings: list[str] = []
         controlled_set = set(CONTROLLED_FAMILIES) | {"无归属"}
@@ -1564,24 +1622,73 @@ class AggregatorNode:
                 return []
             return [str(v)]
 
+        def _ids(v) -> list[str]:
+            if isinstance(v, list):
+                return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip():
+                return [v.strip()]
+            return []
+
+        bad_ids: set[str] = set()
+
+        def _checked_ids(v) -> list[str]:
+            ids = _ids(v)
+            if allowed_evidence_ids is not None:
+                bad = {eid for eid in ids if eid not in allowed_evidence_ids}
+                bad_ids.update(bad)
+            return ids
+
+        def _str_list(v, limit: int) -> list[str]:
+            if not isinstance(v, list):
+                return []
+            out: list[str] = []
+            for item in v:
+                text = str(item).strip()
+                if text and text not in out:
+                    out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+
         # ── relations ──
         relations = []
-        for r in parsed.get("relations", []):
+        seen_relation_keys: set[tuple[str, str]] = set()
+        for r in parsed.get("relations", []) or []:
             if not isinstance(r, dict):
                 continue
+            event_id = str(r.get("event_id", "")).strip()
+            board_code = str(r.get("board_code", "")).strip()
+            if not event_id or not board_code:
+                warnings.append("S2 relation 缺 event_id/board_code，已丢弃")
+                continue
+            if code_to_name and board_code not in code_to_name:
+                warnings.append(f"S2 relation board_code 不在候选: {board_code}，已丢弃")
+                continue
+            key = (event_id, board_code)
+            if key in seen_relation_keys:
+                warnings.append(f"S2 relation 重复: {event_id}→{board_code}，保留首条")
+                continue
+            seen_relation_keys.add(key)
+            evidence_ids = _checked_ids(r.get("evidence_ids"))
+            path = _path(r.get("propagation_path"))
+            confidence = clip(_f(r.get("confidence"), 0.5), 0, 1)
+            # 空传播路径/无证据不能作为高置信事实
+            if not path or not evidence_ids:
+                confidence = min(confidence, 0.5)
             relations.append(GlueRelation(
-                event_id=str(r.get("event_id", "")),
-                board_code=str(r.get("board_code", "")),
+                event_id=event_id,
+                board_code=board_code,
                 strength=clip(_f(r.get("strength"), 0.0), 0, 1),
                 direction=str(r.get("direction", "positive")),
-                propagation_path=_path(r.get("propagation_path")),
-                confidence=clip(_f(r.get("confidence"), 0.5), 0, 1),
+                propagation_path=path,
+                confidence=confidence,
+                evidence_ids=evidence_ids,
             ))
 
         # ── strengths ──
         strengths = []
         seen_codes = set()
-        for s in parsed.get("strengths", []):
+        for s in parsed.get("strengths", []) or []:
             if not isinstance(s, dict):
                 continue
             code = str(s.get("board_code", ""))
@@ -1598,6 +1705,7 @@ class AggregatorNode:
                 capital_read=str(s.get("capital_read", "unknown")),
                 news_read=str(s.get("news_read", "unknown")),
                 sentiment_read=str(s.get("sentiment_read", "unknown")),
+                evidence_ids=_checked_ids(s.get("evidence_ids")),
             ))
 
         # S3: 覆盖不全检测
@@ -1619,7 +1727,7 @@ class AggregatorNode:
 
         # ── families ──
         families = []
-        for f in parsed.get("families", []):
+        for f in parsed.get("families", []) or []:
             if not isinstance(f, dict):
                 continue
             family_name = str(f.get("family", ""))
@@ -1630,8 +1738,44 @@ class AggregatorNode:
                 continue
             families.append(GlueFamily(board_code=code, family=family_name))
 
+        # 证据闭包：伪造/未知 ID 必须让结构化步骤失败，不能静默降级
+        top_evidence_ids = _checked_ids(parsed.get("evidence_ids"))
+        if bad_ids:
+            raise ValueError(
+                f"证据闭包校验失败: 未知 evidence_id {sorted(bad_ids)[:5]}"
+            )
+
+        # ── A6 共享语义产物（Node 4/5 回填源）──
+        concept_suggestions = []
+        raw_concepts = parsed.get("concept_suggestions")
+        if isinstance(raw_concepts, list):
+            for c in raw_concepts:
+                if not isinstance(c, dict):
+                    continue
+                name = str(c.get("concept_name", "")).strip()
+                if not name:
+                    continue
+                concept_suggestions.append({
+                    "concept_name": name,
+                    "evidence": str(c.get("evidence", "")),
+                    "mention_frequency": int(_f(c.get("mention_frequency"), 1)),
+                })
+                if len(concept_suggestions) >= 8:
+                    break
+
+        key_risks = _str_list(parsed.get("key_risks"), 8)
+        cross_sector_risks = _str_list(parsed.get("cross_sector_risks"), 8)
+        hot_topics = _str_list(parsed.get("hot_topics"), 10)
+        narrative = str(parsed.get("narrative", "") or "").strip()
+
         return SemanticGlueResult(
             relations=relations, strengths=strengths, families=families,
+            evidence_ids=top_evidence_ids,
+            concept_suggestions=concept_suggestions,
+            key_risks=key_risks[:8],
+            hot_topics=hot_topics,
+            narrative=narrative,
+            cross_sector_risks=cross_sector_risks,
             degraded=bool(missing_codes),
             degraded_sectors=degraded_sectors,
             warnings=warnings,
@@ -1659,6 +1803,148 @@ class AggregatorNode:
                 "source_news": "",
             })
         return events
+
+    def _ensure_runtime(self):
+        """Lazily create the run runtime when a node is used outside the orchestrator."""
+        from src.got.agent_runtime import ensure_runtime
+
+        return ensure_runtime(self, getattr(self, "_run_date", None))
+
+    def _register_glue_evidence(
+        self,
+        candidates: list[tuple[str, Optional[SectorDetail], dict]],
+        news: NewsContext,
+        capital: CapitalContext,
+        sentiment: SentimentContext,
+    ) -> list:
+        """Register A6 input evidence and return refs for prompt + closure checks."""
+        runtime = self._ensure_runtime()
+        refs = []
+
+        cal = getattr(news, "catalyst_calendar", None)
+        for ev in (cal.events if cal else [])[:60]:
+            refs.append(runtime.register_evidence(
+                kind="event",
+                source=f"catalyst:{ev.source}",
+                locator=ev.event_id,
+                content=self._glue_strip_event(ev),
+                quote=ev.title,
+            ))
+        for me in (getattr(news, "major_events", None) or [])[:30]:
+            refs.append(runtime.register_evidence(
+                kind="news",
+                source="node4",
+                locator=self._major_event_id(me),
+                content={
+                    "title": getattr(me, "title", ""),
+                    "summary": getattr(me, "summary", ""),
+                    "impact_level": getattr(me, "impact_level", ""),
+                    "sentiment": getattr(me, "sentiment", ""),
+                    "affected_sectors": list(getattr(me, "affected_sectors", None) or []),
+                },
+                quote=getattr(me, "title", ""),
+            ))
+
+        sf = capital.evidence.sector_flow if capital and capital.evidence else None
+        flow_3d = (sf or {}).get("sector_flow_all_3d") or {}
+        refs.append(runtime.register_evidence(
+            kind="capital",
+            source="node3",
+            locator="capital.sector_flow_all_3d",
+            content=flow_3d,
+            quote=f"institutional_score={getattr(capital, 'institutional_score', 0.0)}",
+        ))
+
+        refs.append(runtime.register_evidence(
+            kind="sentiment",
+            source="node5",
+            locator="sentiment.global",
+            content={
+                "overall_sentiment": getattr(sentiment, "overall_sentiment", ""),
+                "sentiment_score": getattr(sentiment, "sentiment_score", 0.0),
+                "sentiment_stage": getattr(sentiment, "sentiment_stage", ""),
+                "fear_greed_index": getattr(sentiment, "fear_greed_index", 0.5),
+                "hot_topics": list(getattr(sentiment, "hot_topics", None) or [])[:20],
+            },
+            quote=(getattr(sentiment, "reasoning", "") or "")[:120],
+        ))
+
+        for name, detail, role_info in candidates:
+            code = getattr(detail, "code", "") or ""
+            if not code:
+                continue
+            refs.append(runtime.register_evidence(
+                kind="market",
+                source="node2",
+                locator=f"board:{code}",
+                content={
+                    "name": name,
+                    "role": role_info.get("role"),
+                    "tier": role_info.get("tier"),
+                    "strength_raw": getattr(detail, "strength_score", None),
+                },
+                quote=name,
+            ))
+
+        # 窄身份 Agent 产物只作为证据进入 A6（不得改 sector_role/classification/仓位）
+        narrative_ctx = getattr(self, "_narrative_context", None)
+        for item in (getattr(narrative_ctx, "identities", None) or [])[:40]:
+            symbol = getattr(item, "symbol", "")
+            theme = getattr(item, "theme", "")
+            if not symbol or not theme:
+                continue
+            refs.append(runtime.register_evidence(
+                kind="memory",
+                source="narrative_identity",
+                locator=f"identity:{symbol}:{theme}",
+                content={
+                    "symbol": symbol,
+                    "theme": theme,
+                    "layer": getattr(item, "layer", "other"),
+                    "confidence": getattr(item, "confidence", 0.0),
+                    "abstain": getattr(item, "abstain", False),
+                },
+                quote=theme,
+            ))
+        return refs
+
+    def _apply_glue_relations_to_calendar(
+        self, news: NewsContext, glue: SemanticGlueResult,
+        candidates: list[tuple[str, Optional[SectorDetail], dict]], *, replay: bool,
+    ) -> None:
+        """A6 relations → 催化剂日历扇出（唯一一次，不再调用 LLM）。"""
+        from src.got.glue_relations import apply_glue_relations
+
+        stats = apply_glue_relations(news, glue, candidates, replay=replay)
+        if stats.get("updated") or stats.get("unmapped_relations") or stats.get("db_missing_row"):
+            logger.info(
+                "[Node 6] A6 relations 扇出回填: updated=%d, unmapped=%d, kept=%d, db=%d, missing_row=%d",
+                stats.get("updated", 0), stats.get("unmapped_relations", 0),
+                stats.get("kept_existing", 0), stats.get("db_persisted", 0),
+                stats.get("db_missing_row", 0),
+            )
+
+    def _backfill_semantic_aggregates(
+        self, news: NewsContext, sentiment: SentimentContext, glue: SemanticGlueResult,
+    ) -> None:
+        """把 A6 共享产物回填 Node 4/5（下游只读，不再各自调用 LLM）。"""
+        if getattr(glue, "concept_suggestions", None):
+            news.concept_suggestions = list(glue.concept_suggestions)
+        if getattr(glue, "key_risks", None):
+            news.key_risks = list(glue.key_risks)
+        if getattr(glue, "hot_topics", None):
+            sentiment.hot_topics = list(glue.hot_topics)
+
+        # Node 4 reasoning 是规则文本，回填后重算以保持与 concepts/risks 一致
+        try:
+            from src.got.nodes.news_analysis import NewsAnalysisNode
+
+            news.reasoning = NewsAnalysisNode._fallback_reasoning(
+                news.overall_impact, news.impact_score, news.major_events,
+                news.concept_suggestions, news.key_risks,
+            )
+        except Exception as exc:  # noqa: BLE001 — 展示文本回填失败不影响决策
+            logger.warning("[Node 6] Node 4 reasoning 回填失败（已忽略）: %s", exc)
 
     async def _agent_semantic_glue(
         self,
@@ -1707,9 +1993,13 @@ class AggregatorNode:
             "p" if pipeline_on else
             (GLUE_PROMPT_VARIANT if (GLUE_PROMPT_VARIANT in ("a", "b") and getattr(self, '_replay_mode', False)) else "")
         )
+        # ── 证据注册（A6 是唯一决策语义入口，输出必须可回溯）──
+        evidence_refs = self._register_glue_evidence(candidates, news, capital, sentiment)
+
         prompt = self._build_glue_prompt(
             candidates, news, capital, sentiment,
             variant=("" if pipeline_on else prompt_variant),
+            evidence=evidence_refs,
         )
 
         # ── LLM 调用（C1: temperature=0，D9 甲: 单次全量）──
@@ -1722,8 +2012,9 @@ class AggregatorNode:
                 temperature=0.0,
                 max_tokens=GLUE_MAX_TOKENS,
                 max_retries=3,
-                call_type="got_node6_semantic_glue",
+                call_type="node6.semantic_glue",
                 timeout=float(LLM_CALL_TIMEOUT_S),
+                evidence_refs=evidence_refs,
             )
         except Exception as e:
             # S1: 调用失败
@@ -1759,9 +2050,20 @@ class AggregatorNode:
         # ── 校验 + 构造结果 ──
         # Critical#2: _validate_glue 内部若因畸形结构抛异常，须走 F1 降级而非击穿整个 Node 6
         try:
-            result = self._validate_glue(parsed, candidates)
+            result = self._validate_glue(
+                parsed, candidates,
+                allowed_evidence_ids={ref.evidence_id for ref in evidence_refs},
+            )
         except Exception as e:
             logger.warning(f"[Node 6] glue 校验异常，F1 降级: {e}")
+            if "证据闭包" in str(e):
+                try:
+                    _step = self._ensure_runtime().get("node6.semantic_glue")
+                    if _step is not None:
+                        _step.status = "failed"
+                        _step.error = f"evidence closure: {e}"
+                except Exception:  # noqa: BLE001
+                    pass
             result = self._glue_f1_degraded(candidates, reason=f"S2 校验失败: {e}")
             result.raw_response = raw
             result.status = "S2_validate_failed"
@@ -2427,93 +2729,7 @@ class AggregatorNode:
                     return True
         return False
 
-    async def _llm_refine_sectors(
-        self,
-        sectors: list[SectorIntel],
-        regime: MarketRegime,
-        catalyst_events_by_sector: Optional[dict] = None,
-    ) -> list[SectorIntel]:
-        """LLM 精炼板块情报（可选，生成 narrative + 跨板块风险）
-
-        决策 20：视野扩围 — 基础片为 composite 降序前 REFINE_TOP_N，
-        追加全部埋伏角色候选（总量 ≤ REFINE_MAX_SECTORS），并注入合格催化事件，
-        避免低位带催化的埋伏候选（如 0831 短剧游戏）完全不在 Agent 视野内。
-        """
-        if not sectors:
-            return sectors
-
-        # 回放模式跳过 LLM（纯规则回放，保证可复现性）
-        if getattr(self, '_replay_mode', False):
-            logger.info("[Node 6] replay_mode: 跳过 _llm_refine_sectors")
-            self._llm_refine_succeeded = False
-            return sectors
-
-        # ── 切片：基础片（前 REFINE_TOP_N）+ 埋伏候选追加片 ──
-        base = sectors[:REFINE_TOP_N]
-        extra = [
-            s for s in sectors[REFINE_TOP_N:]
-            if getattr(s, "sector_role", "mainline") == "ambush"
-        ][: max(0, REFINE_MAX_SECTORS - REFINE_TOP_N)]
-        view = base + extra
-
-        # 构建板块情报文本
-        sector_lines = []
-        for i, s in enumerate(view, 1):
-            lines = [
-                # B1 口径标注：composite = 综合分（技术+资金+消息+情绪+生命周期）
-                f"{i}. {s.sector_name} | {s.classification} | composite={s.composite_score:.0f}\n"
-                f"   {s.tech_detail}\n"
-                f"   资金: {s.capital_check}（{s.capital_detail}）\n"
-                f"   催化: {s.news_check}（{s.news_detail}）\n"
-                f"   热度: {s.sentiment_check}（{s.sentiment_detail}）"
-            ]
-            # 埋伏候选注入合格催化事件（决策 20）：让 Agent 看见消息面证据
-            if getattr(s, "sector_role", "mainline") == "ambush" and catalyst_events_by_sector:
-                evs = [
-                    e for e in self._lookup_sector_events(s.sector_name, catalyst_events_by_sector)
-                    if e.confidence >= CATALYST_CONFIDENCE_GATE and e.direction != "negative"
-                ]
-                if evs:
-                    ev_desc = "; ".join(
-                        f"[{e.event_date} {'★' * e.impact_level}] {e.title[:40]}"
-                        for e in evs[:2]
-                    )
-                    lines.append(f"   日历催化剂: {ev_desc}")
-            sector_lines.append("\n".join(lines))
-
-        sectors_text = "\n".join(sector_lines)
-
-        prompt = f"""全局环境：regime={regime.regime}, risk_budget={regime.risk_budget:.2f}
-恐贪指数：{regime.fear_greed:.2f}（{regime.sentiment_stage}）
-
-板块情报：
-{sectors_text}
-
-请输出 JSON：
-{{
-  "narrative": "一段话总结板块格局（50字内）",
-  "cross_sector_risks": ["跨板块风险1", "跨板块风险2"]
-}}"""
-
-        raw_text = await self._call_llm_async(prompt, temperature=0.3, max_tokens=500, call_type="got_node6_refine")
-
-        # A6 阶段 2（规则模式退役）：classification 改由 glue 主导 + 确定性提升兜底，
-        # 本函数不再接受 LLM adjustments 回写（避免双入口打架），只保留 narrative /
-        # cross_sector_risks 的全局摘要价值。
-        try:
-            result = self._parse_json(raw_text)
-
-            # 添加 narrative 到第一个板块的 reasoning（作为全局摘要）
-            narrative = result.get("narrative", "")
-            if narrative and sectors:
-                sectors[0].reasoning = f"[全局] {narrative} | {sectors[0].reasoning}"
-
-            self._llm_refine_succeeded = True
-            return sectors
-        except Exception as e:
-            logger.warning(f"[Node 6] LLM 精炼板块情报失败: {e}")
-            self._llm_refine_succeeded = False
-            return sectors
+    
 
     def _deterministic_catalyst_promotion(
         self,
@@ -3694,7 +3910,7 @@ class AggregatorNode:
         )
 
         try:
-            raw_text = await self._call_llm_async(prompt, temperature=0.2, max_tokens=400, call_type="got_node6_nominate")
+            raw_text = await self._call_llm_async(prompt, temperature=0.2, max_tokens=400, call_type="node6.nominate")
             parsed = self._parse_json(raw_text)
             items = parsed if isinstance(parsed, list) else parsed.get("nominations", [])
             queue_names = {q["name"] for q in queue}
@@ -3764,11 +3980,10 @@ class AggregatorNode:
 
     @staticmethod
     def _major_event_id(me) -> str:
-        """Node 4 事件的稳定合成 id（标题哈希，与跨日/列表顺序无关）。
-
-        日历事件有 `_make_event_id` 造的 event_id，major_events 没有；glue 的 relations
-        只认 event_id，所以这里补一个确定性 id，供 glue prompt 与回连共用。
-        """
+        """Node 4 事件的稳定 id：优先已持久化 event_id，旧归档回退标题哈希。"""
+        persisted = str(getattr(me, "event_id", "") or "").strip()
+        if persisted:
+            return persisted
         title = str(getattr(me, "title", "") or "").strip()
         return f"major_{hashlib.md5(title.encode('utf-8')).hexdigest()[:12]}"
 
@@ -5333,9 +5548,14 @@ class AggregatorNode:
         news: NewsContext,
         sentiment: SentimentContext,
         temporal: list[TemporalInconsistency],
+        extra_risks: Optional[list[str]] = None,
     ) -> list[str]:
-        """汇总关键风险"""
+        """汇总关键风险（A6 跨板块风险并入，去重后最多 6 条）。"""
         risks = list(news.key_risks[:3])
+        for risk in (extra_risks or []):
+            text = str(risk or "").strip()
+            if text and text not in risks:
+                risks.append(text)
 
         if sentiment.sentiment_stage == "euphoria":
             risks.append("散户情绪极度狂热（反向信号）")
@@ -5346,7 +5566,11 @@ class AggregatorNode:
             if t.severity in ("critical", "high"):
                 risks.append(f"[时间异常] {t.description}")
 
-        return risks[:6]
+        deduped: list[str] = []
+        for risk in risks:
+            if risk not in deduped:
+                deduped.append(risk)
+        return deduped[:6]
 
     @staticmethod
     def _collect_key_opportunities(sectors: list[SectorIntel]) -> list[str]:
@@ -5362,8 +5586,9 @@ class AggregatorNode:
         regime: MarketRegime,
         sectors: list[SectorIntel],
         contradictions: Optional[list[Contradiction]] = None,
+        narrative: str = "",
     ) -> str:
-        """构建推理文本（包含 mini GOT 板块情报详情 + 矛盾警示）"""
+        """构建推理文本（包含 mini GOT 板块情报详情 + 矛盾警示 + A6 narrative）"""
         actionable = [s for s in sectors if s.classification == "actionable"]
         caution = [s for s in sectors if s.classification == "caution"]
         lines = [
@@ -5371,6 +5596,9 @@ class AggregatorNode:
             f"{regime.macro_overlay}. 确认板块: {len(actionable)}个, 观察: {len(caution)}个",
             "",
         ]
+        if narrative:
+            lines.append(f"【A6 板块格局】{narrative}")
+            lines.append("")
 
         # ── 矛盾警示（放在最前面，确保可见）──
         if contradictions:
@@ -5614,15 +5842,7 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
             for s in cross_node_signals[:5]
         ) if cross_node_signals else "无共振信号"
 
-        # 串行调用每个矛盾
-        from src.agent.llm_adapter import LLMToolAdapter
-        try:
-            from src.config import get_config
-            llm = LLMToolAdapter(get_config())
-        except Exception as exc:
-            logger.warning(f"[T3仲裁] LLM 初始化失败，降级跳过: {exc}")
-            return contradictions
-
+        # 串行调用每个矛盾（统一 runtime 收口 usage/trace）
         for contradiction in candidates:
             try:
                 prompt = self._ARBITRATION_PROMPT.format(
@@ -5641,34 +5861,14 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
                         f"当前分歧类型决策路径提示：{decision_path_hint}\n"
                     )
 
-                response_text = None
-                for attempt in range(3):
-                    try:
-                        response = await asyncio.to_thread(
-                            llm.call_text,
-                            messages=[
-                                {"role": "system", "content": "你是矛盾仲裁者，只输出 JSON。"},
-                                {"role": "user", "content": prompt},
-                            ],
-                            temperature=0.3,
-                            max_tokens=300,
-                            timeout=60.0,
-                        )
-                        # 落库（成功/失败均记录 token 消耗）
-                        try:
-                            from src.storage import persist_llm_usage
-                            persist_llm_usage(
-                                usage=response.usage or {},
-                                model=response.model or "unknown",
-                                call_type="got_node6_arbitrate",
-                            )
-                        except Exception:
-                            pass
-                        response_text = response.content if response else ""
-                        if response_text:
-                            break
-                    except Exception:
-                        pass
+                response_text = await self._call_llm_async(
+                    "你是矛盾仲裁者，只输出 JSON。\n\n" + prompt,
+                    temperature=0.3,
+                    max_tokens=300,
+                    max_retries=2,
+                    call_type="node6.t3_arbitrate",
+                    timeout=60.0,
+                )
 
                 if not response_text:
                     continue
@@ -5946,8 +6146,8 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
 
         return inconsistencies
 
-    @staticmethod
     async def _simplified_news_override(
+        self,
         news: NewsContext,
         market: MarketContext,
     ) -> Optional[NewsOverride]:
@@ -5980,28 +6180,16 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
 请输出 JSON：
 {{"override": true/false, "overridden_position_limit": 0.0~1.0, "reason": "理由（50字内）"}}"""
 
-        from src.agent.llm_adapter import LLMToolAdapter
-        adapter = LLMToolAdapter()
-
         try:
-            response = await asyncio.to_thread(
-                adapter.call_text,
-                [{"role": "user", "content": prompt}],
+            content = await self._call_llm_async(
+                prompt,
                 temperature=0.2,
                 max_tokens=300,
+                max_retries=1,
+                call_type="node6.news_override",
                 timeout=60.0,
             )
-            # 落库
-            try:
-                from src.storage import persist_llm_usage
-                persist_llm_usage(
-                    usage=response.usage or {},
-                    model=response.model or "unknown",
-                    call_type="got_node6_override",
-                )
-            except Exception:
-                pass
-            result = AggregatorNode._parse_json(response.content or "")
+            result = AggregatorNode._parse_json(content or "")
             proposed = result.get("overridden_position_limit", market.position_limit)
             clamped = clip(proposed, market.position_limit - POSITION_LIMIT_DELTA, market.position_limit + POSITION_LIMIT_DELTA)
 
@@ -6120,8 +6308,8 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
     # LLM 调用工具
     # =========================================================================
 
-    @staticmethod
     async def _call_llm_async(
+        self,
         prompt: str,
         *,
         temperature: float,
@@ -6129,53 +6317,30 @@ JSON: {{"verdict": "upgrade/downgrade/keep", "confidence": 0.0-1.0, "reasoning":
         max_retries: int = 3,
         call_type: str = "got_node6_unknown",
         timeout: float = 60.0,
+        evidence_refs: Optional[list] = None,
     ) -> str:
-        """异步 LLM 调用（统一 timeout + call_type 落库）"""
-        from src.agent.llm_adapter import LLMToolAdapter
+        """异步 LLM 调用（统一 runtime：timeout/重试/usage/trace 一次收口）。
+
+        返回空串表示本次任务失败（调用失败/截断/重试耗尽）；A6 等调用方按既有
+        fail-fast/degrade 语义处理。C-P13 管线继续通过本薄适配复用同一 runtime。
+        """
         from src.got.catalyst_config import LLM_CALL_TIMEOUT_S
 
-        adapter = LLMToolAdapter()
-        messages = [{"role": "user", "content": prompt}]
+        runtime = self._ensure_runtime()
         effective_timeout = timeout if timeout > 0 else LLM_CALL_TIMEOUT_S
-
-        for attempt in range(max_retries + 1):
-            try:
-                response = await asyncio.to_thread(
-                    adapter.call_text, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    timeout=effective_timeout,
-                )
-                content = response.content or ""
-                finish_reason = getattr(response, "finish_reason", None)
-                # Q1 audit: record finish_reason for observability
-                if finish_reason:
-                    logger.debug(f"[Node 6] LLM finish_reason={finish_reason} (attempt {attempt + 1})")
-                # 逐 attempt 落库：每次重试都是一次真实计费调用（含空响应也消耗 token），
-                # 故每个 attempt 各写一行以准确反映 token 花费；下游看板按 call_type 分组过滤
-                # （storage.get_llm_usage_summary 的 by_call_type），不会与既有口径混淆。
-                try:
-                    from src.storage import persist_llm_usage
-                    persist_llm_usage(
-                        usage=response.usage or {},
-                        model=response.model or "unknown",
-                        call_type=call_type,
-                    )
-                except Exception as persist_exc:
-                    logger.debug("[Node 6] persist_llm_usage 失败（已忽略）: %s", persist_exc)
-                # Q1 audit: finish_reason="length" means truncated output — fail fast, no retry
-                if finish_reason == "length":
-                    logger.warning(f"[Node 6] LLM 输出被截断 (finish_reason=length) — 立即失败，不重试")
-                    return ""  # Fail fast: same prompt + same max_tokens = deterministic truncation
-                elif content.strip():
-                    return content.strip()
-                else:
-                    logger.warning(f"[Node 6] LLM 空响应 (attempt {attempt + 1})")
-            except Exception as e:
-                logger.warning(f"[Node 6] LLM 调用失败 (attempt {attempt + 1}): {e}")
-
-            if attempt < max_retries:
-                await asyncio.sleep(1.0)
-
+        step = await runtime.call_text(
+            task_id=call_type,
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            timeout=effective_timeout,
+            evidence_refs=evidence_refs,
+        )
+        if step.status == "ok" and isinstance(step.output, str) and step.output.strip():
+            return step.output.strip()
+        if step.status == "failed":
+            logger.warning("[Node 6] LLM 调用未成功（%s）: %s", call_type, step.error)
         return ""
 
     @staticmethod

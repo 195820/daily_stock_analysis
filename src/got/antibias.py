@@ -80,10 +80,9 @@ def run_antibias(
     *,
     decision: Any,
     target_date: date,
-    llm: Any,
+    got_runtime: Any,
     shadow: bool,
     max_sectors: int,
-    persist_usage=None,
 ) -> Optional[Dict[str, Any]]:
     """对 actionable 板块做一次反偏见 LLM 调用，落 shadow_antibias.json（纯观测）。
 
@@ -117,21 +116,21 @@ def run_antibias(
     items: List[Dict[str, Any]] = []
     error = None
     try:
-        resp = llm.call_text(
-            [{"role": "system", "content": "你是反偏见审查员，只输出 JSON 数组。"},
-             {"role": "user", "content": prompt}],
-            temperature=0.3, max_tokens=1500, timeout=45.0,
+        step = got_runtime.call_text_sync(
+            task_id="node7.antibias",
+            prompt="你是反偏见审查员，只输出 JSON 数组。\n\n" + prompt,
+            temperature=0.3,
+            max_tokens=1500,
+            timeout=45.0,
         )
-        if persist_usage and resp is not None:
-            try:
-                persist_usage(usage=getattr(resp, "usage", {}) or {},
-                              model=getattr(resp, "model", "unknown") or "unknown",
-                              call_type="got_antibias")
-            except Exception:  # noqa: BLE001
-                pass
-        parsed = _parse_llm_json(getattr(resp, "content", "") or "")
+        if step.status != "ok":
+            error = f"llm_{step.status}: {step.error}"
+            parsed = None
+        else:
+            parsed = _parse_llm_json(getattr(step, "output", "") or "")
         if parsed is None:
-            error = "llm_output_unparsed"
+            if error is None:
+                error = "llm_output_unparsed"
         else:
             by_sector = {}
             for m in parsed:

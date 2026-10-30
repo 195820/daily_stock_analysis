@@ -10,6 +10,7 @@
 > - **10-06～07**：M3 人工抽查结案转正（误配率 2.8%，放弃 `--sample-mode full` 前置）；prompt 家族白名单同源化（`PROMPT_EXPOSED_FAMILIES`）；WI-P1-7(b) 家族兜底 embedding 首批 shadow 读数坐实现值不可达（enabled 冻结）；WI-P1-11 基本面取数修复（按报告期取全市场表 + 进程内缓存 + 新增 `earnings.forecast_type`，选行改净利润口径）。
 > - **10-08**：个股级结构化事件（财报披露/解禁）**退出催化剂日历**，退役 9 个取数与映射函数（净 −332 行）。
 > - **10-09～10**：买入侧三道新闸门 **MEG / FTS / FXG**（FXG 已切 veto），判据与产物登记在 [`verification.md`](verification.md) 顶部。
+> - **10-30**：**语义运行时收敛**——新增 `src/got/agent_runtime.py`，Node 1–7/T1/T1-H/catalyst builder 共用 run 级 runtime（证据闭包、usage、`agent_run.json`/`agent_steps.jsonl` trace）；A6 扩为 Node 6 内唯一语义层（relations/strengths/families + narrative/concepts/key_risks/hot_topics/cross_sector_risks/evidence_ids），Node 4 concepts/key_risks 与 Node 5 hot_topics 由 A6 回填；删除 Node 1/2/3/4/7 展示型 LLM 与 Node 6 refine；T5 LLM 对齐退役（macro 改确定性扇出）；事件改稳定 ID + `llm_narrative` 逻辑去重；选股消息面直读 A6 relations；新增身份/涨跌归因窄 Agent、`semantic_memory.py`、只读复盘 `audit_agent.py`、回放 `scripts/replay_got_agent.py` 与 `run_card.json`。现行行为以代码 + [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` 为准。
 >
 > **已知重点脱节区**（读本文时先看上述四档）：Node 6 规则侧三件套已删（正文仍描述其计算）、Phase 2 买入侧闸门未入文、催化剂日历不再含个股级事件、§12 开关清单与 `GOT_*` 实际环境变量已大幅滞后。现行行为以**代码 + [`backlog.md`](backlog.md) / [`verification.md`](verification.md) / [`../CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]`** 为准；现状速览另见根 `CLAUDE.md`。
 
@@ -514,6 +515,24 @@ emerging → fermenting → peak → fading → archived
 **输入**: 全部 5 个 context  
 **输出**: `UnifiedContext`
 
+### 7.0 A6 语义层（Node 6 内唯一语义调用）
+
+**位置**：`AggregatorNode._agent_semantic_glue`，在 Node 6 收到五路 context 后、`_build_ambush_channel` 之前执行；不是独立节点/自主 Agent。
+
+**输入**：Node 2 候选板块、Node 4 catalyst/major events、Node 3 `sector_flow_all_3d`、Node 5 情绪全局/热榜、可选上一版身份记忆；每项注册为 `EvidenceRef`（`ev_<sha256前16>`），prompt 附证据索引。
+
+**输出**：`SemanticGlueResult` = relations / strengths / families + `narrative` / `concept_suggestions` / `key_risks` / `hot_topics` / `cross_sector_risks` / `evidence_ids`。
+
+**校验**：board_code 必须在候选、relation 必须有 event_id、输出 evidence_ids 必须属于本步证据；伪造 ID → `S2_validate_failed`；空传播路径/无证据 → confidence ≤0.5。生产环境非 ok/degraded → Node 6 抛错。
+
+**应用**：
+- strengths → 替换 SectorIntel 四件套（技术/资金/消息/情绪/composite）。
+- concepts/key_risks → 回填 `news_ctx` 并重算 Node 4 规则 reasoning；hot_topics → 回填 `sentiment_ctx`。
+- relations → 仅改写 `llm_narrative/global_map` 的 `affected_sectors` 并 UPSERT `catalyst_events`；macro_rule、direction、major_events 不动。
+- narrative → `UnifiedContext.reasoning`；cross_sector_risks → `UnifiedContext.key_risks`；relations → 内存 `semantic_relations` 供 Phase 2 选股。
+
+**trace**：task_id `node6.semantic_glue`，prompt/raw response/证据/usage 落 `agent_steps.jsonl`；产物 `agent_glue.json`；reasoning.md 渲染关系证据表与共享语义产物。
+
 ### 7.1 L0: 全局环境研判（MarketRegime）
 
 **规则决策树**:
@@ -597,11 +616,12 @@ emerging → fermenting → peak → fading → archived
 
 ### 7.10 LLM 使用
 
-3-6 次调用:
-- _llm_refine_sectors: 1 次，temp=0.3，max=500（仅升级不降级）
-- _simplified_news_override: 1 次（条件性），temp=0.2，max=300
-- _arbitrate_contradictions: ≤3 次串行，temp=0.3，max=300
-- _llm_nominate_ambush: 1 次（条件性），temp=0.2，max=400
+典型 1 次固定 + 条件性调用（全部经 run runtime，`task_id` 见括号）:
+- `node6.semantic_glue`: A6 语义粘合，1 次，temp=0，max=16000（GLUE_MAX_TOKENS）
+- `node6.news_override`: 条件性 1 次（政策事件覆盖），temp=0.2，max=300
+- `node6.t3_arbitrate`: ≤3 次串行（仅 medium/high 矛盾），temp=0.3，max=300
+- `node6.nominate`: 条件性 1 次（仅被吸筹闸拦截的候选），temp=0.2，max=400
+- 已删除：`got_node6_refine`（原 `_llm_refine_sectors`）
 
 ### 7.11 DataQuality
 
@@ -929,18 +949,20 @@ Final = 0.6×lifecycle_priority + 0.4×composite_score
 
 ## 附录 A: LLM 调用总结
 
-**总计每轮**: 12-15 次 LLM 调用
+**典型每轮**: 6 次固定调用（另有条件性审查/仲裁/T1/T1-H 工具循环）
 
 | 节点 | 次数 | temp | max_tokens | 用途 |
 |------|------|------|------------|------|
-| Node 1 | 1 | 0.3 | 200 | 市场摘要 |
-| Node 2 | 1 | 0.3 | 400 | 板块总结 |
-| Node 3 | 1 | 0.3 | 300 | 资金分析 |
-| Node 4 | 4 | 0.2-0.5 | 300-4000 | 事件提取+概念发现+风险+推理 |
-| Node 5 | 1 | 0.3 | 600 | 情绪推理+热门话题 |
-| Node 6 | 3-6 | 0.2-0.3 | 300-500 | 精炼+新闻覆盖+矛盾仲裁+提名 |
-| Node 7 | 1 | 0.3 | 500 | 决策推理 |
-| 催化剂 | 3 | 0.2-0.3 | 400-2000 | 叙事提取+T5 对齐+T2 校验 |
+| Node 1 | 0 | — | — | reasoning 规则生成 |
+| Node 2 | 0 | — | — | reasoning 规则生成 |
+| Node 3 | 0 | — | — | reasoning 规则生成 |
+| Node 4 | 2 | 0.2 | 4000 | 标题粗筛 + 事件提取；概念/风险由 A6 回填（条件性 low rescue） |
+| Node 5 | 1 | 0.3 | 600 | 情绪 reasoning（hot_topics 由 A6 回填） |
+| Node 6 | 1+ | 0-0.3 | 300-16000 | A6 语义粘合固定 1 次；条件性 news override / T3 / nominate |
+| Node 7 | 0 | — | — | 推理总结规则生成；条件性 sector verify / T1-H |
+| 催化剂 | 2 | 0.2-0.3 | 2000-3000 | 叙事提取 + T2 校验；T5 对齐已删除 |
+| T1 候选终审 | 条件性 | — | — | 有界工具循环（run_agent_loop） |
+| T1-H 持仓审查 | 条件性 | — | — | 有界工具循环（run_agent_loop） |
 
 ---
 

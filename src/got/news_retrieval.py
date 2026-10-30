@@ -518,6 +518,7 @@ def score_shard(
         try:
             raw = node._call_llm(
                 prompt, temperature=SHARD_TEMPERATURE, max_tokens=SHARD_MAX_TOKENS,
+                task_id="node4.cluster_shard",
             )
         except Exception as exc:  # noqa: BLE001 — 单片网络/限流失败不拖垮整日
             logger.warning("[Node 4] 分片 %d LLM 异常（跳过该片）: %s", shard_no, exc)
@@ -755,6 +756,7 @@ def review_candidates(
         _final_review_prompt(candidates, cap),
         temperature=FINAL_REVIEW_TEMPERATURE,
         max_tokens=FINAL_REVIEW_MAX_TOKENS,
+        task_id="node4.title_final_review",
     )
     if not raw:
         return None

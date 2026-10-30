@@ -95,8 +95,9 @@ class PortfolioDecisionNode:
     _sector_verify_dead_offsets: set = set()
     _sector_verify_decision_cache: Dict[tuple, Dict[str, Any]] = {}
 
-    def __init__(self, use_mock: bool = False):
+    def __init__(self, use_mock: bool = False, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         # 影子模式观测留痕（reasoning.md 末尾段落的数据源）：
         # 两条线的「跑没跑 / 为什么没跑 / 跑了得到什么」都记在这里，run() 末尾落盘。
         self._shadow_t1: Dict[str, Any] = {}
@@ -141,6 +142,7 @@ class PortfolioDecisionNode:
         sentiment_context: SentimentContext,
         bar_complete: bool = True,
         as_of: Optional[date] = None,
+        semantic_relations: Optional[dict] = None,
     ) -> PortfolioDecision:
         """
         主入口：统一决策流水线
@@ -163,6 +165,8 @@ class PortfolioDecisionNode:
         # backlog §7 #12 修法①：影子五件套 + 候选池快照两个 _save_* 写入点统一读此值，
         # 归档目录跟业务日走（重放/带外跑历史日不再错落墙钟日目录）。
         self._as_of = _as_of
+        # A6 内存 relations（板块名→信号）；None/空时选股消息面走 relation_missing 兜底
+        self._semantic_relations = dict(semantic_relations or {})
         # ── 决策编排层日志透传（2026-10-20）──
         # reconcile（昨日对账）+ assemble（当日装配）的返回值此前在接线处被丢弃，只进 SQLite。
         # 这里转成人读行累积，run() 末尾回填 decision.trade_plan_log → reasoning.md Node 7 段。
@@ -200,6 +204,13 @@ class PortfolioDecisionNode:
 
 
         portfolio = self._get_portfolio_snapshot()
+
+        # 2026-10-30 窄涨跌归因：在持仓打分前构建一次，供 T1-H/审计读取（只读，不改规则）
+        self._move_attributions = {}
+        await self._build_move_attributions(
+            portfolio, unified_context, news_context, market_context,
+            sector_context, capital_context,
+        )
 
         # 提取情绪动量（用于轮动时机检测）
         sentiment_momentum = getattr(sentiment_context, 'sentiment_momentum', 0.0) or 0.0
@@ -297,17 +308,12 @@ class PortfolioDecisionNode:
         # Fix 2: 关闭已卖出的持仓论点快照
         self._close_thesis_snapshots(allocation, portfolio)
 
-        # LLM 精炼（生成可追溯的推理总结）
-        # 审核修复 1.2：精炼失败不阻断产物，回退规则摘要
-        try:
-            reasoning = await self._llm_refinement(
-                risk_assessment, unified_scoring, allocation, unified_context, portfolio,
-                vetoed_candidates=vetoed_candidates,
-            )
-        except Exception as e:
-            logger.warning(f"[Phase 2] LLM 精炼失败，回退规则摘要: {e}")
-            reasoning = f"[LLM 精炼不可用: {e}] 当日决策以规则链路结果为准，见 summary 与 unified_scoring。"
-            degraded_steps.append(f"LLM 精炼: {e}")
+        # 推理总结（纯规则；原 LLM 精炼已删除，2026-10-30 运行时收敛）
+        # 输出必须与 allocation/risk/vetoed 事实一致，不引入模型判断。
+        reasoning = self._reasoning_summary(
+            risk_assessment, unified_scoring, allocation, unified_context,
+            vetoed_candidates=vetoed_candidates,
+        )
 
         # 生成操作总结
         summary = self._generate_summary(allocation, risk_assessment, vetoed_candidates)
@@ -2083,8 +2089,6 @@ class PortfolioDecisionNode:
         if not evidence_cases:
             return {}
 
-        from src.agent.llm_adapter import LLMToolAdapter
-
         lines = []
         for i, case in enumerate(evidence_cases):
             docs = "\n".join(
@@ -2111,20 +2115,40 @@ class PortfolioDecisionNode:
 - uncertain：信息不足/无法判断（不要为了给结论硬填 not_member）"""
 
         try:
-            adapter = LLMToolAdapter()
-            response = adapter.call_text(
-                [{"role": "user", "content": prompt}],
+            from src.got.agent_runtime import ensure_runtime
+
+            runtime = ensure_runtime(self, getattr(self, "_as_of", None))
+            evidence_refs = []
+            for case in evidence_cases:
+                for doc in (case.get("items") or []):
+                    evidence_refs.append(runtime.register_evidence(
+                        kind="web",
+                        source=f"sector_verify:{case.get('provider', 'search')}",
+                        locator=(doc.get("url") or doc.get("title") or case.get("symbol", "")),
+                        content=doc,
+                        quote=doc.get("title"),
+                    ))
+            step = await runtime.call_text(
+                task_id="node7.sector_verify",
+                prompt=prompt,
                 temperature=0.0,
                 max_tokens=1500,
-                timeout=60,
+                max_retries=2,
+                timeout=60.0,
+                evidence_refs=evidence_refs,
             )
+            if step.status != "ok" or not isinstance(step.output, str):
+                raise SectorVerifyUnavailable(f"LLM 仲裁调用失败: {step.error}")
+            content = step.output
+        except SectorVerifyUnavailable:
+            raise
         except Exception as e:   # 适配器/网络/超时
             raise SectorVerifyUnavailable(f"LLM 仲裁调用失败: {e}") from e
 
-        if not response or not getattr(response, "content", None):
+        if not content:
             raise SectorVerifyUnavailable("LLM 仲裁返回空（无 content）")
 
-        match = re.search(r'\[[\s\S]*\]', response.content)
+        match = re.search(r'\[[\s\S]*\]', content)
         if not match:
             raise SectorVerifyUnavailable("LLM 仲裁输出无法提取 JSON 数组")
         try:
@@ -3903,7 +3927,7 @@ class PortfolioDecisionNode:
         # 构建 review executor（T1-H 持仓审查：verdict 词表 hold/add/reduce/exit）
         try:
             from src.agent.factory import build_review_executor
-            executor = build_review_executor(review_type="t1h")
+            executor = build_review_executor(review_type="t1h", got_runtime=getattr(self, "got_runtime", None))
         except Exception as exc:
             logger.warning(f"[T1-H] Review Agent 构建失败，降级跳过: {exc}")
             self._shadow_t1h["executed"] = False
@@ -4254,6 +4278,16 @@ class PortfolioDecisionNode:
             if holding.ambush_exit_reason:
                 catalyst_info += f", 退出理由={holding.ambush_exit_reason}"
 
+        attribution = (getattr(self, "_move_attributions", {}) or {}).get(holding.symbol)
+        if attribution is not None:
+            attribution_info = (
+                f"{attribution.bucket} / theme={attribution.theme or '无'} / "
+                f"confidence={attribution.confidence:.2f} / residual={attribution.residual} / "
+                f"evidence_ids={','.join(attribution.evidence_ids[:4]) or '无'}"
+            )
+        else:
+            attribution_info = "无归因（当日涨跌/证据缺失，不得虚构主力资金）"
+
         return f"""请审查以下持仓股票，给出你的意见。
 
 ## 市场环境
@@ -4265,6 +4299,7 @@ class PortfolioDecisionNode:
 - 板块: {holding.sector_name or "未知"}
 - 综合评分: {holding.composite_score:.1f}/100
 - 持仓信息: {position_info or "无"}
+- 当日归因: {attribution_info}
 - 催化剂: {catalyst_info}
 - 生命周期: {holding.lifecycle_phase or "未知"} (第{holding.lifecycle_day or "?"}天)
 
@@ -4536,6 +4571,10 @@ verdict 含义：
             # 埋伏道 G-A2 pool fast-pass 需要 Node 6 ambush_pool 白名单
             # （归档路径 _load_got_context 已含 unified_context，此处补内存路径对齐）
             "unified_context": unified_context.model_dump(mode="json"),
+            # A6 relations 内存直读（与 Phase 1 同一 run）：选股消息面不再调用 LLM 重新映射
+            "semantic_relations": dict(getattr(self, "_semantic_relations", {}) or {}),
+            # T1 终审走同一 run runtime（仅内部使用，不参与序列化）
+            "_got_runtime": getattr(self, "got_runtime", None),
         }
 
         # 提取候选池 + 5 阶段漏斗筛选
@@ -5989,116 +6028,7 @@ verdict 含义：
 
     # ── LLM 精炼 ──
 
-    async def _llm_refinement(
-        self,
-        risk: PortfolioRiskAssessment,
-        scoring: List[UnifiedScoringResult],
-        allocation: List[TradeAllocation],
-        unified: UnifiedContext,
-        portfolio: Dict[str, Any],
-        vetoed_candidates: Optional[List[UnifiedScoringResult]] = None,
-    ) -> str:
-        """生成可追溯的推理总结"""
-        # 持仓盈亏汇总
-        holdings = [s for s in scoring if s.is_holding]
-        if holdings:
-            pnl_pcts = []
-            for h in holdings:
-                # 从 scoring 中提取 pnl（在 reasoning 中）
-                import re
-                m = re.search(r'P&L\s+([\-\d.]+)%', h.reasoning)
-                if m:
-                    pnl_pcts.append(float(m.group(1)))
-            avg_pnl = sum(pnl_pcts) / len(pnl_pcts) if pnl_pcts else 0
-            holdings_text = "，".join(
-                f"{h.name}({h.symbol})+{pnl_pcts[i]:.1f}%" if pnl_pcts[i] > 0 else f"{h.name}({h.symbol}){pnl_pcts[i]:.1f}%"
-                for i, h in enumerate(holdings)
-            )
-            portfolio_summary = f"持仓盈亏：{holdings_text}，综合盈亏约{avg_pnl:+.1f}%"
-        else:
-            portfolio_summary = "当前无持仓"
-
-        # 格式化 Top 5 评分
-        top_scoring_text = "\n".join(
-            [
-                f"  {i+1}. {s.name} ({s.symbol}) "
-                f"{'【持仓】' if s.is_holding else ''}: "
-                f"{s.composite_score:.1f} 分 — {s.reasoning}"
-                for i, s in enumerate(scoring[:5])
-            ]
-        )
-
-        # 格式化交易建议
-        allocation_text = "\n".join(
-            [
-                f"  {a.action.upper()} {a.name} ({a.symbol}): "
-                f"{a.quantity_delta:+d} 股, ¥{a.target_value:,.0f} — {a.reasoning}"
-                for a in allocation
-            ]
-        )
-
-        # 被预算约束否决的 BUY 候选（显式披露，消除"高分候选 vs 0 交易"的静默矛盾）
-        vetoed_text = ""
-        if vetoed_candidates:
-            vetoed_text = "\n".join(
-                f"  - {s.name} ({s.symbol}): {s.composite_score:.1f} 分, 建议动作 {s.action_recommendation}"
-                for s in vetoed_candidates[:5]
-            )
-            vetoed_text = (
-                "\n以下 BUY 候选已通过评分，但受预算/仓位上限约束未获资金分配"
-                f"（当前仓位 {risk.current_position_ratio:.0%} ≥ 上限 {risk.position_limit:.0%}，卖出释放资金为 0）：\n"
-                f"{vetoed_text}\n"
-            )
-
-        prompt = f"""
-当前风险评估:
-- 仓位上限: {risk.position_limit:.0%}
-- 当前仓位: {risk.current_position_ratio:.0%}
-- 止损线: {risk.stop_loss_threshold:.0%}
-市场背景:
-- 综合研判: {unified.unified_signal}
-- 研判置信度: {unified.overall_confidence:.0%}
-- 关键风险: {', '.join(unified.key_risks[:3])}
-
-{portfolio_summary}
-
-统一打分 Top 5:
-{top_scoring_text}
-
-初步分配建议:
-{allocation_text if allocation_text else "  无（当前无需操作）"}
-{vetoed_text}
-
-请生成一段简洁的推理总结（300 字以内），包含以下两部分:
-
-**第一部分：整体决策理由**
-1. 为什么这样分配仓位？
-2. 主要风险点是什么？
-3. 有什么需要特别注意的？
-
-**第二部分：逐只持仓分析**
-如果当前持仓且没有操作，请逐只说明保留理由（格式：股票名：理由）
-
-重要：你的总结必须与上述"初步分配建议"一致。如果有 BUY 操作，就解释为什么买入；如果没有操作，就解释为什么维持现状。不要自行判断是否需要买入——分配建议已经由规则引擎确定。
-
-注意：用通俗易懂的语言，避免使用技术术语。
-引用评分时必须使用上方给出的精确数值（如"69.5 分"），不得四舍五入或自行重算。
-"""
-
-        try:
-            from src.agent.llm_adapter import LLMToolAdapter
-
-            adapter = LLMToolAdapter()
-            response = await asyncio.to_thread(
-                adapter.call_text,
-                [{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=500,
-            )
-            return (response.content or "").strip()
-        except Exception as e:
-            logger.warning(f"[Phase 2] LLM 精炼失败，降级到规则总结: {e}")
-            return self._rule_based_summary(risk, allocation)
+    
 
     # ── 辅助方法 ──
 
@@ -6138,6 +6068,58 @@ verdict 含义：
                 merged.append(pos)
         return merged
 
+    async def _build_move_attributions(
+        self,
+        portfolio: Dict[str, Any],
+        unified: UnifiedContext,
+        news: NewsContext,
+        market: MarketContext,
+        sector: SectorContext,
+        capital: CapitalContext,
+    ) -> None:
+        """One bounded attribution pass for held symbols; failures degrade to empty."""
+        runtime = getattr(self, "got_runtime", None)
+        if runtime is None:
+            return
+        try:
+            from src.got.narrative_agents import (
+                persist_narrative_context,
+                run_move_attribution,
+            )
+            from src.got.semantic_memory import SemanticMemory
+
+            positions = self._all_positions(portfolio)
+            symbols = [p.get("symbol") for p in positions if p.get("symbol")]
+            if not symbols:
+                return
+            memory = SemanticMemory(self._as_of, agent_run_id=getattr(runtime, "run_id", None))
+            thesis_map: Dict[str, Any] = {}
+            for item in memory.load_memory(symbols=symbols).get("thesis_changes", []):
+                if item.get("is_open"):
+                    thesis_map.setdefault(item["symbol"], item)
+            ctx = await run_move_attribution(
+                positions, unified, news, market, sector, thesis_map,
+                runtime, self._as_of, capital=capital,
+            )
+            self._move_attributions = {
+                item.symbol: item for item in ctx.attributions
+            }
+            if ctx.attributions:
+                memory.record_attributions(ctx.attributions)
+            base = getattr(unified, "narrative_context", None)
+            if base is None:
+                unified.narrative_context = ctx
+            else:
+                base.attributions = list(ctx.attributions)
+            persist_narrative_context(unified.narrative_context, self._as_of)
+            logger.info(
+                "[Phase 2] 涨跌归因: status=%s, %d 只持仓",
+                ctx.status, len(ctx.attributions),
+            )
+        except Exception as exc:  # noqa: BLE001 — 归因只读，失败不阻断决策
+            logger.warning("[Phase 2] 涨跌归因失败（已忽略）: %s", exc)
+            self._move_attributions = {}
+
     def _get_portfolio_snapshot(self) -> Dict[str, Any]:
         """获取当前持仓快照"""
         try:
@@ -6165,6 +6147,58 @@ verdict 含义：
                 "total_cash": 100000.0,
                 "accounts": [],
             }
+
+    def _reasoning_summary(
+        self,
+        risk: PortfolioRiskAssessment,
+        scoring: List[UnifiedScoringResult],
+        allocation: List[TradeAllocation],
+        unified: UnifiedContext,
+        vetoed_candidates: Optional[List[UnifiedScoringResult]] = None,
+    ) -> str:
+        """确定性推理总结（零 LLM）：只陈述风险约束、分配建议与否决候选事实。
+
+        2026-10-30 运行时收敛：原 `_llm_refinement` 删除。本方法与
+        `allocation`/`risk_assessment`/`vetoed_candidates` 强一致，便于审计与回归。
+        """
+        lines = [
+            f"【风险约束】仓位上限 {risk.position_limit:.0%}，当前 {risk.current_position_ratio:.0%}。"
+            + (f" {risk.constraint_reasoning}" if getattr(risk, "constraint_reasoning", "") else ""),
+            f"【市场背景】{getattr(unified, 'unified_signal', 'unknown')}"
+            f"（置信度 {getattr(unified, 'overall_confidence', 0.0):.0%}）。",
+        ]
+        if getattr(unified, "key_risks", None):
+            lines.append("【关键风险】" + "；".join(unified.key_risks[:3]))
+
+        holdings = [s for s in scoring if s.is_holding]
+        if holdings:
+            pairs = []
+            for item in holdings:
+                match = re.search(r"P&L\s+([\-\d.]+)%", item.reasoning or "")
+                pnl = float(match.group(1)) if match else 0.0
+                pairs.append(f"{item.name}({item.symbol}){pnl:+.1f}%")
+            lines.append("【持仓】" + "，".join(pairs))
+        else:
+            lines.append("【持仓】当前无持仓")
+
+        if allocation:
+            trade_lines = [
+                f"{a.action.upper()} {a.name}({a.symbol}) {a.quantity_delta:+d}股/¥{a.target_value:,.0f}"
+                + (f" — {a.reasoning[:80]}" if getattr(a, "reasoning", "") else "")
+                for a in allocation
+            ]
+            lines.append("【交易建议】" + "；".join(trade_lines))
+        else:
+            lines.append("【交易建议】当日无交易建议。")
+
+        if vetoed_candidates:
+            names = "、".join(
+                f"{s.name}({s.symbol},{s.composite_score:.1f}分)" for s in vetoed_candidates[:5]
+            )
+            lines.append(
+                f"【预算否决】{len(vetoed_candidates)} 只 BUY 候选受仓位/预算约束未获分配：{names}"
+            )
+        return "\n".join(lines)
 
     def _generate_summary(
         self,
@@ -6237,23 +6271,3 @@ verdict 含义：
             )
 
         return warnings
-
-    def _rule_based_summary(
-        self,
-        risk: PortfolioRiskAssessment,
-        allocation: List[TradeAllocation],
-    ) -> str:
-        """规则兜底的总结"""
-        if not allocation:
-            return "当前无需操作"
-
-        buy_count = sum(1 for a in allocation if a.action == "buy")
-        sell_count = sum(1 for a in allocation if a.action == "sell")
-
-        parts = []
-        if sell_count > 0:
-            parts.append(f"卖出 {sell_count} 只")
-        if buy_count > 0:
-            parts.append(f"买入 {buy_count} 只")
-
-        return "，".join(parts)

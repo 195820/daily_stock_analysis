@@ -1,0 +1,32 @@
+{
+  "as_of": "2026-10-29",
+  "responses": {
+    "node6.semantic_glue": "{\"evidence_ids\":[],\"strengths\":[{\"board_code\":\"880467\",\"strength\":0.72,\"confidence\":0.8,\"evidence\":\"机场主线\",\"capital_read\":\"medium\",\"news_read\":\"low\",\"sentiment_read\":\"medium\",\"evidence_ids\":[]},{\"board_code\":\"880310\",\"strength\":0.68,\"confidence\":0.75,\"evidence\":\"石油主线\",\"capital_read\":\"medium\",\"news_read\":\"low\",\"sentiment_read\":\"medium\",\"evidence_ids\":[]},{\"board_code\":\"880312\",\"strength\":0.6,\"confidence\":0.7,\"evidence\":\"石油加工\",\"capital_read\":\"low\",\"news_read\":\"low\",\"sentiment_read\":\"low\",\"evidence_ids\":[]},{\"board_code\":\"880313\",\"strength\":0.42,\"confidence\":0.5,\"evidence\":\"石油贸易\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880204\",\"strength\":0.5,\"confidence\":0.5,\"evidence\":\"甘肃\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880462\",\"strength\":0.55,\"confidence\":0.6,\"evidence\":\"空运\",\"capital_read\":\"low\",\"news_read\":\"low\",\"sentiment_read\":\"low\",\"evidence_ids\":[]},{\"board_code\":\"880424\",\"strength\":0.45,\"confidence\":0.5,\"evidence\":\"旅游\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880363\",\"strength\":0.4,\"confidence\":0.5,\"evidence\":\"林业\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880426\",\"strength\":0.46,\"confidence\":0.5,\"evidence\":\"旅游景点\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880684\",\"strength\":0.38,\"confidence\":0.5,\"evidence\":\"BC电池\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880220\",\"strength\":0.44,\"confidence\":0.5,\"evidence\":\"福建\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880638\",\"strength\":0.4,\"confidence\":0.5,\"evidence\":\"TOPCon\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880461\",\"strength\":0.58,\"confidence\":0.6,\"evidence\":\"水运\",\"capital_read\":\"low\",\"news_read\":\"low\",\"sentiment_read\":\"low\",\"evidence_ids\":[]},{\"board_code\":\"880344\",\"strength\":0.2,\"confidence\":0.4,\"evidence\":\"建材弱\",\"capital_read\":\"low\",\"news_read\":\"low\",\"sentiment_read\":\"low\",\"evidence_ids\":[]},{\"board_code\":\"880446\",\"strength\":0.41,\"confidence\":0.5,\"evidence\":\"电气设备\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880305\",\"strength\":0.42,\"confidence\":0.5,\"evidence\":\"补\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880431\",\"strength\":0.42,\"confidence\":0.5,\"evidence\":\"补\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880465\",\"strength\":0.42,\"confidence\":0.5,\"evidence\":\"补\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]},{\"board_code\":\"880489\",\"strength\":0.42,\"confidence\":0.5,\"evidence\":\"补\",\"capital_read\":\"unknown\",\"news_read\":\"unknown\",\"sentiment_read\":\"unknown\",\"evidence_ids\":[]}],\"families\":[],\"relations\":[{\"event_id\":\"e46dbdb7ced495117ccd8eb1d4c74540\",\"board_code\":\"880467\",\"strength\":0.6,\"direction\":\"negative\",\"propagation_path\":[\"AI应用\",\"机场\"],\"confidence\":0.7,\"evidence_ids\":[]},{\"event_id\":\"2dc02d2d5a2b9c0db89611df6b0716d5\",\"board_code\":\"880310\",\"strength\":0.5,\"direction\":\"positive\",\"propagation_path\":[\"贵金属\",\"石油\"],\"confidence\":0.6,\"evidence_ids\":[]}],\"concept_suggestions\":[{\"concept_name\":\"具身智能/物理AI\",\"evidence\":\"fixture\",\"mention_frequency\":2}],\"key_risks\":[\"外需下修\"],\"hot_topics\":[\"具身智能\"],\"cross_sector_risks\":[\"风格切换\"],\"narrative\":\"机场/石油主线，埋伏道等待催化\"}"
+  },
+  "identities": [
+    {
+      "symbol": "002009",
+      "theme": "具身智能/物理AI",
+      "layer": "software_model",
+      "confidence": 0.8,
+      "price_beta": null,
+      "novelty": true,
+      "evidence_ids": ["ev_fixture_news", "ev_fixture_market"],
+      "conflicts": ["与动力电池身份并存"],
+      "abstain": false,
+      "identity_change": "changed"
+    }
+  ],
+  "attributions": [
+    {
+      "symbol": "002009",
+      "date": "2026-10-29",
+      "return_pct": 2.3,
+      "bucket": "theme_alpha",
+      "theme": "具身智能/物理AI",
+      "confidence": 0.65,
+      "evidence_ids": ["ev_fixture_news"],
+      "residual": 0.2
+    }
+  ]
+}

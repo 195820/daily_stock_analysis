@@ -503,7 +503,39 @@ def _get_review_tool_registry():
     return review_registry
 
 
-def build_review_executor(config=None, review_type: str = "t1") -> "AgentExecutor":
+def _instrument_adapter(adapter, runtime, task_id: str):
+    """Wrap a tool-enabled adapter so every completion lands in the run trace."""
+    import time as _time
+
+    class _RuntimeInstrumentedAdapter:
+        def __init__(self, inner, rt, tid):
+            self._inner = inner
+            self._runtime = rt
+            self._task_id = tid
+
+        def call_with_tools(self, messages, tools, **kwargs):
+            started = _time.time()
+            try:
+                response = self._inner.call_with_tools(messages, tools, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                self._runtime.record_completion(
+                    task_id=self._task_id, messages=messages, error=exc,
+                    latency_ms=int((_time.time() - started) * 1000),
+                )
+                raise
+            self._runtime.record_completion(
+                task_id=self._task_id, messages=messages, response=response,
+                latency_ms=int((_time.time() - started) * 1000),
+            )
+            return response
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    return _RuntimeInstrumentedAdapter(adapter, runtime, task_id)
+
+
+def build_review_executor(config=None, review_type: str = "t1", got_runtime=None) -> "AgentExecutor":
     """构建审查专用轻量 AgentExecutor（§15 T1/T1-H）。
 
     与全量 Agent 的区别：
@@ -518,6 +550,7 @@ def build_review_executor(config=None, review_type: str = "t1") -> "AgentExecuto
         config: 可选配置对象（None → get_config()）
         review_type: "t1"（候选股终审，verdict=confirm/warn/reject）或
                      "t1h"（持仓审查，verdict=hold/add/reduce/exit）
+        got_runtime: 可选 GOT run 级 runtime；提供时每次模型调用写入同一 trace
 
     Returns:
         配置好的 AgentExecutor 实例
@@ -537,6 +570,9 @@ def build_review_executor(config=None, review_type: str = "t1") -> "AgentExecuto
     profile = _REVIEW_PROFILES.get(review_type, _REVIEW_PROFILES["t1"])
     review_registry = _get_review_tool_registry()
     llm_adapter = LLMToolAdapter(config)
+    if got_runtime is not None:
+        # T1/T1-H 保留有界工具循环；仅把每次模型调用镜像进同一 run trace
+        llm_adapter = _instrument_adapter(llm_adapter, got_runtime, f"node7.{review_type}")
 
     return AgentExecutor(
         tool_registry=review_registry,

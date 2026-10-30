@@ -29,12 +29,12 @@ def _decision():
     return SimpleNamespace(unified_scoring=_scoring())
 
 
-def _llm(payload):
-    llm = MagicMock()
-    llm.call_text.return_value = SimpleNamespace(
-        content=json.dumps(payload, ensure_ascii=False), usage={}, model="test"
+def _runtime(payload):
+    runtime = MagicMock()
+    runtime.call_text_sync.return_value = SimpleNamespace(
+        status="ok", output=json.dumps(payload, ensure_ascii=False), error=None
     )
-    return llm
+    return runtime
 
 
 @pytest.fixture
@@ -45,7 +45,7 @@ def archive_dir(tmp_path, monkeypatch):
 
 def test_shadow_off_returns_none(archive_dir):
     rec = run_antibias(decision=_decision(), target_date=date(2026, 10, 11),
-                       llm=_llm([]), shadow=False, max_sectors=8)
+                       got_runtime=_runtime([]), shadow=False, max_sectors=8)
     assert rec is None
     assert not (archive_dir / "data").exists()
 
@@ -55,7 +55,7 @@ def test_no_actionable_writes_skipped_row(archive_dir):
     d = SimpleNamespace(unified_scoring=[
         SimpleNamespace(sector_name="煤炭", is_holding=False, action_recommendation="avoid")])
     rec = run_antibias(decision=d, target_date=date(2026, 10, 11),
-                       llm=_llm([]), shadow=True, max_sectors=8)
+                       got_runtime=_runtime([]), shadow=True, max_sectors=8)
     assert rec is not None
     assert rec["skipped_reason"] == "no_actionable_target"
     assert rec["sectors_evaluated"] == 0 and rec["items"] == []
@@ -69,16 +69,14 @@ def test_normal_written_and_aligned(archive_dir):
         {"sector": "半导体", "counter_thesis": "国产替代进度不及预期", "red_line_hit": "追高位置"},
         {"sector": "AI算力", "counter_thesis": "海外云厂商 capex 指引下修", "red_line_hit": "单维高分独裁"},
     ]
-    persist = MagicMock()
     rec = run_antibias(decision=_decision(), target_date=date(2026, 10, 11),
-                       llm=_llm(payload), shadow=True, max_sectors=8, persist_usage=persist)
+                       got_runtime=_runtime(payload), shadow=True, max_sectors=8)
     assert rec["sectors_evaluated"] == 2  # 半导体 + AI算力（煤炭 avoid / 其他 被排除）
     assert rec["counter_thesis_nonempty"] == 2
     assert rec["mode"] == "shadow"
     by = {it["sector"]: it for it in rec["items"]}
     assert by["半导体"]["red_line_hit"] == "追高位置"
     assert "煤炭" not in by and "其他" not in by
-    assert persist.called
     art = archive_dir / "data" / "got_daily" / "20261011" / ANTIBIAS_ARTIFACT
     assert art.exists()
     assert json.loads(art.read_text(encoding="utf-8"))["line"] == "antibias"
@@ -90,17 +88,17 @@ def test_red_line_out_of_enum_flagged(archive_dir):
     d = SimpleNamespace(unified_scoring=[
         SimpleNamespace(sector_name="半导体", is_holding=True, action_recommendation="hold")])
     rec = run_antibias(decision=d, target_date=date(2026, 10, 11),
-                       llm=_llm(payload), shadow=True, max_sectors=8)
+                       got_runtime=_runtime(payload), shadow=True, max_sectors=8)
     item = rec["items"][0]
     assert item["red_line_hit"].startswith("越界:")
     assert item["red_line_hit"] not in RED_LINES
 
 
 def test_llm_failure_records_error(archive_dir):
-    llm = MagicMock()
-    llm.call_text.side_effect = RuntimeError("llm down")
+    runtime = MagicMock()
+    runtime.call_text_sync.side_effect = RuntimeError("llm down")
     rec = run_antibias(decision=_decision(), target_date=date(2026, 10, 11),
-                       llm=llm, shadow=True, max_sectors=8)
+                       got_runtime=runtime, shadow=True, max_sectors=8)
     assert rec is not None and rec["llm_error"].startswith("RuntimeError")
     # 失败也落产物（供"报错率>10%"转正门槛计数）
     art = archive_dir / "data" / "got_daily" / "20261011" / ANTIBIAS_ARTIFACT
@@ -113,5 +111,5 @@ def test_max_sectors_cap(archive_dir):
         for i in range(10)
     ])
     rec = run_antibias(decision=d, target_date=date(2026, 10, 11),
-                       llm=_llm([]), shadow=True, max_sectors=3)
+                       got_runtime=_runtime([]), shadow=True, max_sectors=3)
     assert rec["sectors_evaluated"] == 3

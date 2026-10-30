@@ -553,8 +553,9 @@ from src.got.board_filter import (  # noqa: E402
 class SectorAnalysisNode:
     """板块分析节点（GOT Node 2）"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         self._fetcher_manager: Optional[DataFetcherManager] = None
 
     @property
@@ -798,7 +799,7 @@ class SectorAnalysisNode:
             self._save_sector_trends(analyzed)
 
             # Step 4: LLM 生成 reasoning
-            result.reasoning = await self._generate_reasoning(result)
+            result.reasoning = self._fallback_reasoning(result)
 
             logger.info(
                 f"[Node 2] 完成 — "
@@ -4821,111 +4822,7 @@ class SectorAnalysisNode:
         }
         return _labels.get(sector.rrg.quadrant, "")
 
-    async def _generate_reasoning(self, ctx: SectorContext) -> Optional[str]:
-        """调用 LLM 生成板块分析 reasoning 文本（纯总结，不影响信号）。"""
-        try:
-            from src.agent.llm_adapter import LLMToolAdapter
-        except ImportError:
-            logger.warning("LLMToolAdapter 不可用，跳过 reasoning 生成")
-            return self._fallback_reasoning(ctx)
-
-        mainline_names = ", ".join(
-            f"{g.group_name}(技术{g.group_score:.0f}分,{self._rrg_label(g.members[0]) if g.members else ''})"
-            for g in ctx.active_mainline
-        ) or "无"
-        exhausted_names = ", ".join(
-            f"{s.name}(技术{s.strength_score:.0f}分,{self._rrg_label(s)})" for s in ctx.exhausted_mainline
-        ) or "无"
-        ambush_names = ", ".join(
-            f"{s.name}(技术{s.strength_score:.0f}分)" for s in ctx.ambush
-        ) or "无"
-        defensive_names = ", ".join(
-            f"{s.name}(技术{s.strength_score:.0f}分)" for s in ctx.defensive_rotation
-        ) or "无"
-
-        notes_text = "\n".join(f"- {n}" for n in ctx.notes) if ctx.notes else "无"
-
-        # Node 2 v2: 降级摘要 + 主线家族 + 可信度
-        quality_text = ctx.data_quality.degradation_summary or ""
-        family_text = ""
-        if ctx.theme_families:
-            family_parts = []
-            for f in ctx.theme_families[:5]:
-                family_parts.append(
-                    f"  {f.family_name}: {f.family_score:.0f}分, "
-                    f"共振{f.family_resonance:.0%}, {f.theme_status}"
-                )
-            family_text = "\n".join(family_parts)
-
-        # 加载板块趋势历史用于 LLM prompt 注入（跨日记忆）
-        all_sectors: list[SectorDetail] = []
-        for g in ctx.active_mainline:
-            all_sectors.extend(g.members)
-        all_sectors.extend(ctx.exhausted_mainline)
-        all_sectors.extend(ctx.ambush)
-        all_sectors.extend(ctx.defensive_rotation)
-        trend_context = self._format_trend_context_for_prompt(all_sectors)
-
-        prompt = (
-            "你是一个专业的板块分析师。根据以下板块分析结果，撰写一段简洁的分析报告。\n\n"
-        )
-
-        # Node 2 v2: 降级警告放在最前面
-        if quality_text and "正常" not in quality_text:
-            prompt += f"【数据质量】{quality_text}\n"
-            prompt += f"【评分可信度】{ctx.confidence_level}\n\n"
-
-        prompt += (
-            f"板块分析结果：\n"
-            f"- 活跃主线：{mainline_names}\n"
-            f"- 衰竭主线：{exhausted_names}\n"
-            f"- 埋伏期：{ambush_names}\n"
-            f"- 防守轮动：{defensive_names}\n"
-            f"- 市场方向：{ctx.market_direction}\n"
-            f"- 备注：{notes_text}\n\n"
-        )
-
-        if family_text:
-            prompt += f"主线家族视角：\n{family_text}\n\n"
-
-        # Node 2 v2: 行业板块视角
-        if ctx.industry_top:
-            industry_parts = [
-                f"  {s.name}: {s.strength_score:.0f}分" for s in ctx.industry_top[:5]
-            ]
-            prompt += f"行业板块 Top 5（中期趋势）：\n" + "\n".join(industry_parts) + "\n\n"
-
-        if trend_context:
-            prompt += f"{trend_context}\n\n"
-
-        prompt += (
-            "请输出：\n"
-            "1. 一段200字以内的分析文本，解释当前板块轮动格局\n"
-            "2. 重点说明哪些板块是主线、持续性如何\n"
-            "3. 主线家族的共振情况（哪些家族有多个板块同时活跃）\n"
-            "4. 提示哪些板块处于埋伏期，可能成为下一个主线\n"
-            "5. 风险提示（哪些板块过热需要回避）\n"
-            "6. 若数据质量有降级警告，需在报告中明确提示\n\n"
-            "重要：本节点仅基于技术强度视角（动量/换手/相对强度/宽度）分析，"
-            "注入的分数均为技术强度分，不代表综合推荐强度（资金/消息/情绪未参与）。"
-            "禁止使用“榜首”“最强”“第一主线”等绝对化表述；"
-            "若某板块技术分显著领先，请表述为“技术强度领先”，"
-            "并说明综合研判由后续聚合阶段给出。\n\n"
-            "输出格式：纯文本（不要JSON）"
-        )
-
-        try:
-            adapter = LLMToolAdapter()
-            messages = [{"role": "user", "content": prompt}]
-            response = await asyncio.to_thread(
-                adapter.call_text, messages, temperature=0.3, max_tokens=400,
-            )
-            if response and response.content:
-                return response.content.strip()
-        except Exception as e:
-            logger.warning(f"LLM reasoning 生成失败: {e}")
-
-        return self._fallback_reasoning(ctx)
+    
 
     @staticmethod
     def _fallback_reasoning(ctx: SectorContext) -> str:

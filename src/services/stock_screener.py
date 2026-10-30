@@ -961,6 +961,50 @@ class StockScreenerPipeline:
             "note": "4d/D-3 基线观测，攒 ≥10 交易日后固化归零率基线值（不进选股判定）",
         }
 
+    @staticmethod
+    def _build_semantic_relations(glue: dict, sector_ctx: dict) -> Dict[str, dict]:
+        """agent_glue.relations → {板块名: 最强 relation 信号}（不调用 LLM）。"""
+        code_to_name: Dict[str, str] = {}
+
+        def _collect(item) -> None:
+            if not isinstance(item, dict):
+                return
+            code = item.get("code") or item.get("board_code")
+            name = item.get("name")
+            if code and name:
+                code_to_name.setdefault(str(code), str(name))
+            for member in item.get("members") or []:
+                _collect(member)
+
+        for key in (
+            "active_mainline", "exhausted_mainline", "ambush", "near_miss_ambush",
+            "defensive_rotation", "industry_top", "top_by_score", "cooling_down",
+        ):
+            for item in sector_ctx.get(key) or []:
+                _collect(item)
+
+        out: Dict[str, dict] = {}
+        for rel in glue.get("relations") or []:
+            if not isinstance(rel, dict):
+                continue
+            name = code_to_name.get(str(rel.get("board_code", "")))
+            if not name:
+                continue
+            direction = str(rel.get("direction", "positive") or "positive")
+            sign = 1.0 if direction == "positive" else (-1.0 if direction == "negative" else 0.0)
+            strength = float(rel.get("strength", 0.0) or 0.0)
+            signal = sign * strength
+            current = out.get(name)
+            if current is None or abs(signal) > abs(current["signal"]):
+                out[name] = {
+                    "signal": signal,
+                    "direction": direction,
+                    "strength": strength,
+                    "confidence": float(rel.get("confidence", 0.0) or 0.0),
+                    "event_id": str(rel.get("event_id", "")),
+                }
+        return out
+
     def _load_got_context(self, got_date: date) -> Optional[dict]:
         """动态加载 GOT 上下文
 
@@ -989,6 +1033,21 @@ class StockScreenerPipeline:
                 if filepath.exists():
                     with open(filepath, "r", encoding="utf-8") as f:
                         context[key] = json.load(f)
+
+            # A6 relations 是消息面语义的唯一来源（2026-10-30）：
+            # 从同日 agent_glue.json 读取 relation，映射 board_code→板块名后
+            # 供 _score_news 直接消费；缺文件时不重新发明映射（走 relation_missing 口径）。
+            glue_path = archive_dir / "agent_glue.json"
+            if glue_path.exists():
+                try:
+                    with open(glue_path, "r", encoding="utf-8") as f:
+                        glue = json.load(f)
+                    context["agent_glue"] = glue
+                    context["semantic_relations"] = self._build_semantic_relations(
+                        glue, context.get("sector_context", {}),
+                    )
+                except Exception as exc:  # noqa: BLE001 — 归档脏数据不阻断选股
+                    logger.warning("[GOT选股] agent_glue.json 读取失败（按缺失处理）: %s", exc)
 
             # 如果至少加载了 unified_context，就返回
             if "unified_context" in context:
@@ -2283,7 +2342,9 @@ class StockScreenerPipeline:
         # 消息面评分（全量候选，不排序但记录分数）
         news_ctx = got_context.get("news_context", {})
         sector_ctx = got_context.get("sector_context", {})
-        news_scores, news_avail = self._score_news(candidates, news_ctx, sector_ctx)
+        news_scores, news_avail = self._score_news(
+            candidates, news_ctx, sector_ctx, got_context=got_context,
+        )
         for c in candidates:
             c["news_score"] = news_scores.get(c["code"], 0)
             c["news_available"] = news_avail.get(c["code"], False)
@@ -2518,7 +2579,9 @@ verdict 含义：
         regime = market_ctx.get("market_state", {}).get("regime", "unknown")
 
         try:
-            executor = build_review_executor(review_type="t1")
+            executor = build_review_executor(
+                review_type="t1", got_runtime=got_context.get("_got_runtime"),
+            )
         except Exception as exc:
             logger.warning(f"[T1终审] Review Agent 构建失败，降级跳过: {exc}")
             return finalists
@@ -2899,148 +2962,62 @@ verdict 含义：
         return names
 
     def _score_news(
-        self, candidates: List[Dict], news_ctx: dict, sector_context: dict = None
+        self,
+        candidates: List[Dict],
+        news_ctx: dict,
+        sector_context: dict = None,
+        got_context: dict = None,
     ) -> Tuple[Dict[str, float], Dict[str, bool]]:
-        """消息面评分（15% 权重）— LLM 语义匹配版
+        """消息面评分（15% 权重）— A6 relations 直读版
 
-        流程：
-        1. 将 Node 4 事件 + 板块名列表（TDX_REGISTRY + 动态板块）交给 LLM
-        2. LLM 输出：每个受影响板块的 sentiment × relevance
-        3. 候选股 sector 精确匹配 LLM 输出的板块名 → 评分
-        4. LLM 失败时降级到子串匹配
-
-        Returns:
-            (scores, availability): 评分字典 + 可用性字典
+        流程（2026-10-30 运行时收敛）：
+        1. 读 got_context["semantic_relations"]（同日 A6 relations，board_code→板块名）
+        2. 用同一 relation 的 direction×strength 映射原 `40 + signal*60` 公式
+        3. 无 relation 的板块才走 `_fallback_sector_match`，并标 `news_relation_missing`
+           （不把缺关系伪装成 neutral）
         """
         events = news_ctx.get("major_events", [])
         if not events:
             logger.warning("[消息面] 无新闻事件，所有候选股消息面不可用")
             return {c["code"]: 40.0 for c in candidates}, {c["code"]: False for c in candidates}
 
-        # 构建完整板块名集合
         all_sector_names = self._get_all_sector_names(sector_context or {})
+        relation_map = (got_context or {}).get("semantic_relations") or {}
+        fallback_map = self._fallback_sector_match(events, all_sector_names)
 
-        # 尝试 LLM 语义匹配
-        sector_news_map = self._llm_score_sector_news(events, all_sector_names)
-
-        if sector_news_map:
-            logger.info(f"[消息面-LLM] {len(sector_news_map)} 个板块获匹配")
+        if relation_map:
+            logger.info(f"[消息面-A6] {len(relation_map)} 个板块获 relation 映射")
         else:
-            logger.warning("[消息面-LLM] LLM 匹配失败，降级到子串匹配")
-            sector_news_map = self._fallback_sector_match(events, all_sector_names)
+            logger.warning("[消息面-A6] 无 A6 relations，全部板块走子串匹配（relation_missing）")
 
-        # 评分：基础分 40 + 板块情感分 × 60
-        # 有事件即视为可用（无匹配给中性基础分 40，参与加权）
         has_events = bool(events)
-        scores = {}
-        availability = {}
+        scores: Dict[str, float] = {}
+        availability: Dict[str, bool] = {}
+        missing_count = 0
         for c in candidates:
             sector = c.get("sector", "")
-            news_signal = sector_news_map.get(sector, 0.0)
+            relation = relation_map.get(sector)
+            if relation is None and relation_map:
+                from src.got.board_aliases import normalize_sector_name
+
+                relation = relation_map.get(normalize_sector_name(sector))
+            missing = relation is None
+            if relation is not None:
+                news_signal = float(relation.get("signal", 0.0) or 0.0)
+            else:
+                news_signal = fallback_map.get(sector, 0.0)
+                missing_count += 1
+            c["news_relation_missing"] = missing
             score = 40.0 + news_signal * 60.0
             scores[c["code"]] = max(0.0, min(100.0, score))
-            availability[c["code"]] = has_events
+            availability[c["code"]] = has_events and not missing
 
-        return scores, availability
-
-    def _llm_score_sector_news(self, events: list, all_sector_names: set) -> Dict[str, float]:
-        """调用 LLM 将新闻事件映射到具体板块的情感分
-
-        Args:
-            events: Node 4 新闻事件列表
-            all_sector_names: 合法板块名集合（TDX_REGISTRY + 动态板块）
-
-        Returns:
-            {板块名: 加权情感分}，范围 [-1, +1]
-        """
-        from src.agent.llm_adapter import LLMToolAdapter
-
-        board_list = sorted(all_sector_names)
-
-        if not board_list:
-            logger.warning("[消息面-LLM] 板块名列表为空")
-            return {}
-
-        # 构建事件摘要
-        event_lines = []
-        for i, ev in enumerate(events):
-            title = ev.get("title", "")
-            summary = ev.get("summary", "")[:200]
-            sentiment = ev.get("sentiment", "neutral")
-            impact = ev.get("impact_level", "medium")
-            event_lines.append(f"{i+1}. [{impact}/{sentiment}] {title}\n   {summary}")
-        events_text = "\n".join(event_lines)
-        boards_text = ", ".join(board_list)
-
-        prompt = f"""你是一个A股市场分析专家。给定以下新闻事件和合法板块名列表，判断每个事件影响了哪些板块。
-
-## 新闻事件
-{events_text}
-
-## 合法板块名列表（只能从以下名称中选择）
-{boards_text}
-
-## 输出要求
-输出 JSON 数组，每个元素表示一个受影响的板块：
-[{{"sector": "板块名", "relevance": 0.8, "sentiment": "positive"}}, ...]
-
-规则：
-- sector 必须是上方合法板块名列表中的精确名称
-- relevance: 0-1，事件对该板块的影响程度
-- sentiment: positive / negative / neutral
-- 一个事件可影响多个板块，不同事件可影响同一板块（取最强影响）
-- 只输出 relevance >= 0.3 的板块
-- 只输出 JSON 数组，不要其他文字"""
-
-        try:
-            adapter = LLMToolAdapter(self.config)
-            response = adapter.call_text(
-                [{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=3000,
-                timeout=60,
+        if missing_count:
+            logger.info(
+                "[消息面-A6] %d 只候选无 relation，走子串兜底并标 relation_missing",
+                missing_count,
             )
-
-            if not response or not response.content:
-                logger.warning("[消息面-LLM] LLM 返回空")
-                return {}
-
-            # 解析 JSON
-            import re
-            match = re.search(r'\[[\s\S]*\]', response.content)
-            if not match:
-                logger.warning("[消息面-LLM] 无法提取 JSON 数组")
-                return {}
-
-            items = json.loads(match.group())
-            if not isinstance(items, list):
-                return {}
-
-            # 聚合：同一板块取最强影响
-            sector_scores: Dict[str, float] = {}
-            sentiment_multiplier = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                sector = str(item.get("sector", "")).strip()
-                relevance = float(item.get("relevance", 0))
-                sentiment = str(item.get("sentiment", "neutral")).strip()
-
-                if sector not in all_sector_names or relevance < 0.3:
-                    continue
-
-                signal = relevance * sentiment_multiplier.get(sentiment, 0)
-                # 同一板块多事件取绝对值最大的
-                if abs(signal) > abs(sector_scores.get(sector, 0)):
-                    sector_scores[sector] = signal
-
-            logger.info(f"[消息面-LLM] 解析成功: {len(sector_scores)} 个板块")
-            return sector_scores
-
-        except Exception as e:
-            logger.warning(f"[消息面-LLM] LLM 调用失败: {e}")
-            return {}
+        return scores, availability
 
     def _fallback_sector_match(self, events: list, all_sector_names: set) -> Dict[str, float]:
         """降级方案：子串匹配 affected_sectors → 板块名

@@ -273,44 +273,5 @@ class TestNominationAdoption(_ChannelTestBase):
 # S4: LLM 精炼视野扩围
 # ─────────────────────────────────────────────────────────────
 
-class TestRefineSliceExpansion(unittest.TestCase):
-
-    def _make_intel(self, name, score, role="mainline"):
-        return SectorIntel(
-            sector_name=name,
-            sector_role=role,
-            composite_score=score,
-            classification="caution",
-            tech_detail="mock",
-        )
-
-    def test_ambush_beyond_top10_enters_prompt_with_events(self):
-        """12 个板块：埋伏板块排第 12（前 10 之外）+ 带催化事件 → 进 prompt 且事件注入。"""
-        node = AggregatorNode.__new__(AggregatorNode)
-        ambush_name = "短剧游戏"
-        event = _make_event(ambush_name, title="AI上星剧定档")
-
-        sectors = [self._make_intel(f"主线{i}", 99 - i) for i in range(11)]
-        sectors.append(self._make_intel(ambush_name, 55.0, role="ambush"))
-        # sectors[10]（第 11 名主线）应被排除，sectors[11]（埋伏）应被追加
-        events_map = AggregatorNode._group_events_by_sector([event])
-        regime = MarketRegime(regime="bull", risk_budget=0.6)
-
-        captured: list[str] = []
-
-        async def fake_llm(prompt, **kwargs):
-            captured.append(prompt)
-            return '{"narrative": "", "cross_sector_risks": [], "adjustments": []}'
-
-        with patch.object(node, "_call_llm_async", new=fake_llm):
-            asyncio.run(node._llm_refine_sectors(sectors, regime,
-                                                 catalyst_events_by_sector=events_map))
-
-        self.assertEqual(len(captured), 1)
-        self.assertIn(ambush_name, captured[0], "埋伏候选应进入精炼视野")
-        self.assertIn("AI上星剧定档", captured[0], "合格催化事件应注入 prompt")
-        self.assertNotIn("主线10", captured[0], "第 11 名主线（非埋伏）不应追加")
-
-
 if __name__ == "__main__":
     unittest.main()

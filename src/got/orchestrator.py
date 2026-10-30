@@ -33,15 +33,36 @@ class NonTradingDayError(Exception):
     pass
 
 
+def _sector_names(sector_ctx) -> list[str]:
+    """Sector names for semantic-memory theme lookup (mainline/ambush/industry)."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            names.append(value)
+
+    for group in getattr(sector_ctx, "active_mainline", None) or []:
+        for member in getattr(group, "members", None) or []:
+            _add(getattr(member, "name", "") or "")
+    for attr in ("ambush", "exhausted_mainline", "defensive_rotation", "industry_top"):
+        for detail in getattr(sector_ctx, attr, None) or []:
+            _add(getattr(detail, "name", "") or "")
+    return names
+
+
 class GOTOrchestrator:
     """GOT Phase 1 编排器"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         """
         Args:
             use_mock: 是否使用 mock 数据（MVP 阶段为 True）
+            got_runtime: 可注入的 run 级语义 runtime（缺省在 run() 按业务日创建）
         """
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         self.market_node = MarketAnalysisNode(use_mock=use_mock)
         self.sector_node = SectorAnalysisNode(use_mock=use_mock)
         self.capital_node = CapitalAnalysisNode(use_mock=use_mock)
@@ -126,6 +147,17 @@ class GOTOrchestrator:
         """
         target_date = check_date or date.today()
 
+        # run 级语义 runtime：一次 GOT 运行只创建一个，Node 1-7/T1/T1-H 共用
+        if self.got_runtime is None and not self.use_mock:
+            from src.got.agent_runtime import GOTAgentRuntime
+
+            self.got_runtime = GOTAgentRuntime(target_date)
+        for _node in (
+            self.market_node, self.sector_node, self.capital_node,
+            self.news_node, self.sentiment_node, self.aggregator,
+        ):
+            _node.got_runtime = self.got_runtime
+
         # Step 1: 交易日检查（MVP 阶段跳过）
         if not self.use_mock:
             self._check_trading_day(target_date)
@@ -169,7 +201,7 @@ class GOTOrchestrator:
 
         # Step 2: 并行执行两路
         tech_path_task = self._run_tech_path(holdings_ctx)
-        data_path_task = self._run_data_path(bar_complete)
+        data_path_task = self._run_data_path(bar_complete, as_of=target_date)
 
         tech_result, data_result = await asyncio.gather(
             tech_path_task,
@@ -187,6 +219,35 @@ class GOTOrchestrator:
 
         market_ctx, sector_ctx, capital_ctx = tech_result
         news_ctx, sentiment_ctx = data_result
+
+        # Step 2.4: 窄身份 Agent（Node 2/4 完成后、Node 6 前）
+        # 产物只作证据：不改 sector_role/classification/ambush gate/仓位。
+        narrative_ctx = None
+        if not self.use_mock and self.got_runtime is not None:
+            try:
+                from src.got.narrative_agents import run_identity_agent, persist_narrative_context
+                from src.got.semantic_memory import SemanticMemory
+
+                memory = SemanticMemory(
+                    target_date, agent_run_id=self.got_runtime.run_id,
+                )
+                symbols = list(getattr(holdings_ctx, "symbols", []) or []) if holdings_ctx else []
+                themes = _sector_names(sector_ctx)
+                previous = memory.load_memory(symbols=symbols, themes=themes)
+                narrative_ctx = await run_identity_agent(
+                    holdings_ctx, sector_ctx, news_ctx, previous,
+                    self.got_runtime, target_date,
+                )
+                if narrative_ctx.identities:
+                    memory.record_identities(narrative_ctx.identities)
+                persist_narrative_context(narrative_ctx, target_date)
+                logger.info(
+                    "[GOT] 身份 Agent: status=%s, %d 条身份",
+                    narrative_ctx.status, len(narrative_ctx.identities),
+                )
+            except Exception as exc:  # noqa: BLE001 — 窄 Agent 失败不阻断主流程
+                logger.warning("[GOT] 身份 Agent 失败（已忽略）: %s", exc)
+                narrative_ctx = None
 
         # Step 2.5: Phase 4b 市场结构上下文构造（影子默认开，写入全局供 Node 6 只读消费）
         # 独立于 Node 2 再拉一次 mootdx 快筛（方案 A 的“独立信号”前提）；取数失败目回退 unknown。
@@ -216,6 +277,7 @@ class GOTOrchestrator:
             # as_of 按 target_date —— 补跑历史日会写错跨日基线并污染 regime 状态机。
             # 生产（target_date=today）逐字节不变。
             run_date=target_date,
+            narrative_context=narrative_ctx,
         )
 
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -267,7 +329,7 @@ class GOTOrchestrator:
                 )
                 from src.got.nodes.portfolio_decision import PortfolioDecisionNode
 
-                decision_node = PortfolioDecisionNode(use_mock=False)
+                decision_node = PortfolioDecisionNode(use_mock=False, got_runtime=self.got_runtime)
                 decision = await decision_node.run(
                     unified_context=unified,
                     market_context=market_ctx,
@@ -278,6 +340,8 @@ class GOTOrchestrator:
                     bar_complete=bar_complete,
                     # 3-D 重放 harness：快照 entry/exit 参考日跟随目标日（生产当日二者相等，零行为变化）
                     as_of=target_date,
+                    # A6 内存 relations（与 Phase 1 同一 run），选股消息面不再二次解释
+                    semantic_relations=getattr(self.aggregator, "_semantic_relations", {}),
                 )
 
                 logger.info(
@@ -338,36 +402,33 @@ class GOTOrchestrator:
             except Exception as exc:
                 logger.warning("[GOT] P6 兑现检测失败（已忽略）: %s", exc)
 
-            # 批次 D：持仓异动归因通道（news_pulse，一期纯观测，GOT_NEWS_PULSE_ENABLED 默认关）
-            # Phase 2 完成后追加一步，与 P6 同模式 try/except 不阻断；仅在 decision 产出时跑。
-            if decision is not None:
-                try:
-                    from src.got.catalyst_config import (
-                        GOT_NEWS_PULSE_ENABLED,
-                        GOT_NEWS_PULSE_MAX_STOCKS,
-                        GOT_NEWS_PULSE_THRESHOLD,
-                    )
-                    if GOT_NEWS_PULSE_ENABLED:
-                        from data_provider.base import DataFetcherManager
-                        from src.agent.llm_adapter import LLMToolAdapter
-                        from src.got.news_pulse import run_news_pulse
-                        from src.storage import persist_llm_usage
+            # 语义记忆兑现 + 每日评估口径卡（2026-10-30）：只处理窗口已结束的记录，
+            # 无可验证主题行情时标 unresolved；写入 run_card.json 供回测口径审计。
+            try:
+                from pathlib import Path as _Path
+                from src.got.semantic_memory import SemanticMemory
 
-                        run_news_pulse(
-                            decision=decision,
-                            news_ctx=news_ctx,
-                            sector_ctx=sector_ctx,
-                            market_ctx=market_ctx,
-                            target_date=target_date,
-                            manager=DataFetcherManager(),
-                            llm=LLMToolAdapter(),
-                            enabled=GOT_NEWS_PULSE_ENABLED,
-                            threshold=GOT_NEWS_PULSE_THRESHOLD,
-                            max_stocks=GOT_NEWS_PULSE_MAX_STOCKS,
-                            persist_usage=persist_llm_usage,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[GOT] news_pulse 异动归因观测失败（已忽略）: %s", exc)
+                _memory = SemanticMemory(
+                    target_date,
+                    agent_run_id=getattr(self.got_runtime, "run_id", None),
+                )
+                _stats = await asyncio.to_thread(_memory.record_realizations)
+                _card = _memory.build_run_card()
+                _day_dir = _Path("data/got_daily") / target_date.strftime("%Y%m%d")
+                _day_dir.mkdir(parents=True, exist_ok=True)
+                _card_path = _day_dir / "run_card.json"
+                _tmp = _card_path.with_name(f"run_card.json.{os.getpid()}.tmp")
+                import json as _json
+                _tmp.write_text(_json.dumps(_card, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(_tmp, _card_path)
+                logger.info(
+                    "[GOT] 语义兑现: written=%d unresolved=%d skipped=%d",
+                    _stats.get("written", 0), _stats.get("unresolved", 0),
+                    _stats.get("skipped", 0),
+                )
+            except Exception as exc:  # noqa: BLE001 — 记忆兑现旁挂，不阻断决策
+                logger.warning("[GOT] 语义兑现/run card 失败（已忽略）: %s", exc)
+
 
             # 批次 G：产出前运行时自查（一期只 warn，零行为影响；GOT_OUTPUT_REVIEW 默认开）
             # 绝不阻断主流程/归档；decision 为 None（Phase 2 失败）时 phase2 检查自然降级为空。
@@ -388,31 +449,29 @@ class GOTOrchestrator:
                 logger.warning("[GOT] 产出前自查失败（已忽略）: %s", exc)
 
             # 批次 B：轻量反偏见层 antibias（Phase 2 后一次小 LLM 调用，一期纯影子，落 shadow_antibias.json）
-            # 不参与排序/不进 warnings；与 P6/news_pulse/G 同模式 try/except 不阻断；仅 decision 产出时跑。
+            # 不参与排序/不进 warnings；与 P6/G 同模式 try/except 不阻断；仅 decision 产出时跑。
             if decision is not None:
                 try:
                     from src.got.catalyst_config import (
                         GOT_ANTIBIAS_MAX_SECTORS,
                         GOT_ANTIBIAS_SHADOW,
                     )
-                    if GOT_ANTIBIAS_SHADOW:
-                        from src.agent.llm_adapter import LLMToolAdapter
+                    if GOT_ANTIBIAS_SHADOW and self.got_runtime is not None:
                         from src.got.antibias import run_antibias
-                        from src.storage import persist_llm_usage
 
-                        run_antibias(
+                        await asyncio.to_thread(
+                            run_antibias,
                             decision=decision,
                             target_date=target_date,
-                            llm=LLMToolAdapter(),
+                            got_runtime=self.got_runtime,
                             shadow=GOT_ANTIBIAS_SHADOW,
                             max_sectors=GOT_ANTIBIAS_MAX_SECTORS,
-                            persist_usage=persist_llm_usage,
                         )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[GOT] antibias 反偏见观测失败（已忽略）: %s", exc)
 
             # 批次 C1：数值双源交叉验证（抽样、一期纯观测，落 consistency.json；GOT_CONSISTENCY_SAMPLE=0 关）
-            # 不改任何决策输入；与 P6/news_pulse/G/B 同模式 try/except 不阻断；仅 decision 产出时跑。
+            # 不改任何决策输入；与 P6/G/B 同模式 try/except 不阻断；仅 decision 产出时跑。
             if decision is not None:
                 try:
                     from src.got.catalyst_config import GOT_CONSISTENCY_SAMPLE, GOT_CONSISTENCY_TOL
@@ -429,6 +488,13 @@ class GOTOrchestrator:
                         )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[GOT] 双源交叉验证观测失败（已忽略）: %s", exc)
+
+        # 语义 runtime trace 落盘（失败不阻断主流程）
+        if self.got_runtime is not None:
+            try:
+                self.got_runtime.flush()
+            except Exception as exc:  # noqa: BLE001 — trace 是观测面，不阻断决策
+                logger.warning("[GOT] agent runtime trace 落盘失败（已忽略）: %s", exc)
 
         return unified
 
@@ -460,12 +526,12 @@ class GOTOrchestrator:
 
         return market_ctx, sector_ctx, capital_ctx
 
-    async def _run_data_path(self, bar_complete: bool = True) -> tuple:
+    async def _run_data_path(self, bar_complete: bool = True, as_of: Optional[date] = None) -> tuple:
         """独立数据路：并行（消息面 ‖ 情绪面）"""
         logger.info("[GOT] 独立数据路：开始（并行）")
 
         news_ctx, sentiment_ctx = await asyncio.gather(
-            self.news_node.run(bar_complete=bar_complete),
+            self.news_node.run(bar_complete=bar_complete, as_of=as_of),
             self.sentiment_node.run(),
         )
 

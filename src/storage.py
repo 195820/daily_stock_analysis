@@ -1350,6 +1350,89 @@ class TradePlanRecord(Base):
     )
 
 
+class StockThemeIdentityRecord(Base):
+    """个股主题身份（窄 Agent 输出，2026-10-30）。
+
+    一个 symbol 在 as_of 日最多两条身份（如「具身智能/物理AI」与「动力电池」并存），
+    由确定性 diff 生成 identity_change；LLM 不得重写整段记忆。
+    """
+
+    __tablename__ = 'stock_theme_identity'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    theme = Column(String(64), nullable=False)
+    as_of = Column(Date, nullable=False, index=True)
+    layer = Column(String(32), default='other')                # software_model/hardware/supply_chain/other
+    confidence = Column(Float, default=0.0)
+    price_beta = Column(Float, nullable=True)
+    novelty = Column(Boolean, default=False)
+    evidence_json = Column(Text, default='[]')
+    first_seen = Column(Date, nullable=True)
+    last_seen = Column(Date, nullable=True)
+    identity_change = Column(String(32), default='unchanged')  # new/changed/unchanged/removed
+    agent_run_id = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'theme', 'as_of', name='uix_theme_identity_symbol_theme_date'),
+        Index('ix_theme_identity_symbol_date', 'symbol', 'as_of'),
+    )
+
+
+class MoveAttributionRecord(Base):
+    """持仓/候选当日涨跌归因（sector_beta/theme_alpha/idiosyncratic/unexplained）。"""
+
+    __tablename__ = 'move_attributions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    return_pct = Column(Float, nullable=True)
+    bucket = Column(String(32), default='unexplained')
+    theme = Column(String(64), nullable=True)
+    confidence = Column(Float, default=0.0)
+    evidence_json = Column(Text, default='[]')
+    residual = Column(Float, nullable=True)
+    agent_run_id = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'date', name='uix_move_attr_symbol_date'),
+        Index('ix_move_attr_date_bucket', 'date', 'bucket'),
+    )
+
+
+class NarrativeRealizationRecord(Base):
+    """叙事/身份兑现追踪（主题收益 vs 中证1000 基准，窗口结束后才写）。"""
+
+    __tablename__ = 'narrative_realizations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_kind = Column(String(32), nullable=False)           # identity / thesis / catalyst
+    source_id = Column(String(64), nullable=False)
+    as_of = Column(Date, nullable=False, index=True)
+    horizon_days = Column(Integer, nullable=False)             # 1/3/5
+    symbol = Column(String(16), nullable=True)
+    theme = Column(String(64), nullable=True)
+    entry_date = Column(Date, nullable=True)
+    evaluation_date = Column(Date, nullable=True)
+    theme_return = Column(Float, nullable=True)
+    benchmark_return = Column(Float, nullable=True)
+    excess_return = Column(Float, nullable=True)
+    direction_correct = Column(Boolean, nullable=True)
+    agent_run_id = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'source_kind', 'source_id', 'as_of', 'horizon_days',
+            name='uix_narrative_realization_key',
+        ),
+        Index('ix_narrative_realization_asof', 'as_of', 'horizon_days'),
+    )
+
+
 class CatalystRealizationRecord(Base):
     """催化剂事件兑现归档（P6）。
 

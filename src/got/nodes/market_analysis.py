@@ -63,8 +63,9 @@ INDEX_CONFIG = {
 class MarketAnalysisNode:
     """大盘分析节点"""
 
-    def __init__(self, use_mock: bool = True):
+    def __init__(self, use_mock: bool = True, got_runtime=None):
         self.use_mock = use_mock
+        self.got_runtime = got_runtime
         self._fetcher = None
 
     def _get_fetcher(self):
@@ -164,9 +165,9 @@ class MarketAnalysisNode:
                 confidence, tech_growth.get("score", 0), breadth_data
             )
 
-        # Step 11: LLM reasoning 生成
-        reasoning = await self._generate_llm_reasoning(
-            tech_growth, timeframe_got, cross_pattern, today_change, breadth_data
+        # Step 11: reasoning 生成（纯规则；展示型 LLM 调用已删除，2026-10-30 运行时收敛）
+        reasoning = self._rule_based_reasoning(
+            tech_growth, timeframe_got, cross_pattern, today_change
         )
 
         # Step 12: 合成市场状态条件变量（下游 Node2/Node6 主消费入口，2026-08-19 新增）
@@ -780,77 +781,7 @@ class MarketAnalysisNode:
 
         return confidence
 
-    async def _generate_llm_reasoning(
-        self,
-        tech_growth: dict,
-        timeframe_got: TimeframeGOTResult,
-        cross_pattern: str,
-        today_change: dict,
-        breadth_data: Optional[dict] = None,
-    ) -> str:
-        """LLM 推理生成（Fix 5，1 次调用）
-
-        失败时降级到规则拼接。
-        """
-        # 提取关键字段
-        tg_trend = tech_growth.get("trend", "neutral") if isinstance(tech_growth, dict) else getattr(tech_growth, "trend", "neutral")
-        tg_score = tech_growth.get("score", 0) if isinstance(tech_growth, dict) else getattr(tech_growth, "score", 0)
-        constituents = tech_growth.get("constituents", {}) if isinstance(tech_growth, dict) else getattr(tech_growth, "constituents", {})
-        signals = tech_growth.get("signals", None) if isinstance(tech_growth, dict) else getattr(tech_growth, "signals", None)
-
-        # 格式化时间框架信号
-        tf_detail = ""
-        if signals:
-            for tf_name in ["short_term", "medium_term", "long_term"]:
-                tf_signal = getattr(signals, tf_name, None) if hasattr(signals, tf_name) else (signals.get(tf_name) if isinstance(signals, dict) else None)
-                if tf_signal:
-                    tf_detail += f" {tf_name}={tf_signal.score:+.2f}"
-
-        today_text = ""
-        if today_change:
-            parts = [f"{k}={v:+.2f}%" for k, v in today_change.items()]
-            today_text = ", ".join(parts)
-
-        breadth_text = ""
-        if breadth_data:
-            up = breadth_data.get("up_count", 0)
-            down = breadth_data.get("down_count", 0)
-            limit_up = breadth_data.get("limit_up_count", 0)
-            limit_down = breadth_data.get("limit_down_count", 0)
-            breadth_text = f"上涨{up}家/下跌{down}家, 涨停{limit_up}/跌停{limit_down}"
-
-        prompt = f"""你是资深投资顾问。基于以下大盘技术分析结果，生成简洁研判。
-
-技术指标：
-- 科技成长: {tg_trend}（score={tg_score:.2f}）
-  - 创业板: {constituents.get('399006.SZ', 0):.2f}
-  - 科创50: {constituents.get('000688.SH', 0):.2f}
-- 时间框架: {timeframe_got.unified_trend}（unified_score={timeframe_got.unified_score:.2f}）
-  -{tf_detail}
-  - 矛盾模式: {timeframe_got.contradiction_type}
-- 跨指数模式: {cross_pattern}
-- 今日实时: {today_text or '无数据'}
-- 市场宽度: {breadth_text or '无数据'}
-
-请用 100 字以内总结市场状态和短期方向。直接输出文本，不要 JSON。"""
-
-        try:
-            from src.agent.llm_adapter import LLMToolAdapter
-            adapter = LLMToolAdapter()
-            response = await asyncio.to_thread(
-                adapter.call_text,
-                [{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=200,
-            )
-            content = (response.content or "").strip()
-            if content:
-                return content
-        except Exception as e:
-            logger.warning(f"[Node 1] LLM reasoning 失败: {e}，降级到规则拼接")
-
-        # 降级：规则拼接
-        return self._rule_based_reasoning(tech_growth, timeframe_got, cross_pattern, today_change)
+    
 
     @staticmethod
     def _rule_based_reasoning(
