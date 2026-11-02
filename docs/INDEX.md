@@ -87,7 +87,7 @@
 
 ## 二区 · GOT 现行（`got/`）
 
-> 2026-10-10 文档整理：顶层只留**清单类 + 一份待拍板简报**，已完结的过程稿（0922 审计 / 0926 决策简报 / cp12 系列 / cp13 系列共 8 份）全部移入 [`got/archive/`](got/archive/)。**2026-10-14 治理轮再收 1 份**（`架构审查计划_20261011.md`，原仓库根 untracked）；同时把根目录仅剩的 2 份现行文档（`外网对标实施_PLAN.md` / `GOT_问题分析_PLAN.md`）按「计划单一落点」条款改名移入 `got/plans/`——**仓库根目录自此无 GOT 文档**。
+> 2026-10-10 文档整理：顶层只留**清单类**，已完结的过程稿（0922 审计 / 0926 决策简报 / cp12 系列 / cp13 系列共 8 份）全部移入 [`got/archive/`](got/archive/)。**2026-10-14 治理轮再收 1 份**（`架构审查计划_20261011.md`，原仓库根 untracked）；同时把根目录仅剩的 2 份现行文档（`外网对标实施_PLAN.md` / `GOT_问题分析_PLAN.md`）按「计划单一落点」条款改名移入 `got/plans/`——**仓库根目录自此无 GOT 文档**。**2026-11-02**：`decision_brief_openc3_20260928.md` 由顶层移入 `got/archive/`（更正头 + §3.3 ② 已拍板）。
 
 | 文档 | 性质 |
 | --- | --- |
@@ -95,7 +95,7 @@
 | [got/backlog.md](got/backlog.md) | **待实施**清单（六类处置、0902 15 项处置表、A6 转正与退役、需裁决事项） |
 | [got/verification.md](got/verification.md) | **待验证 / 影子期**清单（判据、实测值与出处，不落达标判定；**2026-10-10 起含 MEG/FTS/FXG 三道买入侧新闸门判据**；「读数起算」已经 10-12 全流程实跑订正：三闸门时钟自 2026-10-12 起算，另含 GATE-1 / D-3 基线 / bear 拦单留痕等新起算节） |
 | [got/architecture.md](got/architecture.md) | GOT 架构设计 v2.0（基于代码实际实现；⚠️ 正文基线为 0831 快照，**文首时效注记已于 2026-10-10 刷新**并列出四个已知脱节区） |
-| [got/decision_brief_openc3_20260928.md](got/decision_brief_openc3_20260928.md) | **当前唯一待拍板简报**（OPEN-C3 `persistence_regime` 死分支：接线/删分支/保留三选一），故不入归档 |
+| [got/archive/decision_brief_openc3_20260928.md](got/archive/decision_brief_openc3_20260928.md) | **历史更正件（已归档）**：OPEN-C3「死分支」事实链已被 2026-10-10 更正头推翻；`range_reversal` 维持观测面已于 2026-10-15 拍板，不再待拍板 |
 
 ### 待实施 / 待批准计划（[`got/plans/`](got/plans/)，十三份）
 
@@ -113,6 +113,7 @@
 | [plans/GOT三问架构裁决_实施计划_20261015.md](got/plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261015.md)（原仓库根 `GOT三问架构裁决_PLAN.md`，10-15 治理轮移入） | **现行实施计划（Phase A–F）**：A 文档落账 ✅（10-15，backlog 三处挂号 + 持仓文档 §七 + 归档稿 [GOT三问架构裁决_20261014.md](got/plans/GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_20261014.md)，裁决正文 [docs/ 顶层](GOT%E4%B8%89%E9%97%AE%E6%9E%B6%E6%9E%84%E8%A3%81%E5%86%B3_PLAN.md)保留不删）；C 决策编排层 v0（C1 trade_plans 表 / C2 `decision_plan.py` / C3 通知接线 / C4 thesis 状态机挂 B 门 / C5 归档渲染）、D 分道预算标定（`SCORING_FORMULA_VERSION` → 2026-10-15.1）、E 三路路由影子、F 埋伏 per-lane validation 待实施 | **Phase B step 0 裁决资料包＝用户裁决门**（W3 五处口径枚举 + 入场锚选项 + thesis 状态机定稿），C4/Phase D ACTIVE 接线挂其后；C1/C2/C3/C5、E、F 不受 B 门阻塞可先行 |
 | [plans/外网对标实施计划_20261011.md](got/plans/%E5%A4%96%E7%BD%91%E5%AF%B9%E6%A0%87%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92_20261011.md)（原根目录 `外网对标实施_PLAN.md`，10-14 治理轮移入） | **部分实施**——项二（direction 净化）✅ / 项一（宏观扇出②+②b）代码在位但双开关缺省关 / 项三 3a ✅（D-3 基线 10-12 起算）/ 项四另列竞品计划 | 3b 双前置＝D-3 基线满 ≥10 交易日 + AlphaSift 接口三点设计拍板；项一翻 `GOT_MACRO_FANOUT_ENABLED`/`GOT_MACRO_SECTOR_ALIGN_ENABLED` 后待全流程读数（判据见 verification.md 项一节） |
 | [plans/regime与数据流断路_文献对照分析_20261011.md](got/plans/regime%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%B5%81%E6%96%AD%E8%B7%AF_%E6%96%87%E7%8C%AE%E5%AF%B9%E7%85%A7%E5%88%86%E6%9E%90_20261011.md)（原根目录 untracked `GOT_问题分析_PLAN.md`，10-14 治理轮移入） | **分析稿（现行，零生产代码）**——分析一（regime 钉死豁免键四方案）供 §7 #14 拍板；分析二（数据流断路接线）中 `confidence_multiplier` 接线建议已被 10-14 §1.J 裁决覆盖为「删除（已实施）」 | backlog §7 **#14** 待拍板；**#16**（cross_node_signals）与 #14 串联出稿；**#15**（industry_top）可独立出分析稿 |
+| [plans/埋伏道误判复盘_002009天奇_20261029.md](got/plans/%E5%9F%8B%E4%BC%8F%E9%81%93%E8%AF%AF%E5%88%A4%E5%A4%8D%E7%9B%98_002009%E5%A4%A9%E5%A5%87_20261029.md) | **分析稿，未批准实施**（1028 建仓 / 1029 未止损全链复盘 + Node 2 主线/埋伏盲区；零生产代码） | 6 条 P0：板块流不可按主题归因 / G-A4 无个股项且同分取输入序 / 个股资金未入闸门 / ambush 缺评（tech 用 ambush_rank、risk 默认 100）/ 叙事道身份错位 / 硬止损优先级最低；**§8 另列 N-1～N-6**（组名隐藏成员 / HI1 刀锋 / ambush 分数不落盘 / D7-D9 映射仅前 300 且逐日排序、可能静默缺失 / 无「具身智能/物理AI」软件模型家族（仅硬件别名） / 无龙头先行通道）；**§9 拍板方向 B+C**（T1 评分+催化 / T2 单评分 / T3 单催化分层准入；催化源扩到原始新闻检索、潜在事件池、跨日发酵；未实施）；**§10 催化剂重复身份**（全球 5 条为板块扇出、HBM 11-04/05 为叙事同源重复；事件身份 vs 行身份拆分、展示聚合/同源合并分级，未实施）；**§11 叙事层 Agent 化**（概念身份时间序列 + 个股涨跌归因两个窄任务；规则保留硬闸门/仓位/止损；影子先行，未实施）；**§12 自迭代审计 Agent 化**（收集→异常分诊→取证→grilling→报告→校验；只读草稿、人工裁决，未实施） |
 
 > ℹ️ **MEG / FTS / FXG 三道买入侧闸门无独立计划文档**（判据在 [verification.md](got/verification.md)，设计与回测在 `plans/加速末期识别缺陷分析_20261008.md` §七）。新计划一律写入 `docs/got/plans/`，**仓库根目录不留 PLAN 稿**（见 [AGENTS.md](AGENTS.md) 文档治理条款）。
 

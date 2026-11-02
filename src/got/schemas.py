@@ -1089,7 +1089,7 @@ class UnifiedContext(BaseModel):
     )
     llm_refinement_used: bool = Field(
         default=False,
-        description="是否使用了 LLM 精炼（板块 narrative）",
+        description="历史字段：2026-10-30 运行时收敛后恒 False，仅归档兼容保留",
     )
     ema_baseline: Optional[float] = Field(
         default=None,

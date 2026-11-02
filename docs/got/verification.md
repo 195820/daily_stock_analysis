@@ -3,6 +3,28 @@
 
 ---
 
+## 2026-11-02 补登（10-30 运行时收敛开关登记 + 两处产物/解析修复）
+
+背景：`bcede32`（2026-10-30）落语义运行时 / 两个窄 Agent / 只读复盘时未同步本清单；11-02 补登判据，并收口两处实锤缺陷。达标判定归项目负责人。
+
+### 10-30 新增开关与已生效改动
+
+| 项 | 开关（缺省） | 产物/行为 | 判据 | 回滚 |
+|---|---|---|---|---|
+| 窄 Agent（身份 + 归因） | `GOT_NARRATIVE_AGENTS_ENABLED`（true）/ `GOT_NARRATIVE_MAX_SYMBOLS`(20) / `GOT_NARRATIVE_TIMEOUT_S`(60) / `GOT_NARRATIVE_CONSTITUENTS_ENABLED`(true) / `..._TIMEOUT_S`(10) | `narrative_context.json`（status/identities/attributions）+ `semantic_memory` 表；A6 只当证据 | ① 有持仓日 `status ∈ {ok, empty}`（无持仓 `empty` 属预期）；② 每条 identity/attribution 的 `evidence_ids` 都能在 `agent_run.json` 闭包中解析（零伪造）；③ 决策面零改动：`sector_role`/闸门/仓位与 `=false` 日逐字节一致（抽 3 日） | 置 false（`status=disabled`，零 LLM 调用） |
+| 只读复盘 | `GOT_AUDIT_ENABLED`（shadow）/ `GOT_AUDIT_MAX_HYPOTHESES`(3) / `_MAX_GRILL_ROUNDS`(2) / `_MAX_SYMBOLIC_TOOLS`(8) / `_MAX_LLM_CALLS`(8) / `_TIMEOUT_S`(180) | `data/got_audit/YYYYMMDD/{report.md,findings.jsonl,audit_runs.jsonl,evidence_pack.json}` + trace | ① 只读：产物目录外零写入（`src/`/docs/thesis/trade_plans/config 无改动）；② 失败/超时/超预算 → `status=incomplete`，不得静默 pass；③ 现有读数可复算：10-29 `incomplete`、10-30 `ok`（0 findings / 2 calls） | `GOT_AUDIT_ENABLED=false`（CLI 直接 no-op） |
+| LLM trace | `GOT_LLM_TRACE_ENABLED`（true） | prompt/raw_response 落 run 目录 | 敏感字段不落盘（`SECRET_PATTERNS` 过滤）；置 false 只少原始报文，调用/usage/证据闭包不变 | false |
+| 已生效非影子改动（10-30） | 无运行期开关 | ① 删除 Node 1/2/3/4 reasoning、Node 6 refine、Node 7 LLM 精炼；② A6 共享语义回填 Node 4 concepts/risks + Node 5 hot_topics；③ 事件稳定 ID（`normalize_title+source+as_of`）+ T5 退役 + `_align_macro_rule_events` 规则扇出；④ 选股消息面直读 A6 relations（缺失标 `relation_missing`） | 回归测试 + 归档字段验收（`agent_run.json`/`agent_steps.jsonl`/`agent_glue.json`/`news.json`）；决策面回归以 10-30 归档为基线 | `git revert bcede32`（无运行期开关） |
+
+### 2026-11-02 两处修复
+
+| 缺陷 | 根因（实证） | 修复 | 判据 |
+|---|---|---|---|
+| `shadow_attention.json` 归档后消失 | `archive_daily_run` 原子替换白名单漏登；Node 4 已 4 次落盘（10-30 日志 14:57/15:01/15:09/15:30），归档后被整目录替换删除 | 新增 `PRE_ARCHIVE_ARTIFACTS` 单一登记点，补 `shadow_attention.json` / `shadow_shortlist_quota.json`；守卫测试 `tests/test_archive_pre_archive_artifacts.py` | 同日二次归档后两产物仍在；attention 判据（2026-10-28 节）**计时自修复后首个归档日重算**，此前归档不计样本 |
+| Q1 low 救援整批丢弃 | 单条送审时模型返回裸对象（10-30 `node4.low_rescue:004` status=ok，输出 `{index:0,...}`），解析器只收数组 → `ValueError: 输出非数组: dict` | 单对象归一 `[obj]`，标量仍 raise；T2b 端到端用例 + T7/T7b | 单对象响应 `upgraded=1`、`shadow_low_events.failure` 不出现；`tests/test_low_sector_rescue.py` 15 passed |
+
+---
+
 ## 2026-10-29 补登（Node 4 分层粗筛 — 生产直接启用 + 事后验证）
 
 计划：`local://node4-news-retrieval-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。
@@ -28,7 +50,7 @@
 
 | 影子线 | 开关（缺省） | 产物 | 决策影响 | 转正判据（归负责人） |
 |---|---|---|---|---|
-| attention 观测（P0-1） | `GOT_ATTENTION_SHADOW`（true） | `shadow_attention.json` | 零：不写 `source_count`、不进 prompt、不进 `_detect_fermenting_events` | ≥10 交易日 `platform_count` 分布稳定 + 多平台同题人工抽检无系统性误聚 |
+| attention 观测（P0-1） | `GOT_ATTENTION_SHADOW`（true） | `shadow_attention.json` | 零：不写 `source_count`、不进 prompt、不进 `_detect_fermenting_events` | ≥10 交易日 `platform_count` 分布稳定 + 多平台同题人工抽检无系统性误聚。**〔11-02 注记：该产物此前被归档原子替换删除，计时自修复后首个归档日重算，见 2026-11-02 节〕** |
 | 正文精读（P0-2） | `GOT_NEWS_FULLTEXT_ENABLED`（**false**） | 无独立产物（prompt 素材行） | true 后细读输入变长（≤`GOT_NEWS_FULLTEXT_MAX_CHARS`=1200 字/条 + 正文补抓） | 对照跑：`affected_stocks` 非空事件数 ≥ 基线、LLM 输出 token 用量无异常 |
 | 短名单类目配额（P1-3） | `GOT_NEWS_SHORTLIST_QUOTA`（false） | `shadow_shortlist_quota.json` | true 时同类目超额部分整组裁掉（按 LLM 顺序，空位不回填） | `category_dist` 实测单一类目常态 ≤6 → 可直接放弃转正并删开关 |
 
@@ -836,7 +858,7 @@
 | 批次 | 开关与缺省 | 影子产物 | 转正门槛 | 当前状态 |
 |---|---|---|---|---|
 | **D0** 个股当日涨幅批量取数 | 无开关（`TencentFetcher.get_stock_quick_change` 为取数原语） | —（供 D 消费） | — | 已落，5 单测 | 
-| **D** news_pulse 持仓异动归因 | `GOT_NEWS_PULSE_ENABLED=0`（缺省**关**）/ `GOT_NEWS_PULSE_THRESHOLD=7.0` / `GOT_NEWS_PULSE_MAX_STOCKS=3` | `data/got_daily/{date}/news_pulse.json` | 先手动跑一周验输出质量（归因表含排除项/性质四选一/盘中收盘两口径）；推送接线另立子项 | 代码+测试就位（6 例），默认关未跑 |
+| ~~**D** news_pulse 持仓异动归因~~ | —（`GOT_NEWS_PULSE_*` 已不存在） | — | — | ✅ **已销（2026-10-30 运行时收敛）**：`news_pulse.py` + `test_news_pulse.py` 删除，原「手动跑一周」判据作废 |
 | **G** output_review 产出自查 | `GOT_OUTPUT_REVIEW=1`（缺省**开**，warn 态零行为） | `data/got_daily/{date}/review.json` | 一期只 warn；critical 项升为**阻断**需两周零误报人工确认（且阻断只拦推送/终端，归档照常） | 已落（一期 warn），10 例 |
 | **A** 证据链与出处 | 无独立总开关；一期 `EVIDENCE_TIER_MULTIPLIER` confirmed==reported==1.0（**零行为变化**）；Node4 抽取 prompt 的 url/时间接地受 `GOT_NEWS_EVIDENCE_GATING=false` 门控（审查 W2：开启会改 LLM 输入，缺省关=prompt 逐字同改造前） | `catalyst_events.evidence_tier/source_url` + `node4_raw_news.url/published_at` 列（已实 DB 迁移） | 二期启用 rumor<1.0 折扣前，先历史归档重放 pool 成员对比 + 人工确认（防换池）；开接地前先同输入 golden 抽取对照 | 已落（催化剂侧 tier+乘数零变化 + 新闻侧回连机制，默认关），13 例；rumor 未标→零变化 |
 | **B** antibias 反偏见 | `GOT_ANTIBIAS_SHADOW=true`（缺省**开**，只观测）/ `GOT_ANTIBIAS_MAX_SECTORS=8` | `data/got_daily/{date}/shadow_antibias.json` | 一期不进排序/warnings；B2 转正前置：glue status=ok 非降级/回放日 + 影子≥10 交易日 + counter_thesis 非空率>80%。**〔10-12 实测补条件：`_collect_actionable_sectors` 只取 `is_holding` 或 action∈(buy_trend,buy_dip,hold)；10-12 三个候选全 `watch` 且空仓 ⇒ 函数 `return None`、零产物零告警 ⇒ 「≥10 交易日」必须只计「有买入/持有标的」的日，否则计时器不动（backlog §9 #7）〕**〔10-15 采样口径注记：产物侧 `{skipped_reason: no_actionable_target}` 落行仍未实施（全仓零命中），在补码前，空仓/全 watch 日「文件缺失 = 无样本日不计」的读法成立；样本侧不足类冲突按 3b 门槛先例用合成上下文补测，不得拿单一行情态样本当全量〕 | 已落，6 例；与 G 的红线不一致校准 warning 待二期接（需跨产物读数） |
@@ -1375,7 +1397,7 @@ C-P11（回填跑批）的产出前提尚未成立。R-C2 的路径约定证据�
 | **M3** 误配率人工抽查 | 人工 | 判据 ≤15%，样本为每日候选全量（≤10 分钟/日）。工具已备：`scripts/export_glue_family_audit.py`（**已纳入版本控制**，commit `0ac5252`），自述"只搬运事实，不做判定，判定列留空给审核者"。<br>📌 **材料已生成（2026-09-14 实跑）**：5 个有效归档日（0904 / 0907 / 0909 / 0910 / 0914，与 §2 的样本数独立互证）、**128 行候选**，类别分布 `same=78` / `recovered=42` / `overridden=6` / `both_none=2`；**待判**的那一类是 `overridden`（6 行）。输出 `data/glue_family_audit/family_audit.html`。判定归负责人。<br>✅ **2026-10-06 评审包已产**（`scripts/build_m3_review_package.py`，流程口径见下行）：最近 5 归档日（0923/0924/0928/0929/0930）候选 120 行 → 分层抽 36 行（回收 25 + 一致 10 + 推翻 1），产物 `data/glue_family_audit/m3_review_20261006.md/.csv/.json`（判定列全空，等负责人填 `grade` 后 `--score` 计分）。**新读数提醒**：`overridden`（推翻）池 5 日合计仅 1 行（0914 那批曾有 6 行）——家族词表同源修复后规则侧/glue 侧已趋一致，**OPEN-C2 设想的「冲突 3」层当前无样本可抽**，M3 的主战场实为「其他回收」层（35 行/5 日）；另有 55/120（46%）是 glue 弃权/双空，按 §8.1 不入 M3 分母，但属 M1/M4 侧要看的信号。<br>✅ **终审完成并结案（2026-10-06）**：36 行判满→误配率 **2.8%**、连续 5 日达标 `status=met`；负责人裁决**直接转正**，放弃 `--sample-mode full` 复跑前置——全量分母实为 **65 行/5 日＝日均约 13 条**（不是此前估计的 120 行判不动，120 含弃权/双空），且分层对难点超采 72.2% vs 总体 55.4% 使 2.8% 属**偏高**读数，按层外推全量 **≈2.2%**，两读数同处红线内。残留：n＝36 功效弱（Wilson95 上界 14.17% 勉强压线）、弱关系堆积 11.1% 未处理；stratified 转**日常预警**，破线需人工复核、不自动回滚。读数表见 **§3** 本指标行，结案论证见【架构计划】§11.8 |
 | **OPEN-C2** M3 人工流程未定义 | 人工 | ✅ **流程已定义（2026-10-06，落进 `scripts/build_m3_review_package.py` + 评审包 §〇 表）**：① **谁判**＝负责人（脚本不代判，M3 无可查询真值表）② **抽样**＝按日分层抽 10（『其他』回收 5 + 冲突 3 + 随机对照 2），seed 固定逐日独立子流可复现，**池不足如实记缺口、绝不跨层补齐**（拿一致样本填冲突空缺会把误配率稀释成假达标）③ **判据三档 + 一档兜底（不参与计分）**＝强关系（存在真实需求/基本面传导）/ 弱关系（链存在但间接牵强）/ 无关系（无实质传导）/ 无法判定（证据不足，不入分子也不入分母，单独披露）④ **计分**＝误配率 = 无关系 /（强+弱+无），只有「无关系」计分子；glue 弃权/双空不入分母（§8.1 定义 M3 针对「给出了归属」的行）⑤ **红线与转正**＝单日 ≤15%（10 样本 → 最多 1 条无关系，2 条即 20% 破线），末尾**连续 5 个抽查日**逐日达标；⑥ **可比性约束**＝分层口径对难点超采、读数偏高。原写「转正必须 `--sample-mode full`（§8.1 每日全量）复跑」，**该前置已于 2026-10-06 负责人裁决作废**：M3 直接以分层终审读数结案（偏高读数作验收属保守方向；按层外推全量 ≈2.2%），stratified 此后只作日常预警。**本项已结**（读数见 §3 M3 行，结案论证见【架构计划】§11.8） |
 | **OPEN-C1** `transition_count` 时间炸弹 | 时间窗 | 🔴 **首次跌破阈值 = 2026-09-24**（已按窗口实算，替代原「约 09-25」估计）。窗口口径 = `load_regime_state_history(days=20)`，取**最近 20 个带 `market_regime` 字段的归档日**（无该字段的日不占窗格）。<br>📌 **实测 20260914 = 11**，窗口为 `0817…0914` —— 原文记的「0813–0826 十天」已过期：**0813 / 0814 早已滚出**，剩余 8 天（`0817–0826`）在 `0915–0924` 逐个滚出。<br>滚动预测（假设期间无新切换）：`0915:10 → 0918:8 → 0921:7 → 0923:5 → **0924:4**`。<br>两个消费者都在 `aggregator.py`：`:3192` 仓位震荡惩罚 ×0.8、`:3335` `range_reversal` 信号生成（需 `>=5` **且** `persistence_regime == "low"`）——**0924 起两者同时失去触发条件** |
-| **A5 影子期** | 时间窗 | 需 ≥10 个交易日（当前有效样本 **5 天**，见 §2；缺口 0908，0911/0912 的产物是测试污染见 §2.2）。距达标差 **5 个交易日** |
+| **A5 影子期** | 时间窗 | ✅ **已结（条目失效）**：A5 glue 影子期已于 2026-09-17 按负责人裁决转正为 A6 阶段 1（见下方同名状态变更节），«≥10 交易日» 判据不再适用；后续 glue 水位观测改由 M1–M6 承担 |
 | **Phase 5b 显著性校准** | 时间窗 | 需归档 ≥60 交易日（`archive/got_timeseries_calibration.md` 记为预计 2026-11 下旬） |
 
 ---

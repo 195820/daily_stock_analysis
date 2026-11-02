@@ -68,7 +68,7 @@
               ┌──────────────────────────────┐                           │
               │  Phase 2: 统一决策             │                           │
               │  风险评估→统一打分→组合优化    │                           │
-              │  →轮动检测→LLM精炼            │                           │
+              │  →轮动检测→规则推理            │                           │
               │  + 埋伏退出信号(P4)           │                           │
               └──────────────┬───────────────┘                           │
                              ↓                                            │
@@ -687,8 +687,6 @@ PMI（月末），CPI/PPI（月中 10 日），社融/M2（月中 13 日），LP
 | IMPACT_WEIGHT | {1:0.3, 2:0.6, 3:1.0} | 影响级别→权重 |
 | ANTICIPATION_DECAY_NEAR | 0.6 | ≤2 交易日→衰减 |
 | ANTICIPATION_DECAY_NORMAL | 1.0 | 3-10 交易日 |
-| REFINE_TOP_N | 10 | LLM 精炼基础 Top-N |
-| REFINE_MAX_SECTORS | 20 | 总板块上限 |
 | AMBUSH_NOMINATION_MAX | 2 | Agent 提名上限 |
 | AMBUSH_NOMINATION_MIN_CONFIDENCE | 0.6 | 提名置信度门槛 |
 | AMBUSH_NOMINATION_MULTIPLIER | 0.6 | 催化分数折扣 |
@@ -745,7 +743,7 @@ PMI（月末），CPI/PPI（月中 10 日），社融/M2（月中 13 日），LP
 2. **统一打分**: 持仓+候选一起评（消除循环依赖）
 3. **组合优化**: 规则分配（卖→预算→买 Top3）
 4. **轮动检测+拥挤检查**
-5. **LLM 精炼**: 1 次调用
+5. **规则推理**: 0 次 LLM 调用（2026-10-30 删除原 LLM 精炼，reasoning 纯规则）
 
 ### 9.2 Step 1 风险评估
 
@@ -938,8 +936,6 @@ Final = 0.6×lifecycle_priority + 0.4×composite_score
 **Node 6 常量**:
 - EMA_ALPHA: 0.3
 - EMA_COLD_START_DAYS: 5
-- REFINE_TOP_N: 10
-- REFINE_MAX_SECTORS: 20
 
 **选股流水线常量**:
 - _STAGNATION_CALIBRATION_DATE: "2026-06-17"

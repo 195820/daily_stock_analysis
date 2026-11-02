@@ -2,20 +2,22 @@
 """
 Node 4 单元测试：Q1 low 事件板块级救援（2026-10-16 补登 #6，用户裁决直连）。
 
-覆盖（T1-T13）：
+覆盖（T1-T15）：
 1. 开关关闭 → disabled 占位影子 + 不调 LLM + 零升级（回滚语义）
 2. 正常升级：sector_impact=high → medium 原地升级（全字段保留）
 3. 无复审候选 → 有效样本落盘（review_candidates=0）
 4. LLM 空响应 → failure 影子落盘 + 降级不升级
 5. 解析失败（非 JSON）→ 同 T4
 6. 解析器剥 ``` 围栏
-7. 解析器非数组输出 raise
-8. 解析器空响应 raise
-9. 非法 verdict 丢弃（index 越界 / sector_impact 非法值）
-10. 升级事件在 run() 过滤行存活（impact_level != "low" 保留）
-11. disabled 占位键完整
-12. 落盘 OSError → 不 raise，升级结果照常返回（留痕失败≠救援失败）
-13. 影子 events[] 含未送审行（无映射事件 reason 标注）
+7. 解析器单对象归一为单元素数组（10-29/30 实锤：单条送审返回裸对象）
+8. 解析器标量输出 raise
+9. 解析器空响应 raise
+10. 非法 verdict 丢弃（index 越界 / sector_impact 非法值）
+11. 升级事件在 run() 过滤行存活（impact_level != "low" 保留）
+12. disabled 占位键完整
+13. 落盘 OSError → 不 raise，升级结果照常返回（留痕失败≠救援失败）
+14. 影子 events[] 含未送审行（无映射事件 reason 标注）
+15. T2b：单对象响应在 run() 级照常升级（端到端）
 """
 
 import asyncio
@@ -58,8 +60,8 @@ def _make_event(title, impact="low", sectors=None, sentiment="positive"):
 
 
 def _fake_llm(verdicts):
-    """构造 _call_llm 替身（签名对齐 (prompt, *, temperature, max_tokens, max_retries)）。"""
-    def _impl(prompt, *, temperature=0.0, max_tokens=0, max_retries=3):
+    """构造 _call_llm 替身（签名对齐 (prompt, *, temperature, max_tokens, max_retries, task_id)）。"""
+    def _impl(prompt, *, temperature=0.0, max_tokens=0, max_retries=3, task_id="node4.llm"):
         return json.dumps(verdicts, ensure_ascii=False)
     return staticmethod(_impl)
 
@@ -130,6 +132,21 @@ class TestLowSectorRescue(unittest.TestCase):
         self.assertEqual(upgraded.sentiment, "positive")
         self.assertEqual(upgraded.title, "A板块利好")
 
+    # T2b ────────────────────────────────────────────────────────
+    def test_t2b_single_object_response_upgrades(self):
+        """单条送审返回裸对象 → 归一后照常升级（10-29/30 的生产形状）。"""
+        events = [_make_event("A板块利好", sectors=["低空经济"])]
+        with patch.object(na, "GOT_LOW_SECTOR_RESCUE", True), \
+             patch.object(na, "date", _FixedDate), \
+             patch.object(na.NewsAnalysisNode, "_call_llm", _fake_llm(
+                 {"index": 0, "sector_impact": "high", "reason": "行业性政策落地"}
+             )):
+            result = self._run_rescue(events)
+        self.assertEqual([e.impact_level for e in result], ["medium"])
+        record = json.loads(_SHADOW_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(record["upgraded"], 1)
+        self.assertNotIn("failure", record)
+
     # T3 ─────────────────────────────────────────────────────────
     def test_t3_no_candidates_valid_sample(self):
         """无复审候选：review_candidates=0 有效样本落盘，不调 LLM。"""
@@ -186,10 +203,15 @@ class TestLowSectorRescue(unittest.TestCase):
         self.assertEqual(verdicts[0]["sector_impact"], "high")
 
     # T7 ─────────────────────────────────────────────────────────
-    def test_t7_parser_non_array_raises(self):
-        """非数组输出 raise ValueError（run() 降级为原过滤行为）。"""
+    def test_t7_parser_single_object_wrapped(self):
+        """单对象输出归一为单元素数组（2026-10-29/30 实锤）。"""
+        verdicts = na.NewsAnalysisNode._parse_low_rescue_verdicts('{"index": 0, "sector_impact": "high"}')
+        self.assertEqual(verdicts, [{"index": 0, "sector_impact": "high"}])
+
+    def test_t7b_parser_scalar_raises(self):
+        """标量输出仍 raise ValueError（不放开非对象形状）。"""
         with self.assertRaises(ValueError):
-            na.NewsAnalysisNode._parse_low_rescue_verdicts('{"index": 0}')
+            na.NewsAnalysisNode._parse_low_rescue_verdicts("123")
 
     # T8 ─────────────────────────────────────────────────────────
     def test_t8_parser_empty_raises(self):

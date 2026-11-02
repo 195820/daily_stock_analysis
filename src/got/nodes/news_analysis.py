@@ -341,6 +341,8 @@ class NewsAnalysisNode:
 
         纯观测：不写 `source_count`、不进 prompt、不进 `_detect_fermenting_events`。
         开关 `GOT_ATTENTION_SHADOW=false` → 缺文件不回现状（零产物）。
+        归档前直写当日目录，文件名须登记 `archive.PRE_ARCHIVE_ARTIFACTS`，
+        否则同日二次归档的原子替换会把它删除（2026-10-30 实锤）。
         """
         if not GOT_ATTENTION_SHADOW:
             return
@@ -583,7 +585,10 @@ class NewsAnalysisNode:
 
     @staticmethod
     def _write_shortlist_quota_shadow(record: Dict[str, Any]) -> None:
-        """落 shadow_shortlist_quota.json（tmp+replace 原子写，影子产物同款惯例）。"""
+        """落 shadow_shortlist_quota.json（tmp+replace 原子写，影子产物同款惯例）。
+
+        归档前直写当日目录，文件名须登记 `archive.PRE_ARCHIVE_ARTIFACTS`。
+        """
         try:
             day_dir = Path("data/got_daily") / date.today().strftime("%Y%m%d")
             day_dir.mkdir(parents=True, exist_ok=True)
@@ -1443,6 +1448,10 @@ class NewsAnalysisNode:
 
         数组协议不走 _extract_json：其 dict-only 截断修复会把截断数组静默解析成
         首事件对象（形状错配非报错）。失败 raise，由 run() 降级为原过滤行为。
+
+        单对象归一（2026-10-29/30 实锤）：只有 1 条送审时模型常返回裸对象
+        ``{"index": 0, ...}``，旧逻辑按「非数组」整批丢弃（归档留痕为
+        「LLM/解析失败，未获判定」）。对象按 ``[obj]`` 归一，标量仍 raise。
         """
         if not raw or not raw.strip():
             raise ValueError("low 救援复审 LLM 空响应")
@@ -1451,6 +1460,8 @@ class NewsAnalysisNode:
             lines = cleaned.split("\n")
             cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         items = json.loads(cleaned)
+        if isinstance(items, dict):
+            items = [items]
         if not isinstance(items, list):
             raise ValueError(f"low 救援复审输出非数组: {type(items).__name__}")
         return [v for v in items if isinstance(v, dict)]

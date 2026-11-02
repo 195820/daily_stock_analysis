@@ -5577,7 +5577,7 @@ verdict 含义：
         new_market_value = total_market_value - sell_proceeds
         position_gap = target_position_value - new_market_value
 
-        # ── Phase 3b：RiskOverridePlan 注入（批次 5 §3.3，Step 5 LLM 精炼前的预算闸门）──
+        # ── Phase 3b：RiskOverridePlan 注入（批次 5 §3.3，买入预算前的预算闸门）──
         # 三态开关（与 4b/5c 同惯例）：shadow（默认）=只算 RiskOverridePlan 落
         #   self._risk_override_shadow 观测、**不改 buy_budget**（旧路径逐字节不变）；
         #   enabled 且 veto_buy → 与 over_limit_forced 并列把 buy_budget 归零（风控优先于既有降级规则）。
@@ -6025,10 +6025,6 @@ verdict 含义：
             )
 
         return allocations, vetoed_candidates
-
-    # ── LLM 精炼 ──
-
-    
 
     # ── 辅助方法 ──
 

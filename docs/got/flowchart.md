@@ -295,7 +295,7 @@ RRG：`rs_ratio` / `rs_momentum` 各做 3 日 EMA（α=.5）；象限阈值 .5/.
 |---|---|---|
 | 前瞻窗口 | `CATALYST_WINDOW_DAYS` | 14 日历日 |
 | 全量刷新 | `CATALYST_FULL_REFRESH_INTERVAL` | 5 交易日；其余增量 |
-| 评分/排序门槛 | `CATALYST_CONFIDENCE_GATE` | .70（B 公式评分、LLM 精炼注入、确定性提升、P5 重排、提名事件、防买顶已发酵） |
+| 评分/排序门槛 | `CATALYST_CONFIDENCE_GATE` | .70（B 公式评分、确定性提升、P5 重排、提名事件、防买顶已发酵） |
 | 埋伏准入 | `CATALYST_CONFIDENCE_GATE_LOW` | .60（可用 env 回滚至 .70） |
 | 蓄水池升格 | `CATALYST_CONFIDENCE_GATE_LOW` | .60（2026-10-23 对齐准入档） |
 | LLM 提名置信度 | `AMBUSH_NOMINATION_MIN_CONFIDENCE` | .60（与事件置信度 .70 双门） |
@@ -430,7 +430,7 @@ Agent 提名：仅救吸筹失败，单次批量 LLM，最多 2 条；**事件�
   - `sentiment_top`：反向信号 + cooling + 加速度<-.1
   - `catalyst_confirmation`：T+3>5% + 资金连续正流入≥3 日
   - `range_reversal`：20 日切换≥5 + 低持续性
-- LLM：板块精炼 1 次（≤10 基础 + 全部埋伏，≤20）；消息覆盖 1 次（±.2 仓位，条件性）；T3 ≤3 次串行；提名 1 次（条件性）。
+- LLM：A6 语义粘合 1 次（全板块，含 narrative/concepts/key_risks）；T3 ≤3 次串行；提名 1 次（条件性）。
 
 ---
 
@@ -611,6 +611,6 @@ T1-H 惩罚：exit severity .4、reduce .2；`1 - severity×confidence`，下限
 3. **`final_position_limit` 不用 Node 1 `position_limit`**：Node 6 按 actionable 数 + 平均 confidence + dwell + transition_count 重算，并 cap 到 `risk_budget`。
 4. **Node 5 是 5 维加权**：`sentiment_momentum` 是独立特征，不是第 6 个加权维度。
 5. **新闻合并权重为 40/35/25**（来源/时效/跨源计数），不是架构文档的 30/25/20/25；热度项已于 2026-10-22 删除。
-6. **催化双档**：评分/排序/精炼/确定性提升/P5/提名事件/防买顶用 .70；埋伏准入 + 蓄水池升格用 .60；LLM 提名置信度另设 .60。
+6. **催化双档**：评分/排序/确定性提升/P5/提名事件/防买顶用 .70；埋伏准入 + 蓄水池升格用 .60；LLM 提名置信度另设 .60。
 7. **Phase 2 分道预算已生效**：`GOT_LANE_BUDGET_ENABLED=1` 为缺省，不是影子；Step 1.5 超限减仓仍是影子。
 8. **Node 2 tier 家族项为 +1**（代码），架构文档写 +2；S/A/B 阈值不变。

@@ -5,13 +5,14 @@
 > **正文与节号一字未改**（包括节号，如 `agent_glue_plan_0903.md` §5.3），因此代码与脚本中的**节号引用仍然可解析**。
 > ⚠️ 但**不是“文件一个字节都没动”**：2026-10-10 搬迁时对三份过程稿做了最小改动（`decision_brief_20260926.md` 加首屏归档注 + 修 3 处指回 backlog 的相对链接前缀；`cp12_prompt_variants_draft_20260926.md` / `cp13_phase2_closeout_20260928.md` 各改文档路径引用），对 6 份根目录稿只新增首屏状态头。三类改动均**不移动 `§X.Y` 节号**，故节号引用不受影响；带路径的引用（`docs/got/<file>.md`）已统一改指 `docs/got/archive/<file>.md`。
 >
-> **当前有效文档**（`docs/got/` 顶层，仅四份清单类 + 一份待拍板简报）：
+> **当前有效文档**（`docs/got/` 顶层，仅四份清单类）：
 > - [`backlog.md`](../backlog.md) —— 待实施
 > - [`verification.md`](../verification.md) —— 待验证 / 影子期
 > - [`architecture.md`](../architecture.md) —— 架构现状权威描述（含时效注记）
 > - [`README.md`](../README.md) —— GOT 文档导航
-> - [`decision_brief_openc3_20260928.md`](../decision_brief_openc3_20260928.md) —— **仍待拍板**（OPEN-C3 死分支三选一），故不入本目录
-> - [`../plans/`](../plans/) —— 待实施 / 待批准计划（十一份，2026-10-14 治理轮后，见 [`docs/INDEX.md`](../../INDEX.md) 二区）
+> - [`../plans/`](../plans/) —— 待实施 / 待批准计划（2026-10-14 治理轮后，见 [`docs/INDEX.md`](../../INDEX.md) 二区）
+>
+> **2026-11-02 新收**：`decision_brief_openc3_20260928.md` 由顶层移入本目录——文首已有 2026-10-10 更正头（「死分支」事实链被推翻），且 `backlog.md` §3.3 ② 已于 2026-10-15 拍板「维持观测面」，原「待拍板」状态结束。
 
 ---
 

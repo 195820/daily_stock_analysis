@@ -133,17 +133,8 @@ def archive_daily_run(
         # Q1/埋伏宽限影子旁路（2026-10-16）：news_analysis._rescue_low_events 与
         # aggregator._compute_ambush_exit_grace_shadow 在归档前直写当日目录，同 glue
         # 语义（当日影子结论末版为准），必须随本轮搬运否则被原子替换删除。
-        for _shadow_name in (
-            SHADOW_LOW_EVENTS_ARTIFACT,
-            SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
-            NEWS_RETRIEVAL_TRACE_ARTIFACT,
-            # 2026-10-30 运行时收敛：run trace 与叙事上下文同样在归档前写入当日目录，
-            # 必须随原子替换搬运，避免被删除。
-            "agent_run.json",
-            "agent_steps.jsonl",
-            "narrative_context.json",
-            "run_card.json",
-        ):
+        # 名单统一登记在模块级 PRE_ARCHIVE_ARTIFACTS，新增旁挂产物只改那一处。
+        for _shadow_name in PRE_ARCHIVE_ARTIFACTS:
             _shadow_src = archive_dir / _shadow_name
             if _shadow_src.exists():
                 shutil.move(str(_shadow_src), str(tmp_dir / _shadow_name))
@@ -837,6 +828,23 @@ SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT = "shadow_ambush_exit_grace.json"
 # Node 4 分层粗筛 trace（2026-10-29）：news_retrieval.read_news 在归档前直写当日目录，
 # 不搬进 tmp 会被 archive_daily_run 的原子替换删除（与 glue/low-events 同语义）。
 NEWS_RETRIEVAL_TRACE_ARTIFACT = "news_retrieval_trace.json"
+SHADOW_ATTENTION_ARTIFACT = "shadow_attention.json"
+SHADOW_SHORTLIST_QUOTA_ARTIFACT = "shadow_shortlist_quota.json"
+
+# 归档前直写当日目录、必须随原子替换搬运进 tmp 的产物（单一登记点）。
+# 新增此类旁挂文件时同时登记于此，否则同日后跑一次就会被删除（2026-10-30 实锤：
+# Node 4 已 4 次落盘 shadow_attention，仍因白名单漏登而在归档后消失）。
+PRE_ARCHIVE_ARTIFACTS = (
+    SHADOW_LOW_EVENTS_ARTIFACT,
+    SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
+    NEWS_RETRIEVAL_TRACE_ARTIFACT,
+    SHADOW_ATTENTION_ARTIFACT,
+    SHADOW_SHORTLIST_QUOTA_ARTIFACT,
+    "agent_run.json",
+    "agent_steps.jsonl",
+    "narrative_context.json",
+    "run_card.json",
+)
 
 
 def _shadow_display_name(name: str, symbol: str) -> str:

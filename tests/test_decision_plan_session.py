@@ -94,7 +94,9 @@ def test_reconcile_records_readable_after_session_close(isolated_db) -> None:
             target_quantity=100.0,
             target_value=150000.0,
             execution_status="pending",
-            valid_until=yesterday + timedelta(days=3),
+            # valid_until 相对「今天」而非固定 plan_date：reconcile 的过期判据读
+            # date.today()，固定日期会在若干天后把本用例变成恒 expired（2026-11-02 实锤）。
+            valid_until=date.today() + timedelta(days=3),
         )
     )
     session.commit()

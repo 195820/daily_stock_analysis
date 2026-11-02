@@ -4,8 +4,8 @@
 正文 = 固定摘要块（操作总结 / 风险三数 / Top3 建议区间 / 轮动 / 拥挤 / warnings）
      + 当日 ``reasoning.md`` 全文（Node 1–7 推理 + 影子模式观测段）。
 
-为什么要塞全文：摘要块实测只有 0.5 KB，`decision.reasoning`（Phase 2 LLM 精炼）
-在旧实现里连终端都打了却没进 push，Node 1–6 的推理与影子读数更是只落归档。
+为什么要塞全文：摘要块实测只有 0.5 KB，`decision.reasoning`（Phase 2 决策推理，
+2026-10-30 起为纯规则生成）在旧实现里连终端都打了却没进 push，Node 1–6 的推理与影子读数更是只落归档。
 NtfySender 对 >3800 B 的正文自动改「摘要 + 附件」（公共 ntfy.sh 单附件 2 MB / 3 h 过期），
 飞书 / 企微 / Telegram / Slack 的 sender 均已实现分段，故整段塞进来是安全的；
 归档缺失时退化为纯摘要，绝不阻断推送。
