@@ -23,6 +23,16 @@
 | `shadow_attention.json` 归档后消失 | `archive_daily_run` 原子替换白名单漏登；Node 4 已 4 次落盘（10-30 日志 14:57/15:01/15:09/15:30），归档后被整目录替换删除 | 新增 `PRE_ARCHIVE_ARTIFACTS` 单一登记点，补 `shadow_attention.json` / `shadow_shortlist_quota.json`；守卫测试 `tests/test_archive_pre_archive_artifacts.py` | 同日二次归档后两产物仍在；attention 判据（2026-10-28 节）**计时自修复后首个归档日重算**，此前归档不计样本 |
 | Q1 low 救援整批丢弃 | 单条送审时模型返回裸对象（10-30 `node4.low_rescue:004` status=ok，输出 `{index:0,...}`），解析器只收数组 → `ValueError: 输出非数组: dict` | 单对象归一 `[obj]`，标量仍 raise；T2b 端到端用例 + T7/T7b | 单对象响应 `upgraded=1`、`shadow_low_events.failure` 不出现；`tests/test_low_sector_rescue.py` 15 passed |
 
+### 2026-11-02 P0 持仓修复（I-1 / I-3 / I-4）
+
+| 项 | 根因 | 修复 | 判据（下次生产跑机械可核对） |
+|---|---|---|---|
+| P4 快照退出 | `assess_holding` 的 P4 在 `thesis_drift` 之后且要求 `sector_role=="ambush"`；002009 被判 mainline + grace 时 `fade_sell` 永不登记 | 快照 `signal` 非空提到 ⓪ 最高优先级，去掉 role 门槛 | 002009 若仍有 open snapshot + `fade_sell`：`unified_scoring` 动作 `sell`、`action_reason_code=p4_exit`、`ambush_exit_signals` 含 002009，快照 `is_open=false`；无 snapshot 持仓不受影响 |
+| H1 资金流桥接 | `holdings_flow_index` 以 thesis `动力电池` 为 wish，但 `sector_flow_all` 键为 `动力电池回收`；Phase 2 又只按当日 boards 查 | `HOLDING_SECTOR_FLOW_BRIDGES` + 消费侧并入 thesis 板块名 | `capital.json.evidence.holdings_flow_index.index["动力电池"]`：`matched=true`、`bridge_from=动力电池`、`matched_key` **逐字节**存在于 `sector_flow_all` 键集合；`_score_capital` 的资金维不再 `capital_data_missing` |
+| cancelled buy 锚 | `reconcile` 只改 trade_plans 状态，不关 open thesis/snapshot（002741/002093 无持仓仍 open） | `_close_buy_plan_anchors`：buy cancelled 且票消失时关闭 | 下一跑若有 cancelled buy plan：对应 `holding_thesis_snapshots.is_open=false`、`lifecycle_state=closed`；`ambush_position_snapshots.is_open=false`、`exit_signal=plan_cancelled`；partial/executed 不关 |
+
+T1-H 裁决（2026-11-02）：继续影子，不转正；有效样本 3 日 / 1-2 只，待 ≥10 个交易日且 ≥3 只持仓复评。`penalty=null` 属影子设计。
+
 ---
 
 ## 2026-10-29 补登（Node 4 分层粗筛 — 生产直接启用 + 事后验证）

@@ -341,11 +341,23 @@ class CapitalAnalysisNode:
         index: dict[str, dict] = {}
         hit_count = 0
         misses: list[str] = []
+        bridged: list[str] = []
+        from src.got.board_aliases import resolve_holding_flow_bridge
+
         for wish in wishes:
             matched_key = _resolve_sector_flow_key(wish, flow_map)
+            bridge_from = ""
+            if not matched_key:
+                bridge_key = resolve_holding_flow_bridge(wish)
+                if bridge_key:
+                    matched_key = _resolve_sector_flow_key(bridge_key, flow_map)
+                    if matched_key:
+                        bridge_from = wish
+                        bridged.append(wish)
             row = {
                 "matched": bool(matched_key),
                 "matched_key": matched_key or "",
+                "bridge_from": bridge_from or None,
                 "flow": flow_map.get(matched_key) if matched_key else None,
                 "flow_3d": flow_3d.get(matched_key) if matched_key else None,
                 "flow_5d": flow_5d.get(matched_key) if matched_key else None,
@@ -361,6 +373,9 @@ class CapitalAnalysisNode:
             note = "sector_flow_all 不可用（Node 3 降级），全部持仓板块资金维缺失"
         elif misses:
             note = f"{len(misses)} 个持仓板块在 sector_flow_all 三级别名匹配后仍未命中"
+        if bridged:
+            bridge_note = f"{len(bridged)} 个持仓板块经口径桥接命中: {', '.join(bridged)}"
+            note = f"{note}；{bridge_note}" if note else bridge_note
 
         return {
             "wishes": wishes,

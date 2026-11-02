@@ -535,6 +535,9 @@ AGENT_REVIEW_TIMEOUT_S = 30            # 审查专用超时（秒）
 AGENT_REVIEW_TOOLS = ("get_realtime_quote", "get_daily_history", "search_stock_news")
 
 # T1-H 持仓审查（§15.4，Phase 2 新增）
+# 2026-11-02 P0 裁决：继续影子，不转正。有效样本仅 10-28/29/30（1-2 只持仓），
+# 且 002009 的 reduce 与 P4 卖出同向，无法区分 T1-H 独立增益；待 ≥10 个交易日
+# 且 ≥3 只持仓后再复评。展示层已明确“影子裁决不施加惩罚”。
 AGENT_HOLDING_REVIEW_ENABLED = os.environ.get("AGENT_HOLDING_REVIEW_ENABLED", "false").lower() == "true"
 AGENT_HOLDING_REVIEW_SHADOW = os.environ.get("AGENT_HOLDING_REVIEW_SHADOW", "true").lower() == "true"
 AGENT_HOLDING_REVIEW_MAX = 3           # 持仓审查最大只数（优先级：埋伏持仓 > P4 退出信号 > 浮亏）

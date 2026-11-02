@@ -235,6 +235,52 @@ def assemble(
     return written
 
 
+def _close_buy_plan_anchors(session, symbols: set[str], as_of: date) -> tuple[int, int]:
+    """买入计划 cancelled 时关闭对应 open thesis / ambush 快照。
+
+    根因（2026-11-02 I-4）：reconcile 只改 trade_plans.execution_status，计划取消后
+    `holding_thesis_snapshots` / `ambush_position_snapshots` 仍 open，污染下一轮持仓
+    回查与 P4 判断（002741/002093 只有 cancelled buy plan、无持仓，却仍被当 open）。
+    仅关闭「买入计划取消且快照无持仓」的锚；partial/executed 不在此列。
+    """
+    if not symbols:
+        return 0, 0
+    from src.storage import AmbushPositionSnapshotRecord, HoldingThesisRecord
+
+    closed_thesis = (
+        session.query(HoldingThesisRecord)
+        .filter(
+            HoldingThesisRecord.symbol.in_(symbols),
+            HoldingThesisRecord.is_open == True,  # noqa: E712
+        )
+        .update(
+            {"is_open": False, "lifecycle_state": "closed"},
+            synchronize_session=False,
+        )
+    )
+    closed_ambush = (
+        session.query(AmbushPositionSnapshotRecord)
+        .filter(
+            AmbushPositionSnapshotRecord.symbol.in_(symbols),
+            AmbushPositionSnapshotRecord.is_open == True,  # noqa: E712
+        )
+        .update(
+            {
+                "is_open": False,
+                "exit_signal": "plan_cancelled",
+                "exit_date": as_of,
+            },
+            synchronize_session=False,
+        )
+    )
+    if closed_thesis or closed_ambush:
+        logger.info(
+            "买入计划取消 → 关闭锚: thesis %d 条 / ambush %d 条（%s）",
+            closed_thesis, closed_ambush, ", ".join(sorted(symbols)),
+        )
+    return closed_thesis, closed_ambush
+
+
 def reconcile(
     yesterday: date,
     holdings_snapshot: dict,
@@ -269,6 +315,7 @@ def reconcile(
         状态已更新的 TradePlanRecord 列表
     """
     updated = []
+    cancelled_buy_symbols: set[str] = set()
     own_session = session is None
     today = date.today()
     
@@ -308,6 +355,7 @@ def reconcile(
                         logger.info(f"卖出计划已执行（票消失）: {plan.symbol} {plan.action} @ {yesterday}")
                     else:
                         plan.execution_status = 'cancelled'
+                        cancelled_buy_symbols.add(plan.symbol)
                         logger.info(f"买入计划已取消（票消失）: {plan.symbol} {plan.action} @ {yesterday}")
                 elif _is_sell:
                     # 卖出计划票仍在：缺昨日基线无法算减掉量，只判 cancelled（见 docstring）
@@ -331,6 +379,12 @@ def reconcile(
                 logger.warning(f"对账交易计划失败（跳过）: {plan.symbol} {plan.action} @ {yesterday} - {e}")
                 continue
         
+        if cancelled_buy_symbols:
+            try:
+                _close_buy_plan_anchors(session, cancelled_buy_symbols, today)
+            except Exception as e:
+                logger.warning(f"买入计划取消后关闭锚失败（不阻断对账）: {e}")
+
         if own_session:
             session.commit()
             logger.info(f"交易计划对账完成: {len(updated)} 条 @ {yesterday}")
@@ -470,7 +524,7 @@ class HoldingAssessmentFacts:
     # ── 懒求值：家族宽限（Node 7 内部会写 drift_watch，故按分支调用，不预求值）──
     grace_resolver: Optional[Callable[[str], tuple[str, bool]]] = None
     # ── P4 埋伏退出（Node 7 用 snapshot 求得；None=无快照）──
-    ambush_exit: Optional[dict] = None    # {"signal","reason","category_tag"}
+    ambush_exit: Optional[dict] = None    # {"signal","reason","category_tag"}；有 open snapshot 即求值，不要求当前 sector_role=="ambush"
     # ── 生命周期驱动信号（纯计算，Node 7 预算；仅在 fallback 分支消费）──
     lifecycle_action: str = ""
     lifecycle_reason: str = ""
@@ -509,7 +563,7 @@ def assess_holding(
     guard_enabled: bool = True,
     history_enabled: bool = False,
 ) -> HoldingVerdict:
-    """持仓动作判定（单入口，8+1 分支）。
+    """持仓动作判定（单入口分支表：P4 快照退出最高优先级；guard/history 为可选前置分支）。
 
     guard_enabled:
         - True：confirmed 板块（actionable + mainline/ambush）+ lifecycle 缺失 → hold。
@@ -540,6 +594,23 @@ def assess_holding(
             "ambush_snap": bool((facts.history or {}).get("ambush_snap")),
         }
 
+    # ⓪ P4 快照退出（最高优先级，2026-11-02）
+    # 快照是入场锚：只要 open snapshot 的 exit signal 非空，就以 P4 退出为准。
+    # 旧链把它放在 thesis_drift 之后且要求 sector_role=="ambush"，导致 002009
+    # 被当日 boards 判为 mainline 时 fade_sell 永不登记（KPI 级漏卖）。
+    _p4_signal = (
+        (facts.ambush_exit or {}).get("signal")
+        if facts.ambush_exit is not None else None
+    )
+    if _p4_signal:
+        return HoldingVerdict(
+            action="sell", reason_code="p4_exit",
+            reason_text=f", [埋伏退出:{_p4_signal}]",
+            evidence={**base_evidence, "p4_signal": _p4_signal,
+                      "p4_reason": (facts.ambush_exit or {}).get("reason") or "",
+                      "p4_anchor": "snapshot"},
+        )
+
     # ① 无板块归属 → 家族宽限（否则卖）
     if not facts.sector_name:
         drift_sector = facts.all_belong_boards[0] if facts.all_belong_boards else ""
@@ -567,22 +638,8 @@ def assess_holding(
             evidence=base_evidence,
         )
 
-    # ③′ P4 埋伏退出「提前判定」（H3 修正已坐实的死分支，2026-10-27）
-    # 原链把 P4 放在 lifecycle=None 分支之后，而埋伏板块的 detail.lifecycle 恒为 None
-    # （Node 2 只给 mainline/exhausted/cooling 赋 lifecycle）⇒ P4 触发时永远被降温档抢先，
-    # 分支结构性不可达。这里只在「真的触发退出」时提前返回；未触发则保持原顺序落降温档，
-    # 所以对无信号的埋伏仓逐字节等价旧行为（当前 ambush_position_snapshots 实测 0 行，
-    # 生产无行为变化；表有数据/催化剂到期后才开始生效）。
+    # ③′ P4 thesis 事件锚（仅 ambush + H3 enabled；快照锚已在 ⓪ 提前返回）
     if facts.sector_role == "ambush":
-        _p4_signal = (facts.ambush_exit or {}).get("signal") if facts.ambush_exit is not None else None
-        if _p4_signal:
-            return HoldingVerdict(
-                action="sell", reason_code="p4_exit",
-                reason_text=f", [埋伏退出:{_p4_signal}]",
-                evidence={**base_evidence, "p4_signal": _p4_signal,
-                          "p4_reason": (facts.ambush_exit or {}).get("reason") or "",
-                          "p4_anchor": "snapshot"},
-            )
         _thesis_status = (
             ((facts.history or {}).get("catalyst") or {}).get("status") if facts.history else None
         )

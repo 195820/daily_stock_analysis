@@ -168,6 +168,22 @@ def test_assess_p4_branches_snapshot_anchor():
     assert (verdict.action, verdict.reason_code) == ("hold", "p4_hold")
 
 
+def test_assess_p4_snapshot_exit_precedes_thesis_drift_grace():
+    """快照锚不依赖当日 sector_role：002009 被误判 mainline 时仍须 fade_sell。"""
+    facts = _facts(
+        sector_role="mainline",
+        thesis_drift=True,
+        thesis_family="机器人",
+        grace_resolver=lambda d: ("hold", True),
+        ambush_exit={"signal": "fade_sell", "reason": "催化已兑现", "category_tag": "fade"},
+    )
+    verdict = assess_holding(facts)
+    assert (verdict.action, verdict.reason_code) == ("sell", "p4_exit")
+    assert verdict.evidence["p4_anchor"] == "snapshot"
+    assert "fade_sell" in verdict.reason_text
+    assert verdict.grace_applied is False
+
+
 def test_assess_p4_exit_precedes_lifecycle_missing_ladder():
     """埋伏板块 lifecycle 恒为 None：退出信号必须抢在 40/60 降温档之前（原链死分支修复）。"""
     facts = _facts(
@@ -343,6 +359,43 @@ def test_build_holdings_flow_index_alias_match_and_miss():
     assert index["index"]["半导体"]["flow"] == 5.0
     assert index["index"]["银行"]["matched"] is False
     assert index["miss"] == ["银行"]
+
+
+def test_build_holdings_flow_index_holding_bridge():
+    """002009：thesis=动力电池，资金流真实键=动力电池回收，必须经桥接命中。"""
+    from src.got.nodes.capital_analysis import CapitalAnalysisNode
+
+    holdings = HoldingsContext(
+        sector_wishes=["动力电池"],
+        positions=[HoldingBrief(symbol="002009")],
+    )
+    evidence = {
+        "sector_flow_all": {"动力电池回收": 6.05},
+        "sector_flow_all_3d": {"动力电池回收": 6.12},
+        "sector_flow_all_5d": {"动力电池回收": 5.80},
+    }
+    index = CapitalAnalysisNode._build_holdings_flow_index(evidence, holdings)
+
+    row = index["index"]["动力电池"]
+    assert row["matched"] is True
+    assert row["matched_key"] == "动力电池回收"
+    assert row["bridge_from"] == "动力电池"
+    assert row["flow"] == 6.05
+    assert row["flow_3d"] == 6.12
+    assert index["hit_count"] == 1
+    assert index["miss"] == []
+    assert "口径桥接" in index["note"]
+
+
+def test_match_holdings_flow_row_accepts_thesis_name():
+    """消费侧把 thesis 板块并入查找名，避免当日 boards 与 thesis 口径错位。"""
+    from src.got.nodes.portfolio_decision import PortfolioDecisionNode
+
+    row = {"matched": True, "matched_key": "动力电池回收", "flow": 6.05}
+    flow_rows = {"动力电池": row}
+    assert PortfolioDecisionNode._match_holdings_flow_row(
+        ["新能源车", "动力电池"], flow_rows,
+    ) is row
 
 
 def test_build_holdings_flow_index_none_without_wishes():

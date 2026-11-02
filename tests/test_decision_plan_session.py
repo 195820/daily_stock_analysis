@@ -24,7 +24,12 @@ from src.got.decision_plan import (
     reconcile,
     reconcile_log_lines,
 )
-from src.storage import DatabaseManager, TradePlanRecord
+from src.storage import (
+    AmbushPositionSnapshotRecord,
+    DatabaseManager,
+    HoldingThesisRecord,
+    TradePlanRecord,
+)
 
 
 @pytest.fixture()
@@ -111,3 +116,67 @@ def test_reconcile_records_readable_after_session_close(isolated_db) -> None:
 
     with isolated_db.get_session() as check:
         assert check.query(TradePlanRecord).one().execution_status == "executed"
+
+
+def test_reconcile_cancelled_buy_closes_open_anchors(isolated_db) -> None:
+    """I-4：买入计划 cancelled 后，对应 open thesis / ambush 快照必须关闭。"""
+    yesterday = date(2026, 10, 26)
+    session = isolated_db.get_session()
+    session.add_all([
+        TradePlanRecord(
+            plan_date=yesterday,
+            symbol="002741",
+            name="光华科技",
+            lane="ambush",
+            action="buy",
+            target_quantity=100.0,
+            target_value=1000.0,
+            execution_status="pending",
+            valid_until=date.today() + timedelta(days=3),
+        ),
+        HoldingThesisRecord(
+            symbol="002741",
+            sector_name="机器人",
+            family_name="机器人",
+            entry_date=date(2026, 10, 25),
+            entry_price=10.0,
+            source="got_buy",
+            lifecycle_state="intact",
+            is_open=True,
+        ),
+        AmbushPositionSnapshotRecord(
+            symbol="002741",
+            sector_name="机器人",
+            category_tag="drift",
+            entry_date=date(2026, 10, 25),
+            entry_price=10.0,
+            is_open=True,
+        ),
+        # 对照：没有 cancelled buy plan 的 open thesis 不得被误关
+        HoldingThesisRecord(
+            symbol="600519",
+            sector_name="白酒",
+            family_name="消费",
+            entry_date=date(2026, 10, 25),
+            entry_price=1500.0,
+            source="got_buy",
+            lifecycle_state="intact",
+            is_open=True,
+        ),
+    ])
+    session.commit()
+    session.close()
+
+    updated = reconcile(yesterday, {})
+    assert len(updated) == 1
+
+    with isolated_db.get_session() as check:
+        assert check.query(TradePlanRecord).one().execution_status == "cancelled"
+        thesis = check.query(HoldingThesisRecord).filter_by(symbol="002741").one()
+        assert thesis.is_open is False
+        assert thesis.lifecycle_state == "closed"
+        snap = check.query(AmbushPositionSnapshotRecord).filter_by(symbol="002741").one()
+        assert snap.is_open is False
+        assert snap.exit_signal == "plan_cancelled"
+        control = check.query(HoldingThesisRecord).filter_by(symbol="600519").one()
+        assert control.is_open is True

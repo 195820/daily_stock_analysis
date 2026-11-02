@@ -33,6 +33,19 @@ SECTOR_NAME_CANONICAL = {
 # 反向：东财板块名 → 同花顺概念板命名
 _SECTOR_NAME_REVERSE = {v: k for k, v in SECTOR_NAME_CANONICAL.items()}
 
+# 持仓 thesis 板块 → Node 3 资金流真实键（仅用于 H1 `holdings_flow_index`，不改身份/漂移）
+# 证据：002009 天奇股份 thesis=动力电池；10-28/10-29 `capital.json` 的板块流键为
+# 「动力电池回收」（1 日 6.05 亿 / 3 日 6.12 亿），而 `sector_flow_all` 无「动力电池」。
+# 这是口径桥接，不是把天奇的叙事身份改为动力电池回收。
+HOLDING_SECTOR_FLOW_BRIDGES = {
+    "动力电池": "动力电池回收",
+}
+
+
+def resolve_holding_flow_bridge(name: str) -> str:
+    """返回持仓 thesis 板块的资金流桥接键；无桥接返回空串。"""
+    return HOLDING_SECTOR_FLOW_BRIDGES.get(name, "")
+
 
 def normalize_sector_name(name: str) -> str:
     """将板块名规范化为 Node 2 使用的东财板块名（无映射则原样返回）。"""

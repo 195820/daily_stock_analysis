@@ -866,11 +866,14 @@ class PortfolioDecisionNode:
                 frame_group_lookup=frame_group_lookup,
             )
             sector_name = stock_sector_info.get("sector_name", "")
-            # H1：把 Node 3 已解析出的真实键喂回 screener，避免别名口径在持仓侧二次丢分
-            flow_row = self._match_holdings_flow_row(
-                [sector_name] + list(stock_sector_info.get("all_belong_boards") or []),
-                flow_rows,
-            )
+            # H1：把 Node 3 已解析出的真实键喂回 screener，避免别名口径在持仓侧二次丢分。
+            # `holdings_flow_index` 以 thesis 板块为 wish；消费侧必须把 thesis 板块一并传入，
+            # 否则 002009（当日 boards=新能源车、thesis=动力电池）会结构性漏掉 Node 3 的索引。
+            _thesis = thesis_map.get(symbol)
+            _flow_names = [sector_name] + list(stock_sector_info.get("all_belong_boards") or [])
+            if _thesis is not None and getattr(_thesis, "sector_name", ""):
+                _flow_names.append(_thesis.sector_name)
+            flow_row = self._match_holdings_flow_row(_flow_names, flow_rows)
             holding_flow_by_symbol[symbol] = flow_row
             holding_candidates.append({
                 "code": symbol,
