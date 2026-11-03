@@ -3,6 +3,84 @@
 
 ---
 
+## 2026-11-03 补登（家族簇 K 线聚类 → 家族 identity — 规则层回测结案，A6 未开播）
+
+计划：`local://kline-family-cluster-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。
+背景读数（生产 2026-09-28–10-30）：47/93 个 actionable 主线板块 `frame_group=其他`（50.5%），
+伤害在覆盖率/失真——`其他` 聚合异质板块成同一 E2 P90 分母、FTS 台账 `其他` 键混杂
+（10-16→10-21 `days_suppressed` 0→1→3，members 石油开采/石油/酿酒）、Phase 2 层 A join 空转。
+
+**结案方式改为历史回测**（2026-11-03 用户裁决：有历史数据的项不上影子，直接回测比对结案）：
+`scripts/backtest_family_cluster.py --start 20260928 --end 20261030`，链式重放 19 个交易日
+（临时归档树，前一日重放产物作为后一日前日归档；基线=旧代码 `unified.json`；不跑 Phase 2、不跑 A6）。
+
+| 判据（机械可核对） | 读数 | 结论 |
+|---|---|---|
+| actionable 主线板块 `其他` 数 | 46 → 0（52.3% → 0.0%） | 达标 |
+| endurance 家族数 | 48 → 63（异质板块不再共用 `其他` 分母） | 达标 |
+| FTS 台账 `其他` 键 | 10-16 `其他(d0:石油开采/石油/路桥)` → 路桥簇 `4ea31266c8e7`；10-20 `其他(d2:石油开采/石油/酿酒)` → 石油簇 `6c6dbcdf075f` + 军工 + 酿酒簇 `e0abe046829b` | 达标（members 不再混杂） |
+| 分组键变更 | 46 个板块-日改键，其中原键=`其他` 33 个；另 13 个为 replay 无 glue 的伪差异（见下） | 达标 |
+| 跨日 identity | 石油簇/酿酒簇/路桥簇多日同 ID（Jaccard 继承） | 达标 |
+
+**改键口径**：逐板块——已有具名键（glue 或 `frame_group≠其他`）的板块**不动**，只有落「其他」/缺失的板块
+改用簇 ID。`would_rewrite`/live 回写同样只覆盖这些成员——**簇标签从不改判已具名板块**（见下）。逐板块而非整簇下发，是因为整簇下发会把簇内具名板块改判成别的家族（回测实测：
+`AI眼镜 AI软件→军工`、`化工机械 周期资源→AI硬件` 等误报），本项只堵漏报、不制造误报。
+
+**聚类基修正（2026-11-03，用户质疑「90 日原始相关把无量板块全同化成大盘」）**：
+
+- 实证（20261023 归档 + 板块 K 线截到当日）：38 成员簇 `工业软件等38板块` 的簇内 pairwise 相关，
+  raw 90/40/20 日 = 最小 +0.70/+0.70/+0.74、中位 +0.92/+0.91/+0.93；去截面均值或 β 调整后中位 ≈ -0.05，
+  complete-linkage@0.65 重聚从 **1 簇（28 只）** 变成 **13-18 子簇（最大 5）**。说明问题不是窗口长短
+  （20/40/90 都一样 beta 饱和），而是**没去市场因子**。
+- 真同族不受影响（残差相关）：石油开采/石油 +0.98、石油/石油加工 +0.80、白酒/酿酒 +1.00、
+  芯片/半导体 +0.95、芯片/光刻机 +0.97、创新药/医药 +0.94、军贸概念/航空 +0.88；
+  跨族伪相关被削掉（芯片/军贸概念 0.51→0.14）。
+- 改动：`_build_theme_families` 默认改用**残差相关**（`GOT_FAMILY_CLUSTER_BASIS=residual`；`raw` 一键回滚），
+  窗口 `GOT_FAMILY_CLUSTER_WINDOW=60`，并修正取窗方向（原 `[:min_len]` 在序列不等长时取到最老段 → `[-window:]`）。
+- **纯度对照**（新增 `scripts/backtest_family_cluster_purity.py`，重建 0928-1030 共 19 日簇）：
+  簇内受控家族多数派占比 **0.654 → 0.797**；最大簇 **39.1 → 23.6**；成员落 >10 簇比例
+  **0.625 → 0.258**；actionable 主线「其他」板块落 >10 簇 **11/46 → 4/46**。样本：日均参与纯度
+  统计的簇 9.4→20.2、具名成员 91.2→84.0（残差基把小簇拆多，评估面基本同量）。
+- **大簇二级切分（2026-11-03，回答「AI硬件/AI软件还能否细分」）**：`GOT_FAMILY_CLUSTER_SPLIT=1`（缺省），
+  ≥`SPLIT_MIN`(10) 成员的一级簇在残差相关 `SPLIT_THRESHOLD`(0.88) 下再聚一次。0928-1030 回测：
+  纯度 **0.797→0.831**、最大簇 **23.6→8.0**、成员落 >10 簇 **0.258→0.013**、actionable「其他」落 blob
+  **4/46→0/46**；簇数 46→62（10-23 单日）。10-23 实例：原 23 成员 AI 混编簇拆成
+  `光刻机/芯片/存储芯片/先进封装/OLED`(6)、`玻璃基板/PCB/MiniLED/折叠屏/消费电子/苹果概念`(6)、
+  `东数西算/数据中心`(5)、`CPO/铜缆/光通信/5G/6G`(5)、`多模态AI/人工智能/AI智能体`(4)、
+  `AIGC/国资云/短剧游戏`(4)、`AI眼镜/AI手机PC`(4)。阈值 0.90 可再细（纯度 0.842、最大簇 7.5）但碎片
+  更多，缺省取 0.88；明细用 `scripts/backtest_family_cluster_purity.py --detail` 看。
+- 影响：本页 0928-1030 回测跑的是**归档里的 raw 簇**（只验证解键逻辑）；基修正后簇成员变化，
+  coverage/纯度已在上面按重建簇重测。规则层结论不变（逐板块、只给「其他」成员补簇键）。
+
+**replay 伪差异（必须记住）**：`--got-replay` 不跑 glue（status=replay_mode），旧归档里由 glue 给出的
+键（`消费`/`周期资源`/`无归属` 等）在新跑里退化到 `frame_group=其他` → 落簇键。13 个此类行不代表规则层
+改了它们的家族判定，生产链路 glue 正常时这些板块仍走 glue 键。判读回测时只认「原键=`其他`」的 33 行。
+
+**开关（缺省）**：`GOT_FAMILY_CLUSTER_ENABLED`（0；ECS `.env=1`）/ `GOT_FAMILY_CLUSTER_REVIEW`（**off**）/
+`GOT_FAMILY_CLUSTER_JACCARD_MIN`（0.34）/ `GOT_FAMILY_CLUSTER_BASIS`（residual）/ `WINDOW`（60）/
+`SPLIT`（1）/ `SPLIT_THRESHOLD`（0.88）/ `SPLIT_MIN`（10）。`REVIEW=off` = 纯规则层（零 LLM）；
+`shadow` 只用于 A6 标签离线抽样（仍不回写）；`live` 才给落「其他」的成员补 `frame_group`
+（Phase 2 层 A join 命中；A6 拒绝的簇保持簇 ID，已具名板块永不改判）。
+
+**A6 标签离线抽样审计（2026-11-03，`scripts/audit_family_cluster_labels.py`）**：3 个交易日
+（10-21 / 10-23 / 10-30）抽样 60 簇（每簇按当前残差+切分基重建），**0 复核异常**；`a6` 判「其他」
+18 簇（多为单成员/真混编，如 汽车整车/啤酒/中成药、煤炭/石油）；vote 簇 19 个、a6 同意 15（79%）；
+切 live 会改写的「其他」板块 9 个板块-簇。标签抽查无系统性错族（芯片链→AI硬件、煤炭+石油→周期资源、
+白酒+乳制品→消费、微盘杂项→其他）。
+审计抓出两处 live 规则缺陷并已修：
+① **A6 明确拒绝仍被 vote 覆盖** → `石油加工→新能源`、`DRG-DIP→AI软件`；修：live 终值优先级改为
+  `A6 approved > A6 rejected(None) > vote > cluster_id`，拒绝不再回落 vote；
+② **live 曾整簇下发标签** → 混合簇（东数西算/数据中心 + 混合现实/无人驾驶）会被整簇标成 AI软件；修：live
+  与 off/shadow 一致**逐板块**，簇标签只补给落「其他」的成员，已具名板块永不改判。
+复核护栏：单簇不重试 + 30s 超时、单日预算 600s、连续 3 簇失败熔断。`REVIEW` 仍为 **off**（零常态 LLM），
+切 live 只需改一行，但需负责人确认后执行。
+
+**已知接受**：首次启用日 FTS latch 键从 `其他` 切到簇 ID → `days_suppressed` 归零重启（链首）；replay 不跑
+A6 复核（`review_status=skipped`）；`cluster_id` 键无法参与 `crowded_families`（受控名）匹配——但键为
+cluster_id 的板块本就落「其他」，改键前同样匹配不到，无灵敏度损失。
+
+---
+
 ## 2026-11-02 补登（10-30 运行时收敛开关登记 + 两处产物/解析修复）
 
 背景：`bcede32`（2026-10-30）落语义运行时 / 两个窄 Agent / 只读复盘时未同步本清单；11-02 补登判据，并收口两处实锤缺陷。达标判定归项目负责人。
@@ -30,6 +108,13 @@
 | P4 快照退出 | `assess_holding` 的 P4 在 `thesis_drift` 之后且要求 `sector_role=="ambush"`；002009 被判 mainline + grace 时 `fade_sell` 永不登记 | 快照 `signal` 非空提到 ⓪ 最高优先级，去掉 role 门槛 | 002009 若仍有 open snapshot + `fade_sell`：`unified_scoring` 动作 `sell`、`action_reason_code=p4_exit`、`ambush_exit_signals` 含 002009，快照 `is_open=false`；无 snapshot 持仓不受影响 |
 | H1 资金流桥接 | `holdings_flow_index` 以 thesis `动力电池` 为 wish，但 `sector_flow_all` 键为 `动力电池回收`；Phase 2 又只按当日 boards 查 | `HOLDING_SECTOR_FLOW_BRIDGES` + 消费侧并入 thesis 板块名 | `capital.json.evidence.holdings_flow_index.index["动力电池"]`：`matched=true`、`bridge_from=动力电池`、`matched_key` **逐字节**存在于 `sector_flow_all` 键集合；`_score_capital` 的资金维不再 `capital_data_missing` |
 | cancelled buy 锚 | `reconcile` 只改 trade_plans 状态，不关 open thesis/snapshot（002741/002093 无持仓仍 open） | `_close_buy_plan_anchors`：buy cancelled 且票消失时关闭 | 下一跑若有 cancelled buy plan：对应 `holding_thesis_snapshots.is_open=false`、`lifecycle_state=closed`；`ambush_position_snapshots.is_open=false`、`exit_signal=plan_cancelled`；partial/executed 不关 |
+
+### 2026-11-02 身份锚 / 别名守卫
+
+| 项 | 修复 | 判据（下次生产跑可核对） |
+|---|---|---|
+| 持仓身份锚 | `UnifiedScoringResult` 新增 `identity_sector_name`/`identity_family_name`；`_find_stock_sector_with_thesis` 以 thesis 买入身份固定，不再随当日 boards 重选 | 持仓行 `identity_sector_name` 等于 `holding_thesis_snapshots.sector_name`；002009 应显示 `identity_sector_name=动力电池`，`sector_name` 可仍为当日匹配的 `新能源车`，但 reasoning 必须带 `[身份:动力电池]` |
+| 父→子别名守卫 | `source=auto/auto_lowconf` 的窄化别名在加载与 `confirm()` 时拒绝；服务器 `data/wencai_board_aliases.json` 已删除 `化工→氟化工概念` | 文件无 `化工` 条目（备份 `.bak.20261102`）；resolver 日志不再出现 `化工 → 氟化工概念`；300497 不得再因该别名被归入“化工”埋伏道 |
 
 T1-H 裁决（2026-11-02）：继续影子，不转正；有效样本 3 日 / 1-2 只，待 ≥10 个交易日且 ≥3 只持仓复评。`penalty=null` 属影子设计。
 

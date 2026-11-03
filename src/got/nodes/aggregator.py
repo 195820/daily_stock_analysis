@@ -47,6 +47,7 @@ from src.got.schemas import (
     GlueFamily,
     CONTROLLED_FAMILIES,
 )
+from src.got import family_cluster
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
     EVIDENCE_TIER_MULTIPLIER,
@@ -461,9 +462,63 @@ class AggregatorNode:
         )
         key_opportunities = self._collect_key_opportunities(sector_intels)
 
+        # ── 家族簇：K 线聚类 → 家族 identity（2026-11-03）──
+        # theme_families 是残差收益相关聚类（已剔除市场 beta），簇身份跨日 Jaccard 继承；词表投票只作
+        # 输入，A6 复核承担标签裁决。ENABLED=0 → family_clusters=None，分组路径逐字节回现状。
+        family_clusters = None
+        family_cluster_shadow = None
+        _cluster_mode = family_cluster.resolve_review_mode()
+        _cluster_jaccard_min = family_cluster.resolve_jaccard_min()
+        if family_cluster.enabled() and getattr(sector, "theme_families", None):
+            try:
+                _actionable_boards = [
+                    i.sector_name for i in sector_intels
+                    if i.classification == "actionable" and i.sector_role == "mainline"
+                ]
+                _frame_group_lookup = dict(getattr(sector, "frame_group_lookup", None) or {})
+                _glue_family_by_name = self._glue_family_by_name(sector, glue)
+                # 只读一次前日归档：簇 ID 继承 + live 期 vote 信任度顺延都用它
+                _prev_cluster_shadow = self._load_previous_family_cluster_shadow()
+                _clusters = await family_cluster.build_family_clusters(
+                    list(sector.theme_families),
+                    _frame_group_lookup,
+                    today,
+                    _cluster_jaccard_min,
+                    _cluster_mode,
+                    _prev_cluster_shadow,
+                    _glue_family_by_name,
+                    getattr(glue, "status", "") or "",
+                    self._build_family_evidence_index(news),
+                    actionable_boards=_actionable_boards,
+                    board_metrics=self._family_board_metrics(sector),
+                    # replay 不复核（LLM 成本 + 回放零副作用契约）：全部 skipped → 纯规则簇键
+                    llm_call=None if replay_mode else self._call_llm_async,
+                )
+                family_clusters = _clusters or None
+                family_cluster_shadow = family_cluster.build_shadow_payload(
+                    _clusters,
+                    mode=_cluster_mode,
+                    jaccard_min=_cluster_jaccard_min,
+                    actionable_boards=_actionable_boards,
+                    frame_group_lookup=_frame_group_lookup,
+                    glue_families=_glue_family_by_name,
+                    prev_unified=_prev_cluster_shadow,
+                )
+                if _cluster_mode == "live":
+                    _rewritten = self._apply_family_cluster_rewrite(sector_intels, _clusters)
+                    if _rewritten:
+                        logger.info(
+                            "[Node 6] 家族簇回写 frame_group: %d 个 actionable 主线板块", _rewritten,
+                        )
+            except Exception as exc:  # noqa: BLE001 — 观测/标签旁路：降级不阻塞主链路
+                logger.warning("[Node 6] 家族簇构建失败（已忽略）: %s", exc)
+                family_clusters = None
+                family_cluster_shadow = None
+
         # ── 主线续航评估（v3.5 S4：对 active_mainline 家族逐一生成）──
         mainline_endurance = self._synthesize_mainline_endurance(
             sector_intels, sector, news, regime, glue=glue,
+            family_clusters=family_clusters, family_cluster_mode=_cluster_mode,
         )
         if mainline_endurance:
             logger.info(
@@ -563,6 +618,7 @@ class AggregatorNode:
             crowded_families=getattr(sector, "crowded_families", []) or [],
             mainline_endurance=mainline_endurance,
             family_suppression=family_suppression,
+            family_cluster_shadow=family_cluster_shadow,
             cross_node_signals=cross_node_signals,
             # A6 阶段 2：资金背离诊断随规则模式退役，恒为 None（schema 字段保留）
             capital_divergence=None,
@@ -5143,6 +5199,8 @@ class AggregatorNode:
         news: NewsContext,
         regime: MarketRegime,
         glue: Optional[SemanticGlueResult] = None,
+        family_clusters: Optional[list] = None,
+        family_cluster_mode: str = "shadow",
     ) -> list[MainlineEndurance]:
         """合成主线续航评估（v3.5 S4）。
 
@@ -5154,6 +5212,12 @@ class AggregatorNode:
         A6 接线：
         - family_name 三级优先：glue.families[board_code].family → intel.frame_group → intel.sector_name
         - E2 公式：family_resonance 分母从固定 50.0 改为当日家族 std_dev P90 自适应归一化（P90=0 时 fallback 50.0）
+
+        家族簇（2026-11-03）：
+        - family_clusters=None（GOT_FAMILY_CLUSTER_ENABLED=0）→ 上面三级优先逐字节不变（回滚路径）；
+        - 非空 → 分组键由 `family_cluster.resolve_endurance_key` 统一裁决：
+          shadow 期未决议簇用 cluster_id（不再与异质板块共用「其他」键），
+          live 期用簇 family_label（A6/vote 终值）。
         """
         from src.got.schemas import MainlineEndurance
         from collections import defaultdict
@@ -5185,16 +5249,28 @@ class AggregatorNode:
                 if getattr(gf, "board_code", "") and getattr(gf, "family", ""):
                     glue_family_by_code[gf.board_code] = gf.family
 
-        # 按家族分组（A6 三级优先：glue.families → intel.frame_group → intel.sector_name）
+        # 按家族分组（A6 三级优先：glue.families → intel.frame_group → intel.sector_name；
+        # 家族簇开启时由 resolve_endurance_key 统一裁决，见下方文档）
+        clusters_by_board: dict[str, Any] = {}
+        for _record in (family_clusters or []):
+            for _board in (getattr(_record, "member_boards", None) or []):
+                clusters_by_board[_board] = _record
         families: dict[str, list[SectorIntel]] = defaultdict(list)
         for intel in actionable_intels:
             _d = detail_lookup.get(intel.sector_name)
             _code = getattr(_d, "code", "") if _d is not None else ""
-            family_name = (
-                (glue_family_by_code.get(_code) if _code else None)
-                or intel.frame_group
-                or intel.sector_name
-            )
+            _glue_family = glue_family_by_code.get(_code) if _code else None
+            if family_clusters is None:
+                # 回滚路径：逐字节等价于三级优先（ENABLED=0 不触簇逻辑）
+                family_name = _glue_family or intel.frame_group or intel.sector_name
+            else:
+                family_name, _ = family_cluster.resolve_endurance_key(
+                    intel.sector_name,
+                    frame_group=intel.frame_group,
+                    glue_family=_glue_family,
+                    clusters_by_board=clusters_by_board,
+                    mode=family_cluster_mode,
+                )
             families[family_name].append(intel)
 
         # ── E2: 预计算各家族 strength std_dev，取当日 P90 作为归一化分母 ──
@@ -5413,12 +5489,138 @@ class AggregatorNode:
 
         return endurance_list
 
+    # =========================================================================
+    # 家族簇（K 线聚类 → 家族 identity）辅助
+    # =========================================================================
+
     @staticmethod
-    def _load_previous_family_suppression() -> dict[str, dict]:
+    def _detail_code_lookup(sector: SectorContext) -> dict[str, str]:
+        """板块名 → 板块代码（覆盖主线/降温/出局/评分/埋伏桶，先到先得）。"""
+        lookup: dict[str, str] = {}
+        for _group in getattr(sector, "active_mainline", None) or []:
+            for _member in getattr(_group, "members", None) or []:
+                lookup.setdefault(_member.name, _member.code)
+        for _bucket in ("cooling_down", "exhausted_mainline", "top_by_score", "ambush"):
+            for _detail in getattr(sector, _bucket, None) or []:
+                lookup.setdefault(_detail.name, _detail.code)
+        return lookup
+
+    @classmethod
+    def _glue_family_by_name(
+        cls, sector: SectorContext, glue: Optional[SemanticGlueResult],
+    ) -> dict[str, str]:
+        """glue.families（board_code 键）→ 板块名键（供簇内投票/分歧检测）。
+
+        此处不按 glue.status 过滤：状态纪律由 family_cluster 统一裁决（非 ok/degraded 视为空），
+        避免两处各写一份白名单漂移。
+        """
+        if glue is None:
+            return {}
+        code_family = {
+            getattr(gf, "board_code", ""): getattr(gf, "family", "")
+            for gf in (getattr(glue, "families", None) or [])
+            if getattr(gf, "board_code", "") and getattr(gf, "family", "")
+        }
+        if not code_family:
+            return {}
+        return {
+            name: code_family[code]
+            for name, code in cls._detail_code_lookup(sector).items()
+            if code in code_family
+        }
+
+    @classmethod
+    def _family_board_metrics(cls, sector: SectorContext) -> dict[str, dict]:
+        """板块名 → {change, strength}（只喂 A6 复核 prompt，不进任何判定）。"""
+        metrics: dict[str, dict] = {}
+        details = []
+        for _group in getattr(sector, "active_mainline", None) or []:
+            details.extend(getattr(_group, "members", None) or [])
+        for _bucket in ("cooling_down", "exhausted_mainline", "top_by_score", "ambush"):
+            details.extend(getattr(sector, _bucket, None) or [])
+        for _detail in details:
+            metrics.setdefault(_detail.name, {
+                "change": getattr(_detail, "today_change", None),
+                "strength": getattr(_detail, "strength_score", None),
+            })
+        return metrics
+
+    @staticmethod
+    def _build_family_evidence_index(news: NewsContext) -> dict[str, dict]:
+        """板块名 → {event_ids, theme}：催化事件只作 A6 复核证据，绝不作家族 key。"""
+        from src.got.board_aliases import normalize_sector_name
+
+        calendar = getattr(news, "catalyst_calendar", None)
+        events = list(getattr(calendar, "events", None) or []) if calendar else []
+        index: dict[str, dict] = {}
+        for event in events:
+            raw_names = list(getattr(event, "affected_sectors", None) or []) or [
+                getattr(event, "sector", "")
+            ]
+            for raw_name in raw_names:
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                for key in {name, normalize_sector_name(name)}:
+                    slot = index.setdefault(key, {"event_ids": [], "theme": ""})
+                    event_id = str(getattr(event, "event_id", "") or "")
+                    if event_id and event_id not in slot["event_ids"]:
+                        slot["event_ids"].append(event_id)
+                    if not slot["theme"]:
+                        slot["theme"] = str(getattr(event, "title", "") or "")[:40]
+        return index
+
+    @staticmethod
+    def _apply_family_cluster_rewrite(sector_intels: list[SectorIntel], clusters: list) -> int:
+        """REVIEW=live：按 would_rewrite 改写 actionable 主线板块 frame_group（Phase 2 join 命中）。
+
+        shadow 期零回写（本函数只在 live 调用）。返回实际改写数。
+        """
+        rewrite: dict[str, str] = {}
+        for record in clusters or []:
+            rewrite.update(getattr(record, "would_rewrite", None) or {})
+        if not rewrite:
+            return 0
+        rewritten = 0
+        for intel in sector_intels or []:
+            if intel.classification != "actionable" or intel.sector_role != "mainline":
+                continue
+            target = rewrite.get(intel.sector_name)
+            if target and intel.frame_group != target:
+                intel.frame_group = target
+                rewritten += 1
+        return rewritten
+
+    def _load_previous_family_cluster_shadow(self) -> Optional[dict]:
+        """加载前日归档的 family_cluster_shadow（簇 ID 继承 + live 信任度基准）。
+
+        锚定 `_run_date`：回放不得读「相对真实今天」的归档（防前视，与 W1 同型修正）。
+        最近一日 unified.json 无该字段（含 2026-11-02 前全部历史日）→ 返回 None（链首）。
+        """
+        import json
+        from src.got.archive import list_archive_dirs
+
+        before = getattr(self, "_run_date", None) or date.today()
+        for d in list_archive_dirs(reverse=True, before=before):
+            unified_path = d / "unified.json"
+            if not unified_path.exists():
+                continue
+            try:
+                with open(unified_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:  # noqa: BLE001 — 读取失败视为无前日（链首）
+                logger.warning("[Node 6] 前日 unified.json 读取失败（簇继承链首）: %s", exc)
+                return None
+            shadow = data.get("family_cluster_shadow")
+            return {"family_cluster_shadow": shadow} if isinstance(shadow, dict) else None
+        return None
+
+    def _load_previous_family_suppression(self) -> dict[str, dict]:
         """加载前日家族压制台账（FTS，从 data/got_daily/ 最近归档的 unified.json）。
 
-        照搬 `_load_previous_reservoir` 读法：`before=date.today()` 保证同日重跑读的是前一交易日，
+        照搬 `_load_previous_reservoir` 读法：`before=_run_date` 保证同日重跑读的是前一交易日，
         days_suppressed 计数在同日多次运行下稳定不重复递增。
+        W1 同型修正：锚定 `_run_date` 而非 date.today()——回放不得读「相对真实今天」的归档（防前视）。
 
         Returns:
             {family_name: entry_dict}，失败/无归档返回空 dict。
@@ -5426,7 +5628,8 @@ class AggregatorNode:
         import json
         from src.got.archive import list_archive_dirs
 
-        date_dirs = list_archive_dirs(reverse=True, before=date.today())
+        before = getattr(self, "_run_date", None) or date.today()
+        date_dirs = list_archive_dirs(reverse=True, before=before)
         for d in date_dirs:
             unified_path = d / "unified.json"
             if unified_path.exists():

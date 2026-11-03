@@ -1162,6 +1162,12 @@ class UnifiedContext(BaseModel):
         default_factory=list,
         description="被压制家族台账（topping_risk + 跨日 latch）；缺省 GOT_FAMILY_TOPPING_GATE_ENABLED=0 时为空",
     )
+    # ── 家族簇观测/复核（K 线聚类 → 家族 identity，2026-11-03）──
+    family_cluster_shadow: Optional[dict] = Field(
+        None,
+        description="家族簇观测/复核（GOT_FAMILY_CLUSTER_ENABLED=1 时产出：clusters/review_stats/"
+                    "coverage；REVIEW=shadow 时含 would_rewrite 但不回写）",
+    )
 
     # ── 跨节点时间线共振（v2.1 Phase 6）──
     cross_node_signals: list[CrossNodeTemporalSignal] = Field(
@@ -1245,6 +1251,15 @@ class UnifiedScoringResult(BaseModel):
     # ── 板块归属（修复：sector_name 缺失导致"板块已踢出"误报）──
     sector_name: Optional[str] = Field(default=None, description="匹配到的板块名（来自 confirmed_sectors）")
     sector_classification: Optional[str] = Field(default=None, description="板块分类: actionable/caution/exclude")
+    # ── 持仓身份锚（买入时定死；2026-11-02）──
+    identity_sector_name: Optional[str] = Field(
+        default=None,
+        description="持仓买入时的 thesis 板块身份（固定，不随当日 boards 重选）；仅持仓股有效",
+    )
+    identity_family_name: Optional[str] = Field(
+        default=None,
+        description="持仓买入时的 thesis 家族身份（固定）；仅持仓股有效",
+    )
     # 生命周期字段（用于 Step 3 吃鱼身+高切低策略）
     lifecycle_phase: Optional[str] = Field(default=None, description="板块生命周期阶段: launch/acceleration/mature/late_stage/mature_exhausted")
     lifecycle_day: Optional[int] = Field(default=None, description="生命周期已运行天数")

@@ -3755,9 +3755,15 @@ class SectorAnalysisNode:
     ) -> list:
         """数据驱动的板块家族聚类（替代硬编码 FAMILY_KEYWORDS 分桶）。
 
-        使用板块 90 日收益相关性矩阵 + 层次聚类（average linkage，numpy 实现）
-        将相关性高的板块自然聚为一族。不同驱动逻辑的板块（如黄金 vs 稀土）
-        因收益相关性低而分入不同族。
+        使用板块最近 N 日收益的**残差相关**矩阵（默认剔除当日截面均值 = 等权市场因子；
+        `GOT_FAMILY_CLUSTER_BASIS=raw` 回退历史口径）+ complete linkage（numpy 实现）
+        将相关性高的板块自然聚为一族。
+
+        2026-11-03 实证修正：原始收益相关在 A 股长期 0.9+（同涨同跌 beta），
+        `raw` 口径下 38 成员簇内 pairwise 相关最小 +0.70 / 中位 +0.92，簇标签没有产业含义；
+        取残差后同一批板块中位相关 ≈ -0.05 → 大块自动拆成子簇，而真同族仍保留
+        （石油开采/石油 +0.98、白酒/酿酒 +1.00、芯片/半导体 +0.95、创新药/医药 +0.94），
+        跨族伪相关被削掉（芯片/军贸概念 0.51→0.14）。
 
         参考：Boubaker et al. (2022) — 按收益相关性合并行业，Sharpe 0.71→1.16。
 
@@ -3799,25 +3805,61 @@ class SectorAnalysisNode:
             logger.warning("[Node 2] 有效收益数据不足，回退到关键词分组")
             return self._build_theme_families_fallback(analyzed)
 
-        # 对齐收益序列长度
+        # 对齐收益序列长度（取**最近**窗口：原实现 [:min_len] 在序列不等长时会取到最老的一段）
         min_len = min(len(r) for r in returns_list if r is not None)
+        basis = (os.getenv("GOT_FAMILY_CLUSTER_BASIS", "residual") or "").strip().lower()
+        if basis not in ("raw", "residual"):
+            basis = "residual"
+        try:
+            window_cap = max(20, int(os.getenv("GOT_FAMILY_CLUSTER_WINDOW", "60")))
+        except (TypeError, ValueError):
+            window_cap = 60
+        window = max(20, min(min_len, window_cap))
 
-        # 计算相关系数矩阵
-        corr_matrix = np.zeros((n_valid, n_valid))
-        for a in range(n_valid):
-            corr_matrix[a, a] = 1.0
-            ra = np.array(returns_list[valid_indices[a]][:min_len])
-            for b in range(a + 1, n_valid):
-                rb = np.array(returns_list[valid_indices[b]][:min_len])
-                if ra.std() > 1e-10 and rb.std() > 1e-10:
-                    c = float(np.corrcoef(ra, rb)[0, 1])
-                    if not np.isnan(c):
-                        corr_matrix[a, b] = c
-                        corr_matrix[b, a] = c
+        # ── 相关性计算基（2026-11-03 实证修正）──
+        # raw   = 原始收益相关（历史实现）：A 股板块间原始相关长期 0.9+（同涨同跌的 beta），
+        #         complete linkage@0.65 必然把板块粘成 20-60 成员的大块（10-23 实测 38 成员簇
+        #         簇内 pairwise 最小相关 +0.70、中位 +0.92），簇标签对成员没有产业含义。
+        # residual = 剔除当日截面均值（等权「市场」因子）后的残差相关：同一批板块残差相关
+        #         中位 ≈ -0.05，可分出石油/机器人/医药等真正同步的子簇。默认 residual。
+        matrix = np.array([
+            list(returns_list[valid_indices[i]])[-window:] for i in range(n_valid)
+        ], dtype=float)
+        if basis == "residual":
+            matrix = matrix - matrix.mean(axis=0, keepdims=True)
+
+        corr_matrix = np.corrcoef(matrix) if n_valid > 1 else np.ones((1, 1))
+        corr_matrix = np.nan_to_num(np.atleast_2d(corr_matrix), nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(corr_matrix, 1.0)
+        logger.info(
+            "[Node 2] 家族聚类基=%s, 窗口=%d 日, 有效板块=%d",
+            basis, window, n_valid,
+        )
 
         # ── Step 2: 层次聚类（complete linkage，纯 numpy）──
         corr_threshold = 0.65  # 相关性 > 0.65 的板块聚为一族（complete linkage 保守）
         cluster_labels = self._hierarchical_cluster(corr_matrix, corr_threshold)
+
+        # ── Step 2b: 大簇二级切分（2026-11-03）──
+        # 一级簇仍偏粗（AI硬件把 芯片/显示/消费电子/算力设施 混成一族）。对大簇在更严阈值下
+        # 再聚一次，得到子链（芯片制造 / 显示面板 / 消费电子 / 数据中心·光模块 / 大模型软件）。
+        # 只切 ≥SPLIT_MIN 成员的大簇，小簇不动；子簇数量 >1 才采用，否则保留原簇。
+        if os.getenv("GOT_FAMILY_CLUSTER_SPLIT", "1") == "1":
+            try:
+                split_min = max(4, int(os.getenv("GOT_FAMILY_CLUSTER_SPLIT_MIN", "10")))
+            except (TypeError, ValueError):
+                split_min = 10
+            try:
+                split_th = float(os.getenv("GOT_FAMILY_CLUSTER_SPLIT_THRESHOLD", "0.88"))
+            except (TypeError, ValueError):
+                split_th = 0.88
+            cluster_labels = self._split_large_clusters(
+                corr_matrix, cluster_labels, split_th, split_min,
+            )
+            logger.info(
+                "[Node 2] 大簇二级切分: 阈值 %.2f, 最小簇 %d → %d 簇",
+                split_th, split_min, len(set(cluster_labels)),
+            )
 
         # ── Step 3: 计算板块一致性评分（Fix 2）──
         coherence_scores = self._compute_all_coherence(corr_matrix, cluster_labels, n_valid)
@@ -3907,6 +3949,43 @@ class SectorAnalysisNode:
             f"（阈值 r>{corr_threshold}）"
         )
         return families
+
+    @classmethod
+    def _split_large_clusters(
+        cls,
+        corr_matrix: np.ndarray,
+        labels: list[int],
+        threshold: float,
+        min_size: int,
+    ) -> list[int]:
+        """一级簇内二级切分：只对 ≥min_size 的簇在 threshold 下重聚，其余不动。
+
+        返回重排后的连续簇标签。切不出多簇（complete linkage 下全连通）则保留原簇。
+        """
+        groups: dict[int, list[int]] = {}
+        for idx, label in enumerate(labels):
+            groups.setdefault(label, []).append(idx)
+
+        final_groups: list[list[int]] = []
+        for members in groups.values():
+            if len(members) < min_size:
+                final_groups.append(members)
+                continue
+            sub = corr_matrix[np.ix_(members, members)]
+            sub_labels = cls._hierarchical_cluster(sub, threshold)
+            parts: dict[int, list[int]] = {}
+            for local_idx, sub_label in enumerate(sub_labels):
+                parts.setdefault(sub_label, []).append(local_idx)
+            if len(parts) <= 1:
+                final_groups.append(members)
+                continue
+            final_groups.extend([[members[i] for i in part] for part in parts.values()])
+
+        relabeled = [0] * len(labels)
+        for new_label, members in enumerate(final_groups):
+            for idx in members:
+                relabeled[idx] = new_label
+        return relabeled
 
     @staticmethod
     def _hierarchical_cluster(

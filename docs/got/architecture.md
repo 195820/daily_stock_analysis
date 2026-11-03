@@ -218,7 +218,8 @@
 - `defensive_rotation`: 防守轮动
 - `cooling_down`: 高位降温
 - `industry_top`: 行业板块 Top
-- `theme_families`: 题材家族
+- `theme_families`: 题材家族（K 线聚类：最近 60 日**残差**收益相关，剔除截面市场因子 +
+  complete linkage@0.65；≥10 成员的大簇在 0.88 下二级切分。`GOT_FAMILY_CLUSTER_BASIS/WINDOW/SPLIT*` 可调）
 - `strength_lookup`: dict[板块名→强度分]（供 Node 6 消费）
 - `confidence_level`: "high"/"medium"/"low"
 
