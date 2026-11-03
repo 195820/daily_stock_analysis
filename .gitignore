@@ -108,3 +108,7 @@ _review_diff*.txt
 # （新实施计划一律写 docs/got/plans/，过程稿完结即入 archive/，不得退回根目录）
 # 2026-10-24 ECS 迁移打包目录（含 .env 副本与 tar.gz，绝不入库）
 /_deploy_pkg/
+
+# 2026-11-03 本地过程产物（用户裁决：生成物/临时脚本不入库）
+/docs/got/flowchart.html
+/docs/got/reviews/
