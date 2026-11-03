@@ -731,7 +731,7 @@ class TestFilterGotFinalistsMergeWiring(unittest.TestCase):
              patch.object(s, "_score_risk", lambda cands, fm: {
                  c["code"]: 80.0 for c in cands}), \
              patch.object(s, "_apply_r4_filter", lambda cands, ctx: cands), \
-             patch.object(s, "_score_news", lambda cands, nctx, sctx=None: (
+             patch.object(s, "_score_news", lambda cands, nctx, sctx=None, **kwargs: (
                  {c["code"]: 60.0 for c in cands}, {c["code"]: True for c in cands})), \
              patch.object(s, "_score_catalyst_relevance", lambda cands, ctx: ({}, {})), \
              patch.object(s, "_compute_got_composite_score", lambda stock, ctx: 66.0), \
@@ -808,7 +808,7 @@ class TestFilterGotFinalistsMergeWiring(unittest.TestCase):
              patch.object(s, "_score_risk", lambda cands, fm: {
                  c["code"]: 80.0 for c in cands}), \
              patch.object(s, "_apply_r4_filter", lambda cands, ctx: cands), \
-             patch.object(s, "_score_news", lambda cands, nctx, sctx=None: (
+             patch.object(s, "_score_news", lambda cands, nctx, sctx=None, **kwargs: (
                  {c["code"]: 60.0 for c in cands}, {c["code"]: True for c in cands})), \
              patch.object(s, "_score_catalyst_relevance", lambda cands, ctx: ({}, {})), \
              patch.object(s, "_compute_got_composite_score", lambda stock, ctx: 66.0), \
@@ -926,6 +926,99 @@ class TestGA2PositionScalars(unittest.TestCase):
 
         self.assertEqual([c["code"] for c in passed], ["600009"])
         self.assertEqual(trace["g_a2_position_unsafe"], 0)
+
+
+class TestAmbushLaneDimensionWiring(unittest.TestCase):
+    """埋伏道资金/消息维度透传（2026-11-03 接线修复）。
+
+    回归背景：埋伏票在 Step 1 即被拆出主线漏斗，R2 `_score_capital` 与 R4 后
+    `_score_news` 只扫主线池 → `ScreenerStock` 四字段落 dataclass 默认值
+    （0.0 / False）→ Phase 2 五维评分把 capital+news 的 30% 权重整体重分配。
+    本用例锁定：候选 dict 的维度分必须随 lane finalist 透传。
+    """
+
+    def _capital_ctx_with_flows(self):
+        flows = {f"板块{i}": float(i) for i in range(1, 11)}  # 满足 >10 全量映射门槛
+        flows.update({"黄金概念": 3.0, "白银概念": 1.0})
+        return {
+            "evidence": {
+                "sector_flow": {
+                    "sector_flow_all": flows,
+                    "sector_flow_all_3d": {"黄金概念": 2.0, "白银概念": 0.5},
+                },
+            },
+        }
+
+    def test_lane_finalists_carry_capital_and_news_dimensions(self):
+        s = _screener()
+        candidates = [
+            {**_ticket("600001", "黄金概念"), "dde_5d_sum": 1.2},
+            {**_ticket("600002", "白银概念"), "dde_5d_sum": 0.8},
+        ]
+        got_context = {
+            "capital_context": self._capital_ctx_with_flows(),
+            "news_context": {
+                "major_events": [
+                    {"title": "x", "impact_level": "high",
+                     "sentiment": "positive", "affected_sectors": ["黄金概念"]},
+                ],
+            },
+            "sector_context": {"ambush": []},  # 三标量缺失 → G-A2 位置带 soft-pass
+            "unified_context": {
+                "ambush_pool": [
+                    {"sector_name": "黄金概念"}, {"sector_name": "白银概念"},
+                ],
+            },
+            "semantic_relations": {
+                "黄金概念": {"signal": 0.5},
+                "白银概念": {"signal": -0.5},
+            },
+        }
+
+        lane_finalists, lane_shadow, lane_trace = s._run_ambush_lane(
+            candidates, got_context, fetcher_manager=None,
+        )
+
+        self.assertEqual(lane_trace.get("lane_error", 0), 0)
+        by_code = {st.code: st for st in lane_finalists}
+        self.assertEqual(set(by_code), {"600001", "600002"})
+
+        gold = by_code["600001"]
+        self.assertTrue(gold.capital_available)
+        self.assertGreater(gold.capital_score, 0.0)
+        self.assertTrue(gold.news_available)
+        self.assertEqual(gold.news_score, 70.0)  # 40 + 0.5×60
+
+        silver = by_code["600002"]
+        self.assertTrue(silver.capital_available)
+        self.assertTrue(silver.news_available)
+        self.assertEqual(silver.news_score, 10.0)  # 40 + (−0.5)×60
+
+        # 候选 dict 同步留痕（供 shadow/trace 复算）
+        for c in candidates:
+            self.assertIn("capital_score", c)
+            self.assertIn("news_score", c)
+
+    def test_lane_scoring_failure_degrades_to_unavailable(self):
+        """`_score_capital` 契约异常（5 日 DDE 缺失且未标降级）→ 维度降级为不可用，
+        闸门链路不受影响（不引入新的崩溃面）。"""
+        s = _screener()
+        candidates = [_ticket("600001", "黄金概念")]  # 无 dde_5d_sum 且未标 degraded
+        got_context = {
+            "capital_context": self._capital_ctx_with_flows(),
+            "news_context": {"major_events": [{"title": "x", "affected_sectors": ["黄金概念"]}]},
+            "sector_context": {"ambush": []},
+            "unified_context": {"ambush_pool": [{"sector_name": "黄金概念"}]},
+        }
+
+        lane_finalists, _, lane_trace = s._run_ambush_lane(
+            candidates, got_context, fetcher_manager=None,
+        )
+
+        self.assertEqual(lane_trace.get("lane_error", 0), 0)
+        self.assertEqual(len(lane_finalists), 1)
+        self.assertFalse(lane_finalists[0].capital_available)
+        self.assertFalse(lane_finalists[0].news_available)
 
 
 if __name__ == "__main__":
