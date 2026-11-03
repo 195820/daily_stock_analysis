@@ -3,6 +3,27 @@
 
 ---
 
+## 2026-11-03 补登（埋伏道资金/消息维度接线修复 — 已生效，无开关）
+
+改动明细见 `docs/CHANGELOG.md` 同日条目；代码 `src/services/stock_screener.py::_run_ambush_lane`。
+
+- **病灶**：埋伏票在 `_filter_got_finalists` Step 1 被拆出主线漏斗，R2 `_score_capital` / R4 后
+  `_score_news` 只扫主线池；lane finalist 的 `ScreenerStock` 四字段恒默认值（0.0/False）→ Phase 2
+  五维评分把 capital+news 的 30% 权重重分配给 sector/tech/risk。20261103 归档实证：3 只埋伏票
+  dims 全 `capital=0/news=0`，composite `61.5 = 50.1×0.357 + 42×0.357 + 100×0.286` 精确复现。
+- **修复**：`_run_ambush_lane` 在 G-A0 前对整条道输入批量补跑两维（DDE 5 日组 + 板块流百分位；
+  A6 relations 直读），写回候选 dict，并在正常/fail-open 两处构造透传四字段；评分异常按
+  「维度不可用」降级，不阻断闸门。
+- **预期行为变化（下个 `--got` 归档核对）**：埋伏票 `dimension_scores.capital/news` 不再恒为默认值；
+  `capital_available=True` 且 `capital<35` 的埋伏票会被 Step 3 降 `watch`（此前因 `not available`
+  短路恒过）。`action` 由 `buy_dip` 变 `watch` 属预期，不视为回归。
+- **回滚**：无环境开关，回退该 commit 即恢复旧行为（两维剔除）。
+- **验证**：`tests/test_ambush_lane_split.py` 36 passed（新增透传 + 契约异常降级 2 例）；
+  `test_lane_budget_d3` / `test_bear_entry_gate` 合计 61 passed；failing-before 已用 HEAD 版
+  `stock_screener.py` 复跑同用例证伪（`capital_available=False`）。
+
+---
+
 ## 2026-11-03 补登（家族簇 K 线聚类 → 家族 identity — 规则层回测结案，A6 未开播）
 
 计划：`local://kline-family-cluster-plan.md`；改动明细见 `docs/CHANGELOG.md` 同日条目。

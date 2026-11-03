@@ -1605,6 +1605,32 @@ class StockScreenerPipeline:
 
         # G-A0 记录：G-A0 成功后，后续闸门 fail-open 只遍历已过滤列表，不把涨停票放回
         limit_up_filtered: List[Dict] = []
+
+        # ── 资金/消息维度评分（2026-11-03 接线修复）──
+        # 埋伏票在 Step 1 就被拆出主线漏斗，不再经过 R2 的 `_score_capital` 与
+        # R4 后的 `_score_news`；`ScreenerStock` 构造若只带 sector/ambush_rank，
+        # 四字段落 dataclass 默认值（0.0 / False）→ Phase 2 五维评分把 capital+news
+        # 的 30% 权重整体重分配给 sector/tech/risk，埋伏票的资金与消息证据对排序
+        # 永久失明（G-A1/G-A2 只是闸门，不产出维度分）。
+        # 分母口径：以拆分后、G-A0 前的整条埋伏道输入为组内百分位（与主线 R2 对
+        # 主线池同构），不放在 G-A4 之后——否则决赛票互相自比，排名退化。
+        capital_ctx = got_context.get("capital_context", {})
+        news_ctx = got_context.get("news_context", {})
+        try:
+            capital_scores, capital_avail = self._score_capital(ambush_candidates, capital_ctx)
+            news_scores, news_avail = self._score_news(
+                ambush_candidates, news_ctx, got_context.get("sector_context", {}),
+                got_context=got_context,
+            )
+        except Exception as exc:  # noqa: BLE001 — 维度评分失败按「不可用」降级，不阻断闸门
+            logger.warning(f"[埋伏道] 资金/消息维度评分失败，按不可用降级: {exc}")
+        else:
+            for c in ambush_candidates:
+                c["capital_score"] = capital_scores.get(c["code"], 0)
+                c["capital_available"] = capital_avail.get(c["code"], False)
+                c["news_score"] = news_scores.get(c["code"], 0)
+                c["news_available"] = news_avail.get(c["code"], False)
+
         try:
             # ── G-A0: 涨停过滤（与主线 R0 同口径；2026-10-27 修复埋伏道绕过 R0）──
             _kept: List[Dict] = []
@@ -1622,13 +1648,11 @@ class StockScreenerPipeline:
                 )
 
             # ── G-A1: 资金面闸门 ──
-            capital_ctx = got_context.get("capital_context", {})
             passed_a1, a1_trace = self._ga1_gate(ambush_candidates, capital_ctx)
             for k, v in a1_trace.items():
                 lane_trace[k] = lane_trace.get(k, 0) + v
 
             # ── G-A2: 催化剂闸门 ──
-            news_ctx = got_context.get("news_context", {})
             # pool fast-pass 白名单：Node 6 ambush_pool 成员（催化证明在池准入时已完成）
             unified_ctx = got_context.get("unified_context") or {}
             pool_names = {
@@ -1677,6 +1701,12 @@ class StockScreenerPipeline:
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
+                    # 2026-11-03 接线修复：资金/消息维度随候选 dict 透传，
+                    # 否则 Phase 2 五维评分恒剔除该两维（默认 0.0 / False）
+                    capital_score=c.get("capital_score", 0),
+                    capital_available=c.get("capital_available", False),
+                    news_score=c.get("news_score", 0),
+                    news_available=c.get("news_available", False),
                 )
                 lane_finalists.append(stock)
 
@@ -1737,6 +1767,11 @@ class StockScreenerPipeline:
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
+                    # 2026-11-03 接线修复：fail-open 路径同样透传资金/消息维度
+                    capital_score=c.get("capital_score", 0),
+                    capital_available=c.get("capital_available", False),
+                    news_score=c.get("news_score", 0),
+                    news_available=c.get("news_available", False),
                 )
                 lane_finalists.append(stock)
             lane_shadow = {
