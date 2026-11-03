@@ -10,6 +10,7 @@ from src.services.board_name_resolver import (
     SELF_HEAL_SIM_THRESHOLD,
     BoardNameResolver,
     _is_dirty_cache,
+    _is_narrowing_alias,
     clean_board_name,
 )
 
@@ -76,6 +77,42 @@ def test_l1_alias_with_dirty_input(tmp_path: Path):
     resolver._ths_concept_names = []
     resolver._ths_industry_names = []
     assert resolver.resolve("生物制药" + _NULL * 2) == "生物医药"
+
+
+def test_is_narrowing_alias_blocks_parent_to_child():
+    assert _is_narrowing_alias("化工", "氟化工概念") is True
+    assert _is_narrowing_alias("化工", "化工原料") is True
+    assert _is_narrowing_alias("半导体", "半导体概念") is False
+    assert _is_narrowing_alias("生物制药", "生物医药") is False
+    assert _is_narrowing_alias("化工", "化工") is False
+
+
+def test_l1_skips_auto_narrowing_alias(tmp_path: Path):
+    alias_file = tmp_path / "aliases.json"
+    alias_file.write_text(json.dumps({
+        "aliases": {"化工": {"target": "氟化工概念", "source": "auto", "kind": "concept"}}
+    }), encoding="utf-8")
+
+    resolver = BoardNameResolver(alias_path=alias_file)
+    resolver._ths_concept_names = []
+    resolver._ths_industry_names = []
+    name, kind = resolver.resolve_with_kind("化工")
+    assert name == "化工"
+    assert kind is None
+
+
+def test_l1_allows_manual_narrowing_alias(tmp_path: Path):
+    alias_file = tmp_path / "aliases.json"
+    alias_file.write_text(json.dumps({
+        "aliases": {"化工": {"target": "氟化工概念", "source": "manual", "kind": "concept"}}
+    }), encoding="utf-8")
+
+    resolver = BoardNameResolver(alias_path=alias_file)
+    resolver._ths_concept_names = []
+    resolver._ths_industry_names = []
+    name, kind = resolver.resolve_with_kind("化工")
+    assert name == "氟化工概念"
+    assert kind == "concept"
 
 
 # ── L2 模糊匹配 ──
@@ -145,6 +182,31 @@ def test_confirm_with_kind(tmp_path: Path):
     assert saved["aliases"]["生物制药"]["target"] == "生物医药"
     assert saved["aliases"]["生物制药"]["kind"] == "concept"
     assert saved["aliases"]["生物制药"]["source"] == "auto"
+
+
+def test_confirm_rejects_auto_narrowing_alias(tmp_path: Path):
+    alias_file = tmp_path / "aliases.json"
+    resolver = BoardNameResolver(alias_path=alias_file)
+
+    resolver.confirm("化工", "氟化工概念", kind="concept")
+    assert not alias_file.exists() or "化工" not in json.loads(
+        alias_file.read_text(encoding="utf-8")
+    ).get("aliases", {})
+
+    # 人工确认仍允许，用于人工裁决
+    resolver.confirm("化工", "氟化工概念", kind="concept", source="manual")
+    saved = json.loads(alias_file.read_text(encoding="utf-8"))
+    assert saved["aliases"]["化工"]["target"] == "氟化工概念"
+    assert saved["aliases"]["化工"]["source"] == "manual"
+
+
+def test_confirm_allows_same_core_concept_suffix(tmp_path: Path):
+    alias_file = tmp_path / "aliases.json"
+    resolver = BoardNameResolver(alias_path=alias_file)
+
+    resolver.confirm("半导体", "半导体概念", kind="concept")
+    saved = json.loads(alias_file.read_text(encoding="utf-8"))
+    assert saved["aliases"]["半导体"]["target"] == "半导体概念"
 
 
 def test_confirm_skips_same_name(tmp_path: Path):

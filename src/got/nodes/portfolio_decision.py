@@ -1281,6 +1281,10 @@ class PortfolioDecisionNode:
                 f"{'（无数据，已跳过）' if not capital_has_data else ''}, "
                 f"动作: {action}"
             )
+            # 身份锚（买入时定死）：当日板块与 thesis 不一致时仍保留身份标签，便于审计/展示
+            _identity_sector = stock_sector_info.get("identity_sector_name")
+            if _identity_sector and _identity_sector != sector_name:
+                reasoning += f" [身份:{_identity_sector}]"
             # H1：资金维数据供给留痕（缺失显式标注 / 命中给 1d-3d-5d 流向）
             if capital_data_missing:
                 reasoning += " [资金维缺失→权重已归一化]"
@@ -1379,6 +1383,8 @@ class PortfolioDecisionNode:
                     reasoning=reasoning,
                     sector_name=sector_name or None,
                     sector_classification=sector_classification,
+                    identity_sector_name=stock_sector_info.get("identity_sector_name"),
+                    identity_family_name=stock_sector_info.get("identity_family_name"),
                     lifecycle_phase=lifecycle_phase,
                     lifecycle_day=lifecycle_day,
                     overheat_severity=overheat_severity,
@@ -3590,12 +3596,16 @@ class PortfolioDecisionNode:
         is_fallback = stock_sector_info.get("is_fallback", False)
         sector_name = stock_sector_info.get("sector_name", "")
 
+        # 持仓身份锚：thesis 是买入时定死的身份，后续不再随当日 boards 重选。
+        # 当日 sector_name 只表示“今天匹配到哪个板块”，身份仍以 thesis 为准。
+        thesis = thesis_map.get(symbol)
+        if thesis is not None and getattr(thesis, "sector_name", ""):
+            stock_sector_info["identity_sector_name"] = thesis.sector_name
+            stock_sector_info["identity_family_name"] = getattr(thesis, "family_name", "") or ""
+
         # 人工主板块覆盖：不再用 thesis 判漂移（覆盖本身就是人工裁决）
         if stock_sector_info.get("is_override"):
             return stock_sector_info
-
-        # 查论点快照
-        thesis = thesis_map.get(symbol)
 
         # 板块漂移检测：有直接匹配但板块名与论点不一致（归一化后比对，避免别名/后缀误报）
         from src.got.board_aliases import normalize_sector_name

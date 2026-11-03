@@ -52,10 +52,33 @@ _NAME_COLUMNS = ("name", "名称", "概念名称", "板块名称")
 
 
 def clean_board_name(name: str) -> str:
-    """清洗板块名：去除 \\u0000 填充符与首尾空白（TDX GBK 定长字段常见脏字符）"""
+    """清洗板块名：去除 \u0000 填充符与首尾空白（TDX GBK 定长字段常见脏字符）"""
     if not name:
         return ""
     return name.replace("\u0000", "").strip()
+
+
+def _is_narrowing_alias(source: str, target: str) -> bool:
+    """判断别名是否把父级板块自动窄化成了子概念。
+
+    2026-11-02：服务器自动学习出 `化工 → 氟化工概念`（source=auto,
+    kind=concept），导致所有“化工”查询实际只查氟化工，富祥股份（化学制药）
+    因此被当成化工埋伏票。自动回写不得把父名缩成子概念；手工别名仍允许人工裁决。
+
+    规则（只拦最明显的窄化，避免误伤 `半导体 → 半导体概念`）：
+    - target 包含 source，且 source 前面还有限定词（如 氟 + 化工）→ 窄化；
+    - target 以 source 开头但后缀不是“概念/板块/行业”（如 化工原料）→ 窄化；
+    - 其余不拦（`半导体 → 半导体概念` 合法）。
+    """
+    if not source or not target or source == target:
+        return False
+    if source not in target:
+        return False
+    idx = target.index(source)
+    if idx > 0:
+        return True
+    suffix = target[len(source):]
+    return bool(suffix) and suffix not in ("概念", "板块", "行业")
 
 
 def _is_dirty_cache(names: List[str]) -> bool:
@@ -93,13 +116,22 @@ class BoardNameResolver:
                 for name, entry in raw.get("aliases", {}).items():
                     if isinstance(entry, str):
                         entry = {"target": entry}
+                    source = entry.get("source", "manual")
                     target = clean_board_name(entry.get("target", ""))
-                    if target:
-                        aliases[clean_board_name(name)] = {
-                            "target": target,
-                            "source": entry.get("source", "manual"),
-                            "kind": entry.get("kind"),
-                        }
+                    cleaned_name = clean_board_name(name)
+                    if not target or not cleaned_name:
+                        continue
+                    if source in ("auto", "auto_lowconf") and _is_narrowing_alias(cleaned_name, target):
+                        logger.warning(
+                            "[板块名解析] 跳过自动窄化别名: %s → %s（source=%s）",
+                            cleaned_name, target, source,
+                        )
+                        continue
+                    aliases[cleaned_name] = {
+                        "target": target,
+                        "source": source,
+                        "kind": entry.get("kind"),
+                    }
         except Exception as e:
             logger.warning(f"[板块名解析] 加载别名表失败({self._alias_path}): {e}")
         self._aliases = aliases
@@ -385,6 +417,13 @@ class BoardNameResolver:
         cleaned = clean_board_name(sector_name)
         target = clean_board_name(resolved_name)
         if not cleaned or not target or cleaned == target:
+            return
+        if source in ("auto", "auto_lowconf") and _is_narrowing_alias(cleaned, target):
+            logger.warning(
+                "[板块名解析] 拒绝自动窄化别名: %s → %s（source=%s，kind=%s）；"
+                "父级板块不得自动缩成子概念，需人工 manual 确认",
+                cleaned, target, source, kind,
+            )
             return
         with self._lock:
             aliases = self._load_aliases()

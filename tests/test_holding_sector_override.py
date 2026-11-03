@@ -67,6 +67,23 @@ class TestHoldingSectorOverride(unittest.TestCase):
         )
         self.assertEqual(out["sector_name"], "东数西算")
         self.assertNotIn("thesis_drift", out)
+        self.assertEqual(out["identity_sector_name"], "光伏")
+
+    def test_thesis_identity_is_fixed_when_current_sector_differs(self):
+        node = PortfolioDecisionNode(use_mock=True)
+        info = {
+            "sector_name": "新能源车",
+            "sector_type": "mainline",
+            "strength": 72.2,
+        }
+        thesis = SimpleNamespace(sector_name="动力电池", family_name="其他")
+        out = node._find_stock_sector_with_thesis(
+            info, "002009", None, {}, {"002009": thesis},
+        )
+        # 当日匹配仍是新能源车；买入身份固定为 thesis 的动力电池，不再被重选
+        self.assertEqual(out["sector_name"], "新能源车")
+        self.assertEqual(out["identity_sector_name"], "动力电池")
+        self.assertTrue(out["thesis_drift"])
 
 
 if __name__ == "__main__":
