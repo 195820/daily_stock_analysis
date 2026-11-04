@@ -435,29 +435,48 @@ class TestAmbushLaneSplit(unittest.TestCase):
         self.assertEqual(trace["g_a3_knife"], 1)
 
     def test_g_a4_rank_dedup_topk(self):
-        """G-A4：score=conf×prox×(1+0.2×pct)；同板块去重取 max；TopK=3 截断"""
+        """G-A4：个股强度项 + 同板块去重取最高 + TopK=3 截断。"""
         s = _screener()
-        # 构造 5 只候选，2 只同板块
+        # 构造 5 只候选，2 只同板块；600002 的 DDE 5d 更高，必须胜出。
         candidates = [
-            {"code": "600001", "sector": "黄金概念", "ambush_rank_score": 0.8},
-            {"code": "600002", "sector": "黄金概念", "ambush_rank_score": 0.9},  # 同板块更高
-            {"code": "600003", "sector": "白银概念", "ambush_rank_score": 0.7},
-            {"code": "600004", "sector": "铜概念", "ambush_rank_score": 0.6},
-            {"code": "600005", "sector": "铝概念", "ambush_rank_score": 0.5},
+            {"code": "600001", "sector": "黄金概念", "dde_5d_sum": 1.0},
+            {"code": "600002", "sector": "黄金概念", "dde_5d_sum": 5.0},
+            {"code": "600003", "sector": "白银概念", "dde_5d_sum": 0.4},
+            {"code": "600004", "sector": "铜概念", "dde_5d_sum": 0.3},
+            {"code": "600005", "sector": "铝概念", "dde_5d_sum": 0.2},
         ]
-        
+
         passed, trace = s._ga4_rank(candidates, flow_percentile={})
-        
+
         # 断言 TopK=3
         self.assertEqual(len(passed), 3)
-        
-        # 断言同板块去重：黄金概念只保留 600002（score 更高）
-        sectors = [c.get("sector") for c in passed]
-        self.assertEqual(sectors.count("黄金概念"), 1)
-        
+
+        # 断言同板块去重：黄金概念只保留 600002（个股强度更高，而非输入序第一）
+        gold = [c for c in passed if c.get("sector") == "黄金概念"]
+        self.assertEqual([c.get("code") for c in gold], ["600002"])
+        self.assertGreater(gold[0]["ambush_stock_strength"], 0.5)
+
         # 断言 trace 含 g_a4_selected
         self.assertIn("g_a4_selected", trace)
         self.assertEqual(trace["g_a4_selected"], 3)
+
+    def test_g_a4_rank_is_input_order_independent(self):
+        """G-A4：打乱输入序，胜者不变（禁止回退输入序）。"""
+        s = _screener()
+        candidates = [
+            {"code": "600001", "sector": "黄金概念", "dde_5d_sum": 1.0},
+            {"code": "600002", "sector": "黄金概念", "dde_5d_sum": 5.0},
+            {"code": "600003", "sector": "白银概念", "dde_5d_sum": 0.4},
+            {"code": "600004", "sector": "铜概念", "dde_5d_sum": 0.3},
+            {"code": "600005", "sector": "铝概念", "dde_5d_sum": 0.2},
+        ]
+        first, _ = s._ga4_rank([dict(c) for c in candidates], flow_percentile={})
+        second, _ = s._ga4_rank([dict(c) for c in reversed(candidates)], flow_percentile={})
+        self.assertEqual(
+            [c.get("code") for c in first],
+            [c.get("code") for c in second],
+        )
+        self.assertEqual([c.get("code") for c in first][0], "600002")
 
     def test_lane_error_fail_open_and_merge(self):
         """G-A4 fail-open：gate 异常 → 全过 + lane_error；合并改 union 语义（2026-10-20 D4）"""
@@ -738,7 +757,7 @@ class TestFilterGotFinalistsMergeWiring(unittest.TestCase):
              patch.object(s, "_generate_got_reasoning", lambda stock, ctx: "理由"), \
              patch.object(s, "_build_backtest_snapshot", lambda stock, fm: {}), \
              patch.object(s, "_get_stock_name", lambda code, fm=None, *a: f"票{code}"), \
-             patch.object(s, "_run_ambush_lane", lambda cands, ctx, fm=None: (
+             patch.object(s, "_run_ambush_lane", lambda cands, ctx, fm=None, **kwargs: (
                  lane_stocks,
                  {"mode": "shadow", "lane_finalists": [
                      {"code": st.code, "sector": st.sector_name} for st in lane_stocks]},
@@ -784,7 +803,7 @@ class TestFilterGotFinalistsMergeWiring(unittest.TestCase):
         """零埋伏 finalist 日（合并块不执行）lane_merge_mode 仍落 funnel_trace"""
         s = _screener()
 
-        def _empty_lane(cands, ctx, fm=None):
+        def _empty_lane(cands, ctx, fm=None, **kwargs):
             return (
                 [],
                 {"mode": "shadow", "lane_finalists": []},
@@ -999,6 +1018,30 @@ class TestAmbushLaneDimensionWiring(unittest.TestCase):
             self.assertIn("capital_score", c)
             self.assertIn("news_score", c)
 
+    def test_lane_finalists_get_real_tech_risk_scores(self):
+        """P0-4：决赛票必须带主线同口径 tech/risk，不得落默认 0/100。"""
+        s = _screener()
+        candidates = [{**_ticket("600001", "黄金概念"), "dde_5d_sum": 1.2}]
+        got_context = {
+            "capital_context": self._capital_ctx_with_flows(),
+            "news_context": {"major_events": [{"title": "x", "affected_sectors": ["黄金概念"]}]},
+            "sector_context": {"ambush": []},
+            "unified_context": {"ambush_pool": [{"sector_name": "黄金概念"}]},
+            "semantic_relations": {"黄金概念": {"signal": 0.5}},
+        }
+        with patch.object(s, "_score_technical_wave", return_value={"600001": 77.0}), \
+             patch.object(s, "_score_risk", return_value={"600001": 66.0}):
+            lane_finalists, lane_shadow, lane_trace = s._run_ambush_lane(
+                candidates, got_context, fetcher_manager=MagicMock(),
+            )
+
+        self.assertEqual(lane_trace.get("lane_error", 0), 0)
+        self.assertEqual(len(lane_finalists), 1)
+        self.assertEqual(lane_finalists[0].tech_wave_score, 77.0)
+        self.assertEqual(lane_finalists[0].risk_score_safe, 66.0)
+        self.assertEqual(lane_shadow["lane_finalists"][0]["tech_wave_score"], 77.0)
+        self.assertEqual(lane_shadow["lane_finalists"][0]["risk_score_safe"], 66.0)
+
     def test_lane_scoring_failure_degrades_to_unavailable(self):
         """`_score_capital` 契约异常（5 日 DDE 缺失且未标降级）→ 维度降级为不可用，
         闸门链路不受影响（不引入新的崩溃面）。"""
@@ -1019,6 +1062,155 @@ class TestAmbushLaneDimensionWiring(unittest.TestCase):
         self.assertEqual(len(lane_finalists), 1)
         self.assertFalse(lane_finalists[0].capital_available)
         self.assertFalse(lane_finalists[0].news_available)
+
+
+class TestAmbushLaneFlowPurity(unittest.TestCase):
+    """P0-3/P0-1：个股 3 日主力净流入闸门 + 板块主题纯度。"""
+
+    def test_ga1_stock_flow_negative_rejects(self):
+        s = _screener()
+        candidates = [
+            {**_ticket("600001", "黄金概念"), "dde_5d_sum": 1.0},
+            {**_ticket("600002", "黄金概念"), "dde_5d_sum": 2.0},
+        ]
+        passed, trace = s._ga1_gate(
+            candidates,
+            _capital_ctx(flow_3d={"黄金概念": 5.0}),
+            stock_flow_3d={"600001": -49_700_000.0, "600002": 10_000_000.0},
+        )
+        self.assertEqual([c["code"] for c in passed], ["600002"])
+        self.assertEqual(trace["g_a1_stock_flow_negative"], 1)
+        self.assertEqual(trace["g_a1_stock_flow_pass"], 1)
+
+    def test_ga1_stock_flow_missing_fail_open(self):
+        s = _screener()
+        candidates = [
+            {**_ticket("600001", "黄金概念"), "dde_5d_sum": 1.0},
+            {**_ticket("600002", "黄金概念"), "dde_5d_sum": 2.0},
+        ]
+        passed, trace = s._ga1_gate(
+            candidates,
+            _capital_ctx(flow_3d={"黄金概念": 5.0}),
+            stock_flow_3d={},
+        )
+        self.assertEqual(len(passed), 2)
+        self.assertEqual(trace["g_a1_stock_flow_missing"], 2)
+
+    def test_purity_rejects_top2_dominant_sector(self):
+        s = _screener()
+        candidates = [
+            {**_ticket(f"60000{i}", "黄金概念"), "dde_5d_sum": 1.0}
+            for i in range(1, 6)
+        ] + [
+            {**_ticket(f"60001{i}", "白银概念"), "dde_5d_sum": 1.0}
+            for i in range(1, 6)
+        ]
+        # 黄金：top1 50%、top2 84.8% → 集中度超限
+        gold_flows = [500.0, 348.0, 100.0, 30.0, 22.0]
+        silver_flows = [100.0, 90.0, 80.0, 70.0, 60.0]
+        stock_flow_3d = {}
+        for i, flow in enumerate(gold_flows, start=1):
+            stock_flow_3d[f"60000{i}"] = flow * 1_000_000
+        for i, flow in enumerate(silver_flows, start=1):
+            stock_flow_3d[f"60001{i}"] = flow * 1_000_000
+
+        # 默认 observe：保留全部，只留 would_drop 读数
+        trace = {}
+        kept = s._filter_impure_ambush_sectors(candidates, stock_flow_3d, trace)
+        self.assertEqual(len(kept), 10)
+        self.assertEqual(trace["g_a1_purity_would_drop"], 5)
+
+        # 显式启用：集中度超限板块整组剔除
+        with patch.dict(os.environ, {"GOT_AMBUSH_PURITY_ENABLED": "1"}):
+            trace_enforced = {}
+            kept_enforced = s._filter_impure_ambush_sectors(
+                candidates, stock_flow_3d, trace_enforced,
+            )
+        self.assertEqual({c["sector"] for c in kept_enforced}, {"白银概念"})
+        self.assertEqual(trace_enforced["g_a1_sector_impure"], 5)
+
+    def test_fetch_stock_flow_3d_sums_last_three_rows(self):
+        import pandas as pd
+
+        class _FakeFetcher:
+            def get_individual_fund_flow(self, code, market):
+                return pd.DataFrame({
+                    "日期": ["2026-10-24", "2026-10-25", "2026-10-26",
+                             "2026-10-27", "2026-10-28"],
+                    "主力净流入-净额": [1e6, 2e6, 3e6, 4e6, 5e6],
+                })
+
+        s = _screener()
+        got = s._fetch_stock_flow_3d(
+            [{"code": "600001"}], _FakeFetcher(), as_of=date(2026, 10, 28),
+        )
+        self.assertEqual(got["600001"], 12e6)
+
+        got_early = s._fetch_stock_flow_3d(
+            [{"code": "600001"}], _FakeFetcher(), as_of=date(2026, 10, 26),
+        )
+        self.assertEqual(got_early["600001"], 6e6)
+
+    def test_fetch_stock_flow_3d_missing_returns_empty(self):
+        class _FakeFetcher:
+            def get_individual_fund_flow(self, code, market):
+                return None
+
+        s = _screener()
+        got = s._fetch_stock_flow_3d(
+            [{"code": "600001"}], _FakeFetcher(), as_of=date(2026, 10, 28),
+        )
+        self.assertEqual(got, {})
+
+
+class TestAmbushIdentityWiring(unittest.TestCase):
+    """P0-5：narrative identity 接线（默认观察，guard 显式开启才剔除）。"""
+
+    def _got_context(self):
+        return {
+            "capital_context": _capital_ctx(flow_3d={"动力电池": 6.0}),
+            "news_context": _news_ctx(),
+            "sector_context": {"ambush": []},
+            "unified_context": {"ambush_pool": [{"sector_name": "动力电池"}]},
+        }
+
+    def _candidate(self):
+        return {
+            **_ticket("002009", "动力电池"),
+            "dde_5d_sum": 1.0,
+            "identity_theme": "具身智能",
+            "identity_layer": "software_model",
+            "identity_confidence": 0.9,
+        }
+
+    def test_identity_index_reads_narrative_context(self):
+        idx = _screener()._identity_index({
+            "narrative_context": {
+                "identities": [{
+                    "symbol": "002009", "theme": "具身智能",
+                    "layer": "software_model", "confidence": 0.9,
+                }],
+            },
+        })
+        self.assertEqual(idx["002009"]["theme"], "具身智能")
+        self.assertEqual(idx["002009"]["layer"], "software_model")
+
+    def test_identity_guard_off_keeps_candidate(self):
+        s = _screener()
+        lane_finalists, _, trace = s._run_ambush_lane(
+            [self._candidate()], self._got_context(), fetcher_manager=None,
+        )
+        self.assertEqual([st.code for st in lane_finalists], ["002009"])
+        self.assertNotIn("g_a0_identity_mismatch", trace)
+
+    def test_identity_guard_drops_software_model_in_battery_sector(self):
+        s = _screener()
+        with patch.dict(os.environ, {"GOT_AMBUSH_IDENTITY_GUARD": "1"}):
+            lane_finalists, _, trace = s._run_ambush_lane(
+                [self._candidate()], self._got_context(), fetcher_manager=None,
+            )
+        self.assertEqual(lane_finalists, [])
+        self.assertEqual(trace["g_a0_identity_mismatch"], 1)
 
 
 if __name__ == "__main__":

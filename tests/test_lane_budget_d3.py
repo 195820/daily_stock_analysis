@@ -74,6 +74,8 @@ def _unified(roles: dict[str, str]) -> UnifiedContext:
 
 @pytest.fixture
 def node(monkeypatch: pytest.MonkeyPatch) -> PortfolioDecisionNode:
+    # 单测不走 GATE-1 实时行情（.env 置 shadow 时会逐票拉东财/akshare，网络慢时整套挂起）
+    monkeypatch.setenv("GOT_TRADABILITY_GATE", "off")
     decision_node = PortfolioDecisionNode(use_mock=False)
     monkeypatch.setattr(
         decision_node, "_get_realtime_price", lambda symbol: PRICE

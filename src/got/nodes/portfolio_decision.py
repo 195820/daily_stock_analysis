@@ -1130,6 +1130,8 @@ class PortfolioDecisionNode:
                 lifecycle_reason=lifecycle_reason,
                 history=history_map.get(symbol),
                 pnl_pct=pnl_pct,
+                pnl_pct_decimal=pnl_pct_decimal,
+                stop_loss_threshold=risk_assessment.stop_loss_threshold,
                 capital_data_missing=capital_data_missing,
             )
             # H2 三态：
@@ -4754,19 +4756,28 @@ verdict 含义：
 
 
             # 缺失维度跳过 + 权重归一化
-            # ── 拦点#8 composite 折算：埋伏票以 ambush_rank_score×100 替换 tech 维度 ──
+            # ── P0-4（2026-11-04）：埋伏票不再用 ambush_rank_score×100 冒充 tech ──
+            # 决赛票已在 `_run_ambush_lane` 补跑主线同口径 `_score_technical_wave` /
+            # `_score_risk`；旧口径把 20 分权重建立在 rank 分与默认 risk=100 上。
+            # 回滚键 `GOT_AMBUSH_REAL_SCORES=0` 恢复旧行为（tech=rank×100 / risk=100）。
             _stock_sector_type = getattr(stock, "sector_type", "") or "mainline"
             _tech_input = stock.tech_wave_score
-            if _ambush_split_active and _stock_sector_type == "ambush":
+            _risk_input = stock.risk_score_safe
+            if (
+                _ambush_split_active
+                and _stock_sector_type == "ambush"
+                and os.getenv("GOT_AMBUSH_REAL_SCORES", "1") != "1"
+            ):
                 _ambush_rank = getattr(stock, "ambush_rank_score", None)
                 if _ambush_rank is not None:
                     _tech_input = _ambush_rank * 100.0
+                _risk_input = 100.0
             dimension_scores = {
                 "capital": capital_score,
                 "news": news_score,
                 "sector": adjusted_sector_score,
                 "tech": _tech_input,
-                "risk": stock.risk_score_safe,
+                "risk": _risk_input,
             }
 
             dimension_available = {
@@ -5042,7 +5053,7 @@ verdict 含义：
                         "news": news_score,
                         "sector": adjusted_sector_score,
                         "tech": _tech_input,
-                        "risk": stock.risk_score_safe,
+                        "risk": _risk_input,
                     },
 
                     action_recommendation=action,

@@ -88,6 +88,9 @@ class ScreenerStock:
     risk_score_safe: float = 100.0         # 风险评分 0-100（越高越安全，与 risk_score 相反）
     sector_type: str = ""                  # 板块类型: active_mainline / ambush
     sector_query_board: str = ""           # 问财实际查询的板块名（resolve_with_kind 产物，可能与 Node6 标签不同）
+    identity_theme: str = ""               # P0-5：narrative identity 主题（缺失=空）
+    identity_layer: str = ""               # software_model / hardware / supply_chain / other
+    identity_confidence: float = 0.0       # identity 置信度 0-1
     ambush_rank_score: Optional[float] = None  # 埋伏道排序分（G-A4 产物，主线票为 None）
     backtest_snapshot: Optional[Dict[str, Any]] = None  # 回测快照
 
@@ -906,7 +909,9 @@ class StockScreenerPipeline:
                 return result
 
             # 3. 执行 5 轮漏斗筛选
-            finalists = self._filter_got_finalists(universe, got_context, top_n)
+            finalists = self._filter_got_finalists(
+                universe, got_context, top_n, as_of=got_date,
+            )
             result.matched_count = len(finalists)
             logger.info(f"[GOT选股] 精选出 {len(finalists)} 只股票")
 
@@ -1049,6 +1054,15 @@ class StockScreenerPipeline:
                 except Exception as exc:  # noqa: BLE001 — 归档脏数据不阻断选股
                     logger.warning("[GOT选股] agent_glue.json 读取失败（按缺失处理）: %s", exc)
 
+            # P0-5：身份 Agent 产物（10-30 起归档）；缺失/空 = fail-open，不阻断选股
+            narrative_path = archive_dir / "narrative_context.json"
+            if narrative_path.exists():
+                try:
+                    with open(narrative_path, "r", encoding="utf-8") as f:
+                        context["narrative_context"] = json.load(f)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[GOT选股] narrative_context.json 读取失败（按缺失处理）: %s", exc)
+
             # 如果至少加载了 unified_context，就返回
             if "unified_context" in context:
                 return context
@@ -1061,6 +1075,19 @@ class StockScreenerPipeline:
             return {"unified_context": unified_data}
 
         return None
+
+    @staticmethod
+    def _identity_index(got_context: dict) -> Dict[str, dict]:
+        """P0-5：narrative_context.identities → {symbol: item}（缺文件/空 → {}）。"""
+        ctx = got_context.get("narrative_context") or {}
+        out: Dict[str, dict] = {}
+        for item in ctx.get("identities") or []:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "")
+            if sym:
+                out[sym] = item
+        return out
 
     def _extract_got_universe(self, got_context: dict) -> List[Dict]:
         """从 GOT 上下文提取选股池（先用问财快速筛选）
@@ -1120,6 +1147,7 @@ class StockScreenerPipeline:
         ]
 
         universe = []
+        identity_index = self._identity_index(got_context)
 
         # 从达标的主线/埋伏板块获取成分股（用问财快速筛选）
         for sector_info in qualified_mainlines + qualified_ambush:
@@ -1160,6 +1188,10 @@ class StockScreenerPipeline:
                     "volume": stock_info.get("volume", 0),
                     # 问财实际查询的板块名（resolve_with_kind 产物，可能与 Node 6 标签不同）
                     "sector_query_board": stock_info.get("sector_query_board", ""),
+                    # P0-5：身份 Agent 产物（theme/layer），缺失=空/0
+                    "identity_theme": (identity_index.get(stock_info["code"]) or {}).get("theme", ""),
+                    "identity_layer": (identity_index.get(stock_info["code"]) or {}).get("layer", ""),
+                    "identity_confidence": (identity_index.get(stock_info["code"]) or {}).get("confidence", 0.0),
                 })
 
         # 去重（同一股票可能在多个板块）
@@ -1559,11 +1591,236 @@ class StockScreenerPipeline:
         # 主板/中小板 涨跌幅限制 10%
         return pct >= 9.5
 
+    def _attach_lane_tech_risk(
+        self, candidates: List[Dict], fetcher_manager,
+    ) -> List[Dict]:
+        """P0-4：埋伏决赛票补跑主线同口径技术/风险评分（仅 ≤ AMBUSH_LANE_TOPK 只）。
+
+        埋伏票在 Step 1 被拆出主线漏斗，不经过 R3 `_score_technical_wave` 与
+        R4 `_score_risk`；旧链用 `ambush_rank_score × 100` 冒充 tech、risk 落默认 100，
+        Phase 2 的 20 分权重来自默认安全分。这里只对决赛票补跑，成本与主线 R3/R4 同构。
+        评分异常/无 fetcher → 中性 50，不阻断闸门。
+        """
+        if not candidates:
+            return candidates
+        if fetcher_manager is None:
+            for c in candidates:
+                c.setdefault("tech_wave_score", 50.0)
+                c.setdefault("risk_score_safe", 50.0)
+            return candidates
+
+        try:
+            tech_scores = self._score_technical_wave(candidates, fetcher_manager)
+        except Exception as exc:  # noqa: BLE001 — 单维失败不阻断道
+            logger.warning("[埋伏道] 技术评分失败，按中性 50 降级: %s", exc)
+            tech_scores = {}
+        try:
+            risk_scores = self._score_risk(candidates, fetcher_manager)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[埋伏道] 风险评分失败，按中性 50 降级: %s", exc)
+            risk_scores = {}
+
+        for c in candidates:
+            c["tech_wave_score"] = tech_scores.get(c["code"], 50.0)
+            c["risk_score_safe"] = risk_scores.get(c["code"], 50.0)
+        return candidates
+
+    @staticmethod
+    def _identity_mismatch(c: Dict) -> bool:
+        """P0-5：`software_model` 身份落在硬件板块 → 入口身份错位。
+
+        仅覆盖最窄可解释规则（电池/光伏/新能源车/减速器）；`GOT_AMBUSH_IDENTITY_GUARD`
+        缺省 0（观察），因为 10-30 归档 identity 为空、无校准样本。开启后必须保留
+        `g_a0_identity_mismatch` trace。
+        """
+        if str(c.get("identity_layer") or "") != "software_model":
+            return False
+        if float(c.get("identity_confidence") or 0.0) < 0.6:
+            return False
+        sector = str(c.get("sector") or "")
+        return any(k in sector for k in ("电池", "光伏", "新能源车", "减速器"))
+
+    def _fetch_stock_flow_3d(
+        self,
+        candidates: List[Dict],
+        fetcher_manager,
+        as_of: Optional[date] = None,
+    ) -> Dict[str, float]:
+        """P0-3/P0-1：近 3 个交易日个股主力净流入（元）。
+
+        数据源 `DataFetcherManager.get_individual_fund_flow`（akshare 日线，含当日
+        可得行）；只取 `日期 <= as_of` 的最后 3 行求和。失败/缺列/无 fetcher →
+        该 code 缺席（调用方按「无数据」fail-open，不误杀整条道）。
+
+        注意：问财 `dde_5d_sum` 的初筛条件本身是「近 5 日 DDE 合计 > 0」，未降级
+        候选构造性恒正，不能拿它当负流闸门；这里必须取东财个股主力净额。
+        """
+        import os
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if os.getenv("GOT_AMBUSH_STOCK_FLOW_ENABLED", "1") != "1":
+            return {}
+        if (
+            not candidates
+            or fetcher_manager is None
+            or not hasattr(fetcher_manager, "get_individual_fund_flow")
+        ):
+            return {}
+
+        from src.got.catalyst_config import AMBUSH_LANE_STOCK_FLOW_WORKERS
+
+        as_of = as_of or date.today()
+        cache = getattr(self, "_stock_flow_3d_cache", None)
+        if cache is None:
+            cache = {}
+            self._stock_flow_3d_cache = cache
+
+        out: Dict[str, float] = {}
+        pending: List[tuple] = []
+        seen: set = set()
+        for c in candidates:
+            code = str(c.get("code") or "")
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            key = (as_of.isoformat(), code)
+            if key in cache:
+                if cache[key] is not None:
+                    out[code] = float(cache[key])
+            else:
+                pending.append((code, key))
+
+        if not pending:
+            return out
+
+        def _market(code: str) -> str:
+            if code.startswith("6"):
+                return "sh"
+            if code.startswith(("4", "8", "9")):
+                return "bj"
+            return "sz"
+
+        def _one(code: str, key: tuple):
+            try:
+                df = fetcher_manager.get_individual_fund_flow(code, _market(code))
+                if df is None or getattr(df, "empty", True):
+                    return key, None
+                date_col = next((col for col in df.columns if "日期" in str(col)), None)
+                flow_col = next(
+                    (
+                        col for col in df.columns
+                        if "主力净流入" in str(col) and "净额" in str(col)
+                    ),
+                    None,
+                )
+                if not date_col or not flow_col:
+                    return key, None
+                import pandas as pd
+
+                work = df[[date_col, flow_col]].copy()
+                work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+                work = work.dropna(subset=[date_col])
+                work = work[work[date_col].dt.date <= as_of]
+                work = work.sort_values(date_col).tail(3)
+                if work.empty:
+                    return key, None
+                return key, float(work[flow_col].sum())
+            except Exception as exc:  # noqa: BLE001 — 单票失败不阻断整道
+                logger.debug("[埋伏道] 个股资金流获取失败 %s: %s", code, exc)
+                return key, None
+
+        workers = min(
+            max(1, int(AMBUSH_LANE_STOCK_FLOW_WORKERS)),
+            len(pending),
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, code, key) for code, key in pending]
+            for fut in as_completed(futures):
+                key, val = fut.result()
+                cache[key] = val
+                if val is not None:
+                    out[key[1]] = float(val)
+        return out
+
+    def _filter_impure_ambush_sectors(
+        self,
+        candidates: List[Dict],
+        stock_flow_3d: Dict[str, float],
+        lane_trace: Dict[str, int],
+    ) -> List[Dict]:
+        """P0-1：板块级主题纯度观察（正流入广度 + top1/top2 集中度）。
+
+        只做「候选子集资金结构」判定。**默认只观察不剔除**（env
+        GOT_AMBUSH_PURITY_ENABLED=0）：10-28 实测动力电池 top1=39.1%/top2=76.7%，
+        而通信设备 top1=70.7%/top2=86.5%——任何能剔除动力电池的集中度阈值都会
+        同时误杀通信设备（中际旭创为合法龙头）。P0-1 的忠实修法需要成员级
+        主营/主题分类，不能靠资金集中度替代；本函数先落可回放读数供校准。
+        """
+        import os
+        from src.got.board_aliases import normalize_sector_name
+        from src.got.catalyst_config import (
+            AMBUSH_LANE_PURITY_MIN_N,
+            AMBUSH_LANE_PURITY_POSITIVE_MIN,
+            AMBUSH_LANE_PURITY_TOP1_MAX,
+            AMBUSH_LANE_PURITY_TOP2_MAX,
+        )
+
+        if not stock_flow_3d:
+            return candidates
+        enforce = os.getenv("GOT_AMBUSH_PURITY_ENABLED", "0") == "1"
+
+        groups: Dict[str, List[Dict]] = {}
+        for c in candidates:
+            groups.setdefault(normalize_sector_name(c.get("sector", "")), []).append(c)
+
+        kept: List[Dict] = []
+        for sector, group in groups.items():
+            flows = [
+                stock_flow_3d.get(str(c.get("code") or ""))
+                for c in group
+            ]
+            flows = [float(v) for v in flows if v is not None]
+            if len(group) < AMBUSH_LANE_PURITY_MIN_N or len(flows) < 3:
+                lane_trace["g_a1_purity_skipped"] = (
+                    lane_trace.get("g_a1_purity_skipped", 0) + 1
+                )
+                kept.extend(group)
+                continue
+
+            positive = sorted((v for v in flows if v > 0), reverse=True)
+            positive_ratio = len(positive) / len(flows)
+            total_positive = sum(positive)
+            if total_positive > 0:
+                top1_share = positive[0] / total_positive
+                top2_share = sum(positive[:2]) / total_positive
+            else:
+                top1_share = 1.0
+                top2_share = 1.0
+            if (
+                top1_share > AMBUSH_LANE_PURITY_TOP1_MAX
+                or top2_share > AMBUSH_LANE_PURITY_TOP2_MAX
+                or positive_ratio < AMBUSH_LANE_PURITY_POSITIVE_MIN
+            ):
+                key = "g_a1_sector_impure" if enforce else "g_a1_purity_would_drop"
+                lane_trace[key] = lane_trace.get(key, 0) + len(group)
+                logger.info(
+                    "[埋伏道] G-A1 板块纯度%s: %s n=%d flows=%d 正流入=%.0f%% "
+                    "top1=%.0f%% top2=%.0f%%",
+                    "剔除" if enforce else "观察(未启用)",
+                    sector, len(group), len(flows), positive_ratio * 100,
+                    top1_share * 100, top2_share * 100,
+                )
+                if enforce:
+                    continue
+            kept.extend(group)
+        return kept
+
     def _run_ambush_lane(
         self,
         ambush_candidates: List[Dict],
         got_context: dict,
         fetcher_manager=None,
+        as_of: Optional[date] = None,
     ) -> Tuple[List[ScreenerStock], dict, dict]:
         """执行埋伏道 G-A0~G-A4 筛选（G-A0=涨停剔除，G-A1~A4=原四闸门）
 
@@ -1633,6 +1890,39 @@ class StockScreenerPipeline:
 
         try:
             # ── G-A0: 涨停过滤（与主线 R0 同口径；2026-10-27 修复埋伏道绕过 R0）──
+            # P0-5：身份错位闸门（默认观察/关闭；无 identity 数据时天然 no-op）
+            import os
+            if os.getenv("GOT_AMBUSH_IDENTITY_GUARD", "0") == "1":
+                _before_identity = len(ambush_candidates)
+                ambush_candidates = [
+                    c for c in ambush_candidates
+                    if not self._identity_mismatch(c)
+                ]
+                _identity_dropped = _before_identity - len(ambush_candidates)
+                if _identity_dropped:
+                    lane_trace["g_a0_identity_mismatch"] = (
+                        lane_trace.get("g_a0_identity_mismatch", 0) + _identity_dropped
+                    )
+                    logger.info(
+                        "[埋伏道] P0-5 身份错位剔除 %d 只（software_model 落在硬件板块）",
+                        _identity_dropped,
+                    )
+
+            # P0-1/P0-3：先取个股 3 日主力净流入（含涨停票），主题纯度先于可买性。
+            # 独立 try/except：取数/纯度预处理异常只降级为「无资金数据」，不得触发
+            # 外层 lane fail-open（那会绕过 G-A0~G-A4 全部门）。
+            stock_flow_3d: Dict[str, float] = {}
+            try:
+                stock_flow_3d = self._fetch_stock_flow_3d(
+                    ambush_candidates, fetcher_manager, as_of=as_of,
+                )
+                ambush_candidates = self._filter_impure_ambush_sectors(
+                    ambush_candidates, stock_flow_3d, lane_trace,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[埋伏道] 个股资金/纯度预处理异常，按无数据 fail-open: %s", exc)
+
+            # ── G-A0: 涨停过滤（与主线 R0 同口径；2026-10-27 修复埋伏道绕过 R0）──
             _kept: List[Dict] = []
             for c in ambush_candidates:
                 if self._is_limit_up(c):
@@ -1647,8 +1937,10 @@ class StockScreenerPipeline:
                     f"{', '.join(str(c.get('code', '')) for c in limit_up_filtered)}"
                 )
 
-            # ── G-A1: 资金面闸门 ──
-            passed_a1, a1_trace = self._ga1_gate(ambush_candidates, capital_ctx)
+            # ── G-A1: 资金面闸门（板块流 + 个股 3 日主力净流入）──
+            passed_a1, a1_trace = self._ga1_gate(
+                ambush_candidates, capital_ctx, stock_flow_3d=stock_flow_3d,
+            )
             for k, v in a1_trace.items():
                 lane_trace[k] = lane_trace.get(k, 0) + v
 
@@ -1687,6 +1979,11 @@ class StockScreenerPipeline:
             for k, v in a4_trace.items():
                 lane_trace[k] = lane_trace.get(k, 0) + v
 
+            # P0-4：决赛票补跑 tech/risk（主线 R3/R4 同口径），不得再用 rank×100 冒充
+            lane_finalists_dicts = self._attach_lane_tech_risk(
+                lane_finalists_dicts, fetcher_manager,
+            )
+
             # 转换为 ScreenerStock
             lane_finalists = []
             for c in lane_finalists_dicts:
@@ -1698,6 +1995,9 @@ class StockScreenerPipeline:
                     sector_name=c.get("sector", ""),
                     sector_type="ambush",
                     sector_query_board=c.get("sector_query_board", ""),
+                    identity_theme=c.get("identity_theme", ""),
+                    identity_layer=c.get("identity_layer", ""),
+                    identity_confidence=c.get("identity_confidence", 0.0),
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
@@ -1707,6 +2007,8 @@ class StockScreenerPipeline:
                     capital_available=c.get("capital_available", False),
                     news_score=c.get("news_score", 0),
                     news_available=c.get("news_available", False),
+                    tech_wave_score=c.get("tech_wave_score", 50.0),
+                    risk_score_safe=c.get("risk_score_safe", 50.0),
                 )
                 lane_finalists.append(stock)
 
@@ -1718,6 +2020,11 @@ class StockScreenerPipeline:
                         "name": s.name,
                         "sector": s.sector_name,
                         "ambush_rank_score": s.ambush_rank_score,
+                        "tech_wave_score": s.tech_wave_score,
+                        "risk_score_safe": s.risk_score_safe,
+                        "identity_theme": s.identity_theme,
+                        "identity_layer": s.identity_layer,
+                        "identity_confidence": s.identity_confidence,
                     }
                     for s in lane_finalists
                 ],
@@ -1754,6 +2061,9 @@ class StockScreenerPipeline:
                 # 如果排序也失败，直接用输入顺序
                 sorted_candidates = list(ambush_candidates)
             lane_finalists_dicts = sorted_candidates[:AMBUSH_LANE_TOPK]
+            lane_finalists_dicts = self._attach_lane_tech_risk(
+                lane_finalists_dicts, fetcher_manager,
+            )
             lane_finalists = []
             for c in lane_finalists_dicts:
                 stock = ScreenerStock(
@@ -1764,6 +2074,9 @@ class StockScreenerPipeline:
                     sector_name=c.get("sector", ""),
                     sector_type="ambush",
                     sector_query_board=c.get("sector_query_board", ""),
+                    identity_theme=c.get("identity_theme", ""),
+                    identity_layer=c.get("identity_layer", ""),
+                    identity_confidence=c.get("identity_confidence", 0.0),
                     sector_score=c.get("sector_score", 0),
                     ambush_rank_score=c.get("ambush_rank_score"),
                     dde_degraded=c.get("dde_degraded", False),
@@ -1772,12 +2085,20 @@ class StockScreenerPipeline:
                     capital_available=c.get("capital_available", False),
                     news_score=c.get("news_score", 0),
                     news_available=c.get("news_available", False),
+                    tech_wave_score=c.get("tech_wave_score", 50.0),
+                    risk_score_safe=c.get("risk_score_safe", 50.0),
                 )
                 lane_finalists.append(stock)
             lane_shadow = {
                 "mode": "shadow",
                 "lane_finalists": [
-                    {"code": s.code, "name": s.name, "sector": s.sector_name, "ambush_rank_score": s.ambush_rank_score}
+                    {"code": s.code, "name": s.name, "sector": s.sector_name,
+                     "ambush_rank_score": s.ambush_rank_score,
+                     "tech_wave_score": s.tech_wave_score,
+                     "risk_score_safe": s.risk_score_safe,
+                     "identity_theme": s.identity_theme,
+                     "identity_layer": s.identity_layer,
+                     "identity_confidence": s.identity_confidence}
                     for s in lane_finalists
                 ],
                 "limit_up_filtered": [
@@ -1798,15 +2119,22 @@ class StockScreenerPipeline:
         self,
         candidates: List[Dict],
         capital_ctx: dict,
+        stock_flow_3d: Optional[Dict[str, float]] = None,
     ) -> Tuple[List[Dict], dict]:
         """G-A1: 资金面闸门
 
         条件 1: dde_degraded=True → fail（降级票不允许过闸）
-        条件 2: 板块 3d 流 > 0 → pass; miss → soft_pass; < 0 → fail
+        条件 2: 个股 3 日主力净流入 ≤0 → fail（P0-3；数据缺失 fail-open）
+        条件 3: 板块 3d 流 > 0 → pass; miss → soft_pass; < 0 → fail
         """
         from src.got.nodes.aggregator import AggregatorNode
 
-        trace = {"g_a1_pass": 0, "g_a1_soft_pass": 0, "g_a1_flow_negative": 0, "g_a1_dde_degraded": 0}
+        trace = {
+            "g_a1_pass": 0, "g_a1_soft_pass": 0,
+            "g_a1_flow_negative": 0, "g_a1_dde_degraded": 0,
+            "g_a1_stock_flow_pass": 0, "g_a1_stock_flow_negative": 0,
+            "g_a1_stock_flow_missing": 0,
+        }
         passed = []
 
         # 提取板块流映射
@@ -1821,7 +2149,19 @@ class StockScreenerPipeline:
                 trace["g_a1_dde_degraded"] += 1
                 continue
 
-            # 条件 2: 板块 3d 流
+            # 条件 2: 个股 3 日主力净流入（P0-3）。缺失→fail-open 并留痕，
+            # 避免数据源故障把埋伏道整条清零；≤0 直接剔（价涨钱走）。
+            _flow_3d = (stock_flow_3d or {}).get(str(c.get("code") or ""))
+            if _flow_3d is None:
+                trace["g_a1_stock_flow_missing"] += 1
+            else:
+                c["main_net_inflow_3d"] = float(_flow_3d)
+                if _flow_3d <= 0:
+                    trace["g_a1_stock_flow_negative"] += 1
+                    continue
+                trace["g_a1_stock_flow_pass"] += 1
+
+            # 条件 3: 板块 3d 流
             sector = c.get("sector", "")
             flow_3d, _ = AggregatorNode._lookup_flow_map(sector, flow_map_3d)
             if flow_3d is None:
@@ -2065,16 +2405,35 @@ class StockScreenerPipeline:
         """
         from datetime import date as date_cls
         from src.got.board_aliases import normalize_sector_name, sector_name_variants
-        from src.got.catalyst_config import AMBUSH_LANE_TOPK, AMBUSH_LANE_ABSORPTION_WEIGHT
+        from src.got.catalyst_config import (
+            AMBUSH_LANE_TOPK,
+            AMBUSH_LANE_ABSORPTION_WEIGHT,
+            AMBUSH_LANE_STOCK_WEIGHT,
+        )
 
         # 默认值从 catalyst_config 取
         if topk is None:
             topk = AMBUSH_LANE_TOPK
         if absorption_weight is None:
             absorption_weight = AMBUSH_LANE_ABSORPTION_WEIGHT
+        stock_weight = AMBUSH_LANE_STOCK_WEIGHT
 
         trace = {"g_a4_selected": 0}
         today = date_cls.today()
+
+        # P0-2：个股强度项。旧实现只吃板块级 absorption，同一板块候选分数逐位相等，
+        # strict `>` 去重等于「保留输入序第一」。这里用 DDE 5d（问财初筛口径）做组内
+        # 降序百分位；缺失/全等 → 0.5，保持中性。个股项只放大排序，不改闸门。
+        dde_values = [float(c.get("dde_5d_sum") or 0.0) for c in candidates]
+        _all_equal = len(set(dde_values)) <= 1
+        n_dde = len(dde_values)
+
+        def _stock_strength(c: Dict) -> float:
+            if n_dde < 2 or _all_equal:
+                return 0.5
+            val = float(c.get("dde_5d_sum") or 0.0)
+            rank = sum(1 for v in dde_values if v > val)
+            return 1.0 - rank / (n_dde - 1)
 
         # 为每个候选计算 ambush_rank_score
         scored_candidates = []
@@ -2089,24 +2448,33 @@ class StockScreenerPipeline:
 
             # 吸收强度（板块 3d 流百分位）
             absorption_strength = flow_percentile.get(normalized_sector, 0.5)
+            stock_strength = _stock_strength(c)
+            c["ambush_stock_strength"] = round(stock_strength, 4)
 
             # 计算排序分
             rank_score = confidence * proximity * (1 + absorption_weight * absorption_strength)
-            c["ambush_rank_score"] = rank_score
+            rank_score *= (1 + stock_weight * stock_strength)
+            c["ambush_rank_score"] = round(rank_score, 6)
             scored_candidates.append(c)
 
-        # 同板块去重（保留最高分）
+        # P0-2：先按确定性键排序，再逐板块取第一。禁止回退到输入序。
+        # 键：rank_score ↓ → DDE 5d ↓ → 当日涨幅 ↓ → 代码 ↑（字符串）。
+        def _rank_sort_key(x: Dict):
+            return (
+                -float(x.get("ambush_rank_score") or 0.0),
+                -float(x.get("dde_5d_sum") or 0.0),
+                -float(x.get("change_pct") or 0.0),
+                str(x.get("code") or ""),
+            )
+
+        scored_candidates.sort(key=_rank_sort_key)
         sector_best: Dict[str, Dict] = {}
         for c in scored_candidates:
-            sector = c.get("sector", "")
-            normalized_sector = normalize_sector_name(sector)
-            existing = sector_best.get(normalized_sector)
-            if existing is None or c["ambush_rank_score"] > existing["ambush_rank_score"]:
-                sector_best[normalized_sector] = c
+            normalized_sector = normalize_sector_name(c.get("sector", ""))
+            sector_best.setdefault(normalized_sector, c)
 
-        # 排序 + TopK
-        sorted_candidates = sorted(sector_best.values(), key=lambda x: x["ambush_rank_score"], reverse=True)
-        top_candidates = sorted_candidates[:topk]
+        # TopK（sector_best 的插入序已是确定性排序）
+        top_candidates = list(sector_best.values())[:topk]
         trace["g_a4_selected"] = len(top_candidates)
 
         return top_candidates, trace
@@ -2234,6 +2602,7 @@ class StockScreenerPipeline:
         got_context: dict,
         top_n: int,
         lane_merge_mode: str = "topn_fill",
+        as_of: Optional[date] = None,
     ) -> List[ScreenerStock]:
         """5 轮漏斗筛选
 
@@ -2475,7 +2844,7 @@ class StockScreenerPipeline:
         if GOT_AMBUSH_SPLIT_ENABLED and ambush_candidates:
             try:
                 lane_finalists, lane_shadow, lane_trace = self._run_ambush_lane(
-                    ambush_candidates, got_context, fetcher_manager
+                    ambush_candidates, got_context, fetcher_manager, as_of=as_of,
                 )
                 # 闸门存活链 INFO 行（2026-10-13 可观测性修复：拆分→闸门→合并断链补齐）
                 # 存活数 = 上一闸门出口 − 本闸门损失；fail-open 时 lane_error=1（见 shadow note）

@@ -1360,7 +1360,7 @@ class UnifiedScoringResult(BaseModel):
                     "no_sector / no_sector_grace / thesis_drift / thesis_drift_grace / "
                     "lifecycle_none_weak / lifecycle_none_cooling / lifecycle_none_strong / "
                     "sector_confirmed / strength_lt50 / cooling_hold / role_other / role_other_grace / "
-                    "p4_exit / p4_hold / lifecycle_signal；None=非持仓。",
+                    "p4_exit / p4_hold / stop_loss / lifecycle_signal；None=非持仓。",
     )
     sector_confirmed_guard: bool = Field(
         default=False,

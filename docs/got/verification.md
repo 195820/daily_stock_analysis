@@ -17,6 +17,16 @@
 
 ---
 
+## 2026-11-04 补登（埋伏道 P0 落地读数）
+
+- **P0-6 硬止损**：`assess_holding` 在 P4 快照后新增硬止损分支；10-29 002009 事实（P&L −5.31%、阈值 −5%、`thesis_drift=True`、家族宽限 hold）重放由 `hold/thesis_drift_grace` → `sell/stop_loss`。P4 快照仍优先。`tests/test_holdings_rewiring.py` 40 passed。
+- **P0-2 G-A4**：个股强度项 = `dde_5d_sum` 组内降序百分位，`rank_score × (1 + 0.2×strength)`；排序键固定为 `rank↓/DDE↓/涨幅↓/code↑`，同板块取排序后第一。现有测试新增「打乱输入序胜者不变」。
+- **P0-4 评分**：决赛票在 G-A4 后补跑 `_score_technical_wave`/`_score_risk`；Phase 2 `tech` 不再等于 `ambush_rank×100`，`risk` 不再默认 100。回滚 `GOT_AMBUSH_REAL_SCORES=0`（`test_bear_entry_gate.py` 两例锁定 70/60 vs 42/100）。
+- **P0-3 个股资金闸门**：10-28 真实数据探针（30 只 ambush 候选，`stock_individual_fund_flow` 截 2026-10-28 前 3 交易日）——002009 天奇 **−49,718,609 元（−0.4972 亿）**；动力电池组 15 只中 9 只正流入。G-A1 新条件会剔除 002009。缺失数据 fail-open（`g_a1_stock_flow_missing`），不因数据源故障清空整条道。**待生产读数**：下一轮 `--got` 核对 `g_a1_stock_flow_missing / lane_in`；缺失率 >20% 先查数据源，不把 fail-open 当通过。
+- **P0-1 板块纯度（观察，未启用）**：同一探针——动力电池 top1 **39.1%** / top2 **76.7%** / 正流入 60%；通信设备 top1 **70.7%** / top2 **86.5%** / 正流入 86.7%。任何能剔除动力电池的集中度阈值都会同时误杀通信设备（中际旭创为合法龙头）⇒ 集中度不能替代主题分类；`GOT_AMBUSH_PURITY_ENABLED` 缺省 0，仅落 `g_a1_purity_would_drop`。10-28 全道重放实测：`g_a1_stock_flow_negative=8`（含 002009），002009 未进 finalists；`g_a1_purity_would_drop=15` 全部落在通信设备组，进一步证明集中度闸门会误杀合法龙头。P0-1 的忠实修法仍待成员级主营/主题分类。
+- **P0-5 身份接线**：`_load_got_context` 已读 `narrative_context.json`，候选/`ScreenerStock` 透传 identity 三字段；`GOT_AMBUSH_IDENTITY_GUARD` 缺省 0。10-30 归档 `narrative_context.status=empty`、identities=0 ⇒ 无校准样本，enforcement 仍为 blocked；合成测试覆盖「software_model + 动力电池 → 剔除」。
+- **回归**：P0 相关 9 个套件 **170 passed**；`test_phase2_exit_code.py` **3 passed**（需 `-s`，pytest capture 与 `main` 导入的既有兼容问题）；`scripts/check_shadow_registry.py --fail-on-expired` OK。`test_lane_budget_d3.py` 补 `GOT_TRADABILITY_GATE=off` 隔离，避免 `.env` shadow 拉实时行情导致挂起。
+
 ## 2026-11-04 补登（T1 reject 前向回测 — 证据已补，结论反向）
 
 - 脚本：`scripts/backtest_t1_rejects.py`；样本：`data/got_daily/*/shadow_t1.json` 的 `rejects[]`（29 个 reject，20 个有 reject 的归档日）。

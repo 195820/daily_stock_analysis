@@ -684,6 +684,17 @@ AMBUSH_LANE_SAFETY_HIGH = 1.03   # close ≤ 20d-high × 1.03
 AMBUSH_LANE_SAFETY_LOW = 0.92    # close ≥ MA20 × 0.92
 # G-A4: 吸筹强度权重（板块 3d 流百分位）
 AMBUSH_LANE_ABSORPTION_WEIGHT = 0.2
+# G-A4: 个股强度项权重（P0-2，DDE 5d 组内百分位；0=关闭，回退旧排序）
+AMBUSH_LANE_STOCK_WEIGHT = 0.2
+# G-A1: 个股 3 日主力净流入闸门（P0-3；env GOT_AMBUSH_STOCK_FLOW_ENABLED=0 回滚）
+# 默认串行：DataFetcherManager/akshare 限流器非线程安全，并发会触发不必要的风控；
+# 30 只候选约 60s，低于主线 R3/R4 的逐票取数成本。可显式调高（≤4）。
+AMBUSH_LANE_STOCK_FLOW_WORKERS = 1
+# G-A1: 板块主题纯度（P0-1；env GOT_AMBUSH_PURITY_ENABLED=0 回滚）
+AMBUSH_LANE_PURITY_TOP1_MAX = 0.60       # 单票占正流入比上限
+AMBUSH_LANE_PURITY_TOP2_MAX = 0.80       # 前两票占正流入比上限（10-28 光华+杰瑞 84.8%）
+AMBUSH_LANE_PURITY_POSITIVE_MIN = 0.30   # 正流入成员占比下限
+AMBUSH_LANE_PURITY_MIN_N = 5             # 少于此成员数不做纯度判定
 # G-A3: 防接刀量比阈值（volume_ratio ≥ 3.0 且当日下跌 → fail）
 AMBUSH_LANE_VOLUME_RATIO_KNIFE = 3.0
 

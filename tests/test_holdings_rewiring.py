@@ -184,6 +184,46 @@ def test_assess_p4_snapshot_exit_precedes_thesis_drift_grace():
     assert verdict.grace_applied is False
 
 
+def test_assess_hard_stop_precedes_thesis_drift_grace():
+    """P0-6：10-29 002009 P&L -5.31% / 阈值 -5%，硬止损不得被宽限吞掉。"""
+    facts = _facts(
+        pnl_pct=-5.31,
+        pnl_pct_decimal=-0.0531,
+        stop_loss_threshold=-0.05,
+        thesis_drift=True,
+        thesis_family="其他",
+        grace_resolver=lambda d: ("hold", True),
+    )
+    verdict = assess_holding(facts)
+    assert (verdict.action, verdict.reason_code) == ("sell", "stop_loss")
+    assert verdict.grace_applied is False
+    assert "止损" in verdict.reason_text
+    assert verdict.evidence["stop_loss_threshold"] == -0.05
+
+
+def test_assess_p4_snapshot_precedes_hard_stop():
+    """P4 快照退出仍最高：硬止损与快照同时满足时保留 p4_exit（需登记/关快照）。"""
+    facts = _facts(
+        pnl_pct_decimal=-0.06,
+        stop_loss_threshold=-0.05,
+        ambush_exit={"signal": "fade_sell", "reason": "催化已兑现", "category_tag": "fade"},
+    )
+    verdict = assess_holding(facts)
+    assert (verdict.action, verdict.reason_code) == ("sell", "p4_exit")
+    assert verdict.evidence["p4_anchor"] == "snapshot"
+
+
+def test_assess_hard_stop_boundary_is_strict_less_than():
+    """与 _lifecycle_sell_signal 同口径：恰好等于阈值不触发。"""
+    facts = _facts(
+        pnl_pct_decimal=-0.05,
+        stop_loss_threshold=-0.05,
+        thesis_drift=True,
+        grace_resolver=lambda d: ("hold", True),
+    )
+    assert assess_holding(facts).reason_code == "thesis_drift_grace"
+
+
 def test_assess_p4_exit_precedes_lifecycle_missing_ladder():
     """埋伏板块 lifecycle 恒为 None：退出信号必须抢在 40/60 降温档之前（原链死分支修复）。"""
     facts = _facts(

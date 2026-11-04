@@ -344,5 +344,33 @@ class TestFxgBaselineBearGateSubblock(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(rec["bear_gate"])
 
 
+class TestAmbushRealScores(_BearGateHarness):
+    """P0-4：埋伏票 composite 使用真实 tech/risk；回滚键恢复 rank×100 / 100。"""
+
+    async def test_ambush_real_scores_used_in_composite(self):
+        stock = _make_stock(
+            sector_name="半导体", sector_type="ambush",
+            ambush_rank_score=0.42, tech_wave_score=70.0, risk_score_safe=60.0,
+        )
+        _, res = await self._run(
+            stock, _intel(), None,
+            {"GOT_AMBUSH_SPLIT_ACTIVE": "1", "GOT_AMBUSH_REAL_SCORES": "1"},
+        )
+        self.assertEqual(res.dimension_scores["tech"], 70.0)
+        self.assertEqual(res.dimension_scores["risk"], 60.0)
+
+    async def test_ambush_real_scores_rollback(self):
+        stock = _make_stock(
+            sector_name="半导体", sector_type="ambush",
+            ambush_rank_score=0.42, tech_wave_score=70.0, risk_score_safe=60.0,
+        )
+        _, res = await self._run(
+            stock, _intel(), None,
+            {"GOT_AMBUSH_SPLIT_ACTIVE": "1", "GOT_AMBUSH_REAL_SCORES": "0"},
+        )
+        self.assertEqual(res.dimension_scores["tech"], 42.0)
+        self.assertEqual(res.dimension_scores["risk"], 100.0)
+
+
 if __name__ == "__main__":
     unittest.main()

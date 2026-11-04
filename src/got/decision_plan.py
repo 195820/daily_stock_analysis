@@ -493,6 +493,7 @@ HOLDING_REASON_LABELS: dict[str, str] = {
     "role_other_grace": "非主线/埋伏角色但家族强（宽限）",
     "p4_exit": "埋伏退出信号",
     "p4_hold": "埋伏持有（无退出信号）",
+    "stop_loss": "触发止损线",
     "lifecycle_signal": "生命周期驱动",
 }
 
@@ -531,7 +532,9 @@ class HoldingAssessmentFacts:
     # ── 历史回查（H3，GOT_HOLDINGS_HISTORY_FEED=enabled 时才参与分支）──
     history: Optional[dict] = None
     # ── 观测 ──
-    pnl_pct: float = 0.0
+    pnl_pct: float = 0.0                 # 百分数（-5.31），仅展示/证据；勿与阈值直接比
+    pnl_pct_decimal: float = 0.0         # 小数（-0.0531），与 stop_loss_threshold 同量纲
+    stop_loss_threshold: Optional[float] = None  # 小数（-0.05）；None=不评估硬止损
     capital_data_missing: Optional[bool] = None
 
 
@@ -609,6 +612,27 @@ def assess_holding(
             evidence={**base_evidence, "p4_signal": _p4_signal,
                       "p4_reason": (facts.ambush_exit or {}).get("reason") or "",
                       "p4_anchor": "snapshot"},
+        )
+
+    # ⓪′ 硬止损（P0-6，2026-11-04）：必须先于任何宽限/生命周期分支。
+    # 旧链把硬止损藏在 ⑧ 消费的 lifecycle_action 里，分支②一旦命中「论点漂移宽限」
+    # 就会吞掉 -5% 止损（10-29 002009：P&L -5.31%、阈值 -5%，输出 hold/宽限）。
+    # P4 快照仍是最高优先级：它是入场锚的明确退出信号，且需要登记/关闭快照。
+    if (
+        facts.stop_loss_threshold is not None
+        and facts.pnl_pct_decimal < facts.stop_loss_threshold
+    ):
+        return HoldingVerdict(
+            action="sell", reason_code="stop_loss",
+            reason_text=(
+                f", [止损:{facts.stop_loss_threshold:.0%}, "
+                f"P&L {facts.pnl_pct_decimal:.1%}]"
+            ),
+            evidence={
+                **base_evidence,
+                "stop_loss_threshold": facts.stop_loss_threshold,
+                "pnl_pct_decimal": facts.pnl_pct_decimal,
+            },
         )
 
     # ① 无板块归属 → 家族宽限（否则卖）
