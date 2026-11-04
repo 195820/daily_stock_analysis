@@ -1432,19 +1432,24 @@ def _render_shadow_risk_override(shadow: "dict | None") -> list[str]:
 
 
 def _render_shadow_tradability(shadow: "dict | None") -> list[str]:
-    """GATE-1 卖出可成交性投影（影子）：mode + 被拦截/待顺延卖单清单。
+    """GATE-1 卖出可成交性投影（影子）：mode + 检查数 + 被拦截/待顺延卖单清单。
 
     降级红线（verification.md GATE-1 节）：行情缺失/超时/异常一律放行不拦截，仅留
-    `quote_unavailable` 告警。空仓/无卖单日 pending_exits 为空属正常（非无样本≠被证伪）。
+    `quote_unavailable` 告警。空仓/无卖单日 pending_exits 为空属正常（非无样本≠被证伪）；
+    `checked_exits` 是分母，用来区分「没卖单」与「卖了但全部可成交」。
     """
     if not shadow:
         return ["**GATE-1 卖出可成交性投影**（影子，只打标）：本次无产物"
                 "（`portfolio_decision.json` 未落 `tradability_shadow`，多为 `GOT_TRADABILITY_GATE=off`）。", ""]
     mode = shadow.get("mode", "shadow")
     pend = shadow.get("pending_exits") or []
+    checked = shadow.get("checked_exits") or []
     tag = "enabled，已顺延" if mode == "enabled" else ("影子，只打标" if mode == "shadow" else "off")
-    lines = [f"**GATE-1 卖出可成交性投影**（{tag}，mode=`{mode}`）："
-             f"被拦截/待顺延卖单 {len(pend)} 笔。"]
+    count_note = (
+        f"检查 {len(checked)} 笔卖单，拦截/待顺延 {len(pend)} 笔。"
+        if checked else f"被拦截/待顺延卖单 {len(pend)} 笔。"
+    )
+    lines = [f"**GATE-1 卖出可成交性投影**（{tag}，mode=`{mode}`）：{count_note}"]
     for e in pend:
         lines.append(
             f"- **{_shadow_display_name(e.get('name'), e.get('symbol'))}**："

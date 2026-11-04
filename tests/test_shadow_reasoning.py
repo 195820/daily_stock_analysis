@@ -522,7 +522,10 @@ def test_shadow_progress_lines_emitted_and_clock_filtered(tmp_path: Path) -> Non
         risk_override_shadow={"mode": "shadow", "conflict_type": "mixed_with_degraded_inputs",
                               "decision_path_hint": "优先补数据", "plan": {"veto_buy": False,
                               "adjustment": "downgrade_one", "target_signal": "hold", "reason": "directional_conflict"}},
-        tradability_shadow={"mode": "shadow", "pending_exits": [
+        tradability_shadow={"mode": "shadow",
+                            "checked_exits": [{"symbol": "600189", "name": "泉阳泉",
+                                               "executable": False, "blocked_reason": "limit_down"}],
+                            "pending_exits": [
             {"symbol": "600189", "name": "泉阳泉", "reason": "limit_down", "intent": "sell", "quantity": 500}]},
     )
     with_prog = "\n".join(_render_shadow_section(base_dir=base, run_date=date(2026, 10, 12), **common))
@@ -533,6 +536,7 @@ def test_shadow_progress_lines_emitted_and_clock_filtered(tmp_path: Path) -> Non
     # 两条新线即使不传 base_dir 也应渲染内容块（标题在）
     assert "3b 风控覆盖（RiskOverridePlan）" in without and "GATE-1 卖出可成交性投影" in without
     assert "veto_buy=False" in without and "limit_down" in without
+    assert "检查 1 笔卖单" in without
     # MEG 起算 10-09，1008 那日被过滤 → 有 meg 文件的 4 天只数 3（证明 clock 过滤生效）
     assert "转正进度·MEG" in with_prog
     assert "有效影子日 **3 / 需 ≥5" in with_prog

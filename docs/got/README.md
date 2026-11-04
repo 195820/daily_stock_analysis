@@ -14,7 +14,7 @@
 | [`architecture.md`](architecture.md) | 架构现状权威描述 | ⚠️ 正文基线为 0831 快照；**文首时效注记已于 2026-10-10 刷新**（除 A6 转正/规则退役外另补入场分道 A/B/C、MEG/FTS/FXG、个股级事件退日历、WI-P1-11、M3 结案等五档，并列出四个已知脱节区） |
 | [`flowchart.md`](flowchart.md) / [`flowchart.html`](flowchart.html) | **全链路流程图（代码实证版）**：主流程 + 选股漏斗 + 每节点数据结构 + 门阈 + 落盘/开关 + 与 `architecture.md` 偏差清单；冲突处以本文为准。`flowchart.html` 为内联 SVG 的浏览器直看版（双击可看，无需联网） | 代码行为变更时同步更新；不替代 `backlog.md` / `verification.md` |
 
-> ❗ **新增影子线必须登记判据**：只写 CHANGELOG 不进 `verification.md`，等于无人验收（MEG/FTS/FXG 就是例）。
+> ❗ **新增影子线必须过四问并登记**：先过 [`docs/AGENTS.md`](../AGENTS.md)「影子模式治理」四问，并在 `src/got/shadow_registry.py` 登记（缺省值/artifact/metric/样本门槛/expiry 全在表内）；[`verification.md`](verification.md) 只记人工判读与跨日结论，不重复逐键字段。能回测/可回放的 gate 不得新开 shadow，`trace`/`frozen`/`dead` 不计转正天数。只写 CHANGELOG 等于无人验收（MEG/FTS/FXG 就是例）。
 
 ## 待实施计划（按依赖排序）
 

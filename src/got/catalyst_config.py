@@ -5,6 +5,9 @@
 映射表中 a_share_sectors 为关键词列表，运行时与 CONCEPT_UNIVERSE 模糊匹配。
 """
 
+# 影子模式治理：新增 *_SHADOW / MODE=shadow 前先过 docs/AGENTS.md「影子模式治理」四问，
+# 并在 src/got/shadow_registry.py 登记；tests/test_shadow_registry.py 会扫描未登记开关。
+
 import logging
 import os
 
@@ -647,9 +650,8 @@ GOT_LANE_BUDGET_ENABLED = os.environ.get("GOT_LANE_BUDGET_ENABLED", "1") == "1"
 # #14 ④ regime jump penalty（backlog §7 #14 拍板 2026-10-15：结构性删除确认层）
 # 两级开关，影子先行纪律：λ 标定回放 → 影子 5 交易日 → 切默认（归负责人判定）。
 # =============================================================================
-# 影子层（缺省 1）：每日并行计算 jump 模型 s_t = argmin_s[|raw−θ_s| + λ·1{s≠s_{t-1}}]，
-# 落 shadow_regime_jump.json 观测；现行两日确认状态机零改动。
-GOT_REGIME_JUMP_SHADOW = os.environ.get("GOT_REGIME_JUMP_SHADOW", "1") == "1"
+# 影子层（2026-11-04 负责人裁决停用，缺省 0；回滚=1）：仅保留离线重调 λ/θ 时使用。
+GOT_REGIME_JUMP_SHADOW = os.environ.get("GOT_REGIME_JUMP_SHADOW", "0") == "1"
 # 生产切换（缺省 0）：=1 时状态机整体替换为 jump 模型（情形 1/3、pinned、迟滞豁免退役；
 # transition_count 重定义为 20 日窗 jump 切换计数）。影子判据达标前禁止置 1。
 GOT_REGIME_JUMP_PENALTY = os.environ.get("GOT_REGIME_JUMP_PENALTY", "0") == "1"

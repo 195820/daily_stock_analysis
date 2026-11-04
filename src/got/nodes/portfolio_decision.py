@@ -5228,6 +5228,7 @@ verdict 含义：
         _tg_shadow = _tg_mode == "shadow"
         _tg_active = _tg_enabled or _tg_shadow
         pending_exits: List[Dict[str, Any]] = []
+        checked_exits: List[Dict[str, Any]] = []
         _quote_cache: Dict[str, Any] = {}
         _entry_cache: Dict[str, Any] = {}  # symbol -> entry_date（避免同一标的多次查库）
         _tg_today = date.today()
@@ -5298,6 +5299,12 @@ verdict 含义：
                 # 留 pending_exits 观测；shadow 只打标不改数量；quote 缺失不拦截。
                 if _tg_active:
                     _tg_res = _tradability_check(score.symbol, score.name, "sell")
+                    checked_exits.append({
+                        "symbol": score.symbol,
+                        "name": score.name,
+                        "executable": bool(_tg_res.executable),
+                        "blocked_reason": _tg_res.blocked_reason,
+                    })
                     if not _tg_res.executable:
                         if _tg_enabled:
                             pending_exits.append({
@@ -6020,6 +6027,7 @@ verdict 含义：
         # GATE-1 留痕：被拦截/打标的顺延清单（供归档复核，shadow 与 enabled 均记）
         self._tradability_pending = {
             "mode": "enabled" if _tg_enabled else ("shadow" if _tg_shadow else "off"),
+            "checked_exits": checked_exits,
             "pending_exits": pending_exits,
             "note": (
                 "GATE-1 可成交性投影：enabled 下被拦截卖单不进当日成交集合（顺延待次日复核）；"

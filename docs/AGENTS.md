@@ -33,8 +33,25 @@
 - **待拍板件例外**：结论未落档的决策简报可留在 `docs/got/` 顶层，拍板后当场入 archive 并回写 `backlog.md`。
 - **状态头强制**：每份计划/分析/归档文档首屏必须有状态头（现行 / 已实施 / 待批准 / 已作废 / 史料）；写“已作废/已取代”时必须点名被谁取代与日期，**不得只写“已废弃”**。
 - **索引同步义务**：新增、改名、移动文档必须同批改 [`docs/INDEX.md`](INDEX.md) 与 [`docs/got/README.md`](got/README.md)；`docs/INDEX.md` 是全量索引，漏登记视为改动未完成。
-- **影子线必登判据**：新增任何影子模式开关/闸门，必须同步在 [`docs/got/verification.md`](got/verification.md) 登记开关缺省值、影子产物、判据工具与转正门槛；**只写 CHANGELOG 不算登记**。
+- **影子线必登判据**：新增任何影子模式开关/闸门，必须先在 `src/got/shadow_registry.py` 登记（缺省值、artifact、metric、样本门槛、expiry 全在表内）；[`docs/got/verification.md`](got/verification.md) 只登记人工判读/跨日结论，不重复逐键字段；**只写 CHANGELOG 不算登记**。
 - **交付前自检**：文档类改动收尾前应跑一次死链自检（`docs/` 内 `](…)` 相对/绝对路径与代码注释里的 `docs/...md` 引用均须可解析）。
+
+### 影子模式治理（2026-11-03 新增：四问准入 + 到期退役）
+
+影子不是默认档，是**没有历史数据可回测时的临时取证手段**。新增/保留任何 `*_SHADOW`、`MODE=shadow`、`REVIEW=shadow` 前必须回答四问，并在 `src/got/shadow_registry.py` 登记：
+
+1. **会改决策吗？** 不会 → 只能叫 `trace` / `observation`，不设转正时钟；禁止用 `shadow` 命名。
+2. **归档输入 + 历史行情能复算吗？** 能 → 先写回测/回放脚本，按回测结果拍板；禁止用影子替代回测。
+3. **多久能触发多少有效样本？** 必须写 `min_samples` 与 `max_days`；到 `max_days` 仍不足样本 → 先改触发条件或做历史回放，不得以「再攒几天」续期。
+4. **到期怎么办？** 必须写 `expiry`；回滚键就是登记表的 `env`（回滚值写 `note` 或 `default`）；到期默认 `retire`，续期必须写 `waiver`（为什么历史数据仍不足、下一评估日）。
+
+硬规则：
+
+- `gate` 型影子必须有 artifact（`event_id` / `verdict` / `reason` 等可复算字段）；只打日志不算。
+- 能回测/可回放的 gate 不得新开 `shadow`；存量 legacy 必须登记 `waiver`，到期未结按退役处理。
+- `trace` / `frozen` / `dead` 不计入影子天数，也不得出现在转正进度条里。
+- 存量 `*_SHADOW` 名称不强制重命名；语义以登记表 `kind` 为准；新增 `trace` / `observation` 不得再使用 `shadow` 命名。
+- 机器校验：`src/got/shadow_registry.py` + `scripts/check_shadow_registry.py`；`tests/test_shadow_registry.py` 会在新增未登记开关、可回测 gate 无 waiver、或登记表出现死条目时失败。
 
 ### GOT 运行规范
 

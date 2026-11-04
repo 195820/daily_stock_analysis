@@ -1500,9 +1500,10 @@ class PortfolioDecision(BaseModel):
     # ── GATE-1 卖出侧可成交性投影留痕（实施报告 2026-09-29）──
     tradability_shadow: Optional[dict] = Field(
         default=None,
-        description="可成交性投影留痕: {mode, pending_exits, note}。mode=shadow 时仅打标"
-                    "（pending_exit/blocked_reason 落 allocation，不改数量）；mode=enabled 时"
-                    "被拦截卖单不进当日成交集合（顺延复核）。"
+        description="可成交性投影留痕: {mode, checked_exits, pending_exits, note}。checked_exits "
+                    "记录本次所有卖出意图的可成交性判定（分母）；pending_exits 只记被拦截/顺延项。"
+                    "mode=shadow 时仅打标（pending_exit/blocked_reason 落 allocation，不改数量）；"
+                    "mode=enabled 时被拦截卖单不进当日成交集合（顺延复核）。"
                     "【按 #5a 先例：不进 R-B8/幂等不变组，按设计 SKIP】",
     )
     # ── WI-P0-3 敞口执行接线 shadow 留痕（实施报告 2026-09-29）──

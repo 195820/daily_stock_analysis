@@ -195,6 +195,10 @@ def test_shadow_flags_without_changing_decision(node, monkeypatch) -> None:
     assert sells[0].pending_exit is True
     assert sells[0].blocked_reason == "limit_down"
     assert node._tradability_pending["mode"] == "shadow"
+    checked = node._tradability_pending["checked_exits"]
+    assert len(checked) == 1
+    assert checked[0]["executable"] is False
+    assert checked[0]["blocked_reason"] == "limit_down"
 
 
 def test_enabled_defers_blocked_sell(node, monkeypatch) -> None:

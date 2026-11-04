@@ -14,6 +14,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.got.schemas import CatalystEvent, CatalystCalendar, NewsEvent
@@ -1199,6 +1200,42 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
 只输出 JSON，不要其他文字。"""
 
+    def _write_t2_shadow(
+        self,
+        events: List[CatalystEvent],
+        verdicts: List[dict],
+        *,
+        executed: bool,
+        reason: str = "",
+    ) -> None:
+        """落 T2 影子判据（仅 shadow 模式），供误杀率/兑现率评估。
+
+        产物：``data/got_daily/YYYYMMDD/shadow_t2.json``。``verdicts`` 包含 keep/drop 全部
+        逐事件判据；``drop_ids`` 是实际（或影子下拟）丢弃集合，二者用于算误杀/漏杀。
+        """
+        from src.got.catalyst_config import NARRATIVE_CRITIC_SHADOW
+
+        if not NARRATIVE_CRITIC_SHADOW:
+            return
+        try:
+            day_dir = Path("data/got_daily") / (self._run_date or date.today()).strftime("%Y%m%d")
+            day_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "line": "t2",
+                "executed": executed,
+                "mode": "shadow",
+                "event_count": len(events),
+                "drop_ids": sorted(self._critic_drop_ids),
+                "verdicts": verdicts,
+            }
+            if reason:
+                record["reason"] = reason
+            tmp = day_dir / "shadow_t2.json.tmp"
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, day_dir / "shadow_t2.json")
+        except OSError as exc:
+            logger.warning("[T2校验] 影子产物落盘失败（已忽略）: %s", exc)
+
     async def _critic_verify_narrative(
         self, events: List[CatalystEvent], source_news: List["NewsEvent"]
     ) -> List[CatalystEvent]:
@@ -1211,7 +1248,9 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
         """
         from src.got.catalyst_config import NARRATIVE_CRITIC_SHADOW
 
+        self._critic_drop_ids = set()
         if not events:
+            self._write_t2_shadow(events, [], executed=False, reason="no_events")
             return events
 
         # 构建原始新闻摘要（只取标题+情感）
@@ -1252,6 +1291,7 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
         try:
             if not content:
                 logger.warning("[T2校验] LLM 返回空（已重试），降级保留全部事件")
+                self._write_t2_shadow(events, [], executed=False, reason="llm_empty")
                 return events
 
             cleaned = content.strip()
@@ -1262,24 +1302,38 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
             if not isinstance(verdicts, list):
                 logger.warning("[T2校验] LLM 输出非数组，降级保留全部")
+                self._write_t2_shadow(events, [], executed=False, reason="non_array")
                 return events
 
             # 建立 event_id → verdict 映射
             drop_ids: set = set()
             self._critic_drop_ids = drop_ids
+            verdict_records: List[dict] = []
             for v in verdicts:
-                if v.get("verdict") == "drop":
-                    drop_ids.add(v.get("event_id", ""))
-                    reason = v.get("reason", "未说明")
-                    checks = v.get("checks", {})
+                if not isinstance(v, dict):
+                    continue
+                event_id = str(v.get("event_id", ""))
+                verdict = str(v.get("verdict", ""))
+                reason = str(v.get("reason", "未说明"))
+                checks = v.get("checks") if isinstance(v.get("checks"), dict) else {}
+                verdict_records.append({
+                    "event_id": event_id,
+                    "verdict": verdict,
+                    "reason": reason[:200],
+                    "checks": checks,
+                })
+                if verdict == "drop":
+                    drop_ids.add(event_id)
                     failed = [k for k, val in checks.items() if val == "fail"]
                     logger.info(
                         "[T2校验%s] DROP %s: %s (失败项: %s)",
                         "影子" if NARRATIVE_CRITIC_SHADOW else "",
-                        v.get("event_id", "?")[:16],
+                        event_id[:16],
                         reason[:40],
                         ", ".join(failed) if failed else "未标注",
                     )
+
+            self._write_t2_shadow(events, verdict_records, executed=True)
 
             if NARRATIVE_CRITIC_SHADOW:
                 # 影子模式：只记日志，不实际丢弃
@@ -1294,6 +1348,10 @@ JSON 数组: [{{"event_id": "...", "verdict": "keep/drop", "reason": "一句话�
 
         except Exception as exc:
             logger.warning("[T2校验] LLM 调用失败，降级保留全部: %s", exc)
+            self._write_t2_shadow(
+                events, [], executed=False,
+                reason=f"exception:{type(exc).__name__}",
+            )
             return events
 
     @staticmethod

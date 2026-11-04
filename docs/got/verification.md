@@ -3,6 +3,42 @@
 
 ---
 
+## 影子模式准入 / 退出（2026-11-03）
+
+> 规则真源：[`docs/AGENTS.md`](../AGENTS.md)「影子模式治理」；机器登记表：`src/got/shadow_registry.py`；检查器：`scripts/check_shadow_registry.py`。
+>
+> 新增/保留任何 `*_SHADOW` / `MODE=shadow` 先过四问：① 会改决策？② 归档 + 历史行情可复算？③ 有效样本门槛？④ 到期动作？
+>
+> **能回测/可回放的 gate 不得新开 shadow**；存量 legacy 必须登记 `waiver` + `expiry`。`trace` / `frozen` / `dead` 不计转正天数。到期默认 retire，续期须写 waiver。
+>
+> 到期巡检：`python scripts/check_shadow_registry.py --fail-on-expired`（建议每次排期前 / 每周跑一次）。
+>
+> 本文以下各节是历史补登 / 读数快照；开关当前状态以登记表为准，不要按旧节的「影子五线」等历史计数推断现状。
+
+---
+
+## 2026-11-04 补登（T1 reject 前向回测 — 证据已补，结论反向）
+
+- 脚本：`scripts/backtest_t1_rejects.py`；样本：`data/got_daily/*/shadow_t1.json` 的 `rejects[]`（29 个 reject，20 个有 reject 的归档日）。
+- Reject 侧：**T+5 n=23，69.6% 下跌，均值 -2.46%**；**T+3 n=27，44.4%，均值 -1.32%**。
+- **Keep-side 同窗基线**（同窗推荐票存活回测，报告 `data/got_daily/backtest_recommendation_survival_T5_20260915_20261103.md`）：推荐票 **T+5 n=92，均值 -4.59%，存活 26.1%**。
+- 判读：被拒票 **-2.46%** 反而好于被推荐票 **-4.59%**（+2.13pp）；**T1 veto 无增量证据**，且 raw precision 未控 beta。当前 29/50，**不 enable；候选 retire**，保留 shadow 仅日志。
+- 复现：`python scripts/backtest_t1_rejects.py --start 20260915 --end 20261103`
+
+---
+
+## 2026-11-04 补登（影子处置与 3b/4b 裁决）
+
+- **3b 分歧摘要**：回放 21/21 + 合成 9/9 已过；负责人 2026-11-04 裁决 **保持 shadow 至 2026-11-30，不注入 T3**。先做 bounded A/B / 合成用例，到期按结果 enable 或 retire。
+- **4b 市场结构**：`scripts/check_market_theme_acceptance.py` 实跑 20260928–20261103：非空日 **21**（≥10）、status=ok **21/21**（100%）、`market_theme` 真值违约 **0** → **文档硬门槛 PASS**。语义读数：top5 平均 strength **88.8** vs 全市场 50.2；同日 top5 涨跌幅 vs strength 相关均值 **+0.35**；同日主线重合 **39.8%**、次日 **20.4%**；噪声板块 **6.7%**（集中在早段）。
+- **4b 裁决**：负责人 2026-11-04 **enable 试运行**；生产 `.env` 已置 `GOT_MARKET_THEME_ENABLED=1`（`GOT_MARKET_THEME_SHADOW` 保持 1 继续留痕）。下个 `--got` 核对 `unified.json.market_theme` 真值非空、`market_theme_shadow` 仍在；回滚=0。
+- **MEG / FTS**：口径更正——MEG 的 T+5 -2.54% 是 snap-thrust **差**（基准受控）；FTS 的 T+10 -7.38% **口径待复核**（若为绝对收益则受弱市影响）。两者生产 0/2 次命中是触发过窄；负责人裁决 **保持 shadow，排期修触发/阈值**，2026-12-15 未修则 retire。下一步：用 `shadow_meg.json` / `shadow_fts.json` 的 `evaluated/flagged` 对照 `sector.json` 的 momentum/topping 读数定位 0/2 命中原因，先定假设再改阈值，不得直接调参碰运气。
+- **Jump / FXG baseline**：负责人裁决 **两条都停**。生产 `/opt/dsa/code/.env` 已改：`GOT_FAMILY_TOPPING_EXCLUDE_BASELINE_SHADOW=0`、`GOT_REGIME_JUMP_SHADOW=0`；代码 jump 缺省同步改 0；备份 `.env.bak.20261104_shadow_ops`。下个 `--got` 核对不再产 `shadow_regime_jump.json` / `fxg_baseline_scoring.json`；FXG veto 本身保持。
+- **部署边界**：上述生产 `.env` 改动下个进程即生效；本地 `shadow_t2.json` / GATE-1 `checked_exits` 代码改动**尚未部署 ECS**，须随下一次代码发布生效（不影响本次 stop/enable 验证）。
+- 复现：`python scripts/check_market_theme_acceptance.py --start 20260928 --end 20261103`
+
+---
+
 ## 2026-11-03 补登（埋伏道资金/消息维度接线修复 — 已生效，无开关）
 
 改动明细见 `docs/CHANGELOG.md` 同日条目；代码 `src/services/stock_screener.py::_run_ambush_lane`。

@@ -13,6 +13,7 @@
   - 影子模式输出内容（`reasoning.md` 末尾「🧪 影子模式观测」段逐线渲染读数+进度+到期提示；A6 glue 已转正，其关系/强度/家族统计改在 Node 6 正文「🧬 A6 语义粘合（已转正）」子块展示）
   - Phase 2 交易建议（持仓分析/候选股/操作建议）
   - 关键风险提示和主线续航评估
+- **影子模式四问**：新增/保留 `*_SHADOW` 或 `MODE=shadow` 前，必须按 `docs/AGENTS.md`「影子模式治理」四问自检，并在 `src/got/shadow_registry.py` 登记；能回测/可回放的 gate 不得新开影子，到期默认退役。
 - **长时间运行命令必须加 `timeout: 0`**：执行 `python main.py --got`、`python main.py --screener` 等命令时，必须在 bash 工具调用中设置 `timeout: 0` 参数，禁止使用默认超时。
 
 ---
