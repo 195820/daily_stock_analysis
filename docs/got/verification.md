@@ -17,6 +17,88 @@
 
 ---
 
+## 2026-11-05 主题驱动全链路 P0/P1（对照底座 + 观察账本，零收益结论）
+
+> 实施稿：根目录 [`主题驱动全链路收益改进实施稿_20261105.md`](../../主题驱动全链路收益改进实施稿_20261105.md)。P0/P1 已实施；P2+ 未开始。**本节所有读数都不是收益改善证据。**
+
+**P0 对照底座（组合模拟成交与记账）**
+
+- 新增 `src/got/portfolio_sim.py`（纯状态成交引擎）、`src/got/backtest_data.py`（冻结行情快照读取）、`scripts/build_stock_ohlcv_cache.py`、`scripts/backtest_portfolio_baseline.py`、`tests/test_portfolio_sim.py`、`tests/test_backtest_data.py`。
+- 口径：归档 `allocation` 作订单流 → 次日开盘价成交；佣金 2.5bp（min ¥5）/ 印花税 5bp 卖出 / 过户费 0.1bp / 滑点 5bp；100 股整手；lot 级 T+1；涨跌停/停牌/缺前收一律不可成交并计数；`raw` 成交 + `qfq` 除权除息换算（21 个 symbol-day 命中，`qfq_mark_fallbacks=1`）。
+- 基线读数（2026-08-01 → 11-05 净值窗口，决策窗口至 11-03）：62 个归档日；订单 69；成交 51 filled / 3 partial（`insufficient_position`）/ 12 rejected（全部 `no_position`）；期末净值 ¥892,554（**−10.74%**）；最大回撤 14.35%；46 只未平仓、仓位利用率约 38.6%；闭合往返 **5 笔 → `insufficient_sample`（绑定约束 closed_trades 5<100）**。
+- 完整性计数：`artifact_missing=6`、`artifact_corrupt=1`（20260917 JSON 截断）、`no_next_session=0`（11-03 决策的 11-04 成交已纳入）、`no_orders=24`、`order_blocked_in_production=0`、`symbol_missing_bar=0`、`stale_marks=13`（明细 `002388` 连缺三日）、`qfq_mark_fallbacks=1`（`000831:2026-11-05`）。缺失样本单独计数，不计作「零订单」。
+- 复现：`python scripts/backtest_portfolio_baseline.py --start 20260801 --end 20261103 --check-repro` → **PASS**；当前内容寻址 digest `e4451fbd…`（`data_sha256=85f6f079…`，由行情快照内容生成，不含抓取时间）。
+- digest 变更留痕：2026-11-05 行情快照从「allocation 53 只」扩为「allocation + candidate_pool 365 只」后，digest 由 `728f6269…` 变为 `e4451fbd…`；成交与净值未变（−10.74%、5 笔闭合、MDD 14.35%），delta 仅快照身份（symbols 53→365 + 以内容指纹替代 `built_at`）。成交只读取订单所需 symbol，扩展不改变任何成交。
+- 已知边界（不得回避）：归档 `allocation` 的卖出数量以真实持仓为前提，模拟组合从固定初始现金起步，卖单按模拟持仓裁剪（12 笔 `no_position` + 3 笔 `insufficient_position`）；46 只未平仓票是「决策忠实重放」的结果，不是组合策略结论。报告头已写死该结构性前提；四组对照与自洽决策回路属 P4 前向影子范围。
+- 闭合往返收益口径：`raw_cash`（含双边费用）+ 逐笔 `qfq_gross_return` 交叉校验；持仓市值走 qfq 除权除息换算，现金/成交走未复权真实价格。
+
+**P1 观察账本（board observation / episode / setup / theme_watch）**
+
+- 新增 `src/got/theme_ledger.py`、`theme_observation`/`theme_episode`/`theme_setup` 三表、`scripts/build_theme_ledger_history.py`、`tests/test_theme_ledger.py`；`GOT_THEME_LEDGER=off|shadow|enabled` 缺省 **off**，登记为 `trace`（`shadow_registry.py`）；`theme_ledger.json` 已进归档原子替换白名单。
+- 分段规则：ENTER≥80 / EXIT<75 / 连续 3 个**真实观测**确认关闭；age 按交易日历含首尾计（开段当日 age=1）；缺档只增 age 不推进确认；`state` 不参与分段。
+- 归档模式重建（2026-10-08 → 11-03，19 日）：3600 条观测；逐日 as-of 快照 + digest 双跑 **PASS**。三个校准案例与验证报告一致：
+  - 减速器 10-23：`episode=880675-2026-10-20`，age=4，state=neutral，`in_top_output=True`；
+  - 短剧 10-29：`state=ambush` 且 `in_ambush_output=False`、`in_top_output=True`（内部 ambush 被 16 条 cap 截掉的事实可还原），age=2，setup `none=armed` / 资金变体 `unknown`；
+  - 短剧 11-03：同一段 age=5（11-02/03 无内部状态，仅 age 按日历增长，无确认推进）。
+- 运行时 builder 冒烟（10-29 归档上下文）：73 条观测（仅输出桶覆盖板块；`state_source=sector_context` 降级路径），`fund_status=known` 来自 `evidence.sector_flow.sector_flow_all`（亿元，正=流入）；880692 关键事实复现。
+- 幂等/零决策改动：同日重跑 73 行无重复、snapshot digest 一致；`purge_derived()` 后重建 projection digest 一致；构建前后 10-29 目录内 19 个决策产物 sha256 **全部未变**。
+- 测试：`test_portfolio_sim` 17 + `test_backtest_data` 6 + `test_theme_ledger` 14 + `test_shadow_registry` 8 + `test_archive_pre_archive_artifacts` 3 = **48 passed**；orchestrator 相邻 23 passed。
+
+**P2-a 离线归因影子（2026-11-05，只读归档，未接生产消费）**
+
+- 新增 `src/got/theme_routing_shadow.py` + `scripts/audit_theme_setup_shadow.py` + `tests/test_theme_routing_shadow.py`。口径：只读 `sector.json`/`unified.json`/`portfolio_decision.json` 的归档闸门事实（break_signals/overheat/crowded/regime/仓位比），**不重算评分、不调用预算、不产生 buy 字段**。
+- E16 变体 B/C/D 与 `scripts/audit_node2_state_counterfactual.py` 同常量同判据，单测对该脚本逐值比对（9 例含 9 组输入）；规则改动两处不同步即失败。
+- 读数（2026-10-08 → 11-03，17 归档日）：setup 审计 924 行、armed 188 行；armed 阻断层 `visible 58 / top_only 55 / unresolved_no_detail 61 / score_rank 6 / regime_blocked 4 / trend_broken 4`；observation 提醒（段内但当日不在任何输出桶）702 条。重复运行 payload digest **PASS**。
+- 校准案例 10-29 短剧：`none` 变体 armed、归档仅落 `top_by_score` → 阻断层 `top_only`（不创建候选，下游仍不可交易），E16 B/C/D = `ambush/active_mainline/active_mainline`；资金三变体 `unknown`（当日无 1d/3d 资金证据）。
+- 逐闸门向量（armed 188 行，事实来源 `archived`，缺证据记 `unknown`）：trend fail 39 / unknown 61；overheat fail 0 / unknown 61；regime fail 55 / unknown 61；crowding fail 3 / unknown 61；budget fail 31 / unknown 61；capacity fail 2 / unknown 61。`budget` 只入向量、不作板块级首要阻断层（Phase 2 执行层约束不是板块掉出 Phase 1 输出桶的原因），避免掩盖板块归因。
+- `top_only` 与 `visible` 分列：验证报告 §3 已明确 `top` 桶不创建候选，若并入 `visible` 会把 10-29 误读为「已可见」。
+- `unresolved_no_detail`（61 armed 行）是诚实缺口：板块不在任何输出桶 detail，无法归因具体闸门；不推断、不计入拒绝统计。
+
+**P2-b-1 观察提醒生产 trace（2026-11-05，只读、开关缺省 off）**
+
+- `UnifiedContext` 新增 `theme_watch_shadow`（trace，仅 `GOT_THEME_LEDGER=shadow/enabled` 落）；`theme_ledger.attach_theme_watch_shadow` 在 Node 6 构造后挂载，fail-open，不改任何决策字段；`archive._render_shadow_theme_watch` 在「影子模式观测」段渲染一条提醒（开关关/无快照时返回空列表，**不占版面**，且**不登记** `SHADOW_PROGRESS_RULES`——trace 不设转正时钟）。
+- 验证：`test_theme_ledger` 21 例（投影无 buy/sell/weight/action/quantity 字段、entries 上限、attach 尊重 off/shadow、缺快照 fail-open、渲染空/有产物、其它字段逐值不变、真实 10-29 快照序列化/渲染）；`test_shadow_reasoning` 22 + 相邻套件合计 **110 passed**，原有影子段字节断言未变。
+- 生产路径端到端集成测试（隔离临时 DB + 临时归档根）：Node 2 行 → `build_and_persist` 写库/落 `theme_ledger.json` → `load_snapshot` 回读 → `attach_theme_watch_shadow` 挂载 → `_render_shadow_theme_watch` 渲染；同日重跑观测行数不翻倍。`build_and_persist`/`load_calendar`/`_load_observation_history` 新增 `db`/`base_dir` 注入参数（生产缺省行为不变）。
+- Node 6 五上下文 + glue/LLM 的整链冒烟本轮未跑（成本高）；首个生产 shadow 日以 `theme_watch_shadow.as_of` 核对新鲜度，缺失时渲染器追加「展示 T-1 或更早」提示。
+
+**P2-b-2 板块层逐闸门向量（2026-11-05）**
+
+- `theme_routing_shadow.gate_verdicts`：trend/overheat/regime/crowding/budget/capacity 六闸门三态判定，`first_failing_gate` 与首要阻断层在单测里逐例对齐；`budget` 的 `risk_assessment` 嵌套字段已修正（此前 188 行全 unknown 是读取层级错误）。
+- 不变量：阻断层 ↔ 首个 fail 一致性 checked=68（`trend_broken` 48 + `regime_blocked` 20，含全部变体行；`visible`/`top_only`/`unresolved`/`score_rank` 在闸门之前判定，不参与该不变量），mismatches=0；脚本不一致时退出码 4。
+- 仍未做：**个股漏斗闸门重走**（R0–R5 需要行情/DDE/问财输入）与四组组合对照；这两项依赖 P3 映射与自洽决策回路，单独立项。
+
+**P3-a 个股—主题回链（2026-11-05，只读审计，不扩候选）**
+
+- 新增 `src/got/theme_stock_link.py` + `scripts/audit_theme_stock_link.py` + `tests/test_theme_stock_link.py`。回链链：`candidate_pool` → board_code（精确名/`sector_query_board`）→ 当日 observation → open episode/age → 四变体 setup → 输出桶可见性；**不生成候选、不改漏斗、无 buy 字段**。
+- 读数（2026-10-08 → 11-03，13 个同时有 candidate_pool 与 sector.json 的归档日）：候选行 414，其中**空占位行 54**（10-12 的 53 行 + 10-09/10-10 各 1 行，symbol/name 均空）单列剔除；真实候选 360，**回链 360（100%）**，finalist 42。
+- 可观测失真：`weak_ambush_board` 70（ambush 道且强度<40；本窗口无 `ambush_broken`，占 ambush 候选 36.6%）、`late_entry`（age>5）34、`strong_board_follower`（板块≥80 且非 finalist，**代理不是直接度量**）116、`board_invisible` 14（全部为 2026-10-23「智谱AI」：在 `strength_lookup` 但当日不在任何输出桶，逐日明细入 MD）。
+- 分道：mainline 169（avg 88.3；其中 49 行 `sector_type` 缺失、按输出桶回退为 `bucket_fallback`）、ambush 191（avg 45.4）、无 unknown 道。`sector_type` 是 2026-10-20 起才写入的字段，早期归档为空，禁止把「字段缺失」记成 unknown 道别。
+- 复现：双跑 payload digest **PASS**（`899891e3…`）；产物 `data/got_daily/theme_stock_link_20261008_20261103.{json,md}`。
+- 事后评估（收盘到收盘，**仅评估、不参与决策**；个股 T+h 收益 − 所属板块指数 T+h）：真实候选 360 中 T+3 可用 315（45 未到期/缺价）、T+5 可用 280（80 未到期/缺价）。全样本 T+3 超额均值 +0.09%（CI −0.44%~+0.80%）、T+5 −0.92%（CI −1.45%~−0.15%）；`non_finalist` T+5 −1.17%（CI −1.63%~−0.31%）、`finalist` T+5 +1.11%（CI −1.51%~+3.88%）；`strong_board_follower` T+5 −1.28%（CI 跨 0）；`weak_ambush_board` T+3 +1.34%（CI +0.59%~+2.35%）但 T+5 −1.25%（CI −1.66%~−0.84%）。**样本仅 13 个归档日/280–315 行、日期簇 CI，属描述性读数，不构成收益结论，也不用于转正。**
+- 候选级**含成本净收益**（次日开盘买 → T+h 收盘卖；费率+滑点，不含最低佣金；T+1 由 horizon≥2 保证）：T+3 可用 315、T+5 可用 280。T+5 候选净均值 **−5.94%**（胜率 22.1%），但这是**绝对收益不是超额**——同 280 行对照：股票毛收益 −6.25%、板块 −5.27%、超额 −0.92%；费用+隔夜跳空合计约 −0.31pp（净 −5.94% vs 毛 −6.25%）。报告已把 reconciliation 表放在净收益表之前，防止把绝对收益误读成超额。
+- 前向口径差异（明示）：本审计要求个股与板块在**同一日历终点**都有 bar（严格执行，缺任一 → unresolved）；`audit_theme_episode_forward_returns.py` 用的是各序列自身 `i+h` 偏移。两者不可直接混比；本审计的 unresolved 计数即该严格口径的代价。
+- 已测：候选 vs 所属板块的毛超额与含成本净收益（强板块居中跟风的直接度量）。未测（报告 `not_measured` 明示）：**板块内同侪相对排名**（每板块每日 1–3 只候选，排名为噪声，主动不做）、分支受益证据链（事件→窄分支→个股）与验证拒绝后的名额释放/递补（需 P3-b 漏斗重放）。
+
+**生产 shadow 启用（2026-11-05 20:43，用户授权“继续实施”）**
+
+- ECS `/opt/dsa/code/.env` 新增 `GOT_THEME_LEDGER=shadow`（第 957 行；备份 `.env.bak.20261105_theme_ledger`，属主 dsa:dsa）。GOT 为 timer 触发的 oneshot（工作日 13:20），**无需重启**，下次 `--got` 生效。
+- 运行时同步：commit `60cbf49`（7 文件：`theme_ledger.py`/`orchestrator.py`/`schemas.py`/`aggregator.py`/`archive.py`/`shadow_registry.py`/`storage.py`），远端 md5 与本地逐文件一致、`py_compile` 通过、`theme_*` 三表已建（0 行）。
+- 生效验证：`import main` 后 `get_mode()` = `shadow`；`scripts/check_theme_ledger.py --date 20261105` 输出 `mode pass / snapshot missing / exit 3`（部署前一日无产物，符合预期）。
+- 首个影子样本：**2026-11-06 13:20 定时跑**；首日验收命令：`python scripts/check_theme_ledger.py --date YYYYMMDD`（退出码 0=pass/warn、2=不自洽、3=缺快照）。
+- 回滚：删除 `.env` 该行或置 `off`，下一次 run 即停写；代码侧无决策改动（A2≡A1 已验证）。
+
+**P4 验收判定器（2026-11-05，机械判据就绪，样本外未跑）**
+
+- 新增 `src/got/theme_acceptance.py` + `scripts/evaluate_theme_arms.py` + `tests/test_theme_acceptance.py`。判据逐条对应实施稿 §2.1/§9：① 两臂 `sample_days>=60` 且闭合 `>=100`；② 净收益胜率差 >0 且日期簇 CI 下界 >0（缺 `exit_date` 的成交剔除并计数披露）；③ 逐日组合收益差 >0 且 CI 下界 >0；④ 最大回撤恶化 ≤1pp；⑤ 单日集中度状态为 `disclosure`（只披露、不参与聚合）；⑥ 风控零绕过无法由回测 payload 证明 → `not_verifiable`（需人工签署）。
+- 新增 `payload_schema` 前置判据：两臂必须含 `metrics/equity_curve/closed_trades/meta`，且 `meta.cost_model`/`initial_cash`/`window` 一致；不一致 → `unresolved`（拒绝比较）。报告 `compared_fields` 明列实际比较字段（`metrics.sample_days`、`metrics.max_drawdown`、`metrics.closed_trades.count`、`closed_trades[].exit_date/net_return`、`equity_curve[][0]/[1]`、`meta.*`）。
+- 状态优先级：`insufficient_sample` > `unresolved` > `fail` > `pass_pending_attestation` > `pass`（schema/日期不可比时 fail 也不可信，故 unresolved 优先）。**机械判据全过但未签署时只能是 `pass_pending_attestation`，不自动 pass。**
+- 自检（基线自比，`--self-check`）：`status=insufficient_sample`；`payload_schema` pass、`sample_days` pass(63)、`closed_trades` insufficient(5<100)、`equity_alignment` pass(63)、`net_return_diff` fail（同臂零差）、`max_drawdown` pass(Δ0)、`single_day_concentration` disclosure、`risk_gate_no_bypass` not_verifiable。自检只验证链路，不是策略结论。
+- 变体 arm 缺失时 CLI 退出码 **2** 且不生成报告（arms 3/4 需 P2-b-3/P3-b 产物）。当前 P4 未跑：基线闭合 5 笔，任何比较只会得到 `insufficient_sample`。
+- **P5 前置审计工具**（2026-11-05，只读）：`scripts/check_theme_ledger.py --date YYYYMMDD` 核对快照/DB 自洽（快照日期、观测数、board_code 集合、主键重复、`unified.theme_watch_shadow`），退出码 0=pass/warn、2=fail、3=缺快照；本地预期 `missing`（开关 off、账本表 0 行）。启用 shadow 后首日即用该脚本验收，不写任何文件以外的状态。
+- **预注册协议**：[`plans/P4_pre_registration_20261105.md`](plans/P4_pre_registration_20261105.md)（2026-11-05 冻结：基线 digest `e4451fbd`、快照 `data_sha256=85f6f079`、成本/初始资金/四臂定义、dev vs holdout 规则、停止条件）。执行前不得修改该协议；修改即作废旧 holdout。
+
+**P2-b-3 未开始**：个股漏斗重走 + 组合四组对照。需先以 `GOT_THEME_LEDGER=shadow` 积累生产样本，并单独裁决门级重放方案；不与账本捆绑转正。
+
 ## 2026-11-04 补登（埋伏道 P0 落地读数）
 
 - **P0-6 硬止损**：`assess_holding` 在 P4 快照后新增硬止损分支；10-29 002009 事实（P&L −5.31%、阈值 −5%、`thesis_drift=True`、家族宽限 hold）重放由 `hold/thesis_drift_grace` → `sell/stop_loss`。P4 快照仍优先。`tests/test_holdings_rewiring.py` 40 passed。
