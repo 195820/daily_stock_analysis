@@ -746,6 +746,9 @@ class SectorAnalysisNode:
                 result.notes.extend(crowding_warnings)
                 logger.info(f"[Node 2] 家族拥挤警示: {crowding_warnings}")
 
+            # Step 3.3b: 早段观察（只看，不进候选/不改状态）
+            result.early_watch = self._build_early_watch(analyzed, result)
+
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
 
@@ -3726,6 +3729,44 @@ class SectorAnalysisNode:
             crowded_families=crowded_families,
             frame_group_lookup=frame_group_lookup,
         )
+
+    @staticmethod
+    def _build_early_watch(analyzed: list, result) -> list[dict]:
+        """strength≥80 但未进入 active/ambush/near-miss 的板块 → 观察清单。
+
+        解决「状态/容量把高强度板块挤出输出」：种业 08-24 strength 81.8、
+        state=exhausted，只落 top_by_score；08-25 83.4 无任何桶 → 观察身份丢失。
+        本清单只读、有独立容量（20），不产生候选资格、不改任何状态。
+        """
+        used: set[str] = set()
+        for group in getattr(result, "active_mainline", []) or []:
+            used.update(m.code for m in getattr(group, "members", []) or [])
+        for field in ("ambush", "near_miss_ambush"):
+            used.update(s.code for s in (getattr(result, field, []) or []))
+        top_codes = {s.code for s in (getattr(result, "top_by_score", []) or [])}
+
+        out: list[dict] = []
+        for s in analyzed:
+            if s.code in used:
+                continue
+            strength = float(getattr(s, "strength_score", 0) or 0)
+            if strength < 80:
+                continue
+            quadrant = (getattr(s, "rrg", None) or {}).get("quadrant")
+            out.append({
+                "code": s.code,
+                "name": s.name,
+                "state": s.state,
+                "strength": round(strength, 2),
+                "today_change": getattr(s, "today_change", None),
+                "tier": getattr(s, "tier", None),
+                "quadrant": quadrant,
+                "in_top_by_score": s.code in top_codes,
+                "reason": "top_only_high_strength" if s.code in top_codes
+                          else "unrouted_high_strength",
+            })
+        out.sort(key=lambda x: x["strength"], reverse=True)
+        return out[:20]
 
     @staticmethod
     def _extract_attack_power(market_context) -> float:

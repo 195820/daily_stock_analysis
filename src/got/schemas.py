@@ -402,6 +402,11 @@ class SectorContext(BaseModel):
         default_factory=list,
         description="评分最高的 N 个板块（参考用，不代表达标）",
     )
+    early_watch: list[dict] = Field(
+        default_factory=list,
+        description="早段观察：strength≥80 但未进入 active/ambush/near-miss 的板块"
+                    "（含 state/age 线索；**只观察，不产生候选资格**）。",
+    )
 
     # ── 新增：行业板块视角（中期趋势）──
     industry_top: list[SectorDetail] = Field(
