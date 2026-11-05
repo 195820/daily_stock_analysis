@@ -85,6 +85,8 @@
 - 运行时同步：commit `60cbf49`（7 文件：`theme_ledger.py`/`orchestrator.py`/`schemas.py`/`aggregator.py`/`archive.py`/`shadow_registry.py`/`storage.py`），远端 md5 与本地逐文件一致、`py_compile` 通过、`theme_*` 三表已建（0 行）。
 - 生效验证：`import main` 后 `get_mode()` = `shadow`；`scripts/check_theme_ledger.py --date 20261105` 输出 `mode pass / snapshot missing / exit 3`（部署前一日无产物，符合预期）。
 - 首个影子样本：**2026-11-06 13:20 定时跑**；首日验收命令：`python scripts/check_theme_ledger.py --date YYYYMMDD`（退出码 0=pass/warn、2=不自洽、3=缺快照）。
+- **2026-11-05 手工回填首日样本**（用户要求当场比对；用当日 13:20 归档上下文跑同一 builder，`run_id=manual-backfill-20261105`，`bar_complete=False`）：334 观测 / 25 段 / 100 setup（`none:armed` 25、`fund_1d:armed` 9、`fund_any:armed` 9，其余 unknown）/ watch 20；75 只候选全部回链，其中 21 只落在 armed 板块。健康检查 `status=warn`（仅 `unified_watch` 缺失——当日 Node 6 跑批早于部署，其余快照/DB/集合/主键全 pass，exit 0）。
+- **A1≡A2（第一版比对）**：回填前后 `portfolio_decision.json` md5 均为 `e04ba039…`，账本无订单接口 → 账本版与基线决策逐字节相同。当日订单要到 11-06 开盘才成交，T+3/T+5 未到期，**不存在可比的收益读数**。
 - 回滚：删除 `.env` 该行或置 `off`，下一次 run 即停写；代码侧无决策改动（A2≡A1 已验证）。
 
 **P4 验收判定器（2026-11-05，机械判据就绪，样本外未跑）**
