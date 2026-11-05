@@ -1208,6 +1208,15 @@ class UnifiedContext(BaseModel):
                     "仅在 enabled 时对 overall_confidence 施加一致性因子。",
     )
 
+    # ── P2-b 主题观察提醒留痕（2026-11-05）──
+    theme_watch_shadow: Optional[dict] = Field(
+        default=None,
+        description="主题观察账本快照的紧凑投影（trace，仅 GOT_THEME_LEDGER=shadow/enabled 落）: "
+                    "{as_of, observation_count, watch_count, dropped_count, entries:[{board_code,"
+                    "board_name, age_days, status, peak_strength, strength, in_*_output}]}。"
+                    "只读展示/复评提醒，**不参与任何评分、候选资格或仓位**；不得映射为 buy。",
+    )
+
     # ── Phase 3b / 分歧摘要观测留痕（批次 5 §3.2，2026-09-28）──
     conflict_summary_shadow: Optional[dict] = Field(
         default=None,

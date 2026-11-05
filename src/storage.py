@@ -36,6 +36,7 @@ from sqlalchemy import (
     Index,
     UniqueConstraint,
     Text,
+    JSON,
     select,
     and_,
     or_,
@@ -1135,6 +1136,97 @@ class Node2SectorTrendRecord(Base):
         self.strength_trajectory = json.dumps(trajectory, ensure_ascii=False)
 
 
+class ThemeObservationRecord(Base):
+    """主题账本 P1：板块-日观测（append-only，单写者 = theme_ledger builder）。
+
+    `state` 仅作观测特征，不参与 episode 分段；`in_*_output` 是当日输出桶成员标志，
+    与内部 state 分列——10-29 短剧「内部 ambush 但被 16 条 cap 截掉」必须可还原。
+    """
+
+    __tablename__ = 'theme_observation'
+
+    board_code = Column(String(20), primary_key=True)
+    trade_date = Column(Date, primary_key=True)
+    theme_id = Column(String(40), index=True)
+    board_name = Column(String(100), nullable=False)
+    strength = Column(Float)
+    state = Column(String(32))
+    in_active_output = Column(Boolean, default=False)
+    in_ambush_output = Column(Boolean, default=False)
+    in_near_miss_output = Column(Boolean, default=False)
+    in_top_output = Column(Boolean, default=False)
+    fund_1d = Column(Float)
+    fund_3d = Column(Float)
+    fund_status = Column(String(16), default='unknown')
+    news_event_ids = Column(JSON, default=list)
+    catalyst_event_ids = Column(JSON, default=list)
+    heat_rank = Column(Integer)
+    ma20 = Column(Float)
+    close = Column(Float)
+    ret_5d = Column(Float)
+    trend_broken = Column(Boolean)
+    trend_status = Column(String(16), default='unknown')
+    source = Column(String(16), default='real')
+    bar_complete = Column(Boolean, default=True)
+    run_id = Column(String(64))
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index('ix_theme_obs_date', 'trade_date'),
+        Index('ix_theme_obs_board_date', 'board_code', 'trade_date'),
+    )
+
+
+class ThemeEpisodeRecord(Base):
+    """主题账本 P1：观察段（episode）。age 由交易日历派生，不入库。"""
+
+    __tablename__ = 'theme_episode'
+
+    episode_id = Column(String(64), primary_key=True)
+    theme_id = Column(String(40), index=True)
+    board_code = Column(String(20), index=True, nullable=False)
+    board_name = Column(String(100), nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date)
+    break_date = Column(Date)
+    confirm_date = Column(Date)
+    peak_strength = Column(Float, default=0.0)
+    peak_date = Column(Date)
+    status = Column(String(20), default='open', index=True)
+    pending_break_days = Column(Integer, default=0)
+    last_observation_date = Column(Date)
+    observations = Column(Integer, default=0)
+    gaps = Column(Integer, default=0)
+    break_reason = Column(String(32), default='')
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ThemeSetupRecord(Base):
+    """主题账本 P1：setup 复评申请。armed ≠ buy，必须重走全部闸门。"""
+
+    __tablename__ = 'theme_setup'
+
+    setup_id = Column(String(96), primary_key=True)
+    theme_id = Column(String(40), index=True)
+    board_code = Column(String(20), index=True, nullable=False)
+    board_name = Column(String(100), nullable=False)
+    episode_id = Column(String(64), index=True, nullable=False)
+    fired_date = Column(Date, nullable=False)
+    setup_type = Column(String(16), nullable=False)
+    age_days = Column(Integer)
+    fund_state = Column(String(16), default='unknown')
+    variant_fund_state = Column(String(16), default='unknown')
+    status = Column(String(20), default='unknown', index=True)
+    expiry_date = Column(Date)
+    invalid_reason = Column(String(32), default='')
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index('ix_theme_setup_status_expiry', 'status', 'expiry_date'),
+    )
+
+
 class SectorFrameRecord(Base):
     """板块持久框记录（仅主线框）。
 
@@ -1717,6 +1809,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._migrate_stock_daily_canonical_id()
             self._migrate_node4_run_based_columns()
             self._migrate_thesis_lifecycle_state()
+            self._migrate_theme_ledger()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -1777,6 +1870,34 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 session.commit()
         except Exception as exc:
             logger.warning("[storage] node2_sector_trends 列迁移失败，降级运行: %s", exc)
+
+    def _migrate_theme_ledger(self) -> None:
+        """幂等迁移：为 theme_setup 补 variant_fund_state（P1 账本表，2026-11-05）。
+
+        表由 create_all 新建，首次上线即含该列；此迁移只覆盖「先建表、后加列」的本地库，
+        避免 INSERT 因缺列抛 OperationalError 并被上层 fail-open 静默吞掉。
+        """
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._SessionLocal() as session:
+                exists = session.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='theme_setup'")
+                ).scalar()
+                if not exists:
+                    return
+                cols = {
+                    row[1]
+                    for row in session.execute(text("PRAGMA table_info(theme_setup)")).fetchall()
+                }
+                if "variant_fund_state" not in cols:
+                    session.execute(
+                        text("ALTER TABLE theme_setup ADD COLUMN variant_fund_state VARCHAR(16)")
+                    )
+                    session.commit()
+                    logger.info("[storage] 迁移 theme_setup: 新增列 variant_fund_state")
+        except Exception as exc:
+            logger.warning("[storage] theme_setup 列迁移失败，降级运行: %s", exc)
 
     def _migrate_thesis_lifecycle_state(self) -> None:
         """幂等轻量迁移：为 holding_thesis_snapshots 补齐 B3 四态状态机列并回填存量行。

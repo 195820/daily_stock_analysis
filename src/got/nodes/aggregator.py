@@ -633,6 +633,14 @@ class AggregatorNode:
             conflict_summary_shadow=conflict_summary_shadow_dict,
         )
 
+        # P2-b：主题观察提醒（trace-only；GOT_THEME_LEDGER=off 缺省不产出、不改任何字段）
+        try:
+            from src.got.theme_ledger import attach_theme_watch_shadow
+
+            attach_theme_watch_shadow(unified, today)
+        except Exception as exc:  # noqa: BLE001 - 观察层失败不得阻断聚合
+            logger.warning("[Node 6] 主题观察提醒挂载失败（已忽略）: %s", exc)
+
         # 持久化（回放模式跳过）
         if replay_mode:
             logger.info("[Node 6] replay_mode: 跳过 _save_context / EMA 回写 / _update_monitoring")

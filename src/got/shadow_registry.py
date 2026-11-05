@@ -55,6 +55,7 @@ MODE_KEYS = {
     "GOT_HOLDINGS_VERDICT_V2",
     "GOT_HOLDINGS_HISTORY_FEED",
     "GOT_NEWS_SHORTLIST_QUOTA",
+    "GOT_THEME_LEDGER",
 }
 
 SHADOW_STATUSES = {"shadow", "retire_pending", "needs_artifact"}
@@ -97,6 +98,19 @@ SHADOW_REGISTRY: dict[str, ShadowRecord] = {
             "保持 shadow 至 11-30，不注入 T3"
         ),
         note="先做 bounded A/B / 合成用例；到期按结果 enable 或 retire。",
+    ),
+    "GOT_THEME_LEDGER": ShadowRecord(
+        env="GOT_THEME_LEDGER",
+        default="off",
+        kind="trace",
+        data_basis="backtestable",
+        status="trace",
+        artifact="theme_ledger.json",
+        metric="观察段/age、状态与输出桶可分、setup 变体可复算（非收益指标）",
+        note=(
+            "P1 账本只写观察产物（off 缺省）；影子期零决策改动。"
+            "P2 若把 observation/setup 接入路由，必须改登记为 gate 并补 min_samples/expiry。"
+        ),
     ),
     "GOT_MARKET_THEME_SHADOW": ShadowRecord(
         env="GOT_MARKET_THEME_SHADOW",

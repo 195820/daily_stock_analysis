@@ -261,6 +261,24 @@ class GOTOrchestrator:
             except Exception as exc:  # noqa: BLE001 - 构造失败不阻断 GOT 主流程
                 logger.warning("[GOT] 4b 市场结构构造失败（已忽略，下游回退 unknown）: %s", exc)
 
+        # Step 2.6: P1 主题观察账本（GOT_THEME_LEDGER=off 缺省；shadow=只写产物）
+        # 只写 theme_ledger.json + 观察表，不参与任何决策；失败 fail-open 不阻断主流程。
+        ledger_mode = os.getenv("GOT_THEME_LEDGER", "off").strip().lower()
+        if not self.use_mock and ledger_mode in ("shadow", "enabled"):
+            try:
+                from src.got.theme_ledger import build_and_persist
+
+                await asyncio.to_thread(
+                    build_and_persist,
+                    target_date,
+                    sector_ctx=sector_ctx,
+                    capital_ctx=capital_ctx,
+                    news_ctx=news_ctx,
+                    run_id=(self.got_runtime.run_id if self.got_runtime else ""),
+                )
+            except Exception as exc:  # noqa: BLE001 - 观察层失败不得阻断 GOT
+                logger.warning("[GOT] 主题观察账本构建失败（已忽略）: %s", exc)
+
         # Step 3: 聚合
         logger.info("[GOT] 两路完成，开始聚合")
         unified = await self.aggregator.run(

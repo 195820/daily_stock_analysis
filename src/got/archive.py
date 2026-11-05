@@ -834,7 +834,10 @@ SHADOW_SHORTLIST_QUOTA_ARTIFACT = "shadow_shortlist_quota.json"
 # 归档前直写当日目录、必须随原子替换搬运进 tmp 的产物（单一登记点）。
 # 新增此类旁挂文件时同时登记于此，否则同日后跑一次就会被删除（2026-10-30 实锤：
 # Node 4 已 4 次落盘 shadow_attention，仍因白名单漏登而在归档后消失）。
+THEME_LEDGER_ARTIFACT = "theme_ledger.json"
+
 PRE_ARCHIVE_ARTIFACTS = (
+    THEME_LEDGER_ARTIFACT,
     SHADOW_LOW_EVENTS_ARTIFACT,
     SHADOW_AMBUSH_EXIT_GRACE_ARTIFACT,
     NEWS_RETRIEVAL_TRACE_ARTIFACT,
@@ -1132,6 +1135,43 @@ def _render_shadow_t1h(t1h: "dict | None") -> list[str]:
         for v in verdicts
     ]
     lines += ["", "影子模式下裁决已归档但未施加降档惩罚，未影响持仓评分。", ""]
+    return lines
+
+
+def _render_shadow_theme_watch(unified: "dict | None", run_date: "date | None" = None) -> list[str]:
+    """主题观察提醒（P2-b trace）：只展示段内板块与输出桶可见性，不参与任何判定。
+
+    与其它影子线不同，本线**不进** SHADOW_PROGRESS_RULES：trace 不设转正时钟；
+    开关关闭或无快照时返回空列表（不占版面、不产出「无产物」噪声）。
+    """
+    shadow = (unified or {}).get("theme_watch_shadow")
+    if not shadow:
+        return []
+    entries = shadow.get("entries") or []
+    as_of = str(shadow.get("as_of") or "")
+    stale_note = ""
+    if run_date is not None and as_of and as_of != run_date.isoformat():
+        stale_note = "（当日快照缺失，展示 T-1 或更早）"
+    lines = [
+        f"**主题观察提醒**（trace，不参与评分/候选/仓位）：as_of `{as_of}`{stale_note}，"
+        f"观察 {shadow.get('observation_count', 0)} 条，展示 {shadow.get('watch_count', 0)} 条，"
+        f"容量截断 {shadow.get('dropped_count', 0)} 条（`theme_ledger.json`）。"
+    ]
+    for item in entries[:8]:
+        buckets = [
+            label for flag, label in (
+                ("in_active_output", "active"),
+                ("in_ambush_output", "ambush"),
+                ("in_near_miss_output", "near-miss"),
+                ("in_top_output", "top"),
+            ) if item.get(flag)
+        ]
+        lines.append(
+            f"- `{item.get('board_name', '?')}({item.get('board_code', '?')})` "
+            f"age={item.get('age_days')} strength={item.get('strength')} "
+            f"段状态={item.get('status')} 输出桶={','.join(buckets) or '无'}"
+        )
+    lines.append("")
     return lines
 
 
@@ -1714,6 +1754,7 @@ def _render_shadow_section(
     lines = [SHADOW_SECTION_TITLE, "", SHADOW_READING_BASELINE_NOTE, ""]
     lines += _render_shadow_market_theme(unified)
     lines += _prog("market_theme")
+    lines += _render_shadow_theme_watch(unified, run_date=run_date)
     lines += _render_shadow_disagreement(unified)
     lines += _prog("disagreement")
     lines += _render_shadow_risk_override(risk_override_shadow)
