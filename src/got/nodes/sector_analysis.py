@@ -747,7 +747,7 @@ class SectorAnalysisNode:
                 logger.info(f"[Node 2] 家族拥挤警示: {crowding_warnings}")
 
             # Step 3.3b: 早段观察（只看，不进候选/不改状态）
-            result.early_watch = self._build_early_watch(analyzed, result)
+            result.early_watch = self._build_early_watch(analyzed, result, sectors_raw)
 
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
@@ -3731,12 +3731,14 @@ class SectorAnalysisNode:
         )
 
     @staticmethod
-    def _build_early_watch(analyzed: list, result) -> list[dict]:
-        """strength≥80 但未进入 active/ambush/near-miss 的板块 → 观察清单。
+    def _build_early_watch(analyzed: list, result, sectors_raw: list | None = None) -> list[dict]:
+        """早段观察：强度≥80 或趋势启动（站上 MA20 + 5/10 日向上 + 近 20 日高 + 5 日分位≥80）。
 
-        解决「状态/容量把高强度板块挤出输出」：种业 08-24 strength 81.8、
-        state=exhausted，只落 top_by_score；08-25 83.4 无任何桶 → 观察身份丢失。
-        本清单只读、有独立容量（20），不产生候选资格、不改任何状态。
+        种业 2026-08-03：5 日 +6.7%（87 分位）、10 日 +8.2%、站上 MA20、贴 20 日高——
+        趋势证据已成立，但 strength 未达 80、也未进任何桶；等 08-24 strength 81.8 时
+        板块指数已 +12.9%，中段已过。故本清单必须有 trend_launch 通道，否则永远晚 2-3 周。
+
+        只读、独立容量 20，不产生候选资格、不改状态/评分。
         """
         used: set[str] = set()
         for group in getattr(result, "active_mainline", []) or []:
@@ -3745,14 +3747,39 @@ class SectorAnalysisNode:
             used.update(s.code for s in (getattr(result, field, []) or []))
         top_codes = {s.code for s in (getattr(result, "top_by_score", []) or [])}
 
+        # 趋势指标（未复权收盘；只用于观察清单）
+        metrics: dict[str, tuple[float, float, bool, float]] = {}
+        for raw in sectors_raw or []:
+            code = str(raw.get("code") or "")
+            closes = [float(k.get("close") or 0) for k in (raw.get("klines") or [])]
+            if code and len(closes) >= 21 and closes[-1] > 0:
+                r5 = closes[-1] / closes[-6] - 1
+                r10 = closes[-1] / closes[-11] - 1
+                ma20 = sum(closes[-20:]) / 20
+                hi20 = max(closes[-20:])
+                metrics[code] = (r5, r10, closes[-1] > ma20, closes[-1] / hi20 - 1)
+        r5_sorted = sorted(v[0] for v in metrics.values())
+
+        def pct5(r5: float) -> float:
+            return sum(1 for x in r5_sorted if x <= r5) / len(r5_sorted) if r5_sorted else 0.0
+
         out: list[dict] = []
         for s in analyzed:
             if s.code in used:
                 continue
             strength = float(getattr(s, "strength_score", 0) or 0)
-            if strength < 80:
+            m = metrics.get(s.code)
+            trend_ok = bool(
+                m and m[2] and m[0] > 0 and m[1] > 0 and m[3] >= -0.02
+                and pct5(m[0]) >= 0.80
+            )
+            if strength < 80 and not trend_ok:
                 continue
             quadrant = (getattr(s, "rrg", None) or {}).get("quadrant")
+            if strength >= 80:
+                reason = "top_only_high_strength" if s.code in top_codes else "unrouted_high_strength"
+            else:
+                reason = "trend_launch"
             out.append({
                 "code": s.code,
                 "name": s.name,
@@ -3762,10 +3789,13 @@ class SectorAnalysisNode:
                 "tier": getattr(s, "tier", None),
                 "quadrant": quadrant,
                 "in_top_by_score": s.code in top_codes,
-                "reason": "top_only_high_strength" if s.code in top_codes
-                          else "unrouted_high_strength",
+                "reason": reason,
+                "r5": None if not m else round(m[0], 4),
+                "r10": None if not m else round(m[1], 4),
+                "pct5": None if not m else round(pct5(m[0]), 4),
+                "high20_dist": None if not m else round(m[3], 4),
             })
-        out.sort(key=lambda x: x["strength"], reverse=True)
+        out.sort(key=lambda x: (x["reason"] == "trend_launch", x["strength"]), reverse=True)
         return out[:20]
 
     @staticmethod

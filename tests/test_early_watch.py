@@ -22,6 +22,10 @@ def result(active=(), ambush=(), near=(), top=()):
     )
 
 
+def raw(code, closes):
+    return {"code": code, "klines": [{"close": c} for c in closes]}
+
+
 class TestEarlyWatch(TestCase):
     def test_top_only_and_unrouted_are_kept(self):
         rows = SectorAnalysisNode._build_early_watch(
@@ -51,6 +55,30 @@ class TestEarlyWatch(TestCase):
             result(top=[SimpleNamespace(code="880692")]),
         )
         self.assertEqual(rows[0]["code"], "880692")
+
+    def test_trend_launch_is_kept_before_strength_80(self):
+        # 种业 08-03 形态：5/10 日向上、站上 MA20、贴 20 日高、5 日分位高
+        closes = [100 + i * 1.0 for i in range(40)]
+        rows = SectorAnalysisNode._build_early_watch(
+            [sec("880710", "种业", 60.0)], result(),
+            [raw("880710", closes)] + [raw(f"88{i:04d}", [100.0] * 40) for i in range(900, 904)],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reason"], "trend_launch")
+        self.assertGreater(rows[0]["r5"], 0)
+        self.assertGreaterEqual(rows[0]["pct5"], 0.8)
+
+    def test_flat_or_below_ma20_not_trend_launch(self):
+        flat = [100.0] * 40
+        rows = SectorAnalysisNode._build_early_watch(
+            [sec("880001", "横盘", 60.0)], result(), [raw("880001", flat)],
+        )
+        self.assertEqual(rows, [])
+        down = [100 - i * 0.5 for i in range(40)]
+        rows = SectorAnalysisNode._build_early_watch(
+            [sec("880002", "下行", 60.0)], result(), [raw("880002", down)],
+        )
+        self.assertEqual(rows, [])
 
     def test_strength_below_80_and_cap(self):
         rows = SectorAnalysisNode._build_early_watch(
