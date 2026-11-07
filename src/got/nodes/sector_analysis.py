@@ -3775,7 +3775,9 @@ class SectorAnalysisNode:
             )
             if strength < 80 and not trend_ok:
                 continue
-            quadrant = (getattr(s, "rrg", None) or {}).get("quadrant")
+            # rrg 是 Pydantic 模型（RRGQuadrant），旧代码按 dict 取值必崩 → 双形态读取
+            rrg = getattr(s, "rrg", None)
+            quadrant = rrg.get("quadrant") if isinstance(rrg, dict) else getattr(rrg, "quadrant", None)
             if strength >= 80:
                 reason = "top_only_high_strength" if s.code in top_codes else "unrouted_high_strength"
             else:
