@@ -4325,7 +4325,6 @@ class SectorAnalysisNode:
         # ambush 两条模式统一走 6 维评分（Track1 状态机 + Track2 补位）。
         excluded_states = {"active_mainline", "exhausted_mainline", "high_position_cooling", "defensive_rotation"}
 
-        ambush_list: list[SectorDetail] = []
         near_miss_list: list[SectorDetail] = []
         ambush_list = self._select_ambush_by_score(analyzed, used_codes)
 
