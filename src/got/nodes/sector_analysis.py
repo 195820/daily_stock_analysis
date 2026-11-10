@@ -566,14 +566,9 @@ PHASE_FETCH_BUDGET = 120
 # 连续相位交易日历回溯窗口（日历日起算；一次性构造后复用，不逐板块扫描）
 _LIFECYCLE_CAL_LOOKBACK_DAYS = 400
 
-# enabled 的启动相位输出容量：**显式 TopN**（0=不限，缺省 0）。
-# 2026-11-09 阈值废弃后，`launch` 只是结构化的相位标签（站上 MA20 + MA20 上行），
-# 不再充当可交易信号；容量按计划口径交给下游 G-A1~A4 / Node 6 / 组合预算。
-# 需要回到旧行为时设 `GOT_NODE2_LAUNCH_TOPN=4`（按 launch_score 降序截断，
-# 被截的仍进 launch_watch 并标 `launch_topn`，不是静默丢弃）。
-_LAUNCH_TOPN_DEFAULT = 0
-
-
+# 2026-11-10 起 `launch` 相位由 P1 回调兜底定义，输出走主线，不再有 launch→ambush
+# 路由与 TopN。`GOT_NODE2_LAUNCH_ROUTE` / `GOT_NODE2_LAUNCH_TOPN` 退役；旧审计脚本
+# 仍可调用 `get_launch_topn()`，固定返回 0（无截断）。
 _MAINLINE_ENTRY_MAX_DIST_DEFAULT = -0.02
 
 
@@ -603,24 +598,9 @@ def _entry_distance(sector) -> Optional[float]:
     return close / high - 1.0
 
 
-def get_launch_route() -> bool:
-    """`GOT_NODE2_LAUNCH_ROUTE`：启动相位是否路由进埋伏（缺省 off）。
-
-    2026-11-10 起缺省关闭：launch 只做相位记账（launch_watch），
-    早期捕捉交给 6 维埋伏评分；`on` 恢复 2026-11-05 的 launch→ambush 路由。
-    """
-    raw = (os.getenv("GOT_NODE2_LAUNCH_ROUTE", "off") or "").strip().lower()
-    return raw in ("1", "on", "true", "yes", "enabled")
-
-
 def get_launch_topn() -> int:
-    """`GOT_NODE2_LAUNCH_TOPN`：Node 2 启动相位输出条数（0=不限）。非法值回退缺省。"""
-    raw = (os.getenv("GOT_NODE2_LAUNCH_TOPN", str(_LAUNCH_TOPN_DEFAULT)) or "").strip()
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return _LAUNCH_TOPN_DEFAULT
-    return max(0, value)
+    """Deprecated compatibility shim：launch 已走主线，不再有 launch TopN。"""
+    return 0
 
 # =============================================================================
 # 噪声板块过滤（v2，2026-08-25）
@@ -658,7 +638,8 @@ class SectorAnalysisNode:
             self._fetcher_manager = DataFetcherManager()
         return self._fetcher_manager
 
-    async def run(self, market_context: MarketContext, holdings=None) -> SectorContext:
+    async def run(self, market_context: MarketContext, holdings=None,
+                  bar_complete: bool = True) -> SectorContext:
         """执行板块分析。
 
         流程：获取数据 → 5维强度 → 启动信号 → 过热信号 → 状态判定 → 分级 → 生命周期 → LLM reasoning
@@ -666,6 +647,7 @@ class SectorAnalysisNode:
         holdings: H1 持仓上下文（`src.got.holdings_context.HoldingsContext`，None=无持仓诉求）。
         仅用于「持仓板块兜底追踪」：诉求板块若未被当日候选集覆盖，补拉 K 线单独评分，
         结果落 `holdings_sectors`/`holdings_coverage`，**不参与**主线/埋伏分类与截面排名分母。
+        bar_complete: 当日日线是否收盘完成；盘中 False → P1 不启动（缺档只保持相位）。
         """
         if self.use_mock:
             logger.info("[Node 2] 使用 mock 数据")
@@ -796,6 +778,7 @@ class SectorAnalysisNode:
                     market_direction=early_direction,
                     all_scores_today=all_scores_today,
                     vol20_pct=vol20_pct_by_code.get(sector_info["code"]),
+                    bar_complete=bar_complete,
                 )
                 if detail is not None:
                     analyzed.append(detail)
@@ -887,6 +870,11 @@ class SectorAnalysisNode:
                 result.accumulation_watch = []
                 result.phase_lookup = {}
             result.phase_data_quality = dict(self._phase_data_quality)
+            result.phase_data_quality["launch_started"] = sum(
+                1 for s in analyzed
+                if s.lifecycle is not None
+                and s.lifecycle.continuous_phase == PHASE_LAUNCH
+            )
 
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
@@ -908,6 +896,7 @@ class SectorAnalysisNode:
                     quality=quality,
                     ths_hot_sectors=ths_hot_sectors,
                     market_direction=early_direction,
+                    bar_complete=bar_complete,
                 )
                 result.holdings_sectors = holdings_details
                 result.holdings_coverage = holdings_coverage
@@ -1438,6 +1427,7 @@ class SectorAnalysisNode:
         quality: DataQuality,
         ths_hot_sectors: dict[str, float],
         market_direction: str,
+        bar_complete: bool = True,
     ) -> tuple[list[SectorDetail], Optional[dict]]:
         """持仓诉求板块兜底追踪：未被当日候选集覆盖的板块单独补拉并评分。
 
@@ -1618,6 +1608,7 @@ class SectorAnalysisNode:
                 ths_hot_sectors=ths_hot_sectors,
                 market_direction=market_direction,
                 all_scores_today=scores_for_rrg,
+                bar_complete=bar_complete,
             )
             if detail is None:
                 coverage["missing"].append(info.get("name", ""))
@@ -1851,6 +1842,7 @@ class SectorAnalysisNode:
         market_direction: str = "分化",
         all_scores_today: Optional[list[float]] = None,
         vol20_pct: Optional[float] = None,
+        bar_complete: bool = True,
     ) -> Optional[SectorDetail]:
         """对单个板块执行完整分析：强度 → RRG → 状态 → 分级 → 生命周期。
 
@@ -1925,7 +1917,7 @@ class SectorAnalysisNode:
             # 时间输入只用 anchor/日历（不含当日风险判定，避免与 break_signals 循环）
             seed = build_lifecycle_evidence(
                 trade_date,
-                bar_complete=True,
+                bar_complete=bar_complete,
                 trend_window=trend_window,
                 r5_pct=r5_pct,
                 vol20_pct=vol20_pct,
@@ -1965,6 +1957,7 @@ class SectorAnalysisNode:
         # 4) 状态判定
         # legacy：RRG 驱动马尔可夫状态机（`_apply_state_machine`），2026-08-31 起返回四元组
         # enabled：连续相位 + 当日风险（`_apply_lifecycle_state_machine`），不重建行情
+        entry_role: Optional[str] = None
         if mode == "enabled":
             price_chg_5d, above_ma20, high20_pos, overheat_level = self._compute_break_signals(
                 df, sector_info,
@@ -1978,7 +1971,7 @@ class SectorAnalysisNode:
             is_defensive = self._check_defensive(sector_info, market_context, df, strength_score)
             lifecycle_evidence = build_lifecycle_evidence(
                 trade_date,
-                bar_complete=True,
+                bar_complete=bar_complete,
                 trend_window=trend_window,
                 r5_pct=r5_pct,
                 vol20_pct=vol20_pct,
@@ -2000,6 +1993,11 @@ class SectorAnalysisNode:
             )
             lifecycle_state = self._classify_lifecycle_state(prev_lc, lifecycle_evidence, calendar)
             state = self._apply_lifecycle_state_machine(lifecycle_state, lifecycle_evidence)
+            entry_role = (
+                "backstop"
+                if lifecycle_state.phase == PHASE_LAUNCH and state == "active_mainline"
+                else None
+            )
             # 保留全量原始相位（含 neutral/dormant），供持久化继承 anchor——
             # 临时 neutral 不得丢锚，否则次日重走 bootstrap
             self._raw_lifecycle_by_code[sector_info["code"]] = lifecycle_state
@@ -2149,6 +2147,7 @@ class SectorAnalysisNode:
             launch_signal=LaunchSignal(**launch) if launch.get("triggered") else None,
             lifecycle=lifecycle,
             accumulation_score=accumulation_score,
+            entry_role=entry_role,
             tier=tier,
             mainline_quality=mainline_quality,
             recommended_action=action,
@@ -3245,7 +3244,8 @@ class SectorAnalysisNode:
         """交易/风险状态映射（enabled 唯一运行时入口，2026-11-05）。
 
         相位 → state：
-          - launch + 未破位 + 未过热衰竭 → ambush（用户语义：启动趋势的埋伏）
+          - launch（P1 回调兜底）+ 未破位 + 未过热衰竭 → active_mainline（2026-11-10 改：
+            兜底走主线，不再占 ambush；旧 launch=早期趋势的 launch→ambush 接线已退役）
           - expansion + 未破位 + 未过热衰竭 → active_mainline
           - mature + 未破位：RRG lagging/weakening / 当日有弱观测 / 过热衰竭 → high_position_cooling，
             否则 active_mainline。**单日 RRG 变化只改风险状态，不改相位/anchor。**
@@ -3265,7 +3265,7 @@ class SectorAnalysisNode:
 
         if phase == PHASE_LAUNCH:
             if broken is False and not exhausted:
-                return "ambush"
+                return "active_mainline"
             return "neutral"
 
         if phase == PHASE_EXPANSION:
@@ -4150,12 +4150,28 @@ class SectorAnalysisNode:
     _INDEPENDENT_MARKET_EXEMPT_MAX = 2   # 豁免名额上限
     _MAINLINE_FAMILY_MAX_MEMBERS = 3     # 家族内部成员裁剪：只保留 Top 3 最强成员
 
+    @staticmethod
+    def _ambush_rank_score(sector: SectorDetail) -> float:
+        """6 维埋伏排序分：legacy 用 `ambush_score_v2`，enabled 回落 `accumulation_score`。
+
+        enabled 只写 `accumulation_score`（旧 6 维分），不再写 `ambush_score_v2`；
+        若不回落，enabled+ROUTE=off 的 ambush 排序分会恒 0、Track2 永远为空。
+        """
+        value = (sector.indicators or {}).get("ambush_score_v2")
+        if value is None:
+            value = getattr(sector, "accumulation_score", None)
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _select_ambush_by_score(self, analyzed, used_codes):
         """6 维埋伏分排序（Track1 状态机 + Track2 补位），enabled/legacy 共用。"""
         excluded_states = {"active_mainline", "exhausted_mainline",
                            "high_position_cooling", "defensive_rotation"}
+        score = self._ambush_rank_score
         track1 = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
-        track1.sort(key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True)
+        track1.sort(key=score, reverse=True)
         track1 = track1[:self.AMBUSH_TRACK1_MAX]
         track1_codes = {s.code for s in track1}
         remaining = max(0, self.AMBUSH_TOP_K - len(track1))
@@ -4164,18 +4180,18 @@ class SectorAnalysisNode:
             if s.state not in excluded_states
             and s.code not in used_codes
             and s.code not in track1_codes
-            and s.indicators.get("ambush_score_v2", 0) > 0
+            and score(s) > 0
         ]
-        track2.sort(key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True)
+        track2.sort(key=score, reverse=True)
         track2 = track2[:remaining] if remaining > 0 else []
         out = list(track1)
         for s in track2:
-            if s.indicators.get("ambush_score_v2", 0) >= self.AMBUSH_SCORE_FLOOR:
+            if score(s) >= self.AMBUSH_SCORE_FLOOR:
                 out.append(s)
         logger.info(
             "[Node 2] 埋伏评分: Track1(状态机)=%d, Track2(补位)=%d, 合并=%d",
-            len(track1), len([s for s in track2 if s.indicators.get("ambush_score_v2", 0)
-                              >= self.AMBUSH_SCORE_FLOOR]), len(out),
+            len(track1), len([s for s in track2 if score(s) >= self.AMBUSH_SCORE_FLOOR]),
+            len(out),
         )
         return out
 
@@ -4310,53 +4326,13 @@ class SectorAnalysisNode:
         )
 
         # ── 埋伏输出 ──
-        # legacy：真并集双轨合并（Track1 状态机 16 条上限 + Track2 补位 AMBUSH_TOP_K）
-        # enabled：只以 `continuous_phase=="launch"` 且已路由 ambush 形成埋伏，按 launch_score
-        #          降序取 **TopN**（`GOT_NODE2_LAUNCH_TOPN`，缺省 4；0=不限）。
-        #          2026-11-06 实证：全量入道（最松时 50/357≈14%）时 16 条之外 T+5 胜率仅 8.5%、
-        #          均值 -4.18%，而前 4 条为 42.9%/-0.81% ⇒ "所有满足条件的都算主线"在结构上
-        #          与"市场每天只有 3–5 个主题"冲突（r5_pct≥0.8 是相对分位，天然固定入选比例）。
-        #          被截的仍进 `launch_watch` 并标 `dropped_reason="launch_topn"`，不是静默截断。
+        # 2026-11-10：launch 相位（P1 回调兜底）改走主线，不再进 ambush；
+        # ambush 两条模式统一走 6 维评分（Track1 状态机 + Track2 补位）。
         excluded_states = {"active_mainline", "exhausted_mainline", "high_position_cooling", "defensive_rotation"}
 
         ambush_list: list[SectorDetail] = []
         near_miss_list: list[SectorDetail] = []
-        if mode == "enabled":
-            launch_candidates = [
-                s for s in analyzed
-                if s.code not in used_codes
-                and s.lifecycle is not None
-                and s.lifecycle.continuous_phase == PHASE_LAUNCH
-            ]
-            # 确定性排序：launch_score 降序 → 强度降序 → 代码升序（同日重跑必须逐条相同）
-            launch_candidates.sort(
-                key=lambda s: (
-                    -(s.lifecycle.launch_score if s.lifecycle.launch_score is not None else -1.0),
-                    -s.strength_score,
-                    s.code,
-                ),
-            )
-            if get_launch_route():
-                routable = [s for s in launch_candidates if s.state == "ambush"]
-                launch_topn = get_launch_topn()
-                ambush_list = routable[:launch_topn] if launch_topn > 0 else list(routable)
-                logger.info(
-                    "[Node 2] 启动路由: launch 合格 %d 个（风险可路由 %d 个）→ ambush %d 个"
-                    "（TopN=%s），其余 %d 个仅留 launch_watch(in_output=False)",
-                    len(launch_candidates), len(routable), len(ambush_list),
-                    launch_topn if launch_topn > 0 else "不限",
-                    len(launch_candidates) - len(ambush_list),
-                )
-            else:
-                # 2026-11-10：launch 只记账，早期捕捉由 6 维埋伏分决定
-                ambush_list = self._select_ambush_by_score(analyzed, used_codes)
-                logger.info(
-                    "[Node 2] 启动相位仅记账: launch %d 个 → launch_watch；"
-                    "埋伏按评分选 %d 个（GOT_NODE2_LAUNCH_ROUTE=on 可恢复旧路由）",
-                    len(launch_candidates), len(ambush_list),
-                )
-        else:
-            ambush_list = self._select_ambush_by_score(analyzed, used_codes)
+        ambush_list = self._select_ambush_by_score(analyzed, used_codes)
 
         ambush_codes = {s.code for s in ambush_list}
         used_codes.update(ambush_codes)
@@ -4537,26 +4513,34 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _build_launch_watch(analyzed: list, result) -> list[dict]:
-        """启动相位观察（enabled）：所有 `continuous_phase=launch` 逐条留痕。
+        """P1 回调兜底观察（enabled）：所有 `continuous_phase=launch` 逐条留痕。
 
-        `in_output=True` 表示已路由进 `ambush`；route=neutral 的 launch 只留痕
-        （`in_output=False`），不得因观察清单获得候选资格。
-        **不设 Node 2 容量上限**：容量由 G-A1~A4、Node 6 与组合预算过滤。
+        `in_output=True` 表示已进入 `active_mainline` 输出（P1 兜底走主线）；
+        未进主线的按 `not_mainline` / `mainline_entry_dist` / `mainline_capacity` 区分。
+        **不设 Node 2 容量上限**：容量由主线分组/attack_power 与下游过滤。
         """
-        ambush_codes = {s.code for s in (getattr(result, "ambush", []) or [])}
+        mainline_codes = {
+            m.code
+            for g in (getattr(result, "active_mainline", []) or [])
+            for m in (getattr(g, "members", []) or [])
+        }
+        max_dist = get_mainline_entry_max_dist()
         rows: list[dict] = []
         for s in analyzed:
             lc = s.lifecycle
             if lc is None or lc.continuous_phase != PHASE_LAUNCH:
                 continue
-            in_output = s.code in ambush_codes
+            in_output = s.code in mainline_codes
             if in_output:
                 dropped_reason = None
-            elif s.state == "ambush":
-                # 风险可路由但被 TopN 截掉（容量，不是风险）——归档里必须与风险丢弃区分
-                dropped_reason = "launch_topn"
+            elif s.state != "active_mainline":
+                dropped_reason = "not_mainline"
             else:
-                dropped_reason = "route_not_ambush"
+                dist = _entry_distance(s)
+                if dist is not None and max_dist is not None and dist > max_dist:
+                    dropped_reason = "mainline_entry_dist"
+                else:
+                    dropped_reason = "mainline_capacity"
             rows.append({
                 "code": s.code,
                 "name": s.name,
@@ -4567,6 +4551,7 @@ class SectorAnalysisNode:
                 "strength": round(float(s.strength_score), 2),
                 "state": s.state,
                 "route_state": s.state,
+                "entry_role": getattr(s, "entry_role", None),
                 "launch_score": lc.launch_score,
                 "r5": s.indicators.get("lifecycle_r5"),
                 "r10": s.indicators.get("lifecycle_r10"),

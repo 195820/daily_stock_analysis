@@ -305,7 +305,11 @@ class SectorDetail(BaseModel):
     lifecycle: Optional[LifecycleInfo] = None
     accumulation_score: Optional[float] = Field(
         default=None,
-        description="低位吸筹观察分（旧 ambush_score_v2 口径，`enabled` 模式只作观察，不路由候选）",
+        description="低位吸筹观察分（旧 ambush_score_v2 口径；enabled 下供 ambush 6 维选股，不再只观察）",
+    )
+    entry_role: Optional[str] = Field(
+        default=None,
+        description="主线入口类型：backstop=P1 回调兜底；None=常规主线/其他",
     )
     tier: Optional[str] = None  # S / A / B
     mainline_quality: Optional[str] = Field(
@@ -441,8 +445,8 @@ class SectorContext(BaseModel):
     )
     launch_watch: list[dict] = Field(
         default_factory=list,
-        description="启动相位观察（enabled）：所有 continuous_phase=launch 的板块逐条留痕，"
-                    "`in_output=True` 表示已路由进 ambush；**不设 Node 2 容量上限**。",
+        description="P1 回调兜底观察（enabled）：所有 continuous_phase=launch 的板块逐条留痕，"
+                    "`in_output=True` 表示已进入 active_mainline；**不设 Node 2 容量上限**。",
     )
     accumulation_watch: list[dict] = Field(
         default_factory=list,

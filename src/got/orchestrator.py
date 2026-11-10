@@ -200,7 +200,7 @@ class GOTOrchestrator:
                 holdings_ctx = None
 
         # Step 2: 并行执行两路
-        tech_path_task = self._run_tech_path(holdings_ctx)
+        tech_path_task = self._run_tech_path(holdings_ctx, bar_complete=bar_complete)
         data_path_task = self._run_data_path(bar_complete, as_of=target_date)
 
         tech_result, data_result = await asyncio.gather(
@@ -516,18 +516,21 @@ class GOTOrchestrator:
 
         return unified
 
-    async def _run_tech_path(self, holdings=None) -> tuple:
+    async def _run_tech_path(self, holdings=None, bar_complete: bool = True) -> tuple:
         """技术分析路：串行依赖（大盘 → 板块 → 资金面）
 
         holdings: H1 持仓上下文（None=mock/构建失败 → 节点按无持仓诉求运行）。
         Node 1（大盘）与持仓无关，保持不传。
+        bar_complete: 当日日线是否收盘完成；透传 Node 2，盘中不启动 P1。
         """
         logger.info("[GOT] 技术分析路：开始")
 
         market_ctx = await self.market_node.run()
         logger.info(f"[GOT]   Node 1 完成 — 科技成长: {market_ctx.tech_growth.trend}")
 
-        sector_ctx = await self.sector_node.run(market_context=market_ctx, holdings=holdings)
+        sector_ctx = await self.sector_node.run(
+            market_context=market_ctx, holdings=holdings, bar_complete=bar_complete,
+        )
         if sector_ctx.status in ("degraded", "failed"):
             raise RuntimeError(
                 f"[GOT] Node 2 板块分析失败（status={sector_ctx.status}），"

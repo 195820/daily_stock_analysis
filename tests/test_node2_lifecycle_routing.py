@@ -12,6 +12,7 @@ from src.got.schemas import (
     AmbushCandidate,
     DataQuality,
     LifecycleInfo,
+    MainlineGroup,
     SectorContext,
     SectorDetail,
 )
@@ -80,8 +81,8 @@ class TestStateMapping(TestCase):
     def map(self, state: LifecycleState, **kw) -> str:
         return self.node._apply_lifecycle_state_machine(state, ev(**kw))
 
-    def test_launch_maps_to_ambush(self):
-        self.assertEqual(self.map(lc_state(PHASE_LAUNCH)), "ambush")
+    def test_launch_maps_to_active_mainline(self):
+        self.assertEqual(self.map(lc_state(PHASE_LAUNCH)), "active_mainline")
 
     def test_launch_with_unknown_break_maps_to_neutral(self):
         self.assertEqual(self.map(lc_state(PHASE_LAUNCH), trend_broken=None), "neutral")
@@ -122,7 +123,7 @@ class TestStateMapping(TestCase):
         self.assertEqual(self.map(lc_state(PHASE_DORMANT), is_defensive=True), "defensive_rotation")
         self.assertEqual(self.map(lc_state(PHASE_MATURE, age=12), is_defensive=True), "defensive_rotation")
         # launch/expansion 不被 defensive 抢成 neutral
-        self.assertEqual(self.map(lc_state(PHASE_LAUNCH), is_defensive=True), "ambush")
+        self.assertEqual(self.map(lc_state(PHASE_LAUNCH), is_defensive=True), "active_mainline")
         self.assertEqual(self.map(lc_state(PHASE_EXPANSION), is_defensive=True), "active_mainline")
         # dormant 未防守 → neutral
         self.assertEqual(self.map(lc_state(PHASE_DORMANT)), "neutral")
@@ -131,77 +132,35 @@ class TestStateMapping(TestCase):
 class TestAmbushRouting(TestCase):
     node = SectorAnalysisNode(use_mock=True)
 
-    def _launch_boards(self, n: int, broken: bool | None = False) -> list[SectorDetail]:
-        boards = []
-        for i in range(n):
-            boards.append(detail(
-                f"88{i:04d}", f"启动{i}", "ambush" if broken is not True else "neutral",
-                strength=60.0 + i,
-                lifecycle=launch_info(score=0.4 + i * 0.01),
-                indicators={"lifecycle_r5": 0.05, "lifecycle_r10": 0.08,
-                            "lifecycle_r5_pct": 0.85, "lifecycle_high20_dist": -0.005},
-            ))
-        return boards
+    def _backstop_board(self, code: str, name: str, dist: float = -0.06) -> SectorDetail:
+        return detail(
+            code, name, "active_mainline", strength=70.0,
+            lifecycle=launch_info(score=0.5),
+            indicators={"pos_close": 100.0 * (1 + dist), "pos_high20": 100.0},
+            accumulation=0.6,
+        )
 
-    def test_enabled_caps_launch_at_topn(self):
-        """显式 TopN=4：风险可路由的 launch 只出前 4，其余标 launch_topn（不是静默截断）。"""
-        boards = self._launch_boards(25)
-        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled",
-                                          "GOT_NODE2_LAUNCH_ROUTE": "on",
-                                          "GOT_NODE2_LAUNCH_TOPN": "4"}):
-            result = self.node._build_mainline_output(SectorContext(), boards, attack_power=0.5)
-            watch = self.node._build_launch_watch(boards, result)
-        self.assertEqual(len(result.ambush), 4)
-        self.assertEqual(len(watch), 25)
-        kept = [row for row in watch if row["in_output"]]
-        dropped = [row for row in watch if not row["in_output"]]
-        self.assertEqual(len(kept), 4)
-        self.assertEqual(len(dropped), 21)
-        self.assertTrue(all(row["dropped_reason"] == "launch_topn" for row in dropped))
-        self.assertTrue(all(row["dropped_reason"] is None for row in kept))
-        # 保留的是 launch_score 最高的 4 条，且按分数降序
-        scores = [s.lifecycle.launch_score for s in result.ambush]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-        # 分数最高 4 条（0.4 + i*0.01，i=0..24 → 0.64/0.63/0.62/0.61）
-        self.assertEqual(scores, [0.64, 0.63, 0.62, 0.61])
-        self.assertEqual(result.near_miss_ambush, [])
+    def test_pullback_launch_enters_mainline_not_ambush(self):
+        board = self._backstop_board("880001", "回调兜底")
+        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled"}):
+            out = self.node._build_mainline_output(SectorContext(), [board], attack_power=0.5)
+        self.assertEqual(
+            [m.code for g in out.active_mainline for m in g.members], ["880001"],
+        )
+        self.assertEqual(out.ambush, [])
 
-    def test_topn_zero_restores_unbounded(self):
-        boards = self._launch_boards(25)
-        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled",
-                                          "GOT_NODE2_LAUNCH_ROUTE": "on",
-                                          "GOT_NODE2_LAUNCH_TOPN": "0"}):
-            result = self.node._build_mainline_output(SectorContext(), boards, attack_power=0.5)
-            watch = self.node._build_launch_watch(boards, result)
-        self.assertEqual(len(result.ambush), 25)
-        self.assertTrue(all(row["in_output"] for row in watch))
+    def test_ambush_uses_accumulation_score_when_v2_missing(self):
+        """enabled 只写 accumulation_score；ambush 排序必须回落，否则恒 0、Track2 永远空。"""
+        scored = detail("880002", "低位吸筹", "neutral", strength=50.0, accumulation=0.6)
+        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled"}):
+            out = self.node._select_ambush_by_score([scored], set())
+        self.assertEqual([s.code for s in out], ["880002"])
 
-    def test_launch_not_routed_by_default(self):
-        """缺省 off：launch 只记账，埋伏由 6 维评分选（Track1 上限 16）。"""
-        boards = self._launch_boards(25)
-        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled",
-                                          "GOT_NODE2_LAUNCH_ROUTE": "off"}):
-            out = self.node._build_mainline_output(SectorContext(), boards, attack_power=0.5)
-        self.assertEqual(len(out.ambush), self.node.AMBUSH_TRACK1_MAX)
-
-    def test_ambush_score_picks_non_launch_board(self):
-        """早期捕捉归埋伏：非 launch 状态但评分过线的板块也能进埋伏。"""
-        launch = detail("880001", "启动", "ambush", strength=60.0,
-                        lifecycle=launch_info(), indicators={})
-        scored = detail("880002", "低位吸筹", "neutral", strength=50.0,
-                        indicators={"ambush_score_v2": 0.6})
-        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled",
-                                          "GOT_NODE2_LAUNCH_ROUTE": "off"}):
-            out = self.node._build_mainline_output(SectorContext(), [launch, scored], attack_power=0.5)
-        self.assertIn("880002", [s.code for s in out.ambush])
-
-    def test_topn_env_is_clamped_and_validated(self):
-        from src.got.nodes.sector_analysis import get_launch_topn
-
-        for raw, expected in (("4", 4), ("0", 0), ("-3", 0), ("abc", 0), ("", 0), ("16", 16)):
-            with self.subTest(raw=raw):
-                with mock.patch.dict(os.environ, {"GOT_NODE2_LAUNCH_TOPN": raw}):
-                    self.assertEqual(get_launch_topn(), expected)
+    def test_ambush_excludes_mainline_even_with_high_accumulation(self):
+        main = detail("880003", "主线", "active_mainline", strength=70.0, accumulation=0.9)
+        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled"}):
+            out = self.node._select_ambush_by_score([main], set())
+        self.assertEqual(out, [])
 
     def test_legacy_still_caps_track1_at_16(self):
         boards = [
@@ -214,21 +173,29 @@ class TestAmbushRouting(TestCase):
         self.assertEqual(len(result.ambush), SectorAnalysisNode.AMBUSH_TRACK1_MAX)
         self.assertEqual(len(result.ambush), 16)
 
-    def test_launch_with_unknown_break_stays_out_of_ambush(self):
-        board = detail("880001", "缺数据启动", "neutral", lifecycle=launch_info())
-        ok_board = detail("880002", "合格启动", "ambush", lifecycle=launch_info(score=0.9))
-        with mock.patch.dict(os.environ, {"GOT_NODE2_LIFECYCLE": "enabled"}):
-            result = self.node._build_mainline_output(
-                SectorContext(), [board, ok_board], attack_power=0.5,
-            )
-            watch = self.node._build_launch_watch([board, ok_board], result)
-        self.assertEqual([s.code for s in result.ambush], ["880002"])
-        by_code = {row["code"]: row for row in watch}
-        self.assertFalse(by_code["880001"]["in_output"])
-        self.assertTrue(by_code["880002"]["in_output"])
-        self.assertEqual(by_code["880001"]["route_state"], "neutral")
-        # 风险不可路由与容量截断必须区分开
-        self.assertEqual(by_code["880001"]["dropped_reason"], "route_not_ambush")
+    def test_launch_watch_marks_mainline_output(self):
+        board = self._backstop_board("880004", "兜底")
+        board.entry_role = "backstop"
+        group = MainlineGroup(
+            group_name="兜底", group_score=70.0, tier="A",
+            mainline_quality="weak", members=[board],
+        )
+        result = SectorContext(active_mainline=[group])
+        rows = self.node._build_launch_watch([board], result)
+        self.assertTrue(rows[0]["in_output"])
+        self.assertIsNone(rows[0]["dropped_reason"])
+        self.assertEqual(rows[0]["entry_role"], "backstop")
+
+    def test_launch_watch_dropped_reason_capacity(self):
+        board = self._backstop_board("880005", "兜底未入组")
+        rows = self.node._build_launch_watch([board], SectorContext())
+        self.assertFalse(rows[0]["in_output"])
+        self.assertEqual(rows[0]["dropped_reason"], "mainline_capacity")
+
+    def test_launch_watch_dropped_reason_entry_dist(self):
+        board = self._backstop_board("880006", "贴高兜底", dist=-0.01)
+        rows = self.node._build_launch_watch([board], SectorContext())
+        self.assertEqual(rows[0]["dropped_reason"], "mainline_entry_dist")
 
     def test_accumulation_watch_sorted_and_capped(self):
         boards = [
