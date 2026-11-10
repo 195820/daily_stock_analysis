@@ -638,8 +638,7 @@ class SectorAnalysisNode:
             self._fetcher_manager = DataFetcherManager()
         return self._fetcher_manager
 
-    async def run(self, market_context: MarketContext, holdings=None,
-                  bar_complete: bool = True) -> SectorContext:
+    async def run(self, market_context: MarketContext, holdings=None) -> SectorContext:
         """执行板块分析。
 
         流程：获取数据 → 5维强度 → 启动信号 → 过热信号 → 状态判定 → 分级 → 生命周期 → LLM reasoning
@@ -647,7 +646,6 @@ class SectorAnalysisNode:
         holdings: H1 持仓上下文（`src.got.holdings_context.HoldingsContext`，None=无持仓诉求）。
         仅用于「持仓板块兜底追踪」：诉求板块若未被当日候选集覆盖，补拉 K 线单独评分，
         结果落 `holdings_sectors`/`holdings_coverage`，**不参与**主线/埋伏分类与截面排名分母。
-        bar_complete: 当日日线是否收盘完成；盘中 False → P1 不启动（缺档只保持相位）。
         """
         if self.use_mock:
             logger.info("[Node 2] 使用 mock 数据")
@@ -778,7 +776,6 @@ class SectorAnalysisNode:
                     market_direction=early_direction,
                     all_scores_today=all_scores_today,
                     vol20_pct=vol20_pct_by_code.get(sector_info["code"]),
-                    bar_complete=bar_complete,
                 )
                 if detail is not None:
                     analyzed.append(detail)
@@ -896,7 +893,6 @@ class SectorAnalysisNode:
                     quality=quality,
                     ths_hot_sectors=ths_hot_sectors,
                     market_direction=early_direction,
-                    bar_complete=bar_complete,
                 )
                 result.holdings_sectors = holdings_details
                 result.holdings_coverage = holdings_coverage
@@ -1427,7 +1423,6 @@ class SectorAnalysisNode:
         quality: DataQuality,
         ths_hot_sectors: dict[str, float],
         market_direction: str,
-        bar_complete: bool = True,
     ) -> tuple[list[SectorDetail], Optional[dict]]:
         """持仓诉求板块兜底追踪：未被当日候选集覆盖的板块单独补拉并评分。
 
@@ -1608,7 +1603,6 @@ class SectorAnalysisNode:
                 ths_hot_sectors=ths_hot_sectors,
                 market_direction=market_direction,
                 all_scores_today=scores_for_rrg,
-                bar_complete=bar_complete,
             )
             if detail is None:
                 coverage["missing"].append(info.get("name", ""))
@@ -1842,7 +1836,6 @@ class SectorAnalysisNode:
         market_direction: str = "分化",
         all_scores_today: Optional[list[float]] = None,
         vol20_pct: Optional[float] = None,
-        bar_complete: bool = True,
     ) -> Optional[SectorDetail]:
         """对单个板块执行完整分析：强度 → RRG → 状态 → 分级 → 生命周期。
 
@@ -1915,9 +1908,11 @@ class SectorAnalysisNode:
             legacy_wave_start = (prev_trend or {}).get("wave_start_date")
             legacy_mainline_days = (prev_trend or {}).get("mainline_days")
             # 时间输入只用 anchor/日历（不含当日风险判定，避免与 break_signals 循环）
+            # Node 2 固定 13:20 盘中执行；P1 按当日快照评估，bar_complete 只作归档
+            # meta 标记，不作启动闸门（用户裁决 2026-11-10）。
             seed = build_lifecycle_evidence(
                 trade_date,
-                bar_complete=bar_complete,
+                bar_complete=True,
                 trend_window=trend_window,
                 r5_pct=r5_pct,
                 vol20_pct=vol20_pct,
@@ -1971,7 +1966,7 @@ class SectorAnalysisNode:
             is_defensive = self._check_defensive(sector_info, market_context, df, strength_score)
             lifecycle_evidence = build_lifecycle_evidence(
                 trade_date,
-                bar_complete=bar_complete,
+                bar_complete=True,
                 trend_window=trend_window,
                 r5_pct=r5_pct,
                 vol20_pct=vol20_pct,
