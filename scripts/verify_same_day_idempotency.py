@@ -71,8 +71,16 @@ MONITORING = repo_root() / "data" / "got_timeseries" / "monitoring.json"
 DB_PATH = repo_root() / "data" / "stock_analysis.db"
 
 DAY_JSONS = ("unified.json", "sentiment.json", "market.json", "sector.json")
-SECTOR_COUNTER_KEYS = ("mainline_days", "ambush_days", "wave_days", "wave_start_date",
-                       "strength_trajectory", "dwell_days", "exit_pressure_days")
+SECTOR_COUNTER_KEYS = (
+    "mainline_days", "ambush_days", "wave_days", "wave_start_date",
+    "strength_trajectory", "dwell_days", "exit_pressure_days",
+    # 连续相位（P2 前置底座，2026-11-05）：同日重跑必须逐字段相同；
+    # lifecycle 嵌套块另由 `_collect_sector_counters` 展开为 `lifecycle.<field>`
+    "lifecycle_continuous_phase", "lifecycle_anchor_date", "lifecycle_phase_age",
+    "lifecycle_phase_dwell", "lifecycle_healthy_days", "lifecycle_weak_days",
+    "lifecycle_peak_close", "lifecycle_last_observation_date",
+    "lifecycle_transition_reason", "lifecycle_data_status", "lifecycle_time_weight",
+)
 R2_SWITCH_HINT = "下一次真实 regime 切换日"
 
 TWO_RUN_COMMAND = (
@@ -118,6 +126,14 @@ def _collect_sector_counters(nodes: dict | list, out: dict[str, dict]) -> dict[s
             key = nodes.get("name") or nodes.get("group_name") or nodes.get("code")
             if key:
                 out.setdefault(str(key), {k: nodes.get(k) for k in SECTOR_COUNTER_KEYS if k in nodes})
+        # 归档里连续相位是 `lifecycle` 嵌套对象（LifecycleInfo），逐字段展开后比对
+        _lifecycle = nodes.get("lifecycle")
+        if isinstance(_lifecycle, dict):
+            key = nodes.get("name") or nodes.get("group_name") or nodes.get("code")
+            if key:
+                bucket = out.setdefault(str(key), {})
+                for _field, _value in _lifecycle.items():
+                    bucket[f"lifecycle.{_field}"] = _value
         for value in nodes.values():
             _collect_sector_counters(value, out)
     elif isinstance(nodes, list):

@@ -36,6 +36,7 @@ from src.got.schemas import (
     MarketRegime,
     SectorIntel,
     SectorDetail,
+    LifecycleInfo,
     AmbushCandidate,
     AmbushReservoirEntry,
     CatalystEvent,
@@ -48,6 +49,7 @@ from src.got.schemas import (
     CONTROLLED_FAMILIES,
 )
 from src.got import family_cluster
+from src.got.sector_lifecycle import get_lifecycle_mode
 from src.got.catalyst_config import (
     IMPACT_WEIGHT,
     EVIDENCE_TIER_MULTIPLIER,
@@ -2303,6 +2305,12 @@ class AggregatorNode:
         raw_data = self._apply_glue_override_to_raw_data(raw_data, glue)
         glue_hit_names = {row[0] for row in raw_data if row[-1].get("_glue_applied")}
 
+        # ── Pass 1.6 (P2 前置底座, 2026-11-05): 统一时间权重 ──
+        # 必须位于 glue 覆写之后（否则 glue 输出会把折价覆盖掉），且只在此处计权一次；
+        # 下游 Node 7 的 lifecycle_day 不再另乘 time_weight。
+        if get_lifecycle_mode() == "enabled":
+            raw_data = self._apply_lifecycle_time_weight(raw_data)
+
         # ── Pass 2: 批量分类（主线/降温走 TOP-N，埋伏按通道结果拆分）──
         # 埋伏板块不走 composite TOP-N：其准入由埋伏通道的闸门+B公式排序决定，
         # composite（Node 2 尺子）对低位埋伏板块天然偏见，不能当埋伏的尺子
@@ -2518,11 +2526,21 @@ class AggregatorNode:
         strength = sector.strength_lookup.get(candidate.sector_name)
         if strength is None:
             return None
+        # 池外板块（升格/蓄水池）也要有年龄：从 phase_lookup 回填 LifecycleInfo，
+        # 否则 Node 7 与选股侧的 lifecycle_day 会静默丢失（P2 前置底座，2026-11-05）
+        lifecycle: Optional[LifecycleInfo] = None
+        raw_phase = (getattr(sector, "phase_lookup", None) or {}).get(candidate.sector_name)
+        if raw_phase:
+            try:
+                lifecycle = LifecycleInfo.model_validate(raw_phase)
+            except Exception:  # noqa: BLE001 — 脏数据不得击穿合成 detail
+                lifecycle = None
         return SectorDetail(
             code=candidate.sector_code,
             name=candidate.sector_name,
             state="ambush",
             strength_score=strength,
+            lifecycle=lifecycle,
         )
 
     def _compute_sector_scores(
@@ -2579,8 +2597,10 @@ class AggregatorNode:
         # ── 综合评分：技术面 + Lifecycle 修正（跨维修正随规则模式退役移除）──
         # 注：命中板块的 composite 会在 Pass 1.5 被 glue 输出（strength×100）整体覆写，
         #     本函数值仅对 glue 漏命中/降级板块生效。
+        # P2 前置底座（2026-11-05）：enabled 下删除 launch/acceleration +8、late_stage -15，
+        #      时间折价统一由 `composite *= lifecycle.time_weight` 在 glue 覆写后执行一次。
         composite = tech_score
-        if detail and detail.lifecycle:
+        if detail and detail.lifecycle and get_lifecycle_mode() != "enabled":
             phase = detail.lifecycle.phase
             if phase in ("launch", "acceleration"):
                 composite += 8  # 早期阶段加分
@@ -2604,6 +2624,34 @@ class AggregatorNode:
         }
 
         return composite, "neutral", "neutral", other
+
+    @staticmethod
+    def _apply_lifecycle_time_weight(raw_data: list[tuple]) -> list[tuple]:
+        """P2 前置底座：`composite *= lifecycle.time_weight`（enabled，glue 之后执行一次）。
+
+        无 `LifecycleInfo` 的板块（neutral/未路由）权重 1.0，不做折价——缺失不当作利空。
+        折价系数写入 `other["_lifecycle_time_weight"]` 供审计，不改技术面 raw 分。
+        """
+        patched: list[tuple] = []
+        for row in raw_data:
+            (name, composite, capital_check, news_check, detail,
+             sector_role, role_info, other) = row
+            lifecycle = getattr(detail, "lifecycle", None) if detail else None
+            try:
+                weight = float(getattr(lifecycle, "time_weight", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                weight = 1.0
+            if lifecycle is None or weight == 1.0:
+                patched.append(row)
+                continue
+            other = dict(other)
+            other["_lifecycle_time_weight"] = weight
+            other["_lifecycle_phase"] = getattr(lifecycle, "continuous_phase", None)
+            patched.append((
+                name, clip(composite * weight, 0, 100), capital_check, news_check,
+                detail, sector_role, role_info, other,
+            ))
+        return patched
 
     def _build_sector_intel_from_scores(
         self,
@@ -2704,11 +2752,16 @@ class AggregatorNode:
         # 主线组成员展开仅为反向查询服务，不参与名额竞争：
         # 同族多成员若各自占名额会挤压其他家族的 actionable 配额（2026-09-01）
         # ── 波次生命周期折扣（v3.5 S3：纠正动量偏见）──
-        # 排序键改为 adjusted = composite × wave_coeff(wave_days)
+        # legacy：排序键 adjusted = composite × wave_coeff(wave_days)
+        # enabled：删除该 wave 计权（时间权重已在 composite 内计过一次），直接按 composite 排序
+        _enabled_lifecycle = get_lifecycle_mode() == "enabled"
         eligible = sorted(
             [(name, score, detail) for name, score, *_rest, detail, _role in candidates
              if name not in result and name not in member_to_group],
-            key=lambda x: x[1] * _wave_coeff(getattr(x[2], "wave_days", None) if x[2] else None),
+            key=lambda x: (
+                x[1] if _enabled_lifecycle
+                else x[1] * _wave_coeff(getattr(x[2], "wave_days", None) if x[2] else None)
+            ),
             reverse=True,
         )
 
@@ -5307,21 +5360,30 @@ class AggregatorNode:
 
         endurance_list = []
         crowded_families = set(getattr(sector, "crowded_families", []) or [])
+        # P2 前置底座（2026-11-05）：enabled 的「行龄」改读连续相位 phase_age，
+        # legacy 仍读 wave_days（不回填、不混用两套时钟）
+        enabled_lifecycle = get_lifecycle_mode() == "enabled"
+
+        def _age_of(detail) -> int:
+            if detail is None:
+                return 0
+            if enabled_lifecycle:
+                lc = getattr(detail, "lifecycle", None)
+                return int(getattr(lc, "days_since_launch", 0) or 0) if lc else 0
+            return int(getattr(detail, "wave_days", 0) or 0)
 
         for family_name, members in families.items():
             # ── 基础指标 ──
             member_details = [detail_lookup.get(m.sector_name) for m in members]
-            wave_days_list = [
-                getattr(d, "wave_days", 0) or 0 for d in member_details if d is not None
-            ]
+            wave_days_list = [_age_of(d) for d in member_details if d is not None]
             max_wave_days = max(wave_days_list) if wave_days_list else 0
 
-            # lifecycle_phase：取最老成员（wave_days 最大）的 phase
+            # lifecycle_phase：取最老成员的 phase
             oldest_detail = None
             oldest_wave = -1
             for d in member_details:
                 if d is not None:
-                    w = getattr(d, "wave_days", 0) or 0
+                    w = _age_of(d)
                     if w > oldest_wave:
                         oldest_wave = w
                         oldest_detail = d
@@ -5360,13 +5422,23 @@ class AggregatorNode:
                     family_name, len(members), len(member_details),
                 )
             for m, d in zip(members, member_details):
-                w = getattr(d, "wave_days", 0) or 0 if d is not None else 0
-                if w >= 6:
-                    tiers["veteran"].append(m.sector_name)
-                elif w >= 3:
-                    tiers["mid"].append(m.sector_name)
+                w = _age_of(d)
+                if enabled_lifecycle:
+                    # 连续相位：new=1–3 / mid=4–10 / veteran≥11
+                    if w >= 11:
+                        tiers["veteran"].append(m.sector_name)
+                    elif w >= 4:
+                        tiers["mid"].append(m.sector_name)
+                    else:
+                        tiers["new"].append(m.sector_name)
                 else:
-                    tiers["new"].append(m.sector_name)
+                    # 波次口径：wave_days ≥6 veteran / 3-5 mid / ≤2 new
+                    if w >= 6:
+                        tiers["veteran"].append(m.sector_name)
+                    elif w >= 3:
+                        tiers["mid"].append(m.sector_name)
+                    else:
+                        tiers["new"].append(m.sector_name)
 
             # ── 跨节点信号 ──
             max_overheat = max(
@@ -5434,8 +5506,12 @@ class AggregatorNode:
                 warning_signals.append("破位信号（跌幅>3%或趋势下行）")
                 warning_score += 2
 
-            # wave_days ≥6（+1）
-            if max_wave_days >= 6:
+            # 老波警示：legacy wave_days≥6（+1）；enabled phase_age≥11（+1）
+            if enabled_lifecycle:
+                if max_wave_days >= 11:
+                    warning_signals.append(f"老波（phase_age={max_wave_days}）")
+                    warning_score += 1
+            elif max_wave_days >= 6:
                 warning_signals.append(f"老波（wave_days={max_wave_days}）")
                 warning_score += 1
 

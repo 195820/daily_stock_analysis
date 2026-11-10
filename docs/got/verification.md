@@ -17,6 +17,16 @@
 
 ---
 
+## 2026-11-10 Node 2 启动条件替换为 P1（未通过 BH-FDR，只作相位供给）
+
+- **替换**：`can_start` 由结构口径（站上 MA20 + MA20 上行 + 5/10 日同向，生产从未输出）改为 **P1** = `above_ma20 ∧ high20_dist ∈ [−10%,−5%] ∧ r5 ∈ [2%,5%] ∧ vol20 截面分位 ≥ 0.70`。`LifecycleEvidence.vol20_pct` 由 `SectorAnalysisNode._compute_vol20`（20 日收益 std，与搜索脚本同口径）+ 当日 matched 候选集分位 `(k+0.5)/n` 注入；缺 K 线/分母不足 → `None` → 不启动。延续逻辑 `_is_healthy` 未动。回滚 `GOT_NODE2_LIFECYCLE=legacy`。
+- **接线**：`.env` `GOT_NODE2_LAUNCH_ROUTE=on`——launch 相位先按 `launch_score` 降序，再只取 `state=="ambush"`（未破位且未过热衰竭）的前 `GOT_NODE2_LAUNCH_TOPN=4` 条进 ambush；被截的仍进 `launch_watch` 并标 `dropped_reason="launch_topn"`，状态不可路由的标 `route_not_ambush`。回滚 `off`。
+- **读数**（`scripts/search_node2_launch_params.py`，2025-12~2026-11 板块-日面板）：P1 t=2.64 / p=0.0082、日均超额 +0.69pp、283 天 / 1034 事件；前 60% +0.58pp（t=2.12）/ 后 40% +0.80pp（t=1.81），同号但不显著。
+- **BH-FDR 判定：未通过**——检验族 N=318（本次实际评估过的组合，含贪心逐条扩展与 P1 自身）、α=0.05、存活 k=48；P1 位次 49，该位次临界 p=0.00770（需 |t| ≥ 2.665），实际 0.0082（|t|=2.640），差 0.025。存活 48 个组合全为负超额（−0.14 ~ −0.68pp），即该族统计上最强的效应是短期滞涨拖累而非启动动量。
+- **处置**：无 alpha 声明；判据只作结构相位供给（成本控制/注意力分配），`.env` 内 `# P1 未通过 BH-FDR` 与 CHANGELOG 同步标注。生产首日（11-10 盘中）归档：`phase_data_quality.mode=enabled`、`launch_watch` 1 条（880647 数据确权 r5=+4.93%、dist=−5.57%）、`ambush` 1 条来自 launch 路由；P1 边界出界 0。
+
+---
+
 ## 2026-11-05 主题驱动全链路 P0/P1（对照底座 + 观察账本，零收益结论）
 
 > 实施稿：根目录 [`主题驱动全链路收益改进实施稿_20261105.md`](../../主题驱动全链路收益改进实施稿_20261105.md)。P0/P1 已实施；P2+ 未开始。**本节所有读数都不是收益改善证据。**

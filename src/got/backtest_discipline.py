@@ -16,7 +16,7 @@ GOT 回测长期是 `.review_tmp` 一次性脚本、无口径卡片，曾发生�
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -112,3 +112,38 @@ def walk_forward_splits(
         out.append((tr, te))
         start += step
     return out
+
+
+def date_cluster_bootstrap_ci(
+    values_by_date: "Mapping[str, Sequence[float]]",
+    *,
+    n_bootstrap: int = 1000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> Tuple[float, float]:
+    """日期簇 bootstrap：以「交易日」为重采样单位，估计均值置信区间。
+
+    实施稿 §2.1 要求「日期簇 bootstrap 95% CI 下界 >0」；按行 IID 重采样会低估
+    同日相关性（同一天的多笔交易共享市场 beta），因此簇单位必须是日期。
+    空输入返回 (0.0, 0.0)；日期按字典序排序后固定采样顺序，配合固定 seed 可复现。
+    """
+    keys = sorted(values_by_date)
+    if not keys:
+        return (0.0, 0.0)
+    pools = [list(values_by_date[k]) for k in keys]
+    rng = np.random.default_rng(seed)
+    n_dates = len(keys)
+    means: List[float] = []
+    for _ in range(n_bootstrap):
+        picks = rng.integers(0, n_dates, size=n_dates)
+        sample: List[float] = []
+        for idx in picks:
+            sample.extend(pools[int(idx)])
+        if sample:
+            means.append(float(np.mean(sample)))
+    if not means:
+        return (0.0, 0.0)
+    lo_pct = (1 - ci) / 2 * 100
+    hi_pct = (1 + ci) / 2 * 100
+    lo, hi = np.percentile(means, [lo_pct, hi_pct])
+    return (round(float(lo), 4), round(float(hi), 4))

@@ -1115,6 +1115,21 @@ class Node2SectorTrendRecord(Base):
     wave_days = Column(Integer, default=0)  # 当前波次持续天数（出框间隙≥2日+回撤≥10分→重置）
     wave_start_date = Column(Date)  # 当前波次起始日期
     wave_peak_strength = Column(Float)  # 当前波次峰值强度（滚动更新）
+    # ── 连续行情相位（P2 前置底座，2026-11-05）──
+    # lifecycle_phase 列仍存**适配后**的下游 phase；原始 launch/expansion/mature/decline/dormant
+    # 只读 lifecycle_continuous_phase，禁止混用。三者非空才视为「已有新相位历史」。
+    lifecycle_continuous_phase = Column(String(20))  # dormant/launch/expansion/mature/decline
+    lifecycle_anchor_date = Column(Date)  # 行情锚日（趋势启动日）
+    lifecycle_phase_age = Column(Integer)  # 锚日含当日=1，按交易日历
+    lifecycle_phase_dwell = Column(Integer)  # 当前相位内真实观测数
+    lifecycle_healthy_days = Column(Integer, default=0)
+    lifecycle_weak_days = Column(Integer, default=0)
+    lifecycle_peak_close = Column(Float)
+    lifecycle_last_observation_date = Column(Date)
+    lifecycle_transition_reason = Column(String(120))
+    lifecycle_data_status = Column(String(20))  # ok / unknown
+    lifecycle_time_weight = Column(Float)
+    accumulation_score = Column(Float)  # 低位吸筹观察分（enabled 只观察不路由）
     created_at = Column(DateTime, default=utc_naive_now)
 
     __table_args__ = (
@@ -1849,6 +1864,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             "wave_days": "INTEGER DEFAULT 0",
             "wave_start_date": "DATE",
             "wave_peak_strength": "FLOAT",
+            # P2 前置底座：连续行情相位（2026-11-05）
+            "lifecycle_continuous_phase": "VARCHAR(20)",
+            "lifecycle_anchor_date": "DATE",
+            "lifecycle_phase_age": "INTEGER",
+            "lifecycle_phase_dwell": "INTEGER",
+            "lifecycle_healthy_days": "INTEGER DEFAULT 0",
+            "lifecycle_weak_days": "INTEGER DEFAULT 0",
+            "lifecycle_peak_close": "FLOAT",
+            "lifecycle_last_observation_date": "DATE",
+            "lifecycle_transition_reason": "VARCHAR(120)",
+            "lifecycle_data_status": "VARCHAR(20)",
+            "lifecycle_time_weight": "FLOAT",
+            "accumulation_score": "FLOAT",
         }
         try:
             with self._SessionLocal() as session:

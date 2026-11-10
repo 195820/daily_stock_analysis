@@ -56,6 +56,8 @@ MODE_KEYS = {
     "GOT_HOLDINGS_HISTORY_FEED",
     "GOT_NEWS_SHORTLIST_QUOTA",
     "GOT_THEME_LEDGER",
+    # Node 2 连续相位模式（legacy|enabled，P2 前置底座；无 shadow 态）
+    "GOT_NODE2_LIFECYCLE",
 }
 
 SHADOW_STATUSES = {"shadow", "retire_pending", "needs_artifact"}
@@ -110,6 +112,31 @@ SHADOW_REGISTRY: dict[str, ShadowRecord] = {
         note=(
             "P1 账本只写观察产物（off 缺省）；影子期零决策改动。"
             "P2 若把 observation/setup 接入路由，必须改登记为 gate 并补 min_samples/expiry。"
+        ),
+    ),
+    "GOT_NODE2_LIFECYCLE": ShadowRecord(
+        env="GOT_NODE2_LIFECYCLE",
+        default="legacy",
+        kind="gate",
+        data_basis="backtestable",
+        status="enabled",
+        artifact="node2 sector.json / node2_sector_trends.lifecycle_* / "
+                 "scripts/audit_node2_lifecycle_ab.py --json-out",
+        metric="相位/年龄/路由/unresolved 单列（收益仍由 P4 验收）；"
+               "launch 输出条数由 GOT_NODE2_LAUNCH_TOPN 控制",
+        expiry="2026-12-05",
+        note=(
+            "P2 prerequisite / direct enabled / rollback legacy：本计划不设 Node2 shadow，"
+            "也不存在生产 `ab` 模式（`ab` 仅离线回测脚本标签）。"
+            "2026-11-05 离线 A/B 通过（33 个完整输入日、hard_break 一律 decline+exhausted）"
+            "→ 代码侧转 enabled；生产生效=`.env` 置 GOT_NODE2_LIFECYCLE=enabled`，"
+            "回滚=改回 legacy（缺省值即 legacy）。"
+            "**偏离已批准计划**：计划要求 launch 全量入道、`in_output=True` 是硬验收项；"
+            "实际生产 `.env` 置 `GOT_NODE2_LAUNCH_TOPN=4`，按 launch_score 截断"
+            "（证据：`scripts/audit_node2_launch_forward_returns.py` 全量 T+5 胜率 25.5%、"
+            "前 4 条 42.9%、16 条外尾部 8.5%/均值 -4.18%）。因此 08-03 缓存重建里"
+            "880710 排第 27、`in_output=False`，计划硬验收第 2 条**未满足**；"
+            "`GOT_NODE2_LAUNCH_TOPN=0` 时四项全过。该偏离待裁决。"
         ),
     ),
     "GOT_MARKET_THEME_SHADOW": ShadowRecord(

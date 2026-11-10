@@ -17,6 +17,7 @@ Node 2: 板块分析节点
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import logging
 import os
@@ -48,6 +49,26 @@ from src.got.schemas import (
 )
 from src.got.family_keywords import FAMILY_KEYWORDS, FAMILY_NAMES
 from src.got import family_embed
+from src.got.sector_lifecycle import (
+    PHASE_DECLINE,
+    PHASE_DORMANT,
+    PHASE_EXPANSION,
+    PHASE_LAUNCH,
+    PHASE_MATURE,
+    LAUNCH_END,
+    EXPANSION_END,
+    MATURE_FLOOR,
+    LifecycleEvidence,
+    LifecycleState,
+    build_lifecycle_evidence,
+    dormant_state,
+    get_lifecycle_mode,
+    lifecycle_state_from_prev_trend,
+    lifecycle_weight,
+    map_lifecycle_phase,
+    phase_age_inputs,
+    transition_lifecycle,
+)
 from src.storage import DatabaseManager, Node2SectorTrendRecord
 
 logger = logging.getLogger(__name__)
@@ -534,6 +555,73 @@ _KLINE_LOOKBACK_DAYS = 90
 # 快筛 Top N（涨跌幅各取 N 个进入完整评分）
 _QUICK_TOP_N = 30
 
+# 启动供给通道（enabled）：3/5 日同向筛选 + 完整 K 线结构门槛；分位只做排序。
+# 分母 <50 或 change_5d 缺失比例 >20% → 本次通道 data_status="unavailable"，
+# 不伪造分位（宁可当日无 launch，也不用残缺截面制造假启动）。
+_LAUNCH_UNIVERSE_MIN = 50
+_LAUNCH_MISSING_MAX_RATIO = 0.20
+# 每日完整 K 线抓取上限（成本预算，不是信号门槛）；超出的板块只参与排序统计。
+PHASE_FETCH_BUDGET = 120
+
+# 连续相位交易日历回溯窗口（日历日起算；一次性构造后复用，不逐板块扫描）
+_LIFECYCLE_CAL_LOOKBACK_DAYS = 400
+
+# enabled 的启动相位输出容量：**显式 TopN**（0=不限，缺省 0）。
+# 2026-11-09 阈值废弃后，`launch` 只是结构化的相位标签（站上 MA20 + MA20 上行），
+# 不再充当可交易信号；容量按计划口径交给下游 G-A1~A4 / Node 6 / 组合预算。
+# 需要回到旧行为时设 `GOT_NODE2_LAUNCH_TOPN=4`（按 launch_score 降序截断，
+# 被截的仍进 launch_watch 并标 `launch_topn`，不是静默丢弃）。
+_LAUNCH_TOPN_DEFAULT = 0
+
+
+_MAINLINE_ENTRY_MAX_DIST_DEFAULT = -0.02
+
+
+def get_mainline_entry_max_dist() -> Optional[float]:
+    """`GOT_MAINLINE_ENTRY_MAX_DIST`：新入主线允许的最大距高（缺省 -0.02）。
+
+    `-0.02` = 距 20 日高 2% 以内的板块不进主线输出；`off`/`none` 关闭。
+    这是**入口质量约束**，不是收益预测：不猜涨跌，只拒绝追顶入场。
+    """
+    raw = (os.getenv("GOT_MAINLINE_ENTRY_MAX_DIST",
+                     str(_MAINLINE_ENTRY_MAX_DIST_DEFAULT)) or "").strip().lower()
+    if raw in ("off", "none", "disable", "disabled"):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _MAINLINE_ENTRY_MAX_DIST_DEFAULT
+    return min(0.0, max(-1.0, value))
+
+
+def _entry_distance(sector) -> Optional[float]:
+    """板块距 20 日高的比例（负值 = 低于高点）；字段缺失返回 None（fail-open）。"""
+    close = (sector.indicators or {}).get("pos_close")
+    high = (sector.indicators or {}).get("pos_high20")
+    if not close or not high or high <= 0:
+        return None
+    return close / high - 1.0
+
+
+def get_launch_route() -> bool:
+    """`GOT_NODE2_LAUNCH_ROUTE`：启动相位是否路由进埋伏（缺省 off）。
+
+    2026-11-10 起缺省关闭：launch 只做相位记账（launch_watch），
+    早期捕捉交给 6 维埋伏评分；`on` 恢复 2026-11-05 的 launch→ambush 路由。
+    """
+    raw = (os.getenv("GOT_NODE2_LAUNCH_ROUTE", "off") or "").strip().lower()
+    return raw in ("1", "on", "true", "yes", "enabled")
+
+
+def get_launch_topn() -> int:
+    """`GOT_NODE2_LAUNCH_TOPN`：Node 2 启动相位输出条数（0=不限）。非法值回退缺省。"""
+    raw = (os.getenv("GOT_NODE2_LAUNCH_TOPN", str(_LAUNCH_TOPN_DEFAULT)) or "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _LAUNCH_TOPN_DEFAULT
+    return max(0, value)
+
 # =============================================================================
 # 噪声板块过滤（v2，2026-08-25）
 #
@@ -557,6 +645,11 @@ class SectorAnalysisNode:
         self.use_mock = use_mock
         self.got_runtime = got_runtime
         self._fetcher_manager: Optional[DataFetcherManager] = None
+        # 连续相位：启动供给通道质量 + 交易日历缓存（每次 run 重置）
+        self._phase_data_quality: dict = self._empty_phase_data_quality("legacy")
+        self._lifecycle_calendar: Optional[list[date]] = None
+        # 全量原始相位（含 neutral/dormant），供 `_save_sector_trends` 继承 anchor
+        self._raw_lifecycle_by_code: dict[str, LifecycleState] = {}
 
     @property
     def fetcher(self) -> DataFetcherManager:
@@ -606,11 +699,39 @@ class SectorAnalysisNode:
             # Step 1.5: 加载板块趋势历史（跨日连续性）
             prev_trends = self._load_all_sector_trends(sectors_raw)
 
+            # Step 1.51: 连续相位运行期缓存（enabled）
+            # 交易日历一次性构造（覆盖最早锚日..今日），不逐板块扫描日历
+            self._raw_lifecycle_by_code = {}
+            self._lifecycle_calendar = None
+            if get_lifecycle_mode() == "enabled":
+                anchors: list[Optional[date]] = []
+                for trend in prev_trends.values():
+                    anchors.append(trend.get("lifecycle_anchor_date"))
+                    anchors.append(trend.get("wave_start_date"))
+                self._ensure_lifecycle_calendar(anchors, date.today())
+
             # Step 1.52: 成分股涨跌幅批量预取（v2 过热 D7/D9 数据源，计划 §4.1）
             # 只对前日 actionable + 今日大涨板块预取，失败降级为代理口径
             await asyncio.to_thread(
                 self._prefetch_constituent_stats, sectors_raw, prev_trends,
             )
+
+            # Step 1.53: vol20 截面分位（P1 启动条件的波动率维度）
+            # 分位在「当日 matched 候选集」上计算，与研究口径（358 板块全缓存）分母不同；
+            # 缺 K 线的板块不参与分位、vol20_pct=None → 不启动（不是静默通过）。
+            vol_pairs: list[tuple[str, float]] = []
+            for sector_info in sectors_raw:
+                code = sector_info.get("code")
+                if not code:
+                    continue
+                v = self._compute_vol20(self._klines_to_df(sector_info.get("klines") or []))
+                if v is not None:
+                    vol_pairs.append((code, v))
+            vol_pairs.sort(key=lambda x: x[1])
+            n_vol = len(vol_pairs)
+            vol20_pct_by_code = {
+                c: (k + 0.5) / n_vol for k, (c, _) in enumerate(vol_pairs)
+            }
 
             # Step 1.55: 提前计算市场方向（用于 regime-dependent P0 门槛）
             # 基于板块 K 线 T-0 涨跌幅判断：普涨/普跌/分化
@@ -674,6 +795,7 @@ class SectorAnalysisNode:
                     ths_hot_sectors=ths_hot_sectors,
                     market_direction=early_direction,
                     all_scores_today=all_scores_today,
+                    vol20_pct=vol20_pct_by_code.get(sector_info["code"]),
                 )
                 if detail is not None:
                     analyzed.append(detail)
@@ -746,8 +868,25 @@ class SectorAnalysisNode:
                 result.notes.extend(crowding_warnings)
                 logger.info(f"[Node 2] 家族拥挤警示: {crowding_warnings}")
 
-            # Step 3.3b: 早段观察（只看，不进候选/不改状态）
-            result.early_watch = self._build_early_watch(analyzed, result, sectors_raw)
+            # Step 3.3b: 观察清单（只看，不进候选/不改状态）
+            # legacy：early_watch（strength≥80 或趋势启动，20 条上限）
+            # enabled：launch_watch（全量 launch 相位 + 是否已路由）+ accumulation_watch（吸筹观察）
+            lifecycle_mode = get_lifecycle_mode()
+            if lifecycle_mode == "enabled":
+                result.early_watch = []
+                result.launch_watch = self._build_launch_watch(analyzed, result)
+                result.accumulation_watch = self._build_accumulation_watch(analyzed)
+                result.phase_lookup = {
+                    s.name: s.lifecycle.model_dump(mode="json")
+                    for s in analyzed
+                    if s.name and s.lifecycle is not None
+                }
+            else:
+                result.early_watch = self._build_early_watch(analyzed, result, sectors_raw)
+                result.launch_watch = []
+                result.accumulation_watch = []
+                result.phase_lookup = {}
+            result.phase_data_quality = dict(self._phase_data_quality)
 
             # Step 3.4b: 行业板块双视角（Node 2 v2，与概念板块独立评分）
             result.industry_top = await self._fetch_and_score_industry_boards(quality)
@@ -799,7 +938,13 @@ class SectorAnalysisNode:
 
 
             # Step 3.6: 板块趋势持久化（跨日记忆）
-            self._save_sector_trends(analyzed)
+            self._save_sector_trends(
+                analyzed,
+                lifecycle_override=(
+                    self._raw_lifecycle_by_code
+                    if get_lifecycle_mode() == "enabled" else None
+                ),
+            )
 
             # Step 4: LLM 生成 reasoning
             result.reasoning = self._fallback_reasoning(result)
@@ -917,6 +1062,32 @@ class SectorAnalysisNode:
             f"[Node 2] T-0 涨跌幅: {t0_count}/{len(sectors)} 个板块（K线计算）"
         )
 
+        # 启动候选复核（enabled）：快筛只给分位线索，完整 90 日 K 线才是启动证据。
+        # 失败板块已进 quality.fetch_failed_fields，绝不用前一交易日数据冒充当日。
+        if get_lifecycle_mode() == "enabled" and any(
+            s.get("launch_candidate_hint") for s in sectors
+        ):
+            launch_after_kline = 0
+            for s in sectors:
+                if not s.get("launch_candidate_hint"):
+                    continue
+                df = self._klines_to_df(s.get("klines") or [])
+                tw = self._measure_trend_window(df) if df is not None else {}
+                ok = bool(
+                    tw.get("above_ma20")
+                    and tw.get("r10") is not None and tw["r10"] > 0
+                    and tw.get("ma20_slope") is not None and tw["ma20_slope"] > 0
+                )
+                s["launch_candidate"] = ok
+                if ok:
+                    launch_after_kline += 1
+            self._phase_data_quality["launch_after_kline"] = launch_after_kline
+            logger.info(
+                "[Node 2] 启动候选完整 K 线复核: %d/%d 通过",
+                launch_after_kline,
+                sum(1 for s in sectors if s.get("launch_candidate_hint")),
+            )
+
         logger.info(
             f"[Node 2] 完成: {len(sectors)}/{len(matched)} 个板块获取成功",
         )
@@ -945,6 +1116,142 @@ class SectorAnalysisNode:
             logger.warning("[Node 2] 同花顺板块热度采集失败: %s", exc)
             return {}
 
+    @staticmethod
+    def _empty_phase_data_quality(mode: str) -> dict:
+        """启动供给通道质量骨架（legacy 只写 mode=legacy 零计数）。"""
+        return {
+            "mode": mode,
+            "quick_universe_count": 0,
+            "quick_valid_count": 0,
+            "launch_candidates": 0,
+            "launch_after_kline": 0,
+            "unavailable_reasons": [],
+        }
+
+    @staticmethod
+    def _build_trading_calendar(start: date, end: date) -> list[date]:
+        """构造 [start, end] 的 A 股交易日序列（一次构造，全板块复用）。"""
+        from src.core.trading_calendar import is_market_open
+
+        days: list[date] = []
+        cur = start
+        while cur <= end:
+            try:
+                if is_market_open("cn", cur):
+                    days.append(cur)
+            except Exception:  # noqa: BLE001 — 日历失败 fail-open，不阻断主链
+                days.append(cur)
+            cur += timedelta(days=1)
+        return days
+
+    def _ensure_lifecycle_calendar(self, anchors: list[Optional[date]], trade_date: date) -> list[date]:
+        """确保日历覆盖「最早锚日 .. trade_date」；一次构造后整轮复用。
+
+        不逐板块扫描日历：锚日集合在加载趋势时已全部已知。
+        """
+        if self._lifecycle_calendar is not None:
+            return self._lifecycle_calendar
+        start = trade_date - timedelta(days=_LIFECYCLE_CAL_LOOKBACK_DAYS)
+        for anchor in anchors:
+            if anchor is not None and anchor < start:
+                start = anchor - timedelta(days=7)
+        self._lifecycle_calendar = self._build_trading_calendar(start, trade_date)
+        return self._lifecycle_calendar
+
+    @staticmethod
+    def _r5_percentile_map(
+        quick_data: dict, all_boards: list[dict],
+    ) -> tuple[dict[str, float], dict]:
+        """全宇宙 5 日涨幅分位（与 `_build_early_watch` 的 pct5 同口径）。
+
+        分母 = 本次 `get_board_quick_change` 成功返回且 `change_5d` 可用的全部非噪声概念板块。
+        分母 <50 或缺失比例 >20% → 返回空映射 + `data_status="unavailable"`，不伪造分位。
+        """
+        values: dict[str, float] = {}
+        total = len(all_boards)
+        for board in all_boards:
+            code = board.get("code")
+            data = quick_data.get(code) or {}
+            raw = data.get("change_5d")
+            if raw is None:
+                continue
+            try:
+                values[code] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        dq = {
+            "quick_universe_count": total,
+            "quick_valid_count": len(values),
+            "data_status": "ok",
+            "unavailable_reasons": [],
+        }
+        if len(values) < _LAUNCH_UNIVERSE_MIN:
+            dq["data_status"] = "unavailable"
+            dq["unavailable_reasons"].append("quick_universe_below_min")
+            return {}, dq
+        missing_ratio = 1.0 - len(values) / max(total, 1)
+        if missing_ratio > _LAUNCH_MISSING_MAX_RATIO:
+            dq["data_status"] = "unavailable"
+            dq["unavailable_reasons"].append("quick_missing_ratio_exceeded")
+            return {}, dq
+        ordered = sorted(values.values())
+        n = len(ordered)
+        pct_map = {code: bisect.bisect_right(ordered, v) / n for code, v in values.items()}
+        return pct_map, dq
+
+    def _discover_launch_boards(
+        self, all_boards: list[dict], quick_data: dict, quality: DataQuality,
+    ) -> tuple[list[dict], dict]:
+        """启动供给通道（enabled）：3/5 日同向 + 无暴跌，按涨幅排序取抓取预算。
+
+        2026-11-09 废弃分位阈值（0.80）：分位是拟合型门槛，样本外无可测预测力
+        （`scripts/fit_node2_phase_model.py`）。这里只剩**成本预算**——
+        `PHASE_FETCH_BUDGET` 是每日完整 K 线抓取上限，不是信号门槛；真正的
+        启动判定在 `_fetch_sector_data` 的结构条件（站上 MA20 + MA20 上行 + r10>0）。
+        """
+        dq = self._empty_phase_data_quality("enabled")
+        dq["quick_universe_count"] = len(all_boards)
+        pct_map, pct_dq = self._r5_percentile_map(quick_data, all_boards)
+        dq["quick_valid_count"] = pct_dq["quick_valid_count"]
+        dq["unavailable_reasons"] = list(pct_dq["unavailable_reasons"])
+        dq["_r5_pct"] = pct_map
+        if pct_dq["data_status"] != "ok":
+            quality.fetch_failed_fields.append("launch_quick_universe")
+            logger.warning(
+                "[Node 2] 启动供给通道不可用: %s（分母 %d/%d）",
+                dq["unavailable_reasons"], pct_dq["quick_valid_count"], len(all_boards),
+            )
+            return [], dq
+
+        selected: list[dict] = []
+        for board in all_boards:
+            code = board.get("code")
+            data = quick_data.get(code) or {}
+            try:
+                c3 = float(data.get("change_3d"))
+                c5 = float(data.get("change_5d"))
+            except (TypeError, ValueError):
+                continue
+            if c3 <= 0 or c5 <= 0 or data.get("has_crash"):
+                continue
+            pct = pct_map.get(code)
+            selected.append({
+                "code": code,
+                "name": board.get("name") or code,
+                "r5_pct": None if pct is None else round(float(pct), 4),
+                "change_3d": c3,
+                "change_5d": c5,
+                "launch_candidate_hint": True,
+            })
+        selected.sort(key=lambda x: x["change_5d"], reverse=True)
+        selected = selected[:PHASE_FETCH_BUDGET]
+        dq["launch_candidates"] = len(selected)
+        logger.info(
+            "[Node 2] 启动供给通道: %d 个候选（分母 %d，抓取预算 %d，结构门槛在完整 K 线）",
+            len(selected), pct_dq["quick_valid_count"], PHASE_FETCH_BUDGET,
+        )
+        return selected, dq
+
     async def _discover_boards(
         self, quality: DataQuality,
     ) -> list[dict[str, Any]]:
@@ -958,6 +1265,9 @@ class SectorAnalysisNode:
         防止板块因跌出截面排名而"蒸发"（煤炭 0831 根因修复）
         降级: stock_all() 失败 → 仅用 registry
         """
+        # 每轮重置（同一实例重跑不得残留上一轮读数）
+        self._phase_data_quality = self._empty_phase_data_quality(get_lifecycle_mode())
+
         # 基础盘：TDX_BOARD_REGISTRY 硬编码
         registry_boards = self._build_registry_boards()
         registry_codes = {b["code"] for b in registry_boards}
@@ -1057,6 +1367,22 @@ class SectorAnalysisNode:
                 f"[Node 2] 时间线维护通道: 补入 {timeline_count} 个前日 actionable 板块"
             )
 
+        # === 启动供给通道（enabled only，P2 前置底座 2026-11-05）===
+        # 通道 5：全宇宙 5 日分位 + 3/5 日同向 + 无暴跌，**不设数量上限**。
+        # 只有 enabled 跑；legacy 保持四通道逐字节不变（phase_data_quality 只写空计数）。
+        mode = get_lifecycle_mode()
+        pct_map: dict[str, float] = {}
+        launch_by_code: dict[str, dict] = {}
+        if mode == "enabled":
+            launch_boards, dq = self._discover_launch_boards(all_boards, quick_data, quality)
+            pct_map = dq.pop("_r5_pct", {}) or {}
+            launch_by_code = {b["code"]: b for b in launch_boards}
+            for code, board in launch_by_code.items():
+                candidate_codes.setdefault(code, board["name"])
+            self._phase_data_quality = dq
+        else:
+            self._phase_data_quality = self._empty_phase_data_quality("legacy")
+
         # 构建候选板块列表（动态 frame_group）
         matched: list[dict] = []
         for code, name in candidate_codes.items():
@@ -1064,7 +1390,7 @@ class SectorAnalysisNode:
             is_from_registry = code in registry_codes
             # 获取该板块的快筛数据（如果有）
             data = quick_data.get(code, {})
-            matched.append({
+            entry = {
                 "code": code,
                 "name": name,
                 "category": "dynamic" if not is_from_registry else "registry",
@@ -1076,7 +1402,12 @@ class SectorAnalysisNode:
                 "up_count": 0,
                 "down_count": 0,
                 "turnover_rate": 0.0,
-            })
+            }
+            if mode == "enabled":
+                # 全宇宙分位随候选行走：任何通道进来的板块都能判启动，不只通道 5
+                entry["r5_pct"] = pct_map.get(code)
+                entry["launch_candidate_hint"] = code in launch_by_code
+            matched.append(entry)
 
         dynamic_count = sum(1 for m in matched if m["category"] == "dynamic")
         b_lite_count = len(top_b_lite)
@@ -1085,7 +1416,9 @@ class SectorAnalysisNode:
             f"(通道1: {len(top_up_1d) + len(top_down_1d)} + "
             f"B-lite: {b_lite_count} + "
             f"registry: {len(matched) - dynamic_count - timeline_count} + "
-            f"时间线: {timeline_count})",
+            f"时间线: {timeline_count}"
+            + (f" + 启动供给: {len(launch_by_code)}" if mode == "enabled" else "")
+            + ")",
         )
         return matched
 
@@ -1517,6 +1850,7 @@ class SectorAnalysisNode:
         ths_hot_sectors: Optional[dict[str, float]] = None,
         market_direction: str = "分化",
         all_scores_today: Optional[list[float]] = None,
+        vol20_pct: Optional[float] = None,
     ) -> Optional[SectorDetail]:
         """对单个板块执行完整分析：强度 → RRG → 状态 → 分级 → 生命周期。
 
@@ -1525,6 +1859,7 @@ class SectorAnalysisNode:
             ranked_indicators: 预计算的截面百分位排名指标（Node 2 v2）
             ths_hot_sectors: 同花顺板块热度字典 {板块名: 热度值}（辅助加成）
             all_scores_today: 当日全部板块 strength_score（供 RRG RS-Ratio 截面排名）
+            vol20_pct: 当日 matched 候选集内的 vol20 截面分位（P1 启动条件；None=不启动）
         """
         klines = sector_info.get("klines", [])
         df = self._klines_to_df(klines)
@@ -1573,12 +1908,48 @@ class SectorAnalysisNode:
         # 2) 启动信号（降级为诊断指标，不再驱动状态）
         launch = self._detect_launch_signal(df, sector_info, market_direction=market_direction)
 
-        # 3) 过热信号（v2: 9 维度，含高潮型检测）
-        overheat = self._detect_overheat_signal(
-            df, sector_info,
-            prev_trend=prev_trend,
-            lifecycle_phase=early_lifecycle_phase,
-        )
+        mode = get_lifecycle_mode()
+        lifecycle_state: Optional[LifecycleState] = None
+        lifecycle_evidence: Optional[LifecycleEvidence] = None
+
+        if mode == "enabled":
+            # ── enabled 调用顺序（固定）：相位时间输入 → 一次过热 → 破位输入 → 相位转移 → 风险状态 ──
+            trade_date = date.today()
+            calendar = self._lifecycle_calendar or []
+            r5_pct = sector_info.get("r5_pct")
+            trend_window = self._measure_trend_window(df, r5_pct=r5_pct)
+            prev_lc = lifecycle_state_from_prev_trend(prev_trend)
+            legacy_state = (prev_trend or {}).get("state")
+            legacy_wave_start = (prev_trend or {}).get("wave_start_date")
+            legacy_mainline_days = (prev_trend or {}).get("mainline_days")
+            # 时间输入只用 anchor/日历（不含当日风险判定，避免与 break_signals 循环）
+            seed = build_lifecycle_evidence(
+                trade_date,
+                bar_complete=True,
+                trend_window=trend_window,
+                r5_pct=r5_pct,
+                vol20_pct=vol20_pct,
+                strength=strength_score,
+                rrg_quadrant=rrg.quadrant,
+                legacy_state=legacy_state,
+                legacy_wave_start=legacy_wave_start,
+                legacy_mainline_days=legacy_mainline_days,
+            )
+            prev_phase, next_age = phase_age_inputs(prev_lc, seed, calendar)
+            # 3) 过热信号：只跑一次（D8 改读连续相位 + phase_age）
+            overheat = self._detect_overheat_signal(
+                df, sector_info,
+                prev_trend=prev_trend,
+                lifecycle_phase=prev_phase,
+                episode_age=next_age,
+            )
+        else:
+            # 3) 过热信号（v2: 9 维度，含高潮型检测）
+            overheat = self._detect_overheat_signal(
+                df, sector_info,
+                prev_trend=prev_trend,
+                lifecycle_phase=early_lifecycle_phase,
+            )
 
         # 3.5) 过热日志（v2: 9 维度明细）
         sector_name_log = sector_info.get("name", "?")
@@ -1591,30 +1962,137 @@ class SectorAnalysisNode:
                 f"D3_breadth={overheat.breadth_score:.2f}"
             )
 
-        # 4) 状态判定（RRG 驱动，替代旧的 8 分支优先级链）
-        # 2026-08-31：返回 (state, exit_pressure, tier) 三元组
-        # 2026-09-02：追加 break_signals（P2-5 落盘，供状态机决策离线复现）
-        state, exit_pressure_days, tier, break_signals = self._determine_state_v3(
-            strength_score, indicators, rrg,
-            sector_info, market_context, df,
-            prev_trend=prev_trend,
-            market_direction=market_direction,
-        )
+        # 4) 状态判定
+        # legacy：RRG 驱动马尔可夫状态机（`_apply_state_machine`），2026-08-31 起返回四元组
+        # enabled：连续相位 + 当日风险（`_apply_lifecycle_state_machine`），不重建行情
+        if mode == "enabled":
+            price_chg_5d, above_ma20, high20_pos, overheat_level = self._compute_break_signals(
+                df, sector_info,
+                prev_trend=prev_trend,
+                lifecycle_phase=prev_phase,
+                overheat=overheat,
+            )
+            trajectory = (prev_trend or {}).get("strength_trajectory") or []
+            prev_score = trajectory[-1] if trajectory else strength_score
+            score_drop = float(prev_score - strength_score)
+            is_defensive = self._check_defensive(sector_info, market_context, df, strength_score)
+            lifecycle_evidence = build_lifecycle_evidence(
+                trade_date,
+                bar_complete=True,
+                trend_window=trend_window,
+                r5_pct=r5_pct,
+                vol20_pct=vol20_pct,
+                strength=strength_score,
+                rrg_quadrant=rrg.quadrant,
+                overheat_level=overheat_level,
+                break_signals={
+                    "price_chg_5d": price_chg_5d,
+                    "above_ma20": bool(above_ma20),
+                    "high20_pos": float(high20_pos),
+                    "overheat_level": overheat_level,
+                    "score_drop": score_drop,
+                },
+                score_drop=score_drop,
+                is_defensive=is_defensive,
+                legacy_state=legacy_state,
+                legacy_wave_start=legacy_wave_start,
+                legacy_mainline_days=legacy_mainline_days,
+            )
+            lifecycle_state = self._classify_lifecycle_state(prev_lc, lifecycle_evidence, calendar)
+            state = self._apply_lifecycle_state_machine(lifecycle_state, lifecycle_evidence)
+            # 保留全量原始相位（含 neutral/dormant），供持久化继承 anchor——
+            # 临时 neutral 不得丢锚，否则次日重走 bootstrap
+            self._raw_lifecycle_by_code[sector_info["code"]] = lifecycle_state
+            # 相位标量随 indicators 落盘：launch_watch 与归档需要 r5/r10/分位原值
+            for _key, _val in (
+                ("lifecycle_r5", trend_window.get("r5")),
+                ("lifecycle_r10", trend_window.get("r10")),
+                ("lifecycle_r5_pct", trend_window.get("r5_pct")),
+                ("lifecycle_high20_dist", trend_window.get("high20_dist")),
+            ):
+                if _val is not None:
+                    indicators[_key] = float(_val)
+            tier = self._classify_mainline_tier(sector_info, indicators)
+            break_signals = {
+                "price_chg_5d": round(float(price_chg_5d), 4) if price_chg_5d is not None else None,
+                "above_ma20": bool(above_ma20),
+                "high20_pos": round(float(high20_pos), 4),
+                "overheat_level": overheat_level,
+                "score_drop": round(float(score_drop), 2),
+            }
+            # 退出压力计数器保留原口径做审计（不参与 enabled 的相位映射）
+            exit_pressure_days = self._compute_exit_pressure(
+                (prev_trend or {}).get("state"),
+                int((prev_trend or {}).get("exit_pressure_days") or 0),
+                strength_score,
+                sector_info.get("today_change"),
+            )
+        else:
+            state, exit_pressure_days, tier, break_signals = self._determine_state_v3(
+                strength_score, indicators, rrg,
+                sector_info, market_context, df,
+                prev_trend=prev_trend,
+                market_direction=market_direction,
+            )
 
-        # 5) 主线分级（复用 _determine_state_v3 已计算的 tier）
+        # 5) 主线分级（legacy 复用 _determine_state_v3 已计算的 tier；enabled 已单独计算）
         # 仅主线相关状态输出 tier，其余状态置 None
         if state not in ("active_mainline", "exhausted_mainline", "high_position_cooling"):
             tier = None
 
-        # 6) 生命周期（RRG 象限直接映射；含 cooling 降温期）
+        # 6) 生命周期
         lifecycle: Optional[LifecycleInfo] = None
-        if state in ("active_mainline", "exhausted_mainline", "high_position_cooling"):
+        if mode == "enabled":
+            # 只在已路由状态输出：neutral/dormant 不暴露生命周期，防止
+            # top_by_score / 持仓兜底把「未路由 launch」当成可交易生命周期
+            if (
+                lifecycle_state is not None
+                and lifecycle_state.phase != PHASE_DORMANT
+                and state in ("ambush", "active_mainline", "high_position_cooling", "exhausted_mainline")
+                # decline 允许无锚（首日即破位且无旧主线状态）：它仍是已被路由的风险状态，
+                # 必须让 Node 7 看到 mature_exhausted；其它相位必须有锚才算有效行情
+                and (lifecycle_state.anchor_date is not None or lifecycle_state.phase == PHASE_DECLINE)
+            ):
+                lifecycle = LifecycleInfo(
+                    phase=map_lifecycle_phase(lifecycle_state.phase) or "mature",
+                    days_since_launch=lifecycle_state.phase_age,
+                    thresholds={
+                        "launch_end": LAUNCH_END,
+                        "expansion_end": EXPANSION_END,
+                        "mature_floor": MATURE_FLOOR,
+                    },
+                    continuous_phase=lifecycle_state.phase,
+                    anchor_date=lifecycle_state.anchor_date,
+                    phase_dwell=lifecycle_state.phase_dwell,
+                    healthy_days=lifecycle_state.healthy_days,
+                    weak_days=lifecycle_state.weak_days,
+                    transition_reason=lifecycle_state.transition_reason,
+                    data_status=lifecycle_state.data_status,
+                    time_weight=lifecycle_weight(lifecycle_state),
+                    launch_score=lifecycle_evidence.launch_score if lifecycle_evidence else None,
+                )
+        elif state in ("active_mainline", "exhausted_mainline", "high_position_cooling"):
+            # legacy：RRG 象限直接映射（含 cooling 降温期）
             prev_days = prev_trend.get("mainline_days") if prev_trend else None
             lifecycle = self._classify_lifecycle_v3(rrg, prev_days)
 
         # 7) 推荐操作
         action: Optional[str] = None
-        if state == "active_mainline" and rrg.quadrant in ("leading", "improving"):
+        if mode == "enabled":
+            # 只是建议文本；最终 buy 仍需 Node 6、选股与 Phase 2 闸门
+            if state == "ambush":
+                action = "buy"
+            elif state == "active_mainline":
+                action = "buy" if (
+                    lifecycle_state is not None and lifecycle_state.phase == PHASE_EXPANSION
+                ) else "reduce_or_hold"
+            elif state == "high_position_cooling":
+                action = "reduce_or_hold"
+            elif state == "exhausted_mainline":
+                action = "exit"
+            else:
+                action = None
+        elif state == "active_mainline" and rrg.quadrant in ("leading", "improving"):
             action = _LIFECYCLE_ACTION_MAP.get(
                 lifecycle.phase if lifecycle else "mature",
             )
@@ -1628,9 +2106,11 @@ class SectorAnalysisNode:
         if state in ("active_mainline", "exhausted_mainline"):
             mainline_quality = "weak" if tier == "B" else "strong"
 
-        # 9) 埋伏近失诊断：非 ambush/defensive 板块，差 1 条闸门 → 标记供 Node 6 观察
+        # 9) 埋伏近失诊断
+        # legacy：非 ambush/defensive 板块，差 1 条闸门 → 标记供 Node 6 观察
+        # enabled：不再把「吸筹近失」当「启动近失」，恒为空（吸筹另走 accumulation_watch）
         near_miss: Optional[list[str]] = None
-        if state not in ("ambush", "defensive_rotation"):
+        if mode != "enabled" and state not in ("ambush", "defensive_rotation"):
             is_def = self._check_defensive(sector_info, market_context, df, strength_score)
             if not is_def:
                 fail_count, fail_list = self._check_ambush_near_miss(
@@ -1638,6 +2118,19 @@ class SectorAnalysisNode:
                 )
                 if fail_count == 1:
                     near_miss = fail_list
+
+        # 9.5) 低位吸筹观察分
+        # enabled：旧 6 维分改写入 accumulation_score（只观察、不路由、不参与 state 判定）
+        # legacy：保持原双轨口径（_determine_state_v3 → _is_ambush_candidate 已写 indicators）
+        accumulation_score: Optional[float] = None
+        if mode == "enabled":
+            if is_defensive:
+                accumulation_score = 0.0
+            else:
+                accumulation_score = round(
+                    self._compute_ambush_score_v2(df, indicators, rrg, strength_score, prev_trend), 2,
+                )
+            indicators["accumulation_score"] = accumulation_score
 
         # MEG 层1信号：动能衰竭三态（§7.3，零新增数据——复用 prev_trend.momentum_trajectory）
         momentum_state, rs_mom_decay_2d = self._compute_momentum_state(rrg, prev_trend)
@@ -1655,6 +2148,7 @@ class SectorAnalysisNode:
             indicators=indicators,
             launch_signal=LaunchSignal(**launch) if launch.get("triggered") else None,
             lifecycle=lifecycle,
+            accumulation_score=accumulation_score,
             tier=tier,
             mainline_quality=mainline_quality,
             recommended_action=action,
@@ -1717,6 +2211,86 @@ class SectorAnalysisNode:
         except Exception as e:
             logger.debug(f"K线转 DataFrame 失败: {e}")
             return None
+
+    @staticmethod
+    def _measure_trend_window(
+        df: pd.DataFrame,
+        *,
+        r5_pct: Optional[float] = None,
+    ) -> dict:
+        """单窗口趋势测量（唯一口径，供 early_watch / launch 通道 / lifecycle 共用）。
+
+        至少 21 根有效收盘，返回
+        `close, ma20, r5, r10, high20_dist, above_ma20, r5_pct`：
+        - `r5  = close[-1]/close[-6]-1`
+        - `r10 = close[-1]/close[-11]-1`
+        - `high20_dist = close[-1]/max(high[-20:])-1`（无有效 high 回退 close）
+        - `r5_pct` 由调用方用**同一完整快筛宇宙**算好后传入，缺则 None。
+
+        数据不足/异常时全部返回 None（不伪造 0 值，避免被读成「趋势破坏」）。
+        """
+        empty = {
+            "close": None, "ma20": None, "r5": None, "r10": None,
+            "high20_dist": None, "above_ma20": None, "r5_pct": r5_pct,
+            "ma20_slope": None,
+        }
+        if df is None or len(df) < 21:
+            return empty
+        try:
+            close = df["close"]
+            last = float(close.iloc[-1])
+            if not np.isfinite(last) or last <= 0:
+                return empty
+            c6 = float(close.iloc[-6])
+            c11 = float(close.iloc[-11])
+            ma20 = float(close.iloc[-20:].mean())
+            if not np.isfinite(ma20) or ma20 <= 0:
+                return empty
+            r5 = last / c6 - 1 if c6 > 0 else None
+            r10 = last / c11 - 1 if c11 > 0 else None
+            high20 = 0.0
+            if "high" in df.columns:
+                try:
+                    high20 = float(df["high"].iloc[-20:].max())
+                except (TypeError, ValueError):
+                    high20 = 0.0
+            if not np.isfinite(high20) or high20 <= 0:
+                high20 = float(close.iloc[-20:].max())
+            high20_dist = (last / high20 - 1) if high20 > 0 else None
+            ma20_slope = None
+            if len(close) >= 25:
+                try:
+                    prev_ma20 = float(close.iloc[-25:-5].mean())
+                    if np.isfinite(prev_ma20) and prev_ma20 > 0:
+                        ma20_slope = float(ma20 / prev_ma20 - 1)
+                except Exception:  # noqa: BLE001 — 斜率失败按缺失处理
+                    ma20_slope = None
+            return {
+                "close": last,
+                "ma20": ma20,
+                "r5": None if r5 is None else float(r5),
+                "r10": None if r10 is None else float(r10),
+                "high20_dist": None if high20_dist is None else float(high20_dist),
+                "above_ma20": bool(last > ma20),
+                "r5_pct": r5_pct,
+                "ma20_slope": ma20_slope,
+            }
+        except Exception as exc:  # noqa: BLE001 — 测量失败不得击穿主链
+            logger.debug("[Node 2] 趋势窗口测量失败: %s", exc)
+            return empty
+
+    @staticmethod
+    def _compute_vol20(df) -> Optional[float]:
+        """20 日收益波动率（日收益标准差，P1 的 vol20 原值）。
+
+        与 `scripts/search_node2_launch_params.py` 的 `vol20` 同口径
+        （近 20 个日收益的标准差，ddof=0）。不足 21 根 K 线返回 None，
+        不伪造波动率——None 的板块不参与截面分位、不启动。
+        """
+        if df is None or len(df) < 21:
+            return None
+        rets = df["close"].astype(float).pct_change().dropna().tail(20)
+        return float(rets.std()) if len(rets) >= 20 else None
 
     def _calculate_raw_metrics(
         self,
@@ -2169,6 +2743,8 @@ class SectorAnalysisNode:
         self, df: pd.DataFrame, sector_info: dict,
         prev_trend: Optional[dict] = None,
         lifecycle_phase: str = "",
+        *,
+        episode_age: Optional[int] = None,
     ) -> OverheatSeverity:
         """检测板块过热信号 — 渐进式严重度评分（v2: 9 维度）。
 
@@ -2184,8 +2760,12 @@ class SectorAnalysisNode:
         Args:
             df: 板块 K 线 DataFrame
             sector_info: 板块信息字典
-            prev_trend: 前日趋势记录（用于 D8 主线疲劳判定）
-            lifecycle_phase: 生命周期阶段（acceleration/mature/late_stage 等）
+            prev_trend: 前日趋势记录（legacy 的 D8 主线疲劳判定）
+            lifecycle_phase: 生命周期阶段（acceleration/mature/late_stage 等；enabled 传连续相位）
+            episode_age: 连续相位的 phase_age（enabled 专用，keyword-only）。
+                传入时 D8 改读「相位 + 年龄」，不再读 `prev_trend["mainline_days"]`；
+                未传（legacy）时走原逻辑。该口径属于 enabled 的显式新口径，
+                在 no-time-weight 臂仍保留，避免把过热风险与时间权重混为一项实验。
 
         前置条件：背离型维度仅在板块距 60d 高点 ≤10% 时有意义
 
@@ -2315,9 +2895,18 @@ class SectorAnalysisNode:
                     leader_score = 0.3
 
         # ── 8. 主线疲劳（D8，高潮型，无前置条件）──
-        # mainline_days ≥ 5 且仍标 acceleration → 生命周期滞后惩罚
+        # legacy：mainline_days ≥ 5 且仍标 acceleration → 生命周期滞后惩罚
+        # enabled：改读连续相位 + phase_age（不读 mainline_days），
+        #          launch=0 / expansion(4–7)=.3 / expansion(8–10)=1.0 / mature|decline=1.0 / dormant=0
         fatigue_score = 0.0
-        if mainline_days >= 7 and lifecycle_phase == "acceleration":
+        if episode_age is not None:
+            if lifecycle_phase in ("mature", "decline"):
+                fatigue_score = 1.0
+            elif lifecycle_phase == "expansion":
+                fatigue_score = 0.3 if episode_age <= 7 else 1.0
+            else:
+                fatigue_score = 0.0
+        elif mainline_days >= 7 and lifecycle_phase == "acceleration":
             fatigue_score = 1.0
         elif mainline_days >= 5 and lifecycle_phase == "acceleration":
             fatigue_score = 0.6
@@ -2389,12 +2978,18 @@ class SectorAnalysisNode:
         self, df: pd.DataFrame, sector_info: dict,
         prev_trend: Optional[dict] = None,
         lifecycle_phase: str = "",
+        *,
+        overheat: Optional[OverheatSeverity] = None,
     ) -> tuple[Optional[float], bool, float, str]:
         """计算状态机的破位/未破位判据信号。
 
         返回 (price_chg_5d, above_ma20, high20_pos, overheat_level)。
         price_chg_5d 用真实 5 日涨幅（不随当日截面排名变），是区分
         high_position_cooling（回调未破位）与 exhausted_mainline（破位）的主判据。
+
+        `overheat` 传入时直接用其 level，跳过内部重复检测（enabled 路径：过热对象
+        已按「previous phase + next_age」算过一次，不执行两遍 9 维检测）；
+        未传（legacy）走原逻辑。
         """
         if df is None or len(df) == 0:
             return None, False, 1.0, "normal"
@@ -2409,12 +3004,15 @@ class SectorAnalysisNode:
             high20_pos = float(close.iloc[-1] / max(close.iloc[-20:]))
         else:
             high20_pos = 1.0
-        overheat = self._detect_overheat_signal(
-            df, sector_info,
-            prev_trend=prev_trend,
-            lifecycle_phase=lifecycle_phase,
-        )
-        return price_chg_5d, above_ma20, high20_pos, overheat.level
+        if overheat is not None:
+            overheat_level = overheat.level
+        else:
+            overheat_level = self._detect_overheat_signal(
+                df, sector_info,
+                prev_trend=prev_trend,
+                lifecycle_phase=lifecycle_phase,
+            ).level
+        return price_chg_5d, above_ma20, high20_pos, overheat_level
 
     @staticmethod
     def _compute_fast_signals(df: pd.DataFrame) -> tuple[Optional[float], float]:
@@ -2638,6 +3236,65 @@ class SectorAnalysisNode:
             return "neutral"                      # E16 条件转假
 
         return "neutral"
+
+    @staticmethod
+    def _apply_lifecycle_state_machine(
+        state: LifecycleState,
+        evidence: LifecycleEvidence,
+    ) -> str:
+        """交易/风险状态映射（enabled 唯一运行时入口，2026-11-05）。
+
+        相位 → state：
+          - launch + 未破位 + 未过热衰竭 → ambush（用户语义：启动趋势的埋伏）
+          - expansion + 未破位 + 未过热衰竭 → active_mainline
+          - mature + 未破位：RRG lagging/weakening / 当日有弱观测 / 过热衰竭 → high_position_cooling，
+            否则 active_mainline。**单日 RRG 变化只改风险状态，不改相位/anchor。**
+          - decline → exhausted_mainline（与 Node 7 mature_exhausted 清仓语义一致）
+          - dormant/未开段：仅当 `_check_defensive` 且未破位才 defensive_rotation，否则 neutral
+
+        `trend_broken is None`（缺数据）→ neutral，不把缺数据当成可交易启动。
+        defensive 只作风险覆盖：launch/expansion 不被抢成 neutral，decline 永远优先 exhausted。
+        """
+        phase = state.phase
+        broken = evidence.trend_broken
+        exhausted = evidence.overheat_level == "exhausted"
+        rrg_q = evidence.rrg_quadrant
+
+        if phase == PHASE_DECLINE:
+            return "exhausted_mainline"
+
+        if phase == PHASE_LAUNCH:
+            if broken is False and not exhausted:
+                return "ambush"
+            return "neutral"
+
+        if phase == PHASE_EXPANSION:
+            if broken is False and not exhausted:
+                return "active_mainline"
+            return "neutral"
+
+        if phase == PHASE_MATURE:
+            if broken is not False:
+                return "neutral"
+            if rrg_q in ("lagging", "weakening") or state.weak_days > 0 or exhausted:
+                return "high_position_cooling"
+            if evidence.is_defensive:
+                return "defensive_rotation"
+            return "active_mainline"
+
+        # dormant（含 data_status=unknown 且未开段）
+        if evidence.is_defensive and broken is False:
+            return "defensive_rotation"
+        return "neutral"
+
+    @staticmethod
+    def _classify_lifecycle_state(
+        previous: Optional[LifecycleState],
+        evidence: LifecycleEvidence,
+        calendar: list[date],
+    ) -> LifecycleState:
+        """连续相位转移入口（包装纯函数 `transition_lifecycle`）。"""
+        return transition_lifecycle(previous, evidence, calendar)
 
     @staticmethod
     def _compute_exit_pressure(
@@ -3493,6 +4150,35 @@ class SectorAnalysisNode:
     _INDEPENDENT_MARKET_EXEMPT_MAX = 2   # 豁免名额上限
     _MAINLINE_FAMILY_MAX_MEMBERS = 3     # 家族内部成员裁剪：只保留 Top 3 最强成员
 
+    def _select_ambush_by_score(self, analyzed, used_codes):
+        """6 维埋伏分排序（Track1 状态机 + Track2 补位），enabled/legacy 共用。"""
+        excluded_states = {"active_mainline", "exhausted_mainline",
+                           "high_position_cooling", "defensive_rotation"}
+        track1 = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
+        track1.sort(key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True)
+        track1 = track1[:self.AMBUSH_TRACK1_MAX]
+        track1_codes = {s.code for s in track1}
+        remaining = max(0, self.AMBUSH_TOP_K - len(track1))
+        track2 = [
+            s for s in analyzed
+            if s.state not in excluded_states
+            and s.code not in used_codes
+            and s.code not in track1_codes
+            and s.indicators.get("ambush_score_v2", 0) > 0
+        ]
+        track2.sort(key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True)
+        track2 = track2[:remaining] if remaining > 0 else []
+        out = list(track1)
+        for s in track2:
+            if s.indicators.get("ambush_score_v2", 0) >= self.AMBUSH_SCORE_FLOOR:
+                out.append(s)
+        logger.info(
+            "[Node 2] 埋伏评分: Track1(状态机)=%d, Track2(补位)=%d, 合并=%d",
+            len(track1), len([s for s in track2 if s.indicators.get("ambush_score_v2", 0)
+                              >= self.AMBUSH_SCORE_FLOOR]), len(out),
+        )
+        return out
+
     def _build_mainline_output(
         self,
         raw_result: SectorContext,
@@ -3510,16 +4196,42 @@ class SectorAnalysisNode:
         """
         from src.got.schemas import MainlineGroup
 
+        mode = get_lifecycle_mode()
+
+        def _rank_score(sector: SectorDetail) -> float:
+            """排序分：enabled 用 `strength × time_weight`（高龄高原始强度不得挤掉早期组）；
+            raw `strength_score` 原样保留供风控与展示。legacy 用原始强度。"""
+            if mode == "enabled" and sector.lifecycle is not None:
+                return sector.strength_score * sector.lifecycle.time_weight
+            return sector.strength_score
+
         used_codes: set[str] = set()
 
         # ── 主线聚合：状态驱动（替代原框遍历）──
         # 直接取 state == "active_mainline" 的板块，按 frame_group 聚合
+        #
+        # 2026-11-10 入口位置约束（为何在输出层而不是状态机）：
+        # strength_score = 0.30·price_momentum + 0.25·turnover_expansion +
+        # 0.25·relative_strength + 0.20·breadth_health，四项全是截面百分位 ——
+        # 按定义「涨得最多」分最高，主线输出必然堆在 20 日高附近（归档实测：
+        # 576 个主线板块-日里 70% 距高 ≤2%，贴高成员 T+5 超额 -0.86pp，
+        # 非贴高 +0.06pp）。这是结构偏差，不是 bug，所以不能靠调 strength 权重修。
+        # 约束只决定「谁有资格进新主线」，不预测收益；贴高板块仍留在
+        # top_by_score / industry_top / cooling 等描述通道。
+        # 回滚：GOT_MAINLINE_ENTRY_MAX_DIST=off。
+        max_dist = get_mainline_entry_max_dist()
+        excluded_at_high = 0
         family_boards: dict[str, list[SectorDetail]] = {}
         family_tiers: dict[str, str] = {}
 
         for sector in analyzed:
             if sector.state != "active_mainline":
                 continue
+            if max_dist is not None:
+                dist = _entry_distance(sector)
+                if dist is not None and dist > max_dist:
+                    excluded_at_high += 1
+                    continue
             used_codes.add(sector.code)
             fg = sector.frame_group or _build_frame_group(sector.name)
             family_boards.setdefault(fg, []).append(sector)
@@ -3533,9 +4245,9 @@ class SectorAnalysisNode:
         mainline_groups: list[MainlineGroup] = []
         for fg, boards in family_boards.items():
             best_tier = family_tiers.get(fg, "B")
-            group_score = max(b.strength_score for b in boards)
+            group_score = max(_rank_score(b) for b in boards)
             has_strong = best_tier in ("S", "A")
-            sorted_boards = sorted(boards, key=lambda s: s.strength_score, reverse=True)
+            sorted_boards = sorted(boards, key=_rank_score, reverse=True)
             # 家族内部成员裁剪：只保留 Top N 最强成员（防膨胀）
             display_name = sorted_boards[0].name
             pruned_boards = sorted_boards[:self._MAINLINE_FAMILY_MAX_MEMBERS]
@@ -3552,6 +4264,12 @@ class SectorAnalysisNode:
                 members=pruned_boards,
             ))
         mainline_groups.sort(key=lambda g: g.group_score, reverse=True)
+        if excluded_at_high:
+            logger.info(
+                "[Node 2] 主线入口约束: 剔除贴高 %d 个（dist20 > %.1f%%），保留 %d 个主线板块",
+                excluded_at_high, (max_dist or 0.0) * 100,
+                sum(len(g.members) for g in mainline_groups),
+            )
 
         # attack_power 5 档阶梯裁剪
         if attack_power < 0.15:
@@ -3591,73 +4309,87 @@ class SectorAnalysisNode:
             key=lambda g: g.group_score, reverse=True,
         )
 
-        # ── 埋伏输出：真并集双轨合并 ──
+        # ── 埋伏输出 ──
+        # legacy：真并集双轨合并（Track1 状态机 16 条上限 + Track2 补位 AMBUSH_TOP_K）
+        # enabled：只以 `continuous_phase=="launch"` 且已路由 ambush 形成埋伏，按 launch_score
+        #          降序取 **TopN**（`GOT_NODE2_LAUNCH_TOPN`，缺省 4；0=不限）。
+        #          2026-11-06 实证：全量入道（最松时 50/357≈14%）时 16 条之外 T+5 胜率仅 8.5%、
+        #          均值 -4.18%，而前 4 条为 42.9%/-0.81% ⇒ "所有满足条件的都算主线"在结构上
+        #          与"市场每天只有 3–5 个主题"冲突（r5_pct≥0.8 是相对分位，天然固定入选比例）。
+        #          被截的仍进 `launch_watch` 并标 `dropped_reason="launch_topn"`，不是静默截断。
         excluded_states = {"active_mainline", "exhausted_mainline", "high_position_cooling", "defensive_rotation"}
 
-        track1_ambush = [s for s in analyzed if s.state == "ambush" and s.code not in used_codes]
-        track1_ambush.sort(
-            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
-        )
-        track1_ambush = track1_ambush[:self.AMBUSH_TRACK1_MAX]
-
-        track1_codes = {s.code for s in track1_ambush}
-        remaining_slots = max(0, self.AMBUSH_TOP_K - len(track1_ambush))
-        track2_candidates = [
-            s for s in analyzed
-            if s.state not in excluded_states
-            and s.code not in used_codes
-            and s.code not in track1_codes
-            and s.indicators.get("ambush_score_v2", 0) > 0
-        ]
-        track2_candidates.sort(
-            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
-        )
-        track2_topk = track2_candidates[:remaining_slots] if remaining_slots > 0 else []
-
-        ambush_list = list(track1_ambush)
-        for s in track2_topk:
-            if s.indicators.get("ambush_score_v2", 0) >= self.AMBUSH_SCORE_FLOOR:
-                ambush_list.append(s)
+        ambush_list: list[SectorDetail] = []
+        near_miss_list: list[SectorDetail] = []
+        if mode == "enabled":
+            launch_candidates = [
+                s for s in analyzed
+                if s.code not in used_codes
+                and s.lifecycle is not None
+                and s.lifecycle.continuous_phase == PHASE_LAUNCH
+            ]
+            # 确定性排序：launch_score 降序 → 强度降序 → 代码升序（同日重跑必须逐条相同）
+            launch_candidates.sort(
+                key=lambda s: (
+                    -(s.lifecycle.launch_score if s.lifecycle.launch_score is not None else -1.0),
+                    -s.strength_score,
+                    s.code,
+                ),
+            )
+            if get_launch_route():
+                routable = [s for s in launch_candidates if s.state == "ambush"]
+                launch_topn = get_launch_topn()
+                ambush_list = routable[:launch_topn] if launch_topn > 0 else list(routable)
+                logger.info(
+                    "[Node 2] 启动路由: launch 合格 %d 个（风险可路由 %d 个）→ ambush %d 个"
+                    "（TopN=%s），其余 %d 个仅留 launch_watch(in_output=False)",
+                    len(launch_candidates), len(routable), len(ambush_list),
+                    launch_topn if launch_topn > 0 else "不限",
+                    len(launch_candidates) - len(ambush_list),
+                )
+            else:
+                # 2026-11-10：launch 只记账，早期捕捉由 6 维埋伏分决定
+                ambush_list = self._select_ambush_by_score(analyzed, used_codes)
+                logger.info(
+                    "[Node 2] 启动相位仅记账: launch %d 个 → launch_watch；"
+                    "埋伏按评分选 %d 个（GOT_NODE2_LAUNCH_ROUTE=on 可恢复旧路由）",
+                    len(launch_candidates), len(ambush_list),
+                )
+        else:
+            ambush_list = self._select_ambush_by_score(analyzed, used_codes)
 
         ambush_codes = {s.code for s in ambush_list}
         used_codes.update(ambush_codes)
 
-        if track1_ambush or track2_topk:
-            logger.info(
-                f"[Node 2] 埋伏双轨: Track1(状态机)={len(track1_ambush)}, "
-                f"Track2(补位{remaining_slots})={len(track2_topk)}, "
-                f"合并后={len(ambush_list)}"
-            )
+        # ── 近失埋伏（legacy 专有；enabled 不把吸筹近失误当启动近失）──
+        if mode != "enabled":
+            near_miss_floor = self.AMBUSH_SCORE_FLOOR * self.AMBUSH_NEAR_MISS_RATIO
+            for s in analyzed:
+                if s.code in used_codes:
+                    continue
+                if s.state in excluded_states:
+                    continue
+                score = s.indicators.get("ambush_score_v2", 0)
+                if score < near_miss_floor:
+                    continue
+                in_pool = s.code in ambush_codes
+                above_floor = score >= self.AMBUSH_SCORE_FLOOR
+                if in_pool or above_floor:
+                    continue
+                s.near_miss_conditions = [f"score_below_floor({score:.2f}<{self.AMBUSH_SCORE_FLOOR:.2f})"]
+                near_miss_list.append(s)
 
-        # ── 近失埋伏 ──
-        near_miss_floor = self.AMBUSH_SCORE_FLOOR * self.AMBUSH_NEAR_MISS_RATIO
-        near_miss_list = []
-        for s in analyzed:
-            if s.code in used_codes:
-                continue
-            if s.state in excluded_states:
-                continue
-            score = s.indicators.get("ambush_score_v2", 0)
-            if score < near_miss_floor:
-                continue
-            in_pool = s.code in ambush_codes
-            above_floor = score >= self.AMBUSH_SCORE_FLOOR
-            if in_pool or above_floor:
-                continue
-            s.near_miss_conditions = [f"score_below_floor({score:.2f}<{self.AMBUSH_SCORE_FLOOR:.2f})"]
-            near_miss_list.append(s)
-
-        near_miss_list.sort(
-            key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
-        )
-        if near_miss_list:
-            logger.info(
-                f"[Node 2] 近失埋伏: {len(near_miss_list)} 个 "
-                f"(分数区间 [{near_miss_floor:.2f}, {self.AMBUSH_SCORE_FLOOR}))"
+            near_miss_list.sort(
+                key=lambda s: s.indicators.get("ambush_score_v2", 0), reverse=True,
             )
-        near_miss_list = near_miss_list[:10]
-        for s in near_miss_list:
-            used_codes.add(s.code)
+            if near_miss_list:
+                logger.info(
+                    f"[Node 2] 近失埋伏: {len(near_miss_list)} 个 "
+                    f"(分数区间 [{near_miss_floor:.2f}, {self.AMBUSH_SCORE_FLOOR}))"
+                )
+            near_miss_list = near_miss_list[:10]
+            for s in near_miss_list:
+                used_codes.add(s.code)
 
         # 衰竭主线：从 analyzed 中 state=="exhausted_mainline" 过滤（状态驱动）
         exhausted_mainline = [
@@ -3732,13 +4464,14 @@ class SectorAnalysisNode:
 
     @staticmethod
     def _build_early_watch(analyzed: list, result, sectors_raw: list | None = None) -> list[dict]:
-        """早段观察：强度≥80 或趋势启动（站上 MA20 + 5/10 日向上 + 近 20 日高 + 5 日分位≥80）。
+        """早段观察：强度≥80，或趋势启动（站上 MA20 + 5/10 日向上 + 近 20 日高 + 5 日分位≥80）。
 
-        种业 2026-08-03：5 日 +6.7%（87 分位）、10 日 +8.2%、站上 MA20、贴 20 日高——
-        趋势证据已成立，但 strength 未达 80、也未进任何桶；等 08-24 strength 81.8 时
-        板块指数已 +12.9%，中段已过。故本清单必须有 trend_launch 通道，否则永远晚 2-3 周。
+        只读、独立容量 20，不产生候选资格、不改状态/评分。`legacy` 模式输出；
+        `enabled` 由 `launch_watch` 取代（相位模型自带启动年龄与全量路由）。
 
-        只读、独立容量 20，不产生候选资格、不改状态/评分。
+        历史口径修正（2026-11-05）：本清单**不保证**任何具体板块入选——2026-08-03
+        生产归档没有种业，真实缓存全宇宙 65 个趋势候选里种业按 pct5/r5 排第 45，
+        20 条上限会截掉它；不能把「合成 5 板块必被 Top20 保留」当作生产事实。
         """
         used: set[str] = set()
         for group in getattr(result, "active_mainline", []) or []:
@@ -3748,17 +4481,17 @@ class SectorAnalysisNode:
         top_codes = {s.code for s in (getattr(result, "top_by_score", []) or [])}
 
         # 趋势指标（未复权收盘；只用于观察清单）
-        metrics: dict[str, tuple[float, float, bool, float]] = {}
+        metrics: dict[str, dict] = {}
         for raw in sectors_raw or []:
             code = str(raw.get("code") or "")
-            closes = [float(k.get("close") or 0) for k in (raw.get("klines") or [])]
-            if code and len(closes) >= 21 and closes[-1] > 0:
-                r5 = closes[-1] / closes[-6] - 1
-                r10 = closes[-1] / closes[-11] - 1
-                ma20 = sum(closes[-20:]) / 20
-                hi20 = max(closes[-20:])
-                metrics[code] = (r5, r10, closes[-1] > ma20, closes[-1] / hi20 - 1)
-        r5_sorted = sorted(v[0] for v in metrics.values())
+            if not code:
+                continue
+            df = SectorAnalysisNode._klines_to_df(raw.get("klines") or [])
+            tw = SectorAnalysisNode._measure_trend_window(df) if df is not None else None
+            if not tw or tw.get("close") is None:
+                continue
+            metrics[code] = tw
+        r5_sorted = sorted(v["r5"] for v in metrics.values() if v.get("r5") is not None)
 
         def pct5(r5: float) -> float:
             return sum(1 for x in r5_sorted if x <= r5) / len(r5_sorted) if r5_sorted else 0.0
@@ -3770,8 +4503,10 @@ class SectorAnalysisNode:
             strength = float(getattr(s, "strength_score", 0) or 0)
             m = metrics.get(s.code)
             trend_ok = bool(
-                m and m[2] and m[0] > 0 and m[1] > 0 and m[3] >= -0.02
-                and pct5(m[0]) >= 0.80
+                m and m["above_ma20"] and m["r5"] is not None and m["r5"] > 0
+                and m["r10"] is not None and m["r10"] > 0
+                and m["high20_dist"] is not None and m["high20_dist"] >= -0.02
+                and pct5(m["r5"]) >= 0.80
             )
             if strength < 80 and not trend_ok:
                 continue
@@ -3792,13 +4527,76 @@ class SectorAnalysisNode:
                 "quadrant": quadrant,
                 "in_top_by_score": s.code in top_codes,
                 "reason": reason,
-                "r5": None if not m else round(m[0], 4),
-                "r10": None if not m else round(m[1], 4),
-                "pct5": None if not m else round(pct5(m[0]), 4),
-                "high20_dist": None if not m else round(m[3], 4),
+                "r5": None if not m or m["r5"] is None else round(m["r5"], 4),
+                "r10": None if not m or m["r10"] is None else round(m["r10"], 4),
+                "pct5": None if not m or m["r5"] is None else round(pct5(m["r5"]), 4),
+                "high20_dist": None if not m or m["high20_dist"] is None else round(m["high20_dist"], 4),
             })
         out.sort(key=lambda x: (x["reason"] == "trend_launch", x["strength"]), reverse=True)
         return out[:20]
+
+    @staticmethod
+    def _build_launch_watch(analyzed: list, result) -> list[dict]:
+        """启动相位观察（enabled）：所有 `continuous_phase=launch` 逐条留痕。
+
+        `in_output=True` 表示已路由进 `ambush`；route=neutral 的 launch 只留痕
+        （`in_output=False`），不得因观察清单获得候选资格。
+        **不设 Node 2 容量上限**：容量由 G-A1~A4、Node 6 与组合预算过滤。
+        """
+        ambush_codes = {s.code for s in (getattr(result, "ambush", []) or [])}
+        rows: list[dict] = []
+        for s in analyzed:
+            lc = s.lifecycle
+            if lc is None or lc.continuous_phase != PHASE_LAUNCH:
+                continue
+            in_output = s.code in ambush_codes
+            if in_output:
+                dropped_reason = None
+            elif s.state == "ambush":
+                # 风险可路由但被 TopN 截掉（容量，不是风险）——归档里必须与风险丢弃区分
+                dropped_reason = "launch_topn"
+            else:
+                dropped_reason = "route_not_ambush"
+            rows.append({
+                "code": s.code,
+                "name": s.name,
+                "phase": lc.phase,
+                "continuous_phase": lc.continuous_phase,
+                "phase_age": lc.days_since_launch,
+                "phase_dwell": lc.phase_dwell,
+                "strength": round(float(s.strength_score), 2),
+                "state": s.state,
+                "route_state": s.state,
+                "launch_score": lc.launch_score,
+                "r5": s.indicators.get("lifecycle_r5"),
+                "r10": s.indicators.get("lifecycle_r10"),
+                "r5_pct": s.indicators.get("lifecycle_r5_pct"),
+                "high20_dist": s.indicators.get("lifecycle_high20_dist"),
+                "overheat_level": (s.break_signals or {}).get("overheat_level"),
+                "break_signals": s.break_signals,
+                "in_output": in_output,
+                "dropped_reason": dropped_reason,
+            })
+        rows.sort(key=lambda r: (r["launch_score"] if r["launch_score"] is not None else -1.0), reverse=True)
+        return rows
+
+    @staticmethod
+    def _build_accumulation_watch(analyzed: list, limit: int = 16) -> list[dict]:
+        """低位吸筹观察（enabled）：旧 6 维分口径，只展示、不进入选股车道。"""
+        rows: list[dict] = []
+        for s in analyzed:
+            score = s.accumulation_score
+            if score is None or score <= 0:
+                continue
+            rows.append({
+                "code": s.code,
+                "name": s.name,
+                "state": s.state,
+                "strength": round(float(s.strength_score), 2),
+                "ambush_score_v2": score,
+            })
+        rows.sort(key=lambda r: r["ambush_score_v2"], reverse=True)
+        return rows[:limit]
 
     @staticmethod
     def _extract_attack_power(market_context) -> float:
@@ -4440,6 +5238,23 @@ class SectorAnalysisNode:
                         "exit_pressure_days": int(getattr(latest, "exit_pressure_days", 0) or 0),
                         # 动量 EMA 历史序列（最近 N 天，最新在末尾）
                         "momentum_trajectory": momentum_traj,
+                        # 波次起始日（连续相位首次 bootstrap 的年龄来源）
+                        "wave_start_date": getattr(latest, "wave_start_date", None),
+                        # ── 连续相位（2026-11-05）：三者齐备才算「已有新相位历史」──
+                        "lifecycle_continuous_phase": getattr(latest, "lifecycle_continuous_phase", None),
+                        "lifecycle_anchor_date": getattr(latest, "lifecycle_anchor_date", None),
+                        "lifecycle_phase_age": getattr(latest, "lifecycle_phase_age", None),
+                        "lifecycle_phase_dwell": getattr(latest, "lifecycle_phase_dwell", None),
+                        "lifecycle_healthy_days": getattr(latest, "lifecycle_healthy_days", None),
+                        "lifecycle_weak_days": getattr(latest, "lifecycle_weak_days", None),
+                        "lifecycle_peak_close": getattr(latest, "lifecycle_peak_close", None),
+                        "lifecycle_last_observation_date": getattr(
+                            latest, "lifecycle_last_observation_date", None,
+                        ),
+                        "lifecycle_transition_reason": getattr(latest, "lifecycle_transition_reason", None),
+                        "lifecycle_data_status": getattr(latest, "lifecycle_data_status", None),
+                        "lifecycle_time_weight": getattr(latest, "lifecycle_time_weight", None),
+                        "accumulation_score": getattr(latest, "accumulation_score", None),
                     }
 
             if result:
@@ -4469,7 +5284,53 @@ class SectorAnalysisNode:
             return None, 0
         return getattr(rec, "state", None), int(getattr(rec, "dwell_days", 0) or 0)
 
-    def _save_sector_trends(self, sectors: list[SectorDetail]) -> None:
+    @staticmethod
+    def _lifecycle_db_fields(
+        state: Optional[LifecycleState], adapted_phase: Optional[str],
+    ) -> dict:
+        """`node2_sector_trends` 生命周期列（新旧列同源一次写全）。
+
+        `lifecycle_phase` 存**适配后**下游 phase；原始连续相位只落
+        `lifecycle_continuous_phase`。state=None（legacy）时全部为空，旧列行为不变。
+        """
+        return {
+            "lifecycle_phase": adapted_phase,
+            "lifecycle_continuous_phase": state.phase if state else None,
+            "lifecycle_anchor_date": state.anchor_date if state else None,
+            "lifecycle_phase_age": state.phase_age if state else None,
+            "lifecycle_phase_dwell": state.phase_dwell if state else None,
+            "lifecycle_healthy_days": state.healthy_days if state else None,
+            "lifecycle_weak_days": state.weak_days if state else None,
+            "lifecycle_peak_close": state.peak_close if state else None,
+            "lifecycle_last_observation_date": state.last_observation_date if state else None,
+            "lifecycle_transition_reason": state.transition_reason if state else None,
+            "lifecycle_data_status": state.data_status if state else None,
+            "lifecycle_time_weight": lifecycle_weight(state) if state else None,
+        }
+
+    @staticmethod
+    def _lifecycle_state_from_record(rec) -> Optional[LifecycleState]:
+        """从 `Node2SectorTrendRecord` 行构造 `LifecycleState`（缺列/缺值 → None）。"""
+        if rec is None:
+            return None
+        return lifecycle_state_from_prev_trend({
+            "lifecycle_anchor_date": getattr(rec, "lifecycle_anchor_date", None),
+            "lifecycle_phase_age": getattr(rec, "lifecycle_phase_age", None),
+            "lifecycle_phase_dwell": getattr(rec, "lifecycle_phase_dwell", None),
+            "lifecycle_continuous_phase": getattr(rec, "lifecycle_continuous_phase", None),
+            "lifecycle_healthy_days": getattr(rec, "lifecycle_healthy_days", None),
+            "lifecycle_weak_days": getattr(rec, "lifecycle_weak_days", None),
+            "lifecycle_peak_close": getattr(rec, "lifecycle_peak_close", None),
+            "lifecycle_last_observation_date": getattr(rec, "lifecycle_last_observation_date", None),
+            "lifecycle_transition_reason": getattr(rec, "lifecycle_transition_reason", None),
+            "lifecycle_data_status": getattr(rec, "lifecycle_data_status", None),
+        })
+
+    def _save_sector_trends(
+        self,
+        sectors: list[SectorDetail],
+        lifecycle_override: Optional[dict[str, LifecycleState]] = None,
+    ) -> None:
         """保存板块趋势到 SQLite，支持跨日追踪。
 
         追踪目标（2026-08-17 状态机校准扩展）：
@@ -4477,6 +5338,12 @@ class SectorAnalysisNode:
         - 精确状态快照（state）与驻留天数（dwell_days）—— 马尔可夫转移矩阵的记忆
         - RRG 3日EMA 平滑值（rrg_ratio_ema / rrg_momentum_ema）—— 次日状态判定的前值
         - 主线持续时间（mainline_days，含 cooling/exhausted 衍生期，保住"曾是主线 N 天"）
+        - 连续相位（lifecycle_* 列，2026-11-05）：anchor/age/dwell/peak 全部落盘，
+          临时 neutral 也保留 anchor（override 里含 dormant/neutral），次日可继承
+
+        `lifecycle_override`：enabled 传入**全量**原始相位（含未路由板块）。
+        存在但 code 缺失时写 dormant/unknown，**不 fallback 到 sector.lifecycle**；
+        legacy 不传，旧列从 `sector.lifecycle` 写，行为逐字节不变。
         """
         if not sectors:
             return
@@ -4524,6 +5391,21 @@ class SectorAnalysisNode:
                     sector.wave_start_date = wave_start_date
                     sector.wave_peak_strength = wave_peak_strength
 
+                    # ── 连续相位列（一次写全；legacy 全空、旧列保持原值）──
+                    if lifecycle_override is not None:
+                        lc_state = lifecycle_override.get(sector.code)
+                        if lc_state is None:
+                            # override 存在但缺 code：写 dormant/unknown，不 fallback
+                            lc_state = dormant_state(data_status="unknown")
+                        lc_fields = self._lifecycle_db_fields(
+                            lc_state, map_lifecycle_phase(lc_state.phase),
+                        )
+                    else:
+                        lc_fields = self._lifecycle_db_fields(
+                            None, sector.lifecycle.phase if sector.lifecycle else None,
+                        )
+                    lc_fields["accumulation_score"] = sector.accumulation_score
+
                     # 创建或更新记录
                     db_record = session.query(Node2SectorTrendRecord).filter_by(
                         sector_code=sector.code,
@@ -4537,7 +5419,6 @@ class SectorAnalysisNode:
                         db_record.rrg_ratio_ema = rrg_ratio_ema
                         db_record.rrg_momentum_ema = rrg_momentum_ema
                         db_record.unified_signal = self._state_to_signal(sector.state)
-                        db_record.lifecycle_phase = sector.lifecycle.phase if sector.lifecycle else None
                         db_record.strength_score = sector.strength_score
                         db_record.exit_pressure_days = sector.exit_pressure_days or 0
                         db_record.is_mainline = is_mainline
@@ -4549,6 +5430,8 @@ class SectorAnalysisNode:
                         db_record.wave_peak_strength = wave_peak_strength
                         db_record.set_strength_trajectory(trend_data["trajectory"])
                         db_record.trend_direction = trend_data["trend_direction"]
+                        for _col, _val in lc_fields.items():
+                            setattr(db_record, _col, _val)
                     else:
                         # 创建新记录
                         db_record = Node2SectorTrendRecord(
@@ -4560,7 +5443,6 @@ class SectorAnalysisNode:
                             rrg_ratio_ema=rrg_ratio_ema,
                             rrg_momentum_ema=rrg_momentum_ema,
                             unified_signal=self._state_to_signal(sector.state),
-                            lifecycle_phase=sector.lifecycle.phase if sector.lifecycle else None,
                             strength_score=sector.strength_score,
                             is_mainline=is_mainline,
                             mainline_days=mainline_days,
@@ -4571,6 +5453,7 @@ class SectorAnalysisNode:
                             wave_days=wave_days,
                             wave_start_date=wave_start_date,
                             wave_peak_strength=wave_peak_strength,
+                            **lc_fields,
                         )
                         db_record.set_strength_trajectory(trend_data["trajectory"])
                         session.add(db_record)
@@ -4624,6 +5507,19 @@ class SectorAnalysisNode:
                     # 补写：状态按驱逐/熄灭判定，exit_pressure +1，其余字段从 prev 复制
                     # ── 写入侧 NUL 剥离（v3.5 S1：防止幽灵行污染）──
                     name_clean = name.strip().strip('\x00') if name else ""
+                    if lifecycle_override is not None:
+                        # enabled：缺档只推进日历年龄（bar_complete=False），保持 phase/anchor/peak；
+                        # 不生成 launch_watch、不新增健康/退出确认，也不跑 legacy bootstrap。
+                        gap_lc = transition_lifecycle(
+                            self._lifecycle_state_from_record(prev_rec),
+                            LifecycleEvidence(trade_date=today, bar_complete=False),
+                            self._lifecycle_calendar or [today],
+                        )
+                        gap_lc_fields = self._lifecycle_db_fields(
+                            gap_lc, map_lifecycle_phase(gap_lc.phase),
+                        )
+                    else:
+                        gap_lc_fields = {"lifecycle_phase": prev_rec.lifecycle_phase}
                     session.add(Node2SectorTrendRecord(
                         sector_code=code,
                         sector_name=name_clean,
@@ -4636,7 +5532,6 @@ class SectorAnalysisNode:
                         rrg_ratio_ema=getattr(prev_rec, "rrg_ratio_ema", None),
                         rrg_momentum_ema=getattr(prev_rec, "rrg_momentum_ema", None),
                         unified_signal=self._state_to_signal(new_state),
-                        lifecycle_phase=prev_rec.lifecycle_phase,
                         strength_score=getattr(prev_rec, "strength_score", 0),
                         is_mainline=new_is_mainline,
                         mainline_days=(
@@ -4646,6 +5541,7 @@ class SectorAnalysisNode:
                         ambush_days=prev_rec.ambush_days,
                         exit_pressure_days=new_ep,
                         trend_direction=prev_rec.trend_direction,
+                        **gap_lc_fields,
                     ))
                     gap_count += 1
                 if gap_count > 0:

@@ -23,7 +23,8 @@ def result(active=(), ambush=(), near=(), top=()):
 
 
 def raw(code, closes):
-    return {"code": code, "klines": [{"close": c} for c in closes]}
+    # 与生产 `_df_to_klines` 同形：close/high/volume 齐备（_klines_to_df 需要 volume）
+    return {"code": code, "klines": [{"close": c, "high": c, "volume": 1000} for c in closes]}
 
 
 class TestEarlyWatch(TestCase):
@@ -56,17 +57,37 @@ class TestEarlyWatch(TestCase):
         )
         self.assertEqual(rows[0]["code"], "880692")
 
-    def test_trend_launch_is_kept_before_strength_80(self):
-        # 种业 08-03 形态：5/10 日向上、站上 MA20、贴 20 日高、5 日分位高
+    def test_trend_launch_channel_keeps_pre_80_board(self):
+        # 通道行为断言：趋势证据成立（5/10 日向上、站上 MA20、贴 20 日高、5 日分位高）
+        # 且 strength<80 也能进观察清单。
+        # ⚠️ 这里**不**断言任何真实板块（如种业）必然入选——清单有 20 条上限，
+        # 全宇宙候选多于 20 时会被截断（2026-08-03 缓存实测种业排第 45）。
         closes = [100 + i * 1.0 for i in range(40)]
         rows = SectorAnalysisNode._build_early_watch(
-            [sec("880710", "种业", 60.0)], result(),
+            [sec("880710", "合成启动A", 60.0)], result(),
             [raw("880710", closes)] + [raw(f"88{i:04d}", [100.0] * 40) for i in range(900, 904)],
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["reason"], "trend_launch")
         self.assertGreater(rows[0]["r5"], 0)
         self.assertGreaterEqual(rows[0]["pct5"], 0.8)
+
+    def test_real_rrg_model_does_not_crash(self):
+        """rrg 是 Pydantic 模型（RRGQuadrant），旧实现按 dict 取值必崩（.get）。"""
+        from src.got.schemas import RRGQuadrant
+
+        board = sec("880001", "真实RRG", 88.0)
+        board.rrg = RRGQuadrant(rs_ratio=0.8, rs_momentum=0.7, quadrant="leading")
+        rows = SectorAnalysisNode._build_early_watch([board], result())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["quadrant"], "leading")
+
+    def test_missing_trend_window_is_not_a_candidate(self):
+        """K 线不足 21 根 → 无测量、不入选（不伪造 0 值）。"""
+        rows = SectorAnalysisNode._build_early_watch(
+            [sec("880005", "短史", 60.0)], result(), [raw("880005", [100.0] * 10)],
+        )
+        self.assertEqual(rows, [])
 
     def test_flat_or_below_ma20_not_trend_launch(self):
         flat = [100.0] * 40

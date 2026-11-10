@@ -43,7 +43,11 @@ def _archive(base, run_date: date) -> None:
 
 @pytest.mark.parametrize(
     "artifact",
-    [arch.SHADOW_ATTENTION_ARTIFACT, arch.SHADOW_SHORTLIST_QUOTA_ARTIFACT],
+    [
+        arch.SHADOW_ATTENTION_ARTIFACT,
+        arch.SHADOW_SHORTLIST_QUOTA_ARTIFACT,
+        arch.THEME_LEDGER_ARTIFACT,
+    ],
 )
 def test_pre_archive_artifact_survives_atomic_replace(tmp_path, artifact):
     """同日二次归档后，归档前直写的旁挂产物不得被删除。"""

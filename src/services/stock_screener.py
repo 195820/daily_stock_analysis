@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import Config
+from src.got.sector_lifecycle import get_lifecycle_mode
 from src.storage import DatabaseManager, ScreenerResultRecord
 
 logger = logging.getLogger(__name__)
@@ -3773,11 +3774,14 @@ verdict 含义：
                     logger.debug(f"[过热警告] {c['code']} {c.get('name','')} ({c['sector']}) severity={overheat_sev:.2f}")
 
                 # 8. 板块生命周期 mature 惩罚（软过滤，防追高成熟期板块）
-                lifecycle_phase = c.get("sector_lifecycle_phase", "")
-                if lifecycle_phase == "mature":
-                    score -= 10      # 成熟期板块：上涨空间有限
-                elif lifecycle_phase == "late_stage":
-                    score -= 20      # 晚期板块：即将衰竭
+                # P2 前置底座（2026-11-05）：enabled 下删除该项——时间折价已在
+                # Node 6 composite 计过一次，个股 risk 不再对同一板块年龄重复降权。
+                if get_lifecycle_mode() != "enabled":
+                    lifecycle_phase = c.get("sector_lifecycle_phase", "")
+                    if lifecycle_phase == "mature":
+                        score -= 10      # 成熟期板块：上涨空间有限
+                    elif lifecycle_phase == "late_stage":
+                        score -= 20      # 晚期板块：即将衰竭
 
                 scores[c["code"]] = max(0, score)
             except Exception as e:

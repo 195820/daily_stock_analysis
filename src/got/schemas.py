@@ -225,10 +225,38 @@ class LaunchSignal(BaseModel):
 
 
 class LifecycleInfo(BaseModel):
-    """生命周期信息"""
-    phase: str = Field(..., description="launch / acceleration / mature / late_stage / mature_exhausted")
+    """生命周期信息（连续相位 + 下游适配相位，两套词表禁止混用）。
+
+    - `continuous_phase`：行情相位，`dormant/launch/expansion/mature/decline`
+      （来自 `src.got.sector_lifecycle`，锚点=趋势启动日，跨旧 state 字符串继承）。
+    - `phase`：下游既有适配词表，`launch/acceleration/mature/late_stage/mature_exhausted`
+      （`enabled` 模式不再产出 `late_stage`；`legacy` 仍可）。
+
+    `days_since_launch` 等于连续相位的 `phase_age`（锚日含当日=1，按交易日历），
+    不再等于 `mainline_days+1`；`mainline_days` 仍是「处于主线风险状态的天数」。
+    """
+    phase: str = Field(
+        ...,
+        description="launch / acceleration / mature / mature_exhausted（enabled 不再产出 late_stage；legacy 仍可）",
+    )
     days_since_launch: Optional[int] = None
     thresholds: dict[str, int] = Field(default_factory=dict)
+    continuous_phase: str = Field(
+        default="dormant",
+        description="dormant / launch / expansion / mature / decline（原始连续相位；下游只读此字段判断行情相位）",
+    )
+    anchor_date: Optional[date] = Field(
+        default=None, description="行情锚日（趋势启动日）；dormant 为空",
+    )
+    phase_dwell: int = Field(default=0, description="当前相位内真实观测数（缺档不推进）")
+    healthy_days: int = Field(default=0, description="连续健康观测天数")
+    weak_days: int = Field(default=0, description="连续弱观测天数（≥3 确认 decline）")
+    transition_reason: str = Field(default="", description="受控转移原因（归档比对用）")
+    data_status: str = Field(default="unknown", description="ok / unknown（unknown 不当作利空）")
+    time_weight: float = Field(default=1.0, description="相位时间权重（仅在 composite 生效一次）")
+    launch_score: Optional[float] = Field(
+        default=None, description="启动诊断分（容量排序用；None=输入不完整，不按 0 分拒绝已有段）",
+    )
 
 
 class OverheatSeverity(BaseModel):
@@ -275,6 +303,10 @@ class SectorDetail(BaseModel):
     indicators: dict[str, float] = Field(default_factory=dict)
     launch_signal: Optional[LaunchSignal] = None
     lifecycle: Optional[LifecycleInfo] = None
+    accumulation_score: Optional[float] = Field(
+        default=None,
+        description="低位吸筹观察分（旧 ambush_score_v2 口径，`enabled` 模式只作观察，不路由候选）",
+    )
     tier: Optional[str] = None  # S / A / B
     mainline_quality: Optional[str] = Field(
         default=None,
@@ -405,7 +437,25 @@ class SectorContext(BaseModel):
     early_watch: list[dict] = Field(
         default_factory=list,
         description="早段观察：strength≥80 但未进入 active/ambush/near-miss 的板块"
-                    "（含 state/age 线索；**只观察，不产生候选资格**）。",
+                    "（含 state/age 线索；**只观察，不产生候选资格**）。legacy 输出。",
+    )
+    launch_watch: list[dict] = Field(
+        default_factory=list,
+        description="启动相位观察（enabled）：所有 continuous_phase=launch 的板块逐条留痕，"
+                    "`in_output=True` 表示已路由进 ambush；**不设 Node 2 容量上限**。",
+    )
+    accumulation_watch: list[dict] = Field(
+        default_factory=list,
+        description="低位吸筹观察（enabled）：旧 ambush_score_v2 口径，只观察、不路由候选。",
+    )
+    phase_lookup: dict[str, dict] = Field(
+        default_factory=dict,
+        description="板块名 → LifecycleInfo 原始字典（全量 analyzed，供 Node 6 合成 detail 回填年龄）",
+    )
+    phase_data_quality: dict = Field(
+        default_factory=dict,
+        description="启动供给通道质量（mode/quick_universe_count/quick_valid_count/"
+                    "launch_candidates/launch_after_kline/unavailable_reasons）",
     )
 
     # ── 新增：行业板块视角（中期趋势）──
